@@ -35,6 +35,73 @@
         "title": "RegisterRequest",
         "type": "object"
       },
+      "BatchExecuteQuoteResponse": {
+        "description": "A list of quote execution responses or errors.",
+        "properties": {
+          "data": {
+            "items": {
+              "properties": {
+                "execution": {
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "buy",
+                        "sell"
+                      ],
+                      "type": "string"
+                    },
+                    "company_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "good_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "port_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "quantity": {
+                      "type": "integer"
+                    },
+                    "total_price": {
+                      "type": "integer"
+                    },
+                    "unit_price": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "success",
+                    "error"
+                  ],
+                  "type": "string"
+                },
+                "token": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "BatchExecuteQuoteResponse",
+        "type": "object"
+      },
       "BlendedPriceResponse": {
         "description": "Response schema for a calculated blended price.",
         "properties": {
@@ -340,6 +407,22 @@
         "title": "Player",
         "type": "object"
       },
+      "BatchExecuteQuoteRequest": {
+        "description": "Request to execute multiple quotes at once.",
+        "properties": {
+          "requests": {
+            "items": {
+              "$ref": "#/components/schemas/ExecuteQuoteRequest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "requests"
+        ],
+        "title": "BatchExecuteQuoteRequest",
+        "type": "object"
+      },
       "ShipyardResponse": {
         "description": "Response schema for a single shipyard.",
         "properties": {
@@ -504,6 +587,22 @@
         "title": "LoginRequest",
         "type": "object"
       },
+      "BatchQuoteRequest": {
+        "description": "Request to get multiple quotes at once.",
+        "properties": {
+          "requests": {
+            "items": {
+              "$ref": "#/components/schemas/QuoteRequest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "requests"
+        ],
+        "title": "BatchQuoteRequest",
+        "type": "object"
+      },
       "CompanyEconomyResponse": {
         "description": "Response schema for company economy summary.",
         "properties": {
@@ -560,6 +659,9 @@
             "format": "uuid",
             "type": "string"
           },
+          "price_bounds": {
+            "type": "string"
+          },
           "stock_bounds": {
             "type": "string"
           },
@@ -578,6 +680,7 @@
           "port_id",
           "good_id",
           "stock_bounds",
+          "price_bounds",
           "inserted_at",
           "updated_at"
         ],
@@ -937,6 +1040,40 @@
         "title": "TransferToWarehouseRequest",
         "type": "object"
       },
+      "TransitLog": {
+        "description": "A log of a ship's transit between ports.",
+        "properties": {
+          "arrived_at": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "departed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "route_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ship_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "departed_at",
+          "ship_id",
+          "route_id"
+        ],
+        "title": "TransitLog",
+        "type": "object"
+      },
       "PageMetadata": {
         "description": "Pagination metadata for cursor-based paginated results.",
         "properties": {
@@ -983,6 +1120,77 @@
           "updated_at"
         ],
         "title": "Shipyard",
+        "type": "object"
+      },
+      "BatchQuoteResponse": {
+        "description": "A list of quote responses or errors.",
+        "properties": {
+          "data": {
+            "items": {
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "quote": {
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "buy",
+                        "sell"
+                      ],
+                      "type": "string"
+                    },
+                    "company_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "good_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "port_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "quantity": {
+                      "type": "integer"
+                    },
+                    "timestamp": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "total_price": {
+                      "type": "integer"
+                    },
+                    "unit_price": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "status": {
+                  "enum": [
+                    "success",
+                    "error"
+                  ],
+                  "type": "string"
+                },
+                "token": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "BatchQuoteResponse",
         "type": "object"
       },
       "ShipTypeResponse": {
@@ -1058,6 +1266,34 @@
           "metadata"
         ],
         "title": "LedgerResponse",
+        "type": "object"
+      },
+      "Trader": {
+        "description": "An NPC Trader entity.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Trader",
         "type": "object"
       },
       "RoutesResponse": {
@@ -1437,6 +1673,46 @@
         "title": "LedgerEntry",
         "type": "object"
       },
+      "TransitLogsResponse": {
+        "description": "Response schema for a paginated list of transit logs.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/TransitLog"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "TransitLogsResponse",
+        "type": "object"
+      },
+      "TradersResponse": {
+        "description": "Response schema for a list of traders.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Trader"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "TradersResponse",
+        "type": "object"
+      },
       "ErrorResponse": {
         "description": "Response schema for standard errors (e.g., 401 Unauthorized)",
         "example": {
@@ -1448,6 +1724,10 @@
           "errors": {
             "properties": {
               "detail": {
+                "type": "string"
+              },
+              "id": {
+                "description": "The ID of the resource associated with the error, if applicable.",
                 "type": "string"
               }
             },
@@ -1664,6 +1944,67 @@
   },
   "openapi": "3.0.0",
   "paths": {
+    "/api/v1/trade/quotes/execute/batch": {
+      "post": {
+        "callbacks": {},
+        "description": "Executes multiple trades based on previously generated quote tokens.",
+        "operationId": "batchExecuteQuote",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchExecuteQuoteRequest"
+              }
+            }
+          },
+          "description": "Batch execution details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchExecuteQuoteResponse"
+                }
+              }
+            },
+            "description": "Trades executed successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Execution failed"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Execute multiple signed quotes",
+        "tags": [
+          "Trade"
+        ]
+      }
+    },
     "/api/v1/world/goods": {
       "get": {
         "callbacks": {},
@@ -3011,7 +3352,7 @@
     "/api/v1/trade/trader-positions": {
       "get": {
         "callbacks": {},
-        "description": "Returns a list of goods a trader is buying or selling at a port.",
+        "description": "Returns a list of goods a trader is buying or selling optionally filtered by port..",
         "operationId": "traderPositions",
         "parameters": [
           {
@@ -3233,6 +3574,58 @@
         "summary": "Subscribe to world events",
         "tags": [
           "Events"
+        ]
+      }
+    },
+    "/api/v1/trade/traders": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of NPC traders.",
+        "operationId": "traders",
+        "parameters": [
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TradersResponse"
+                }
+              }
+            },
+            "description": "List of traders"
+          }
+        },
+        "summary": "List traders",
+        "tags": [
+          "Trade"
         ]
       }
     },
@@ -3561,6 +3954,102 @@
         "summary": "Calculate blended price",
         "tags": [
           "Market"
+        ]
+      }
+    },
+    "/api/v1/ships/{ship_id}/transit-logs": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a paginated list of transit logs for a specific ship owned by the current company.",
+        "operationId": "transitLogs",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "path",
+            "name": "ship_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransitLogsResponse"
+                }
+              }
+            },
+            "description": "List of transit logs"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List transit logs for a ship",
+        "tags": [
+          "Fleet"
         ]
       }
     },
@@ -4376,6 +4865,67 @@
         "summary": "Get port details",
         "tags": [
           "World"
+        ]
+      }
+    },
+    "/api/v1/trade/quotes/batch": {
+      "post": {
+        "callbacks": {},
+        "description": "Generates signed quotes for multiple trades at once.",
+        "operationId": "batchQuote",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchQuoteRequest"
+              }
+            }
+          },
+          "description": "Batch quote request details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchQuoteResponse"
+                }
+              }
+            },
+            "description": "Batch quotes generated successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get multiple trade quotes",
+        "tags": [
+          "Trade"
         ]
       }
     }
