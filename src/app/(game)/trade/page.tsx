@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Good, Port, Quote, TraderPosition } from "@/lib/types";
+import { Good, Port, Quote, Ship, TraderPosition, Warehouse } from "@/lib/types";
 import { worldApi } from "@/lib/api/world";
 import { tradeApi } from "@/lib/api/trade";
+import { fleetApi } from "@/lib/api/fleet";
 import { warehousesApi } from "@/lib/api/warehouses";
-import type { Warehouse } from "@/lib/types";
+import { saveQuote, removeQuote } from "@/lib/quote-store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -18,14 +19,19 @@ export default function TradePage() {
   const [ports, setPorts] = useState<Port[]>([]);
   const [goods, setGoods] = useState<Good[]>([]);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
+  const [ships, setShips] = useState<Ship[]>([]);
   const [traders, setTraders] = useState<TraderPosition[]>([]);
 
   const [selectedPort, setSelectedPort] = useState("");
   const [selectedTrader, setSelectedTrader] = useState("");
   const [selectedGood, setSelectedGood] = useState("");
-  const [selectedWarehouse, setSelectedWarehouse] = useState("");
   const [direction, setDirection] = useState<"buy" | "sell">("buy");
   const [quantity, setQuantity] = useState("1");
+
+  // Destination: ship or warehouse to receive/source the goods
+  const [destType, setDestType] = useState<"ship" | "warehouse">("ship");
+  const [selectedShip, setSelectedShip] = useState("");
+  const [selectedWarehouse, setSelectedWarehouse] = useState("");
 
   const [quote, setQuote] = useState<Quote | null>(null);
   const [quoteSecondsLeft, setQuoteSecondsLeft] = useState(0);
@@ -34,8 +40,13 @@ export default function TradePage() {
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    Promise.all([worldApi.getPorts(), worldApi.getGoods(), warehousesApi.getWarehouses()])
-      .then(([p, g, w]) => { setPorts(p); setGoods(g); setWarehouses(w); })
+    Promise.all([
+      worldApi.getPorts(),
+      worldApi.getGoods(),
+      warehousesApi.getWarehouses(),
+      fleetApi.getShips(),
+    ])
+      .then(([p, g, w, s]) => { setPorts(p); setGoods(g); setWarehouses(w); setShips(s); })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -56,18 +67,21 @@ export default function TradePage() {
     return () => clearInterval(interval);
   }, [quote]);
 
+  const dockedShipsAtPort = ships.filter((s) => s.status === "docked" && s.port_id === selectedPort);
+
   const handleGetQuote = async () => {
-    if (!selectedTrader || !selectedGood || !quantity) return;
+    if (!selectedGood || !quantity) return;
     setSubmitting(true);
     setMessage("");
     try {
       const q = await tradeApi.createQuote({
-        trader_id: selectedTrader,
+        port_id: selectedPort,
         good_id: selectedGood,
         quantity: Number(quantity),
-        direction,
+        action: direction,
       });
       setQuote(q);
+      saveQuote(q);
     } catch (e: unknown) {
       setMessage(`Error: ${(e as Error).message}`);
     } finally {
@@ -77,10 +91,19 @@ export default function TradePage() {
 
   const handleExecuteQuote = async () => {
     if (!quote) return;
+    const destId = destType === "ship" ? selectedShip : selectedWarehouse;
+    if (!destId) {
+      setMessage("Please select a destination.");
+      return;
+    }
     setSubmitting(true);
     setMessage("");
     try {
-      await tradeApi.executeQuote({ quote_id: quote.id, warehouse_id: selectedWarehouse || undefined });
+      await tradeApi.executeQuote({
+        token: quote.token,
+        destinations: [{ type: destType, id: destId, quantity: quote.quantity }],
+      });
+      removeQuote(quote.token);
       setMessage("Trade executed successfully!");
       setQuote(null);
     } catch (e: unknown) {
@@ -103,7 +126,7 @@ export default function TradePage() {
             <div className="space-y-2">
               <Label>Port</Label>
               <Select value={selectedPort} onValueChange={setSelectedPort}>
-                <SelectTrigger><SelectValue placeholder="Select a port…" /></SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Select a port..." /></SelectTrigger>
                 <SelectContent>
                   {ports.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}
                 </SelectContent>
@@ -114,10 +137,10 @@ export default function TradePage() {
               <div className="space-y-2">
                 <Label>Trader</Label>
                 <Select value={selectedTrader} onValueChange={setSelectedTrader}>
-                  <SelectTrigger><SelectValue placeholder="Select a trader…" /></SelectTrigger>
+                  <SelectTrigger><SelectValue placeholder="Select a trader..." /></SelectTrigger>
                   <SelectContent>
                     {[...new Map(traders.map((t) => [t.trader_id, t])).values()].map((t) => (
-                      <SelectItem key={t.trader_id} value={t.trader_id}>{t.trader_id.slice(0, 8)}…</SelectItem>
+                      <SelectItem key={t.trader_id} value={t.trader_id}>{t.trader_id.slice(0, 8)}...</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
@@ -127,7 +150,7 @@ export default function TradePage() {
             <div className="space-y-2">
               <Label>Good</Label>
               <Select value={selectedGood} onValueChange={setSelectedGood}>
-                <SelectTrigger><SelectValue placeholder="Select a good…" /></SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Select a good..." /></SelectTrigger>
                 <SelectContent>
                   {goods.map((g) => <SelectItem key={g.id} value={g.id}>{g.name}</SelectItem>)}
                 </SelectContent>
@@ -150,19 +173,7 @@ export default function TradePage() {
               <Input type="number" min="1" value={quantity} onChange={(e) => setQuantity(e.target.value)} />
             </div>
 
-            <div className="space-y-2">
-              <Label>Warehouse (optional)</Label>
-              <Select value={selectedWarehouse} onValueChange={setSelectedWarehouse}>
-                <SelectTrigger><SelectValue placeholder="No warehouse (ship cargo)" /></SelectTrigger>
-                <SelectContent>
-                  {warehouses.map((w) => (
-                    <SelectItem key={w.id} value={w.id}>{ports.find((p) => p.id === w.port_id)?.name ?? w.port_id}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <Button onClick={handleGetQuote} disabled={submitting || !selectedTrader || !selectedGood}>
+            <Button onClick={handleGetQuote} disabled={submitting || !selectedPort || !selectedGood}>
               {submitting ? <Spinner className="size-4" /> : "Get Quote (120s)"}
             </Button>
           </CardContent>
@@ -174,15 +185,59 @@ export default function TradePage() {
             <CardContent className="space-y-4">
               <div className="space-y-1 text-sm">
                 <div className="flex justify-between"><span className="text-muted-foreground">Good</span><span>{goods.find((g) => g.id === quote.good_id)?.name ?? quote.good_id}</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Action</span><span className="capitalize">{quote.action}</span></div>
                 <div className="flex justify-between"><span className="text-muted-foreground">Quantity</span><span>{quote.quantity.toLocaleString()}</span></div>
-                <div className="flex justify-between"><span className="text-muted-foreground">Price / unit</span><span className="font-mono">£{quote.price_per_unit.toLocaleString()}</span></div>
-                <div className="flex justify-between font-semibold"><span>Total</span><span className="font-mono">£{quote.total_price.toLocaleString()}</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Price / unit</span><span className="font-mono">{quote.unit_price.toLocaleString()}</span></div>
+                <div className="flex justify-between font-semibold"><span>Total</span><span className="font-mono">{quote.total_price.toLocaleString()}</span></div>
               </div>
               <div className="flex items-center gap-2">
                 <Badge variant={quoteSecondsLeft > 30 ? "success" : "warning"}>
                   {quoteSecondsLeft}s left
                 </Badge>
               </div>
+
+              <div className="space-y-3 border-t pt-3">
+                <div className="space-y-2">
+                  <Label>Destination type</Label>
+                  <Select value={destType} onValueChange={(v: string) => { setDestType(v as "ship" | "warehouse"); setSelectedShip(""); setSelectedWarehouse(""); }}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ship">Ship</SelectItem>
+                      <SelectItem value="warehouse">Warehouse</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {destType === "ship" ? (
+                  <div className="space-y-2">
+                    <Label>Ship</Label>
+                    <Select value={selectedShip} onValueChange={setSelectedShip}>
+                      <SelectTrigger><SelectValue placeholder="Select a ship..." /></SelectTrigger>
+                      <SelectContent>
+                        {(dockedShipsAtPort.length > 0 ? dockedShipsAtPort : ships.filter((s) => s.status === "docked")).map((s) => (
+                          <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {selectedPort && dockedShipsAtPort.length === 0 && (
+                      <p className="text-xs text-muted-foreground">No ships docked at this port - showing all docked ships.</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Label>Warehouse</Label>
+                    <Select value={selectedWarehouse} onValueChange={setSelectedWarehouse}>
+                      <SelectTrigger><SelectValue placeholder="Select a warehouse..." /></SelectTrigger>
+                      <SelectContent>
+                        {warehouses.map((w) => (
+                          <SelectItem key={w.id} value={w.id}>{ports.find((p) => p.id === w.port_id)?.name ?? w.port_id}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+              </div>
+
               <Button onClick={handleExecuteQuote} disabled={submitting || quoteSecondsLeft === 0}>
                 {submitting ? <Spinner className="size-4" /> : "Execute Trade"}
               </Button>

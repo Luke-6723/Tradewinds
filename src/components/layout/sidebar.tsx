@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import {
   AnchorIcon,
   BarChart3Icon,
+  ClipboardListIcon,
   LayoutDashboardIcon,
   MapIcon,
   PackageIcon,
@@ -18,6 +19,7 @@ const nav = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboardIcon },
   { href: "/ports", label: "Ports", icon: MapIcon },
   { href: "/trade", label: "Trade", icon: StoreIcon },
+  { href: "/quotes", label: "Quotes", icon: ClipboardListIcon },
   { href: "/market", label: "Market", icon: BarChart3Icon },
   { href: "/fleet", label: "Fleet", icon: ShipIcon },
   { href: "/warehouses", label: "Warehouses", icon: AnchorIcon },

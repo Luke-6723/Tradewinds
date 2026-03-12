@@ -88,7 +88,7 @@ export interface ShipType {
   description?: string;
   capacity: number;
   speed: number;
-  upkeep_cost: number;
+  upkeep: number;
   base_price: number;
 }
 
@@ -104,26 +104,34 @@ export interface TraderPosition {
 }
 
 export interface QuoteRequest {
-  trader_id: UUID;
+  port_id: UUID;
   good_id: UUID;
   quantity: number;
-  direction: "buy" | "sell";
+  action: "buy" | "sell";
 }
 
 export interface Quote {
-  id: UUID;
-  trader_id: UUID;
+  token: string;
+  action: "buy" | "sell";
+  company_id: UUID;
   good_id: UUID;
+  port_id: UUID;
   quantity: number;
-  price_per_unit: number;
+  unit_price: number;
   total_price: number;
-  direction: "buy" | "sell";
-  expires_at: ISO8601;
+  timestamp: ISO8601;
+  expires_at: ISO8601; // computed client-side: timestamp + 120s
+}
+
+export interface TradeDestination {
+  type: "ship" | "warehouse";
+  id: UUID;
+  quantity: number;
 }
 
 export interface ExecuteQuoteRequest {
-  quote_id: UUID;
-  warehouse_id?: UUID;
+  token: string;
+  destinations: TradeDestination[];
 }
 
 export interface DirectTradeRequest {
@@ -168,10 +176,7 @@ export interface FillOrderRequest {
 export interface BlendedPrice {
   good_id: UUID;
   port_id: UUID;
-  buy_price: number | null;
-  sell_price: number | null;
-  buy_depth: number;
-  sell_depth: number;
+  blended_price: number;
 }
 
 // ─── Fleet ─────────────────────────────────────────────────────────────────
@@ -261,7 +266,8 @@ export interface CompanyEvent {
 
 // ─── API response wrapper ──────────────────────────────────────────────────
 export interface ApiError {
-  error: string;
+  error?: string;
   message?: string;
+  errors?: Record<string, string[]>;
   status: number;
 }
