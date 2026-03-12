@@ -219,23 +219,52 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
         s = appendLog(s, `${ship.name}: arrived at buy port ${portName(ship.port_id)}, buying ${plan.quantity}× ${goodName(plan.goodId)}…`);
         await sleep(DOCK_DELAY_MS);
         try {
-          const buyQuote = await tradeApi.createQuote({
+          // First quote: get the unit price to compute what we can afford
+          const priceQuote = await tradeApi.createQuote({
             port_id: ship.port_id,
             good_id: plan.goodId,
             quantity: plan.quantity,
             action: "buy",
           });
 
-          const maxAffordable = Math.floor(availableFunds / buyQuote.unit_price);
+          const maxAffordable = Math.floor(availableFunds / priceQuote.unit_price);
           const actualQty = Math.min(plan.quantity, maxAffordable);
           if (actualQty < 1) {
-            s = appendLog(s, `${ship.name}: insufficient funds (£${availableFunds.toLocaleString()} < £${buyQuote.unit_price}/unit), resetting`);
+            s = appendLog(s, `${ship.name}: insufficient funds (£${availableFunds.toLocaleString()} < £${priceQuote.unit_price}/unit), resetting`);
             if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
             s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
             continue;
           }
           if (actualQty < plan.quantity) {
             s = appendLog(s, `${ship.name}: funds capped — buying ${actualQty}× instead of ${plan.quantity}×`);
+          }
+
+          // If quantity changed, get a fresh quote so the token matches the execute quantity exactly
+          const buyQuote = actualQty < plan.quantity
+            ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: actualQty, action: "buy" })
+            : priceQuote;
+
+          // Verify affordability against the fresh quote's price (may differ from priceQuote)
+          if (actualQty * buyQuote.unit_price > availableFunds) {
+            const finalQty = Math.floor(availableFunds / buyQuote.unit_price);
+            if (finalQty < 1) {
+              s = appendLog(s, `${ship.name}: insufficient funds after re-quote, resetting`);
+              if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
+              s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
+              continue;
+            }
+            // One final re-quote for the verified affordable amount
+            const finalQuote = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: finalQty, action: "buy" });
+            await tradeApi.executeQuote({ token: finalQuote.token, destinations: [{ type: "ship", id: ship.id, quantity: finalQty }] });
+            availableFunds -= finalQty * finalQuote.unit_price;
+            const sellLegs = plan.sellLegs ?? [];
+            const newPlan: ShipPlan = { goodId: plan.goodId, goodName: plan.goodName, quantity: finalQty, actualBuyPrice: finalQuote.unit_price, legs: sellLegs.slice(1), sellPortId: plan.sellPortId, sellPrice: plan.sellPrice };
+            s.ships = { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan: newPlan } };
+            if (sellLegs.length > 0) await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
+            if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
+            s.claimed = { ...s.claimed, [claimKey(plan.goodId, plan.sellPortId)]: ship.id };
+            s = appendLog(s, `${ship.name}: bought ${finalQty}× ${goodName(plan.goodId)} @ £${finalQuote.unit_price} → ${portName(plan.sellPortId)}`);
+            continue;
           }
 
           await tradeApi.executeQuote({
@@ -562,19 +591,17 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
 
           if (margin < MIN_MARGIN) continue;
 
-          const maxAffordable = Math.floor(availableFunds / buyItem.quote.unit_price);
-          const actualQty = Math.min(qty, maxAffordable);
-          if (actualQty < 1) {
+          // Affordability check using batch quote price as a fast pre-filter
+          if (availableFunds < buyItem.quote.unit_price) {
             s = appendLog(s, `${ship.name}: insufficient funds (£${availableFunds.toLocaleString()} < £${buyItem.quote.unit_price}/unit for ${goodName(c.goodId)}), skipping`);
             continue;
-          }
-          if (actualQty < qty) {
-            s = appendLog(s, `${ship.name}: funds capped — will buy ${actualQty}× instead of ${qty}×`);
           }
 
           try {
             if (isGlobal) {
-              // Travel empty to buy port first — quantity will be re-checked on arrival
+              // Travel empty to buy port — quantity capped by rough affordability estimate
+              const maxAffordable = Math.floor(availableFunds / buyItem.quote.unit_price);
+              const reserveQty    = Math.min(qty, maxAffordable);
               await fleetApi.transit(ship.id, { route_id: c.toLegsBuy[0].routeId });
               s.claimed = { ...s.claimed, [claimKey(c.goodId, c.buyPortId)]: ship.id };
               s.ships = {
@@ -584,7 +611,7 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
                   plan: {
                     goodId:         c.goodId,
                     goodName:       goodName(c.goodId),
-                    quantity:       actualQty,
+                    quantity:       reserveQty,
                     actualBuyPrice: 0,
                     legs:           c.toLegsBuy.slice(1),
                     buyPortId:      c.buyPortId,
@@ -594,16 +621,36 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
                   },
                 },
               };
-              availableFunds -= actualQty * buyItem.quote.unit_price;
-              const estProfit = (c.npcSellPrice - buyItem.quote.unit_price) * actualQty;
-              s = appendLog(s, `${ship.name}: heading to ${portName(c.buyPortId)} to buy ${actualQty}× ${goodName(c.goodId)}, then → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
+              // Speculative reservation so other ships don't over-commit to the same funds
+              availableFunds -= reserveQty * buyItem.quote.unit_price;
+              const estProfit = (c.npcSellPrice - buyItem.quote.unit_price) * reserveQty;
+              s = appendLog(s, `${ship.name}: heading to ${portName(c.buyPortId)} to buy ${reserveQty}× ${goodName(c.goodId)}, then → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
             } else {
-              // Buy immediately here, then travel to sell
-              await tradeApi.executeQuote({
-                token:        buyItem.token,
-                destinations: [{ type: "ship", id: ship.id, quantity: actualQty }],
+              // Buy immediately here — get a fresh individual quote for the real price
+              const freshQuote = await tradeApi.createQuote({
+                port_id: portId,
+                good_id: c.goodId,
+                quantity: qty,
+                action:   "buy",
               });
-              availableFunds -= actualQty * buyItem.quote.unit_price;
+              const freshAffordable = Math.floor(availableFunds / freshQuote.unit_price);
+              const buyQty = Math.min(qty, freshAffordable);
+              if (buyQty < 1) {
+                s = appendLog(s, `${ship.name}: insufficient funds after fresh quote (£${availableFunds.toLocaleString()} at £${freshQuote.unit_price}/unit), skipping`);
+                continue;
+              }
+              if (buyQty < qty) {
+                s = appendLog(s, `${ship.name}: funds capped — buying ${buyQty}× instead of ${qty}×`);
+              }
+              // If the affordable amount differs, get a precise quote for that exact quantity
+              const buyToken = buyQty < qty
+                ? (await tradeApi.createQuote({ port_id: portId, good_id: c.goodId, quantity: buyQty, action: "buy" })).token
+                : freshQuote.token;
+              await tradeApi.executeQuote({
+                token:        buyToken,
+                destinations: [{ type: "ship", id: ship.id, quantity: buyQty }],
+              });
+              availableFunds -= buyQty * freshQuote.unit_price;
               await fleetApi.transit(ship.id, { route_id: c.sellLegs[0].routeId });
               s.claimed = { ...s.claimed, [claimKey(c.goodId, portId)]: ship.id };
               s.ships = {
@@ -613,16 +660,16 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
                   plan: {
                     goodId:         c.goodId,
                     goodName:       goodName(c.goodId),
-                    quantity:       actualQty,
-                    actualBuyPrice: buyItem.quote.unit_price,
+                    quantity:       buyQty,
+                    actualBuyPrice: freshQuote.unit_price,
                     legs:           c.sellLegs.slice(1),
                     sellPortId:     c.sellPortId,
                     sellPrice:      c.npcSellPrice,
                   },
                 },
               };
-              const estProfit = (c.npcSellPrice - buyItem.quote.unit_price) * actualQty;
-              s = appendLog(s, `${ship.name}: bought ${actualQty}× ${goodName(c.goodId)} @ £${buyItem.quote.unit_price} → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
+              const estProfit = (c.npcSellPrice - freshQuote.unit_price) * buyQty;
+              s = appendLog(s, `${ship.name}: bought ${buyQty}× ${goodName(c.goodId)} @ £${freshQuote.unit_price} → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
             }
 
             executed = true;

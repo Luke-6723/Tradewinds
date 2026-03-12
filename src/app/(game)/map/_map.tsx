@@ -21,15 +21,16 @@ import { PORT_COORDS } from "@/lib/map-data";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 interface Props {
-  ports:     Port[];
-  routes:    Route[];
-  ships:     Ship[];
-  mstIds:    Set<string>;
-  portById:  Map<string, Port>;
-  routeById: Map<string, Route>;
-  ap:        AutopilotState;
-  hovered:   string | null;
-  onHover:   (id: string | null) => void;
+  ports:        Port[];
+  routes:       Route[];
+  ships:        Ship[];
+  portById:     Map<string, Port>;
+  routeById:    Map<string, Route>;
+  ap:           AutopilotState;
+  hovered:      string | null;
+  onHover:      (id: string | null) => void;
+  hoveredPort:  string | null;
+  onPortHover:  (id: string | null) => void;
 }
 
 // ── Ship position helper ───────────────────────────────────────────────────
@@ -84,10 +85,28 @@ function FlyToHovered({ ships, portById, routeById, hovered }: {
   return null;
 }
 
+// ── Resolve coords for an ordered list of port IDs ────────────────────────
+function portChain(
+  portIds: string[],
+  portById: Map<string, Port>,
+): Array<[number, number]> {
+  return portIds.flatMap((id) => {
+    const port = portById.get(id);
+    if (!port) return [];
+    const coords = PORT_COORDS[port.name];
+    return coords ? [coords] : [];
+  });
+}
+
 // ── Main map component ─────────────────────────────────────────────────────
 export default function LeafletMap({
-  ports, routes, ships, mstIds, portById, routeById, ap, hovered, onHover,
+  ports, routes, ships, portById, routeById, ap,
+  hovered, onHover, hoveredPort, onPortHover,
 }: Props) {
+
+  // Set of route IDs actively being traveled
+  const activeRouteIds = new Set(ships.map((s) => s.route_id).filter(Boolean) as string[]);
+
   return (
     <MapContainer
       center={[53, 2]}
@@ -107,63 +126,98 @@ export default function LeafletMap({
         ships={ships} portById={portById} routeById={routeById} hovered={hovered}
       />
 
-      {/* Route lines — MST for background structure, plus any route a ship is actively on */}
+      {/* Route lines — active ships only, plus port-hover highlights */}
       {routes.map((r) => {
-        const activeRoute = ships.some((s) => s.route_id === r.id);
-        if (!mstIds.has(r.id) && !activeRoute) return null;
+        const isActive      = activeRouteIds.has(r.id);
+        const isPortHovered = hoveredPort !== null &&
+          (r.from_id === hoveredPort || r.to_id === hoveredPort);
+
+        if (!isActive && !isPortHovered) return null;
+
         const fromPort = portById.get(r.from_id);
         const toPort   = portById.get(r.to_id);
         if (!fromPort || !toPort) return null;
         const from = PORT_COORDS[fromPort.name];
         const to   = PORT_COORDS[toPort.name];
         if (!from || !to) return null;
+
         return (
           <Polyline
             key={r.id}
             positions={[from, to]}
             pathOptions={
-              activeRoute
-                ? { color: "#7dd3fc", weight: 2.5, dashArray: "8 6", opacity: 0.8 }
-                : { color: "#4a7fa5", weight: 1.5, dashArray: "6 8", opacity: 0.5 }
+              isPortHovered && !isActive
+                ? { color: "#a78bfa", weight: 2, dashArray: "6 5", opacity: 0.75 }
+                : isActive
+                ? { color: "#7dd3fc", weight: 2.5, dashArray: "8 6", opacity: 0.85 }
+                : { color: "#a78bfa", weight: 1.5, dashArray: "6 5", opacity: 0.6 }
             }
           />
         );
       })}
 
-      {/* Autopilot destination lines */}
+      {/* Hovered-ship planned route — full multi-hop legs, port-anchored */}
       {ships.map((ship) => {
+        if (hovered !== ship.id) return null;
         const ast = ap.ships[ship.id];
         if (!ast?.plan) return null;
-        const destId   = ast.phase === "transiting_to_buy" ? ast.plan.buyPortId : ast.plan.sellPortId;
-        const destPort = portById.get(destId ?? "");
-        if (!destPort) return null;
-        const dest = PORT_COORDS[destPort.name];
-        const pos  = shipLatLng(ship, portById, routeById);
-        if (!dest || !pos) return null;
-        return (
-          <Polyline
-            key={`ap-${ship.id}`}
-            positions={[pos, dest]}
-            pathOptions={{ color: "#f59e0b", weight: 2, dashArray: "8 5", opacity: 0.85 }}
-          />
-        );
+
+        const segments: Array<{ portIds: string[]; color: string }> = [];
+
+        if (ast.phase === "transiting_to_buy" && ast.plan.buyPortId) {
+          // Origin: current docked port OR next port on current route
+          const originId = ship.port_id
+            ?? routeById.get(ship.route_id ?? "")?.to_id;
+          if (originId) {
+            const buyLegsIds = [originId, ...ast.plan.legs.map((l) => l.toPortId)];
+            segments.push({ portIds: buyLegsIds, color: "#f59e0b" }); // amber — to buy port
+          }
+          if (ast.plan.sellLegs && ast.plan.buyPortId) {
+            const sellLegIds = [ast.plan.buyPortId, ...ast.plan.sellLegs.map((l) => l.toPortId)];
+            segments.push({ portIds: sellLegIds, color: "#2dd4bf" }); // teal — to sell port
+          }
+        } else if (ast.phase === "transiting_to_sell") {
+          const originId = ship.port_id
+            ?? routeById.get(ship.route_id ?? "")?.to_id;
+          if (originId) {
+            const legIds = [originId, ...ast.plan.legs.map((l) => l.toPortId)];
+            segments.push({ portIds: legIds, color: "#2dd4bf" }); // teal — to sell port
+          }
+        }
+
+        return segments.map((seg, i) => {
+          const positions = portChain(seg.portIds, portById);
+          if (positions.length < 2) return null;
+          return (
+            <Polyline
+              key={`plan-${ship.id}-${i}`}
+              positions={positions}
+              pathOptions={{ color: seg.color, weight: 2.5, dashArray: "10 5", opacity: 0.9 }}
+            />
+          );
+        });
       })}
 
       {/* Port markers */}
       {ports.map((port) => {
-        const coords = PORT_COORDS[port.name];
+        const coords  = PORT_COORDS[port.name];
         if (!coords) return null;
-        const hub = port.is_hub;
+        const hub     = port.is_hub;
+        const isHovP  = hoveredPort === port.id;
         return (
           <CircleMarker
             key={port.id}
             center={coords}
             radius={hub ? 8 : 6}
             pathOptions={{
-              color:       hub ? "#fcd34d" : "#38bdf8",
-              fillColor:   hub ? "#f59e0b" : "#7dd3fc",
+              color:       isHovP ? "#c4b5fd" : hub ? "#fcd34d" : "#38bdf8",
+              fillColor:   isHovP ? "#a78bfa"  : hub ? "#f59e0b" : "#7dd3fc",
               fillOpacity: 0.9,
-              weight:      hub ? 2 : 1.5,
+              weight:      isHovP ? 2.5 : hub ? 2 : 1.5,
+            }}
+            eventHandlers={{
+              mouseover: () => onPortHover(port.id),
+              mouseout:  () => onPortHover(null),
             }}
           >
             <Tooltip

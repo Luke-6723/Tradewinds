@@ -8,7 +8,6 @@ import type { Port, Route, Ship } from "@/lib/types";
 import { useAutopilot } from "@/hooks/use-autopilot";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
-import { buildMST } from "@/lib/map-data";
 
 // ── Leaflet must be loaded client-side only ────────────────────────────────
 const LeafletMap = dynamic(() => import("./_map"), { ssr: false, loading: () => (
@@ -29,7 +28,8 @@ export default function MapPage() {
   const [routes,  setRoutes]  = useState<Route[]>([]);
   const [ships,   setShips]   = useState<Ship[]>([]);
   const [loading, setLoading] = useState(true);
-  const [hovered, setHovered] = useState<string | null>(null);
+  const [hovered,      setHovered]      = useState<string | null>(null);
+  const [hoveredPort,  setHoveredPort]  = useState<string | null>(null);
   const { state: ap } = useAutopilot();
 
   useEffect(() => {
@@ -46,7 +46,6 @@ export default function MapPage() {
 
   const portById  = useMemo(() => new Map(ports.map((p) => [p.id, p])),  [ports]);
   const routeById = useMemo(() => new Map(routes.map((r) => [r.id, r])), [routes]);
-  const mstIds    = useMemo(() => buildMST(routes), [routes]);
 
   if (loading) {
     return (
@@ -82,12 +81,13 @@ export default function MapPage() {
           ports={ports}
           routes={routes}
           ships={ships}
-          mstIds={mstIds}
           portById={portById}
           routeById={routeById}
           ap={ap}
           hovered={hovered}
           onHover={setHovered}
+          hoveredPort={hoveredPort}
+          onPortHover={setHoveredPort}
         />
       </div>
 
