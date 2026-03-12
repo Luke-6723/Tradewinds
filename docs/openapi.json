@@ -1,0 +1,4391 @@
+{
+  "components": {
+    "responses": {},
+    "schemas": {
+      "RegisterRequest": {
+        "description": "Request schema for player registration",
+        "example": {
+          "discord_id": "1234567890",
+          "email": "kibb@example.com",
+          "name": "Kibb",
+          "password": "password123"
+        },
+        "properties": {
+          "discord_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "email": {
+            "format": "email",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "password": {
+            "minLength": 8,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "email",
+          "password"
+        ],
+        "title": "RegisterRequest",
+        "type": "object"
+      },
+      "BlendedPriceResponse": {
+        "description": "Response schema for a calculated blended price.",
+        "properties": {
+          "data": {
+            "properties": {
+              "blended_price": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "blended_price"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "BlendedPriceResponse",
+        "type": "object"
+      },
+      "RenameShipRequest": {
+        "description": "Request schema to rename a ship.",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "RenameShipRequest",
+        "type": "object"
+      },
+      "CreateOrderRequest": {
+        "description": "Request schema to create a new market order.",
+        "properties": {
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "price": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "side": {
+            "enum": [
+              "buy",
+              "sell"
+            ],
+            "type": "string"
+          },
+          "total": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "port_id",
+          "good_id",
+          "side",
+          "price",
+          "total"
+        ],
+        "title": "CreateOrderRequest",
+        "type": "object"
+      },
+      "RouteResponse": {
+        "description": "Response schema for a single route.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Route"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "RouteResponse",
+        "type": "object"
+      },
+      "CreateWarehouseRequest": {
+        "description": "Request to purchase a new warehouse.",
+        "properties": {
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "port_id"
+        ],
+        "title": "CreateWarehouseRequest",
+        "type": "object"
+      },
+      "ShipType": {
+        "description": "A class of ship with its static stats.",
+        "properties": {
+          "base_price": {
+            "type": "integer"
+          },
+          "capacity": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "passengers": {
+            "type": "integer"
+          },
+          "speed": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "upkeep": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "capacity",
+          "speed",
+          "base_price",
+          "upkeep",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "ShipType",
+        "type": "object"
+      },
+      "QuoteRequest": {
+        "description": "Request to get a quote from a trader.",
+        "properties": {
+          "action": {
+            "enum": [
+              "buy",
+              "sell"
+            ],
+            "type": "string"
+          },
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "quantity": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "port_id",
+          "good_id",
+          "action",
+          "quantity"
+        ],
+        "title": "QuoteRequest",
+        "type": "object"
+      },
+      "WarehousesResponse": {
+        "description": "Response schema for a list of warehouses.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Warehouse"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "WarehousesResponse",
+        "type": "object"
+      },
+      "WarehouseResponse": {
+        "description": "Response schema for a single warehouse.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Warehouse"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "WarehouseResponse",
+        "type": "object"
+      },
+      "Warehouse": {
+        "description": "A warehouse owned by a company.",
+        "properties": {
+          "capacity": {
+            "type": "integer"
+          },
+          "company_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "level": {
+            "type": "integer"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "level",
+          "capacity",
+          "port_id",
+          "company_id",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Warehouse",
+        "type": "object"
+      },
+      "Player": {
+        "description": "A player in the system",
+        "example": {
+          "discord_id": "1234567890",
+          "email": "kibb@example.com",
+          "enabled": true,
+          "id": 1,
+          "inserted_at": "2026-03-08T16:00:00Z",
+          "name": "Kibb"
+        },
+        "properties": {
+          "discord_id": {
+            "description": "The player's Discord ID",
+            "nullable": true,
+            "type": "string"
+          },
+          "email": {
+            "description": "The player's email",
+            "format": "email",
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Whether the player account is enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The player ID",
+            "type": "integer"
+          },
+          "inserted_at": {
+            "description": "When the player was created",
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "description": "The player's name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "email",
+          "enabled",
+          "inserted_at"
+        ],
+        "title": "Player",
+        "type": "object"
+      },
+      "ShipyardResponse": {
+        "description": "Response schema for a single shipyard.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Shipyard"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ShipyardResponse",
+        "type": "object"
+      },
+      "Order": {
+        "description": "An order on the market.",
+        "properties": {
+          "company_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "posted_reputation": {
+            "type": "integer"
+          },
+          "price": {
+            "type": "integer"
+          },
+          "remaining": {
+            "type": "integer"
+          },
+          "side": {
+            "enum": [
+              "buy",
+              "sell"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "open",
+              "filled",
+              "cancelled",
+              "expired"
+            ],
+            "type": "string"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "company_id",
+          "port_id",
+          "good_id",
+          "side",
+          "price",
+          "total",
+          "remaining",
+          "status",
+          "posted_reputation",
+          "created_at",
+          "expires_at",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Order",
+        "type": "object"
+      },
+      "Port": {
+        "description": "A port location in the world.",
+        "properties": {
+          "country_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "is_hub": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "shortcode": {
+            "type": "string"
+          },
+          "tax_rate_bps": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "shortcode",
+          "country_id",
+          "is_hub",
+          "tax_rate_bps",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Port",
+        "type": "object"
+      },
+      "LoginRequest": {
+        "description": "Request schema for player login",
+        "example": {
+          "email": "kibb@example.com",
+          "password": "password123"
+        },
+        "properties": {
+          "email": {
+            "format": "email",
+            "type": "string"
+          },
+          "password": {
+            "minLength": 8,
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "LoginRequest",
+        "type": "object"
+      },
+      "CompanyEconomyResponse": {
+        "description": "Response schema for company economy summary.",
+        "properties": {
+          "data": {
+            "properties": {
+              "reputation": {
+                "type": "integer"
+              },
+              "ship_upkeep": {
+                "type": "integer"
+              },
+              "total_upkeep": {
+                "type": "integer"
+              },
+              "treasury": {
+                "type": "integer"
+              },
+              "warehouse_upkeep": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "treasury",
+              "reputation",
+              "ship_upkeep",
+              "warehouse_upkeep",
+              "total_upkeep"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "CompanyEconomyResponse",
+        "type": "object"
+      },
+      "TraderPosition": {
+        "description": "An NPC trader's position for a specific good at a port.",
+        "properties": {
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "stock_bounds": {
+            "type": "string"
+          },
+          "trader_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "trader_id",
+          "port_id",
+          "good_id",
+          "stock_bounds",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "TraderPosition",
+        "type": "object"
+      },
+      "ShipResponse": {
+        "description": "Response schema for a single ship.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Ship"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ShipResponse",
+        "type": "object"
+      },
+      "PortResponse": {
+        "description": "Response schema for a single port.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Port"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "PortResponse",
+        "type": "object"
+      },
+      "GoodsResponse": {
+        "description": "Response schema for a list of goods.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Good"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "GoodsResponse",
+        "type": "object"
+      },
+      "TradeExecutionResponse": {
+        "description": "Response from executing a trade.",
+        "properties": {
+          "data": {
+            "properties": {
+              "action": {
+                "enum": [
+                  "buy",
+                  "sell"
+                ],
+                "type": "string"
+              },
+              "company_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "good_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "port_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "total_price": {
+                "type": "integer"
+              },
+              "unit_price": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "company_id",
+              "port_id",
+              "good_id",
+              "action",
+              "quantity",
+              "unit_price",
+              "total_price"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "TradeExecutionResponse",
+        "type": "object"
+      },
+      "ExecuteTradeRequest": {
+        "description": "Request to execute an immediate trade.",
+        "properties": {
+          "action": {
+            "enum": [
+              "buy",
+              "sell"
+            ],
+            "type": "string"
+          },
+          "destinations": {
+            "items": {
+              "$ref": "#/components/schemas/TradeDestination"
+            },
+            "type": "array"
+          },
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "port_id",
+          "good_id",
+          "action",
+          "destinations"
+        ],
+        "title": "ExecuteTradeRequest",
+        "type": "object"
+      },
+      "QuoteResponse": {
+        "description": "A quote from a trader.",
+        "properties": {
+          "data": {
+            "properties": {
+              "quote": {
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "buy",
+                      "sell"
+                    ],
+                    "type": "string"
+                  },
+                  "company_id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "good_id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "port_id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "quantity": {
+                    "type": "integer"
+                  },
+                  "timestamp": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "total_price": {
+                    "type": "integer"
+                  },
+                  "unit_price": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "company_id",
+                  "port_id",
+                  "good_id",
+                  "action",
+                  "quantity",
+                  "unit_price",
+                  "total_price",
+                  "timestamp"
+                ],
+                "type": "object"
+              },
+              "token": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "token",
+              "quote"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "QuoteResponse",
+        "type": "object"
+      },
+      "OrderResponse": {
+        "description": "Response schema for a single market order.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Order"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "OrderResponse",
+        "type": "object"
+      },
+      "PurchaseShipRequest": {
+        "description": "Request schema to purchase a ship from a shipyard.",
+        "properties": {
+          "ship_type_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ship_type_id"
+        ],
+        "title": "PurchaseShipRequest",
+        "type": "object"
+      },
+      "Good": {
+        "description": "A tradeable commodity.",
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "category",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Good",
+        "type": "object"
+      },
+      "PortsResponse": {
+        "description": "Response schema for a list of ports.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Port"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "PortsResponse",
+        "type": "object"
+      },
+      "ShipTypesResponse": {
+        "description": "Response schema for a list of ship types.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ShipType"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ShipTypesResponse",
+        "type": "object"
+      },
+      "ExecuteQuoteRequest": {
+        "description": "Request to execute a quote.",
+        "properties": {
+          "destinations": {
+            "items": {
+              "$ref": "#/components/schemas/TradeDestination"
+            },
+            "type": "array"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "destinations"
+        ],
+        "title": "ExecuteQuoteRequest",
+        "type": "object"
+      },
+      "CompanyResponse": {
+        "description": "Response schema for a single company.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Company"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "CompanyResponse",
+        "type": "object"
+      },
+      "TransferToWarehouseRequest": {
+        "description": "Request schema to transfer cargo from a ship to a warehouse.",
+        "properties": {
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "quantity": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "warehouse_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_id",
+          "good_id",
+          "quantity"
+        ],
+        "title": "TransferToWarehouseRequest",
+        "type": "object"
+      },
+      "PageMetadata": {
+        "description": "Pagination metadata for cursor-based paginated results.",
+        "properties": {
+          "after": {
+            "nullable": true,
+            "type": "string"
+          },
+          "before": {
+            "nullable": true,
+            "type": "string"
+          },
+          "limit": {
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "title": "PageMetadata",
+        "type": "object"
+      },
+      "Shipyard": {
+        "description": "A shipyard at a specific port.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "port_id",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Shipyard",
+        "type": "object"
+      },
+      "ShipTypeResponse": {
+        "description": "Response schema for a single ship type.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ShipType"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ShipTypeResponse",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "description": "Response schema for the health check endpoint",
+        "example": {
+          "database": "connected",
+          "oban_lag_seconds": 0,
+          "server_time": "2026-03-08T16:00:00Z",
+          "status": "healthy"
+        },
+        "properties": {
+          "database": {
+            "enum": [
+              "connected",
+              "disconnected"
+            ],
+            "type": "string"
+          },
+          "oban_lag_seconds": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "server_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "healthy",
+              "degraded",
+              "unhealthy"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "database",
+          "oban_lag_seconds",
+          "server_time"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "LedgerResponse": {
+        "description": "Response schema for a company's ledger.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/LedgerEntry"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "LedgerResponse",
+        "type": "object"
+      },
+      "RoutesResponse": {
+        "description": "Response schema for a list of routes.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Route"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "RoutesResponse",
+        "type": "object"
+      },
+      "ShipyardInventory": {
+        "description": "An unowned ship available for purchase at a shipyard.",
+        "properties": {
+          "cost": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "ship_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ship_type_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "shipyard_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "shipyard_id",
+          "ship_type_id",
+          "ship_id",
+          "cost",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "ShipyardInventory",
+        "type": "object"
+      },
+      "CreateCompanyRequest": {
+        "description": "Request body for creating a new company.",
+        "properties": {
+          "home_port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "ticker": {
+            "maxLength": 5,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "ticker",
+          "home_port_id"
+        ],
+        "title": "CreateCompanyRequest",
+        "type": "object"
+      },
+      "TraderPositionsResponse": {
+        "description": "Response schema for a list of trader positions.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/TraderPosition"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "TraderPositionsResponse",
+        "type": "object"
+      },
+      "GoodResponse": {
+        "description": "Response schema for a single good.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Good"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "GoodResponse",
+        "type": "object"
+      },
+      "OrdersResponse": {
+        "description": "Response schema for a list of market orders.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Order"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "OrdersResponse",
+        "type": "object"
+      },
+      "LoginResponse": {
+        "description": "Response schema for successful login, returning a JWT token",
+        "properties": {
+          "data": {
+            "properties": {
+              "token": {
+                "description": "Authentication token to be used in Authorization header",
+                "type": "string"
+              }
+            },
+            "required": [
+              "token"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "LoginResponse",
+        "type": "object"
+      },
+      "Company": {
+        "description": "A company directed by a player.",
+        "properties": {
+          "home_port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reputation": {
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "bankrupt"
+            ],
+            "type": "string"
+          },
+          "ticker": {
+            "type": "string"
+          },
+          "treasury": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "ticker",
+          "treasury",
+          "reputation",
+          "status",
+          "home_port_id"
+        ],
+        "title": "Company",
+        "type": "object"
+      },
+      "Ship": {
+        "description": "A ship owned by a company.",
+        "properties": {
+          "arriving_at": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "company_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "port_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "route_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "ship_type_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "docked",
+              "traveling"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "status",
+          "company_id",
+          "ship_type_id",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Ship",
+        "type": "object"
+      },
+      "FillOrderRequest": {
+        "description": "Request schema to fill an existing market order.",
+        "properties": {
+          "quantity": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "quantity"
+        ],
+        "title": "FillOrderRequest",
+        "type": "object"
+      },
+      "RegisterResponse": {
+        "description": "Response schema for successful registration",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Player"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "RegisterResponse",
+        "type": "object"
+      },
+      "LedgerEntry": {
+        "description": "A financial transaction in a company's ledger.",
+        "properties": {
+          "amount": {
+            "type": "integer"
+          },
+          "company_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "meta": {
+            "type": "object"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "initial_deposit",
+              "transfer",
+              "ship_purchase",
+              "tax",
+              "market_trade",
+              "market_listing_fee",
+              "market_penalty_fine",
+              "warehouse_upgrade",
+              "warehouse_upkeep",
+              "ship_upkeep",
+              "npc_trade",
+              "bailout"
+            ],
+            "type": "string"
+          },
+          "reference_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "reference_type": {
+            "enum": [
+              "market",
+              "ship",
+              "warehouse",
+              "order",
+              "system"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "company_id",
+          "occurred_at",
+          "amount",
+          "reason",
+          "reference_type",
+          "reference_id",
+          "idempotency_key",
+          "inserted_at"
+        ],
+        "title": "LedgerEntry",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "description": "Response schema for standard errors (e.g., 401 Unauthorized)",
+        "example": {
+          "errors": {
+            "detail": "Unauthorized"
+          }
+        },
+        "properties": {
+          "errors": {
+            "properties": {
+              "detail": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "detail"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "errors"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "CompaniesResponse": {
+        "description": "Response schema for a list of companies.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Company"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "CompaniesResponse",
+        "type": "object"
+      },
+      "ShipsResponse": {
+        "description": "Response schema for a list of ships.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Ship"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "ShipsResponse",
+        "type": "object"
+      },
+      "Route": {
+        "description": "A travel route between two ports.",
+        "properties": {
+          "distance": {
+            "type": "integer"
+          },
+          "from_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "to_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "distance",
+          "from_id",
+          "to_id",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Route",
+        "type": "object"
+      },
+      "TradeDestination": {
+        "description": "A destination for a trade.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "quantity": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "type": {
+            "enum": [
+              "ship",
+              "warehouse"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "quantity"
+        ],
+        "title": "TradeDestination",
+        "type": "object"
+      },
+      "InventoryResponse": {
+        "description": "Response schema for a shipyard's inventory.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ShipyardInventory"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "InventoryResponse",
+        "type": "object"
+      },
+      "ChangesetResponse": {
+        "description": "Response schema for validation errors (422 Unprocessable Entity)",
+        "example": {
+          "errors": {
+            "email": [
+              "has invalid format",
+              "has already been taken"
+            ],
+            "password": [
+              "should be at least 8 character(s)"
+            ]
+          }
+        },
+        "properties": {
+          "errors": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "A map of field names to lists of error messages",
+            "type": "object"
+          }
+        },
+        "required": [
+          "errors"
+        ],
+        "title": "ChangesetResponse",
+        "type": "object"
+      },
+      "TransferToShipRequest": {
+        "description": "Request schema to transfer cargo from a warehouse to a docked ship.",
+        "properties": {
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "quantity": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "ship_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ship_id",
+          "good_id",
+          "quantity"
+        ],
+        "title": "TransferToShipRequest",
+        "type": "object"
+      },
+      "TransitRequest": {
+        "description": "Request schema to put a ship in transit.",
+        "properties": {
+          "route_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "route_id"
+        ],
+        "title": "TransitRequest",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "bearerFormat": "JWT",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "Tradewinds API",
+    "version": "1.0"
+  },
+  "openapi": "3.0.0",
+  "paths": {
+    "/api/v1/world/goods": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of all tradeable goods.",
+        "operationId": "goods",
+        "parameters": [
+          {
+            "description": "Filter by category",
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoodsResponse"
+                }
+              }
+            },
+            "description": "List of goods"
+          }
+        },
+        "summary": "List goods",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/world/routes/{id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of a specific route by ID.",
+        "operationId": "route",
+        "parameters": [
+          {
+            "description": "Route ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteResponse"
+                }
+              }
+            },
+            "description": "Route details"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Route not found"
+          }
+        },
+        "summary": "Get route details",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/trade/quote": {
+      "post": {
+        "callbacks": {},
+        "description": "Generates a signed quote for a trade.",
+        "operationId": "quote",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuoteRequest"
+              }
+            }
+          },
+          "description": "Quote request details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuoteResponse"
+                }
+              }
+            },
+            "description": "Quote generated successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Market not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a trade quote",
+        "tags": [
+          "Trade"
+        ]
+      }
+    },
+    "/api/v1/ships": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of ships owned by the current company.",
+        "operationId": "ships",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipsResponse"
+                }
+              }
+            },
+            "description": "List of ships"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List company ships",
+        "tags": [
+          "Fleet"
+        ]
+      }
+    },
+    "/api/v1/auth/revoke": {
+      "post": {
+        "callbacks": {},
+        "description": "Revokes the currently active JWT token, logging the player out.",
+        "operationId": "revoke",
+        "parameters": [],
+        "responses": {
+          "204": {
+            "description": "Token successfully revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke token",
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/api/v1/ships/{ship_id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of a specific ship owned by the current company.",
+        "operationId": "ship",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "path",
+            "name": "ship_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipResponse"
+                }
+              }
+            },
+            "description": "Ship details"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get ship details",
+        "tags": [
+          "Fleet"
+        ]
+      },
+      "patch": {
+        "callbacks": {},
+        "description": "Changes the name of a ship owned by the current company.",
+        "operationId": "renameShip",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "path",
+            "name": "ship_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameShipRequest"
+              }
+            }
+          },
+          "description": "Rename details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipResponse"
+                }
+              }
+            },
+            "description": "Ship renamed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rename a ship",
+        "tags": [
+          "Fleet"
+        ]
+      }
+    },
+    "/api/v1/warehouses": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of warehouses owned by the current company.",
+        "operationId": "warehouses",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehousesResponse"
+                }
+              }
+            },
+            "description": "List of warehouses"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List company warehouses",
+        "tags": [
+          "Logistics"
+        ]
+      },
+      "post": {
+        "callbacks": {},
+        "description": "Purchases a level 1 warehouse at a specific port.",
+        "operationId": "create",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWarehouseRequest"
+              }
+            }
+          },
+          "description": "Warehouse details",
+          "required": false
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseResponse"
+                }
+              }
+            },
+            "description": "Warehouse created successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Insufficient funds or unauthorized"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Purchase a new warehouse",
+        "tags": [
+          "Logistics"
+        ]
+      }
+    },
+    "/api/v1/warehouses/{warehouse_id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of a specific warehouse owned by the current company.",
+        "operationId": "warehouse",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Warehouse ID",
+            "in": "path",
+            "name": "warehouse_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseResponse"
+                }
+              }
+            },
+            "description": "Warehouse details"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get warehouse details",
+        "tags": [
+          "Logistics"
+        ]
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "callbacks": {},
+        "description": "Authenticates a player and returns a JWT token for subsequent API calls.",
+        "operationId": "login",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "description": "Login credentials",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            },
+            "description": "Successful login"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Disabled account"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "summary": "Login player",
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/api/v1/warehouses/{warehouse_id}/shrink": {
+      "post": {
+        "callbacks": {},
+        "description": "Downgrades a warehouse to the previous tier, decreasing its capacity.",
+        "operationId": "shrink",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Warehouse ID",
+            "in": "path",
+            "name": "warehouse_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseResponse"
+                }
+              }
+            },
+            "description": "Warehouse downgraded successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Downgrade a warehouse",
+        "tags": [
+          "Logistics"
+        ]
+      }
+    },
+    "/api/v1/market/orders/{order_id}/fill": {
+      "post": {
+        "callbacks": {},
+        "description": "Fills a specified quantity of an open order.",
+        "operationId": "fillOrder",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Order ID",
+            "in": "path",
+            "name": "order_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FillOrderRequest"
+              }
+            }
+          },
+          "description": "Fill details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            },
+            "description": "Order filled successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Trade voided or invalid quantity"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Order not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Fill an order",
+        "tags": [
+          "Market"
+        ]
+      }
+    },
+    "/api/v1/companies": {
+      "post": {
+        "callbacks": {},
+        "description": "Creates a new company and assigns the player as its first director.",
+        "operationId": "createCompany",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCompanyRequest"
+              }
+            }
+          },
+          "description": "Company details",
+          "required": false
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanyResponse"
+                }
+              }
+            },
+            "description": "Company created"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a new company",
+        "tags": [
+          "Companies"
+        ]
+      }
+    },
+    "/api/v1/shipyards/{shipyard_id}/purchase": {
+      "post": {
+        "callbacks": {},
+        "description": "Purchases a ship from the shipyard inventory for the current company.",
+        "operationId": "purchase",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Shipyard ID",
+            "in": "path",
+            "name": "shipyard_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PurchaseShipRequest"
+              }
+            }
+          },
+          "description": "Purchase details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipResponse"
+                }
+              }
+            },
+            "description": "Ship purchased successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Insufficient funds or unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Shipyard or inventory not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Purchase a ship",
+        "tags": [
+          "Shipyards"
+        ]
+      }
+    },
+    "/api/v1/company": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of the company specified in the 'tradewinds-company-id' header.",
+        "operationId": "company",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanyResponse"
+                }
+              }
+            },
+            "description": "Company details"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not a director of this company"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get current company",
+        "tags": [
+          "Companies"
+        ]
+      }
+    },
+    "/api/v1/me": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the profile of the currently authenticated player.",
+        "operationId": "me",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterResponse"
+                }
+              }
+            },
+            "description": "Current player"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get current player profile",
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/api/v1/market/orders/{order_id}": {
+      "delete": {
+        "callbacks": {},
+        "description": "Cancels an open order.",
+        "operationId": "deleteOrder",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Order ID",
+            "in": "path",
+            "name": "order_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Order cancelled successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Order not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Cancel an order",
+        "tags": [
+          "Market"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the health status of the application, including database connectivity and Oban job lag.",
+        "operationId": "show",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Healthy"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Unhealthy"
+          }
+        },
+        "summary": "Health Check",
+        "tags": [
+          "Health"
+        ]
+      }
+    },
+    "/api/v1/trade/execute": {
+      "post": {
+        "callbacks": {},
+        "description": "Executes a trade directly without a quote.",
+        "operationId": "execute",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteTradeRequest"
+              }
+            }
+          },
+          "description": "Trade details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TradeExecutionResponse"
+                }
+              }
+            },
+            "description": "Trade executed successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Execution failed"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Execute an immediate trade",
+        "tags": [
+          "Trade"
+        ]
+      }
+    },
+    "/api/v1/world/ship-types/{id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of a specific ship type.",
+        "operationId": "shipType",
+        "parameters": [
+          {
+            "description": "Ship Type ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipTypeResponse"
+                }
+              }
+            },
+            "description": "Ship type details"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship type not found"
+          }
+        },
+        "summary": "Get ship type details",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/trade/trader-positions": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of goods a trader is buying or selling at a port.",
+        "operationId": "traderPositions",
+        "parameters": [
+          {
+            "description": "Port ID",
+            "in": "query",
+            "name": "port_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraderPositionsResponse"
+                }
+              }
+            },
+            "description": "List of trader positions"
+          }
+        },
+        "summary": "List trader positions",
+        "tags": [
+          "Trade"
+        ]
+      }
+    },
+    "/api/v1/company/economy": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns financial summary and upkeep information for the current company.",
+        "operationId": "economy",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanyEconomyResponse"
+                }
+              }
+            },
+            "description": "Economy summary"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not a director of this company"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get company economy summary",
+        "tags": [
+          "Companies"
+        ]
+      }
+    },
+    "/api/v1/me/companies": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of companies where the current player is a director.",
+        "operationId": "companies",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompaniesResponse"
+                }
+              }
+            },
+            "description": "List of companies"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List player's companies",
+        "tags": [
+          "Companies"
+        ]
+      }
+    },
+    "/api/v1/world/ports/{port_id}/shipyard": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the shipyard located at a specific port.",
+        "operationId": "shipyardForPort",
+        "parameters": [
+          {
+            "description": "Port ID",
+            "in": "path",
+            "name": "port_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipyardResponse"
+                }
+              }
+            },
+            "description": "Shipyard details"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Shipyard not found"
+          }
+        },
+        "summary": "Get shipyard for port",
+        "tags": [
+          "Shipyards"
+        ]
+      }
+    },
+    "/api/v1/world/events": {
+      "get": {
+        "callbacks": {},
+        "description": "Server-Sent Events (SSE) endpoint streaming public world events (e.g. general economy shocks, news).",
+        "operationId": "worldEvents",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "SSE stream"
+          }
+        },
+        "summary": "Subscribe to world events",
+        "tags": [
+          "Events"
+        ]
+      }
+    },
+    "/api/v1/company/events": {
+      "get": {
+        "callbacks": {},
+        "description": "Server-Sent Events (SSE) endpoint streaming private company events (e.g. ship arrivals, completed trades, ledger updates).",
+        "operationId": "companyEvents",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "SSE stream"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Subscribe to company events",
+        "tags": [
+          "Events"
+        ]
+      }
+    },
+    "/api/v1/world/routes": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of all routes in the world.",
+        "operationId": "routes",
+        "parameters": [
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by origin port",
+            "in": "query",
+            "name": "from_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by destination port",
+            "in": "query",
+            "name": "to_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutesResponse"
+                }
+              }
+            },
+            "description": "List of routes"
+          }
+        },
+        "summary": "List routes",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/ships/{ship_id}/transfer-to-warehouse": {
+      "post": {
+        "callbacks": {},
+        "description": "Transfers cargo from a docked ship to a warehouse.",
+        "operationId": "transferToWarehouse",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "path",
+            "name": "ship_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferToWarehouseRequest"
+              }
+            }
+          },
+          "description": "Transfer details",
+          "required": false
+        },
+        "responses": {
+          "204": {
+            "description": "Cargo transferred successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Transfer cargo to warehouse",
+        "tags": [
+          "Fleet"
+        ]
+      }
+    },
+    "/api/v1/shipyards/{shipyard_id}/inventory": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns all unowned ships available for purchase at a shipyard.",
+        "operationId": "inventory",
+        "parameters": [
+          {
+            "description": "Shipyard ID",
+            "in": "path",
+            "name": "shipyard_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InventoryResponse"
+                }
+              }
+            },
+            "description": "List of ships in inventory"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Shipyard not found"
+          }
+        },
+        "summary": "Get shipyard inventory",
+        "tags": [
+          "Shipyards"
+        ]
+      }
+    },
+    "/api/v1/market/blended-price": {
+      "get": {
+        "callbacks": {},
+        "description": "Calculates the blended price for filling a specific quantity of an order.",
+        "operationId": "blendedPrice",
+        "parameters": [
+          {
+            "description": "Port ID",
+            "in": "query",
+            "name": "port_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Good ID",
+            "in": "query",
+            "name": "good_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Order side (buy or sell)",
+            "in": "query",
+            "name": "side",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quantity to fill",
+            "in": "query",
+            "name": "quantity",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlendedPriceResponse"
+                }
+              }
+            },
+            "description": "Blended price"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "No liquidity available"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "summary": "Calculate blended price",
+        "tags": [
+          "Market"
+        ]
+      }
+    },
+    "/api/v1/warehouses/{warehouse_id}/grow": {
+      "post": {
+        "callbacks": {},
+        "description": "Upgrades a warehouse to the next tier, increasing its capacity.",
+        "operationId": "grow",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Warehouse ID",
+            "in": "path",
+            "name": "warehouse_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseResponse"
+                }
+              }
+            },
+            "description": "Warehouse upgraded successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Insufficient funds or unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Upgrade a warehouse",
+        "tags": [
+          "Logistics"
+        ]
+      }
+    },
+    "/api/v1/warehouses/{warehouse_id}/transfer-to-ship": {
+      "post": {
+        "callbacks": {},
+        "description": "Transfers cargo from a warehouse to a docked ship.",
+        "operationId": "transferToShip",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Warehouse ID",
+            "in": "path",
+            "name": "warehouse_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferToShipRequest"
+              }
+            }
+          },
+          "description": "Transfer details",
+          "required": false
+        },
+        "responses": {
+          "204": {
+            "description": "Cargo transferred successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse or ship not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Transfer cargo to ship",
+        "tags": [
+          "Logistics"
+        ]
+      }
+    },
+    "/api/v1/company/ledger": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the financial ledger entries for the current company, ordered by most recent first.",
+        "operationId": "ledger",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerResponse"
+                }
+              }
+            },
+            "description": "Company ledger"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not a director of this company"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get company ledger",
+        "tags": [
+          "Companies"
+        ]
+      }
+    },
+    "/api/v1/world/ship-types": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of all available ship types.",
+        "operationId": "shipTypes",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipTypesResponse"
+                }
+              }
+            },
+            "description": "List of ship types"
+          }
+        },
+        "summary": "List ship types",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/trade/quotes/execute": {
+      "post": {
+        "callbacks": {},
+        "description": "Executes a trade based on a previously generated quote token.",
+        "operationId": "executeQuote",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteQuoteRequest"
+              }
+            }
+          },
+          "description": "Execution details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TradeExecutionResponse"
+                }
+              }
+            },
+            "description": "Trade executed successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Execution failed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid token or ownership"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Execute a signed quote",
+        "tags": [
+          "Trade"
+        ]
+      }
+    },
+    "/api/v1/ships/{ship_id}/transit": {
+      "post": {
+        "callbacks": {},
+        "description": "Puts a ship in transit along a specific route.",
+        "operationId": "transit",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "path",
+            "name": "ship_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransitRequest"
+              }
+            }
+          },
+          "description": "Transit details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipResponse"
+                }
+              }
+            },
+            "description": "Ship in transit"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Transit a ship",
+        "tags": [
+          "Fleet"
+        ]
+      }
+    },
+    "/api/v1/world/goods/{id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of a specific good.",
+        "operationId": "good",
+        "parameters": [
+          {
+            "description": "Good ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoodResponse"
+                }
+              }
+            },
+            "description": "Good details"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Good not found"
+          }
+        },
+        "summary": "Get good details",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/auth/register": {
+      "post": {
+        "callbacks": {},
+        "description": "Creates a new player account with the provided details.",
+        "operationId": "register",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "description": "Registration details",
+          "required": false
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterResponse"
+                }
+              }
+            },
+            "description": "Player created"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "summary": "Register a new player",
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/api/v1/market/orders": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of open orders for a specific port, good, and side.",
+        "operationId": "orders",
+        "parameters": [
+          {
+            "description": "Port ID",
+            "in": "query",
+            "name": "port_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Good ID",
+            "in": "query",
+            "name": "good_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Order side (buy or sell)",
+            "in": "query",
+            "name": "side",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrdersResponse"
+                }
+              }
+            },
+            "description": "List of orders"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "summary": "List open market orders",
+        "tags": [
+          "Market"
+        ]
+      },
+      "post": {
+        "callbacks": {},
+        "description": "Posts a new order to the market.",
+        "operationId": "createOrder",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOrderRequest"
+              }
+            }
+          },
+          "description": "Order details",
+          "required": false
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            },
+            "description": "Order created successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Insufficient funds or reputation"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a market order",
+        "tags": [
+          "Market"
+        ]
+      }
+    },
+    "/api/v1/world/ports": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a list of all ports in the world.",
+        "operationId": "ports",
+        "parameters": [
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by country ID",
+            "in": "query",
+            "name": "country_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by hub status",
+            "in": "query",
+            "name": "is_hub",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortsResponse"
+                }
+              }
+            },
+            "description": "List of ports"
+          }
+        },
+        "summary": "List ports",
+        "tags": [
+          "World"
+        ]
+      }
+    },
+    "/api/v1/world/ports/{id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the details of a specific port.",
+        "operationId": "port",
+        "parameters": [
+          {
+            "description": "Port ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortResponse"
+                }
+              }
+            },
+            "description": "Port details"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Port not found"
+          }
+        },
+        "summary": "Get port details",
+        "tags": [
+          "World"
+        ]
+      }
+    }
+  },
+  "security": [],
+  "servers": [
+    {
+      "url": "https://tradewinds.fly.dev",
+      "variables": {}
+    }
+  ],
+  "tags": []
+}
