@@ -21,6 +21,41 @@ type RawQuoteData = {
   };
 };
 
+export type BatchQuoteItem =
+  | {
+      status: "success";
+      token: string;
+      quote: {
+        action: "buy" | "sell";
+        company_id: string;
+        good_id: string;
+        port_id: string;
+        quantity: number;
+        unit_price: number;
+        total_price: number;
+        timestamp: string;
+      };
+      message?: string;
+    }
+  | { status: "error"; message: string; token?: never; quote?: never };
+
+export type BatchExecuteItem =
+  | {
+      status: "success";
+      token: string;
+      execution: {
+        action: "buy" | "sell";
+        company_id: string;
+        good_id: string;
+        port_id: string;
+        quantity: number;
+        unit_price: number;
+        total_price: number;
+      };
+      message?: string;
+    }
+  | { status: "error"; message: string; token?: never; execution?: never };
+
 export const tradeApi = {
   getTraderPositions: (portId?: string) =>
     api.get<TraderPosition[]>(
@@ -36,4 +71,8 @@ export const tradeApi = {
     api.post<void>("/trade/quotes/execute", data),
   executeDirect: (data: DirectTradeRequest) =>
     api.post<void>("/trade/execute", data),
+  batchCreateQuotes: (data: { requests: QuoteRequest[] }): Promise<BatchQuoteItem[]> =>
+    api.post<BatchQuoteItem[]>("/trade/quotes/batch", data),
+  batchExecuteQuotes: (data: { requests: ExecuteQuoteRequest[] }): Promise<BatchExecuteItem[]> =>
+    api.post<BatchExecuteItem[]>("/trade/quotes/execute/batch", data),
 };

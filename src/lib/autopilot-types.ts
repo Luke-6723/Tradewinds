@@ -1,5 +1,5 @@
 export const CYCLE_MS = 30_000;
-export const MAX_LOG = 100;
+export const MAX_LOG = 30;
 
 export interface RouteLeg {
   toPortId: string;
@@ -9,16 +9,21 @@ export interface RouteLeg {
 
 export interface ShipPlan {
   goodId: string;
+  goodName: string;
   quantity: number;
   actualBuyPrice: number;
-  /** Remaining legs after first transit (may be empty for direct routes). */
+  /** Remaining legs in current journey phase (to buy port OR to sell port). */
   legs: RouteLeg[];
   sellPortId: string;
   sellPrice: number;
+  /** Only set during transiting_to_buy: the port where we'll purchase the goods. */
+  buyPortId?: string;
+  /** Only set during transiting_to_buy: the legs from buyPort → sellPort. */
+  sellLegs?: RouteLeg[];
 }
 
 export interface AutopilotShipState {
-  phase: "idle" | "transiting_to_sell";
+  phase: "idle" | "transiting_to_buy" | "transiting_to_sell";
   plan?: ShipPlan;
 }
 

@@ -1,15 +1,27 @@
-import { NextResponse } from "next/server";
+import { type NextRequest, NextResponse } from "next/server";
 import { autopilotManager } from "@/lib/server/autopilot-manager";
+import { COOKIE_COMPANY, COOKIE_TOKEN } from "@/lib/auth-cookies";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export function GET() {
-  return NextResponse.json(autopilotManager.getState());
+function getCredentials(req: NextRequest) {
+  const token     = req.cookies.get(COOKIE_TOKEN)?.value   ?? process.env.TRADEWINDS_TOKEN ?? "";
+  const companyId = req.cookies.get(COOKIE_COMPANY)?.value ?? process.env.TRADEWINDS_COMPANY_ID ?? "";
+  return { token, companyId };
 }
 
-export async function POST(req: Request) {
+export async function GET(req: NextRequest) {
+  const { companyId } = getCredentials(req);
+  return NextResponse.json(await autopilotManager.getState(companyId));
+}
+
+export async function POST(req: NextRequest) {
+  const { token, companyId } = getCredentials(req);
+  if (!token || !companyId) {
+    return NextResponse.json({ error: "No credentials" }, { status: 401 });
+  }
   const { enabled } = await req.json() as { enabled: boolean };
-  autopilotManager.setEnabled(enabled);
-  return NextResponse.json(autopilotManager.getState());
+  const state = autopilotManager.setEnabled(companyId, token, enabled);
+  return NextResponse.json(state);
 }

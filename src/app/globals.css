@@ -128,3 +128,31 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ── Leaflet overrides ──────────────────────────────────────────────────── */
+.leaflet-port-label {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: #94a3b8 !important;
+  font-family: ui-monospace, monospace !important;
+  font-size: 9px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.06em !important;
+  text-transform: uppercase;
+  pointer-events: none !important;
+}
+.leaflet-port-label::before { display: none !important; }
+
+.leaflet-tooltip {
+  background: #0f172a !important;
+  border: 1px solid #1e293b !important;
+  border-radius: 6px !important;
+  color: #e2e8f0 !important;
+  font-size: 12px !important;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5) !important;
+  padding: 6px 10px !important;
+}
+.leaflet-tooltip::before { display: none !important; }
+
+.leaflet-container { font-family: inherit; }

@@ -24,11 +24,15 @@ export interface AuthResponse {
 export interface Company {
   id: UUID;
   name: string;
+  ticker: string;
   home_port_id: UUID;
   treasury: number;
   reputation: number;
-  is_locked: boolean;
-  created_at: ISO8601;
+  status: "active" | "bankrupt";
+  is_locked?: boolean;
+  created_at?: ISO8601;
+  inserted_at?: ISO8601;
+  updated_at?: ISO8601;
 }
 
 export interface CompanyEconomy {
@@ -44,7 +48,7 @@ export interface LedgerEntry {
   company_id: UUID;
   amount: number;
   description: string;
-  created_at: ISO8601;
+  occurred_at: ISO8601;
 }
 
 export interface CreateCompanyRequest {
@@ -99,6 +103,7 @@ export interface TraderPosition {
   port_id: UUID;
   good_id: UUID;
   stock_bounds: string;
+  price_bounds: string;
   inserted_at: ISO8601;
   updated_at: ISO8601;
 }
@@ -193,6 +198,25 @@ export interface Ship {
   updated_at: ISO8601;
 }
 
+export interface Cargo {
+  good_id: UUID;
+  quantity: number;
+}
+
+export interface TransitLog {
+  id: UUID;
+  ship_id: UUID;
+  route_id: UUID;
+  departed_at: ISO8601;
+  arrived_at: ISO8601 | null;
+}
+
+export interface PageMetadata {
+  after: string | null;
+  before: string | null;
+  limit: number | null;
+}
+
 export interface RenameShipRequest {
   name: string;
 }
@@ -268,6 +292,6 @@ export interface CompanyEvent {
 export interface ApiError {
   error?: string;
   message?: string;
-  errors?: Record<string, string[]>;
+  errors?: Record<string, string | string[]>;
   status: number;
 }

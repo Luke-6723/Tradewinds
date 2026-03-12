@@ -564,6 +564,22 @@
         "title": "Port",
         "type": "object"
       },
+      "CargoResponse": {
+        "description": "Response schema for a list of cargo.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Cargo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "CargoResponse",
+        "type": "object"
+      },
       "LoginRequest": {
         "description": "Request schema for player login",
         "example": {
@@ -813,6 +829,24 @@
           "destinations"
         ],
         "title": "ExecuteTradeRequest",
+        "type": "object"
+      },
+      "Cargo": {
+        "description": "Cargo loaded on a ship or stored in a warehouse.",
+        "properties": {
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "quantity": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "good_id",
+          "quantity"
+        ],
+        "title": "Cargo",
         "type": "object"
       },
       "QuoteResponse": {
@@ -4589,25 +4623,31 @@
     "/api/v1/market/orders": {
       "get": {
         "callbacks": {},
-        "description": "Returns a list of open orders for a specific port, good, and side.",
+        "description": "Returns a list of open orders, optionally filtered by ports, goods, and side.",
         "operationId": "orders",
         "parameters": [
           {
-            "description": "Port ID",
+            "description": "List of Port IDs",
             "in": "query",
-            "name": "port_id",
+            "name": "port_ids",
             "required": false,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           {
-            "description": "Good ID",
+            "description": "List of Good IDs",
             "in": "query",
-            "name": "good_id",
+            "name": "good_ids",
             "required": false,
             "schema": {
-              "type": "string"
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           {
@@ -4821,6 +4861,75 @@
         "summary": "List ports",
         "tags": [
           "World"
+        ]
+      }
+    },
+    "/api/v1/ships/{ship_id}/inventory": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the cargo currently loaded on a specific ship owned by the current company.",
+        "operationId": "shipInventory",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "path",
+            "name": "ship_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CargoResponse"
+                }
+              }
+            },
+            "description": "List of cargo"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Ship not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get ship inventory",
+        "tags": [
+          "Fleet"
         ]
       }
     },

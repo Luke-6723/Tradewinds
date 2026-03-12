@@ -1,8 +1,11 @@
 import { type NextRequest, NextResponse } from "next/server";
+import { COOKIE_COMPANY, COOKIE_TOKEN, UPSTREAM } from "@/lib/auth-cookies";
 
-const UPSTREAM = process.env.TRADEWINDS_API_URL ?? "https://tradewinds.fly.dev";
-const TOKEN = process.env.TRADEWINDS_TOKEN;
-const COMPANY_ID = process.env.TRADEWINDS_COMPANY_ID;
+function resolveAuth(req: NextRequest): { token: string | null; companyId: string | null } {
+  const token     = req.cookies.get(COOKIE_TOKEN)?.value   ?? process.env.TRADEWINDS_TOKEN   ?? null;
+  const companyId = req.cookies.get(COOKIE_COMPANY)?.value ?? process.env.TRADEWINDS_COMPANY_ID ?? null;
+  return { token, companyId };
+}
 
 function upstreamUrl(slug: string[], req: NextRequest): string {
   const path = slug.join("/");
@@ -11,11 +14,12 @@ function upstreamUrl(slug: string[], req: NextRequest): string {
 }
 
 function forwardHeaders(req: NextRequest): HeadersInit {
+  const { token, companyId } = resolveAuth(req);
   const headers: Record<string, string> = {
     "Content-Type": req.headers.get("content-type") ?? "application/json",
   };
-  if (TOKEN) headers["Authorization"] = `Bearer ${TOKEN}`;
-  if (COMPANY_ID) headers["tradewinds-company-id"] = COMPANY_ID;
+  if (token)     headers["Authorization"]           = `Bearer ${token}`;
+  if (companyId) headers["tradewinds-company-id"]   = companyId;
   return headers;
 }
 
@@ -23,11 +27,9 @@ async function handler(
   req: NextRequest,
   { params }: { params: Promise<{ proxy: string[] }> },
 ) {
-  if (!TOKEN) {
-    return NextResponse.json(
-      { error: "TRADEWINDS_TOKEN is not configured. Run scripts/setup.mjs first." },
-      { status: 503 },
-    );
+  const { token } = resolveAuth(req);
+  if (!token) {
+    return NextResponse.json({ error: "Not authenticated." }, { status: 401 });
   }
 
   const { proxy } = await params;
@@ -52,10 +54,6 @@ async function handler(
     }
   }
 
-  // Stream the body directly rather than buffering. fetch() auto-decompresses
-  // gzip, so upstream.body carries the raw bytes at the decompressed size —
-  // inconsistent with the original content-length. Streaming (and dropping
-  // content-length) lets the client read until the stream ends naturally.
   const responseBody = upstream.status === 204 ? null : upstream.body;
 
   return new NextResponse(responseBody, {

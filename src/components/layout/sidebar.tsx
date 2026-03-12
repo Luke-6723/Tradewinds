@@ -6,6 +6,7 @@ import {
   AnchorIcon,
   BarChart3Icon,
   ClipboardListIcon,
+  Globe2Icon,
   LayoutDashboardIcon,
   MapIcon,
   PackageIcon,
@@ -14,23 +15,25 @@ import {
   StoreIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { EventsFeed } from "@/components/layout/events-feed";
 
 const nav = [
-  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboardIcon },
-  { href: "/ports", label: "Ports", icon: MapIcon },
-  { href: "/trade", label: "Trade", icon: StoreIcon },
-  { href: "/quotes", label: "Quotes", icon: ClipboardListIcon },
-  { href: "/market", label: "Market", icon: BarChart3Icon },
-  { href: "/fleet", label: "Fleet", icon: ShipIcon },
-  { href: "/warehouses", label: "Warehouses", icon: AnchorIcon },
-  { href: "/goods", label: "Goods", icon: PackageIcon },
+  { href: "/dashboard",  label: "Dashboard",  icon: LayoutDashboardIcon },
+  { href: "/map",        label: "Map",         icon: Globe2Icon },
+  { href: "/ports",      label: "Ports",       icon: MapIcon },
+  { href: "/trade",      label: "Trade",       icon: StoreIcon },
+  { href: "/quotes",     label: "Quotes",      icon: ClipboardListIcon },
+  { href: "/market",     label: "Market",      icon: BarChart3Icon },
+  { href: "/fleet",      label: "Fleet",       icon: ShipIcon },
+  { href: "/warehouses", label: "Warehouses",  icon: AnchorIcon },
+  { href: "/goods",      label: "Goods",       icon: PackageIcon },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
 
   return (
-    <aside className="flex h-full w-56 shrink-0 flex-col border-r bg-card">
+    <aside className="flex h-full w-64 shrink-0 flex-col border-r bg-card">
       <div className="flex h-14 items-center border-b px-4">
         <ShoppingCartIcon className="mr-2 size-5 text-primary" />
         <span className="font-bold text-lg tracking-tight">Tradewinds</span>
@@ -52,6 +55,10 @@ export function Sidebar() {
           </Link>
         ))}
       </nav>
+      <div className="flex flex-col gap-3 border-t p-3">
+        <EventsFeed type="company" compact />
+        <EventsFeed type="world" compact />
+      </div>
     </aside>
   );
 }

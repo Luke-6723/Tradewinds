@@ -4,7 +4,7 @@ import { use, useEffect, useState } from "react";
 import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
 import { warehousesApi } from "@/lib/api/warehouses";
-import type { Port, Route, Ship, Warehouse } from "@/lib/types";
+import type { Cargo, Good, Port, Route, Ship, Warehouse } from "@/lib/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +20,8 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
   const [ports, setPorts] = useState<Port[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
+  const [cargo, setCargo] = useState<Cargo[]>([]);
+  const [goods, setGoods] = useState<Good[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [newName, setNewName] = useState("");
@@ -47,12 +49,16 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
       fleetApi.getShip(shipId),
       worldApi.getPorts().catch(() => []),
       warehousesApi.getWarehouses().catch(() => []),
+      fleetApi.getInventory(shipId).catch(() => []),
+      worldApi.getGoods().catch(() => []),
     ])
-      .then(([s, p, w]) => {
+      .then(([s, p, w, c, g]) => {
         setShip(s);
         setNewName(s.name);
         setPorts(p as Port[]);
         setWarehouses(w as Warehouse[]);
+        setCargo(c as Cargo[]);
+        setGoods(g as Good[]);
         if (s.port_id) {
           return worldApi.getRoutes(s.port_id).catch(() => []);
         }
@@ -98,11 +104,35 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
 
       {message && <div className="rounded-lg border p-3 text-sm text-muted-foreground">{message}</div>}
 
-      <Tabs defaultValue="transit">
+      <Tabs defaultValue="cargo">
         <TabsList>
+          <TabsTrigger value="cargo">Cargo</TabsTrigger>
           <TabsTrigger value="transit">Transit</TabsTrigger>
           <TabsTrigger value="rename">Rename</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="cargo" className="mt-4">
+          <Card className="max-w-sm">
+            <CardHeader><CardTitle>Cargo Hold</CardTitle></CardHeader>
+            <CardContent>
+              {cargo.length === 0 ? (
+                <p className="text-sm text-muted-foreground">Empty hold.</p>
+              ) : (
+                <div className="divide-y">
+                  {cargo.map((c) => {
+                    const good = goods.find((g) => g.id === c.good_id);
+                    return (
+                      <div key={c.good_id} className="flex items-center justify-between py-2 text-sm">
+                        <span>{good?.name ?? c.good_id.slice(0, 8)}</span>
+                        <span className="font-mono text-muted-foreground">{c.quantity.toLocaleString()} units</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
 
         <TabsContent value="transit" className="mt-4">
           <Card className="max-w-sm">

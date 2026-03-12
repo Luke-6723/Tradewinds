@@ -1,18 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
-import type { Company, CompanyEconomy, LedgerEntry, Port, Ship } from "@/lib/types";
+import type { Cargo, Company, CompanyEconomy, Good, LedgerEntry, Port, Ship } from "@/lib/types";
 import { useAutopilot } from "@/hooks/use-autopilot";
 import { CYCLE_MS } from "@/lib/autopilot-types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
-import { EventsFeed } from "@/components/layout/events-feed";
-import { BotIcon } from "lucide-react";
+import { BotIcon, TrendingDownIcon, TrendingUpIcon } from "lucide-react";
 
 export default function DashboardPage() {
   const [company, setCompany] = useState<Company | null>(null);
@@ -20,6 +19,8 @@ export default function DashboardPage() {
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [ships, setShips] = useState<Ship[]>([]);
   const [ports, setPorts] = useState<Port[]>([]);
+  const [goods, setGoods] = useState<Good[]>([]);
+  const [shipCargo, setShipCargo] = useState<Record<string, Cargo[]>>({});
   const [loading, setLoading] = useState(true);
   const { state: ap, toggle: toggleAp } = useAutopilot();
 
@@ -30,13 +31,24 @@ export default function DashboardPage() {
       companyApi.getLedger(),
       fleetApi.getShips().catch(() => []),
       worldApi.getPorts().catch(() => []),
+      worldApi.getGoods().catch(() => []),
     ])
-      .then(([c, e, l, s, p]) => {
+      .then(([c, e, l, s, p, g]) => {
         setCompany(c);
         setEconomy(e);
         setLedger(l);
         setShips(s as Ship[]);
         setPorts(p as Port[]);
+        setGoods(g as Good[]);
+        // Fetch cargo for all ships in parallel
+        const ships = s as Ship[];
+        Promise.all(
+          ships.map((ship) =>
+            fleetApi.getInventory(ship.id).then((cargo) => ({ id: ship.id, cargo })).catch(() => ({ id: ship.id, cargo: [] as Cargo[] }))
+          )
+        ).then((results) => {
+          setShipCargo(Object.fromEntries(results.map(({ id, cargo }) => [id, cargo])));
+        });
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -52,6 +64,8 @@ export default function DashboardPage() {
 
   const portName = (id: string | null) =>
     id ? (ports.find((p) => p.id === id)?.name ?? id.slice(0, 8)) : "at sea";
+  const goodName = (id: string | null | undefined) =>
+    id ? (goods.find((g) => g.id === id)?.name ?? id.slice(0, 8)) : "?";
 
   return (
     <div className="space-y-6">
@@ -73,7 +87,7 @@ export default function DashboardPage() {
       {/* Autopilot card */}
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex justify-between items-center">
             <CardTitle className="flex items-center gap-2">
               <BotIcon className="size-4" />
               Autopilot
@@ -111,14 +125,22 @@ export default function DashboardPage() {
 
           {/* Per-ship status */}
           {ships.length > 0 && (
-            <div className="divide-y rounded-lg border text-sm">
+            <div className="border rounded-lg divide-y text-sm">
               {ships.map((ship) => {
                 const ss = ap.ships[ship.id];
                 const phase = ss?.phase ?? "idle";
+                const cargo = shipCargo[ship.id] ?? [];
                 return (
-                  <div key={ship.id} className="flex items-center justify-between px-3 py-2">
-                    <span className="font-medium">{ship.name}</span>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <div key={ship.id} className="flex justify-between items-center px-3 py-2">
+                    <div>
+                      <span className="font-medium">{ship.name}</span>
+                      {cargo.length > 0 && (
+                        <p className="text-muted-foreground text-xs">
+                          {cargo.map((c) => `${c.quantity}× ${goodName(c.good_id)}`).join(", ")}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 text-muted-foreground text-xs">
                       <Badge
                         variant={ship.status === "docked" ? "success" : "info"}
                         className="text-xs"
@@ -126,10 +148,15 @@ export default function DashboardPage() {
                         {ship.status}
                       </Badge>
                       <span>{portName(ship.port_id)}</span>
+                      {ship.status === "traveling" && ship.arriving_at && (
+                        <Countdown to={ship.arriving_at} />
+                      )}
                       {ap.enabled && (
                         <Badge variant={phase === "idle" ? "secondary" : "warning"} className="text-xs">
                           {phase === "transiting_to_sell"
-                            ? `→ ${portName(ss?.plan?.sellPortId ?? null)}`
+                            ? `→ sell @ ${portName(ss?.plan?.sellPortId ?? null)}`
+                            : phase === "transiting_to_buy"
+                            ? `→ buy ${goodName(ss?.plan?.goodId)}`
                             : phase}
                         </Badge>
                       )}
@@ -142,10 +169,10 @@ export default function DashboardPage() {
 
           {/* Log */}
           {ap.log.length > 0 && (
-            <div className="rounded-lg border bg-muted/30 p-3 max-h-48 overflow-y-auto space-y-1">
+            <div className="space-y-1 bg-muted/30 p-3 border rounded-lg max-h-48 overflow-y-auto">
               {ap.log.slice(0, 20).map((entry, i) => (
                 <div key={i} className="flex gap-2 text-xs">
-                  <span className="text-muted-foreground shrink-0 tabular-nums">
+                  <span className="tabular-nums text-muted-foreground shrink-0">
                     {new Date(entry.at).toLocaleTimeString()}
                   </span>
                   <span>{entry.message}</span>
@@ -155,36 +182,27 @@ export default function DashboardPage() {
           )}
 
           {ap.enabled && ap.log.length === 0 && (
-            <p className="text-sm text-muted-foreground">
+            <p className="text-muted-foreground text-sm">
               Scanning for opportunities… (first cycle runs immediately on enable)
             </p>
           )}
         </CardContent>
       </Card>
 
-      <div className="gap-4 grid lg:grid-cols-2">
-        <EventsFeed type="company" />
-        <EventsFeed type="world" />
-      </div>
-
       {ledger.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle>Recent Ledger</CardTitle>
+            <div className="flex justify-between items-center">
+              <CardTitle>Recent Ledger</CardTitle>
+              <span className={`text-sm font-mono font-semibold ${ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0) >= 0 ? "text-green-600" : "text-destructive"}`}>
+                net {ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0) >= 0 ? "+" : ""}£{ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0).toLocaleString()}
+              </span>
+            </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-0">
             <div className="divide-y">
               {ledger.slice(0, 20).map((entry) => (
-                <div key={entry.id} className="flex justify-between items-center py-2 text-sm">
-                  <span className="text-muted-foreground">{entry.description}</span>
-                  <span
-                    className={
-                      entry.amount >= 0 ? "text-green-600 font-mono" : "text-destructive font-mono"
-                    }
-                  >
-                    {entry.amount >= 0 ? "+" : ""}£{entry.amount.toLocaleString()}
-                  </span>
-                </div>
+                <LedgerRow key={entry.id} entry={entry} />
               ))}
             </div>
           </CardContent>
@@ -204,6 +222,53 @@ function StatCard({ label, value }: { label: string; value: string }) {
         <p className="font-mono font-bold text-2xl">{value}</p>
       </CardContent>
     </Card>
+  );
+}
+
+function Countdown({ to }: { to: string }) {
+  const [label, setLabel] = useState("");
+  const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const target = new Date(to).getTime();
+
+    function update() {
+      const diff = Math.max(0, Math.floor((target - Date.now()) / 1000));
+      const m = Math.floor(diff / 60);
+      const s = diff % 60;
+      setLabel(diff === 0 ? "docking…" : `docks in ${m}:${String(s).padStart(2, "0")}`);
+      if (diff > 0) rafRef.current = window.setTimeout(update, 1000);
+    }
+
+    update();
+    return () => { if (rafRef.current) clearTimeout(rafRef.current); };
+  }, [to]);
+
+  return <span className="font-mono">{label}</span>;
+}
+
+function LedgerRow({ entry }: { entry: LedgerEntry }) {
+  const positive = entry.amount >= 0;
+  const Icon = positive ? TrendingUpIcon : TrendingDownIcon;
+  const date = new Date(entry.occurred_at);
+  const isToday = new Date().toDateString() === date.toDateString();
+  const dateLabel = isToday
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+  return (
+    <div className="group flex items-center gap-3 hover:bg-muted/40 px-4 py-3 transition-colors">
+      <div className={`flex size-8 shrink-0 items-center justify-center rounded-full ${positive ? "bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-400" : "bg-red-100 text-destructive dark:bg-red-950"}`}>
+        <Icon className="size-4" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm truncate">{entry.description}</p>
+        <p className="tabular-nums text-muted-foreground text-xs">{dateLabel}</p>
+      </div>
+      <span className={`text-sm font-mono font-semibold shrink-0 ${positive ? "text-green-600 dark:text-green-400" : "text-destructive"}`}>
+        {positive ? "+" : ""}£{Math.abs(entry.amount).toLocaleString()}
+      </span>
+    </div>
   );
 }
 

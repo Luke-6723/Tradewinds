@@ -81,10 +81,10 @@ export class ApiRequestError extends Error {
   }
 }
 
-function formatErrors(errors: Record<string, string[]> | undefined): string | undefined {
+function formatErrors(errors: Record<string, string | string[]> | undefined): string | undefined {
   if (!errors) return undefined;
   return Object.entries(errors)
-    .map(([field, msgs]) => `${field}: ${msgs.join(", ")}`)
+    .map(([field, msgs]) => `${field}: ${Array.isArray(msgs) ? msgs.join(", ") : msgs}`)
     .join("; ");
 }
 

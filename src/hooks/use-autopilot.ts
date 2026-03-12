@@ -10,7 +10,7 @@ export function useAutopilot() {
 
   const fetchState = useCallback(async () => {
     try {
-      const res = await fetch("/api/autopilot");
+      const res = await fetch("/api/autopilot", { cache: "no-store" });
       if (res.ok) setState(await res.json() as AutopilotState);
     } catch { /* ignore network errors */ }
   }, []);

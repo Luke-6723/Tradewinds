@@ -1,20 +1,19 @@
 import { type NextRequest, NextResponse } from "next/server";
+import { COOKIE_COMPANY, COOKIE_TOKEN, UPSTREAM } from "@/lib/auth-cookies";
+import { saveEvent } from "@/lib/db/collections";
 
-const UPSTREAM = process.env.TRADEWINDS_API_URL ?? "https://tradewinds.fly.dev";
-const TOKEN = process.env.TRADEWINDS_TOKEN;
-const COMPANY_ID = process.env.TRADEWINDS_COMPANY_ID;
+export async function GET(req: NextRequest) {
+  const token     = req.cookies.get(COOKIE_TOKEN)?.value   ?? process.env.TRADEWINDS_TOKEN;
+  const companyId = req.cookies.get(COOKIE_COMPANY)?.value ?? process.env.TRADEWINDS_COMPANY_ID;
 
-export async function GET(_req: NextRequest) {
-  if (!TOKEN || !COMPANY_ID) {
-    return NextResponse.json({ error: "Auth env vars not set" }, { status: 503 });
+  if (!token || !companyId) {
+    return NextResponse.json({ error: "Not authenticated." }, { status: 401 });
   }
 
-  const upstreamUrl = `${UPSTREAM}/api/v1/company/events`;
-
-  const upstream = await fetch(upstreamUrl, {
+  const upstream = await fetch(`${UPSTREAM}/api/v1/company/events`, {
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
-      "tradewinds-company-id": COMPANY_ID,
+      Authorization: `Bearer ${token}`,
+      "tradewinds-company-id": companyId,
     },
   });
 
@@ -22,7 +21,24 @@ export async function GET(_req: NextRequest) {
     return NextResponse.json({ error: "Failed to connect to company events" }, { status: 502 });
   }
 
-  const { readable, writable } = new TransformStream();
+  // Tap the stream: parse each SSE event and save to MongoDB while forwarding
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+
+      // Parse "data: {...}\n" lines from the SSE chunk
+      const text = new TextDecoder().decode(chunk);
+      for (const line of text.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const raw = line.slice(5).trim();
+        try {
+          const data = JSON.parse(raw) as Record<string, unknown>;
+          void saveEvent({ scope: "company", companyId, data });
+        } catch { /* non-JSON line — skip */ }
+      }
+    },
+  });
+
   upstream.body.pipeTo(writable).catch(() => {});
 
   return new NextResponse(readable, {
