@@ -1,5 +1,5 @@
 import type { Good, Port, Route, ShipType, PageMetadata } from "@/lib/types";
-import { api } from "./client";
+import { api, requestRaw } from "./client";
 
 type Paginated<T> = { data: T[]; metadata: PageMetadata };
 
@@ -11,7 +11,7 @@ async function fetchAllPages<T>(baseUrl: string): Promise<T[]> {
     const url: string = after
       ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}after=${encodeURIComponent(after)}`
       : baseUrl;
-    const page: Paginated<T> = await api.get<Paginated<T>>(url);
+    const page = await requestRaw<Paginated<T>>(url);
     results.push(...page.data);
     after = page.metadata?.after ?? null;
   } while (after);

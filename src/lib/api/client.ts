@@ -88,10 +88,10 @@ function formatErrors(errors: Record<string, string | string[]> | undefined): st
     .join("; ");
 }
 
-async function request<T>(
+async function requestCore(
   path: string,
   options: RequestInit = {},
-): Promise<T> {
+): Promise<Response> {
   await acquireToken();
 
   const url = `${BASE_URL}${path}`;
@@ -110,9 +110,22 @@ async function request<T>(
     throw new ApiRequestError(res.status, body);
   }
 
+  return res;
+}
+
+/** Standard request — auto-unwraps the `{ data: T }` envelope. */
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await requestCore(path, options);
   if (res.status === 204) return undefined as unknown as T;
   const { data } = await res.json();
   return data;
+}
+
+/** Raw request — returns the full JSON body without unwrapping `data`. */
+export async function requestRaw<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await requestCore(path, options);
+  if (res.status === 204) return undefined as unknown as T;
+  return res.json();
 }
 
 export const api = {
