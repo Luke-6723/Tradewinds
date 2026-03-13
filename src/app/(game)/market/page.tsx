@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Trash2Icon } from "lucide-react";
+import { Trash2Icon, ShoppingCartIcon } from "lucide-react";
 
 export default function MarketPage() {
   const [ports, setPorts] = useState<Port[]>([]);
@@ -59,6 +59,30 @@ export default function MarketPage() {
     finally { setSubmitting(false); }
   };
 
+  const [fillId, setFillId] = useState<string | null>(null);
+  const [fillQty, setFillQty] = useState("1");
+  const [fillWarehouse, setFillWarehouse] = useState("");
+  const [filling, setFilling] = useState(false);
+
+  const handleFill = async (order: MarketOrder) => {
+    setFilling(true); setMessage("");
+    try {
+      await marketApi.fillOrder(order.id, {
+        quantity: Number(fillQty),
+        ...(fillWarehouse ? { warehouse_id: fillWarehouse } : {}),
+      });
+      setMessage("Order filled!"); setFillId(null); loadOrders();
+    } catch (e: unknown) { setMessage(`Error: ${(e as Error).message}`); }
+    finally { setFilling(false); }
+  };
+
+  const openFill = (order: MarketOrder) => {
+    setFillId(order.id);
+    setFillQty(String(order.remaining));
+    setFillWarehouse(warehouses.find((w) => w.port_id === order.port_id)?.id ?? "");
+    setMessage("");
+  };
+
   const handleCancel = async (id: string) => {
     try { await marketApi.cancelOrder(id); loadOrders(); } catch (e: unknown) { setMessage(`Error: ${(e as Error).message}`); }
   };
@@ -92,23 +116,53 @@ export default function MarketPage() {
             {orders.length === 0 ? (
               <p className="p-4 text-muted-foreground text-sm">No orders match the filter.</p>
             ) : orders.map((o) => (
-              <div key={o.id} className="flex items-center justify-between px-4 py-3 text-sm">
-                <div className="space-y-0.5">
-                  <div className="flex items-center gap-2">
-                    <Badge variant={o.side === "sell" ? "info" : "success"}>{o.side.toUpperCase()}</Badge>
-                    <span className="font-medium">{goods.find((g) => g.id === o.good_id)?.name ?? o.good_id.slice(0, 8)}</span>
+              <div key={o.id} className="px-4 py-3 text-sm space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <Badge variant={o.side === "sell" ? "info" : "success"}>{o.side.toUpperCase()}</Badge>
+                      <span className="font-medium">{goods.find((g) => g.id === o.good_id)?.name ?? o.good_id.slice(0, 8)}</span>
+                    </div>
+                    <p className="text-muted-foreground">{ports.find((p) => p.id === o.port_id)?.name ?? o.port_id}</p>
                   </div>
-                  <p className="text-muted-foreground">{ports.find((p) => p.id === o.port_id)?.name ?? o.port_id}</p>
-                </div>
-                <div className="flex items-center gap-4">
-                  <div className="text-right">
-                    <p className="font-mono font-semibold">£{o.price.toLocaleString()}</p>
-                    <p className="text-xs text-muted-foreground">{o.remaining}/{o.total} remaining</p>
+                  <div className="flex items-center gap-4">
+                    <div className="text-right">
+                      <p className="font-mono font-semibold">£{o.price.toLocaleString()}</p>
+                      <p className="text-xs text-muted-foreground">{o.remaining}/{o.total} remaining</p>
+                    </div>
+                    <Button size="icon-sm" variant="ghost" onClick={() => openFill(o)} title="Fill order">
+                      <ShoppingCartIcon className="size-4" />
+                    </Button>
+                    <Button size="icon-sm" variant="ghost" onClick={() => handleCancel(o.id)}>
+                      <Trash2Icon className="size-4 text-destructive" />
+                    </Button>
                   </div>
-                  <Button size="icon-sm" variant="ghost" onClick={() => handleCancel(o.id)}>
-                    <Trash2Icon className="size-4 text-destructive" />
-                  </Button>
                 </div>
+                {fillId === o.id && (
+                  <div className="flex items-end gap-2 pt-1 border-t">
+                    <div className="space-y-1">
+                      <Label className="text-xs">Quantity</Label>
+                      <Input type="number" min="1" max={o.remaining} value={fillQty} onChange={(e) => setFillQty(e.target.value)} className="w-24 h-8" />
+                    </div>
+                    {warehouses.filter((w) => w.port_id === o.port_id).length > 0 && (
+                      <div className="space-y-1">
+                        <Label className="text-xs">Warehouse</Label>
+                        <Select value={fillWarehouse} onValueChange={setFillWarehouse}>
+                          <SelectTrigger className="w-44 h-8"><SelectValue placeholder="Select…" /></SelectTrigger>
+                          <SelectContent>
+                            {warehouses.filter((w) => w.port_id === o.port_id).map((w) => (
+                              <SelectItem key={w.id} value={w.id}>{w.id.slice(0, 8)}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+                    <Button size="sm" onClick={() => handleFill(o)} disabled={filling} className="h-8">
+                      {filling ? <Spinner className="size-4" /> : "Fill"}
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => setFillId(null)} className="h-8">Cancel</Button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
