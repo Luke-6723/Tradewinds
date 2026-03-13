@@ -97,13 +97,15 @@ export default function DashboardPage() {
 
   // ── Chart data ─────────────────────────────────────────────────────────────
 
+  // Ledger is already oldest-first from the DB — filter out any entries with invalid dates
+  const validLedger = ledger.filter((e) => e.occurred_at && !isNaN(new Date(e.occurred_at).getTime()));
+
   // Treasury balance over time (oldest → newest, running total)
   const treasuryChartData = (() => {
-    if (!company || ledger.length === 0) return [];
-    const sorted = [...ledger].reverse(); // oldest first
-    const baseline = company.treasury - sorted.reduce((s, e) => s + e.amount, 0);
+    if (!company || validLedger.length === 0) return [];
+    const baseline = company.treasury - validLedger.reduce((s, e) => s + e.amount, 0);
     let running = baseline;
-    return sorted.map((e) => {
+    return validLedger.map((e) => {
       running += e.amount;
       const d = new Date(e.occurred_at);
       return {
@@ -114,16 +116,17 @@ export default function DashboardPage() {
     });
   })();
 
-  // Daily income vs expenses
+  // Daily income vs expenses (oldest → newest)
   const dailyPnlData = (() => {
     const byDay: Record<string, { day: string; income: number; expenses: number }> = {};
-    for (const e of ledger) {
-      const day = new Date(e.occurred_at).toLocaleDateString([], { month: "short", day: "numeric" });
+    for (const e of validLedger) {
+      const d = new Date(e.occurred_at);
+      const day = d.toLocaleDateString([], { month: "short", day: "numeric" });
       if (!byDay[day]) byDay[day] = { day, income: 0, expenses: 0 };
       if (e.amount >= 0) byDay[day].income += e.amount;
       else byDay[day].expenses += Math.abs(e.amount);
     }
-    return Object.values(byDay).reverse();
+    return Object.values(byDay);
   })();
 
   // Upkeep split for pie chart
