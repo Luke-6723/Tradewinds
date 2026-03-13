@@ -12,7 +12,31 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
-import { BotIcon, PackageIcon, TrendingDownIcon, TrendingUpIcon } from "lucide-react";
+import {
+  BotIcon,
+  BuildingIcon,
+  PackageIcon,
+  ShipIcon,
+  StarIcon,
+  TrendingDownIcon,
+  TrendingUpIcon,
+  WalletIcon,
+} from "lucide-react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 export default function DashboardPage() {
   const [company, setCompany] = useState<Company | null>(null);
@@ -71,22 +95,230 @@ export default function DashboardPage() {
   const goodName = (id: string | null | undefined) =>
     id ? (goods.find((g) => g.id === id)?.name ?? id.slice(0, 8)) : "?";
 
+  // ── Chart data ─────────────────────────────────────────────────────────────
+
+  // Treasury balance over time (oldest → newest, running total)
+  const treasuryChartData = (() => {
+    if (!company || ledger.length === 0) return [];
+    const sorted = [...ledger].reverse(); // oldest first
+    const baseline = company.treasury - sorted.reduce((s, e) => s + e.amount, 0);
+    let running = baseline;
+    return sorted.map((e) => {
+      running += e.amount;
+      const d = new Date(e.occurred_at);
+      return {
+        label: d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+          " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        balance: running,
+      };
+    });
+  })();
+
+  // Daily income vs expenses
+  const dailyPnlData = (() => {
+    const byDay: Record<string, { day: string; income: number; expenses: number }> = {};
+    for (const e of ledger) {
+      const day = new Date(e.occurred_at).toLocaleDateString([], { month: "short", day: "numeric" });
+      if (!byDay[day]) byDay[day] = { day, income: 0, expenses: 0 };
+      if (e.amount >= 0) byDay[day].income += e.amount;
+      else byDay[day].expenses += Math.abs(e.amount);
+    }
+    return Object.values(byDay).reverse();
+  })();
+
+  // Upkeep split for pie chart
+  const upkeepData = economy && (economy.ship_upkeep + economy.warehouse_upkeep) > 0
+    ? [
+        { name: "Ships", value: economy.ship_upkeep },
+        { name: "Warehouses", value: economy.warehouse_upkeep },
+      ]
+    : [];
+  const PIE_COLORS = ["#6366f1", "#f59e0b"];
+
+  const totalLedgerNet = ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0);
+
   return (
     <div className="space-y-6">
-      <h1 className="font-bold text-2xl">Dashboard</h1>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="font-bold text-2xl">{company?.name ?? "Dashboard"}</h1>
+          <p className="text-muted-foreground text-sm mt-0.5">{company?.ticker} · {company?.status}</p>
+        </div>
+      </div>
 
+      {/* Stat cards */}
       <div className="gap-4 grid sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="Treasury" value={`£${company?.treasury.toLocaleString() ?? 0}`} />
-        <StatCard label="Reputation" value={String(company?.reputation ?? 0)} />
+        <StatCard
+          label="Treasury"
+          value={`£${company?.treasury.toLocaleString() ?? 0}`}
+          icon={<WalletIcon className="size-4" />}
+          accent="green"
+        />
+        <StatCard
+          label="Reputation"
+          value={String(company?.reputation ?? 0)}
+          icon={<StarIcon className="size-4" />}
+          accent="yellow"
+        />
         <StatCard
           label="Ship Upkeep"
           value={economy ? `£${economy.ship_upkeep.toLocaleString()}` : "—"}
+          sub={`${ships.length} ship${ships.length !== 1 ? "s" : ""}`}
+          icon={<ShipIcon className="size-4" />}
+          accent="blue"
         />
         <StatCard
           label="Warehouse Upkeep"
           value={economy ? `£${economy.warehouse_upkeep.toLocaleString()}` : "—"}
+          sub={economy ? `Total: £${economy.total_upkeep.toLocaleString()}/cycle` : undefined}
+          icon={<BuildingIcon className="size-4" />}
+          accent="purple"
         />
       </div>
+
+      {/* Charts row */}
+      {(treasuryChartData.length > 1 || upkeepData.length > 0) && (
+        <div className="gap-4 grid lg:grid-cols-3">
+          {/* Treasury over time */}
+          {treasuryChartData.length > 1 && (
+            <Card className="lg:col-span-2">
+              <CardHeader>
+                <CardTitle className="text-sm font-medium text-muted-foreground">Treasury Balance</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={200}>
+                  <AreaChart data={treasuryChartData} margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="treasuryGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#6366f1" stopOpacity={0.25} />
+                        <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
+                    <XAxis dataKey="label" hide />
+                    <YAxis
+                      tickFormatter={(v) => `£${(v as number / 1000).toFixed(0)}k`}
+                      tick={{ fontSize: 11 }}
+                      width={52}
+                      className="fill-muted-foreground"
+                    />
+                    <Tooltip
+                      content={({ active, payload }) => {
+                        if (!active || !payload?.length) return null;
+                        const d = payload[0].payload as { label: string; balance: number };
+                        return (
+                          <div className="bg-popover border rounded-lg px-3 py-2 shadow-md text-sm">
+                            <p className="text-muted-foreground text-xs mb-1">{d.label}</p>
+                            <p className="font-mono font-semibold">£{d.balance.toLocaleString()}</p>
+                          </div>
+                        );
+                      }}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="balance"
+                      stroke="#6366f1"
+                      strokeWidth={2}
+                      fill="url(#treasuryGrad)"
+                      dot={false}
+                      activeDot={{ r: 4, fill: "#6366f1" }}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Upkeep split */}
+          {upkeepData.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-medium text-muted-foreground">Upkeep Split</CardTitle>
+              </CardHeader>
+              <CardContent className="flex flex-col items-center justify-center gap-3">
+                <ResponsiveContainer width="100%" height={160}>
+                  <PieChart>
+                    <Pie
+                      data={upkeepData}
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={45}
+                      outerRadius={70}
+                      paddingAngle={3}
+                      dataKey="value"
+                    >
+                      {upkeepData.map((_, i) => (
+                        <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      content={({ active, payload }) => {
+                        if (!active || !payload?.length) return null;
+                        const d = payload[0].payload as { name: string; value: number };
+                        return (
+                          <div className="bg-popover border rounded-lg px-3 py-2 shadow-md text-sm">
+                            <p className="text-muted-foreground text-xs">{d.name}</p>
+                            <p className="font-mono font-semibold">£{d.value.toLocaleString()}</p>
+                          </div>
+                        );
+                      }}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="flex gap-4 text-xs text-muted-foreground">
+                  {upkeepData.map((d, i) => (
+                    <span key={d.name} className="flex items-center gap-1.5">
+                      <span className="inline-block size-2.5 rounded-full" style={{ backgroundColor: PIE_COLORS[i] }} />
+                      {d.name}: £{d.value.toLocaleString()}
+                    </span>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* Daily P&L bar chart */}
+      {dailyPnlData.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Daily P&amp;L</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ResponsiveContainer width="100%" height={180}>
+              <BarChart data={dailyPnlData} margin={{ top: 4, right: 8, left: 8, bottom: 0 }} barGap={2}>
+                <CartesianGrid strokeDasharray="3 3" className="stroke-border" vertical={false} />
+                <XAxis dataKey="day" tick={{ fontSize: 11 }} className="fill-muted-foreground" />
+                <YAxis
+                  tickFormatter={(v) => `£${(v as number / 1000).toFixed(0)}k`}
+                  tick={{ fontSize: 11 }}
+                  width={52}
+                  className="fill-muted-foreground"
+                />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload?.length) return null;
+                    return (
+                      <div className="bg-popover border rounded-lg px-3 py-2 shadow-md text-sm space-y-1">
+                        <p className="text-muted-foreground text-xs font-medium">{label as string}</p>
+                        {payload.map((p) => (
+                          <p key={p.name as string} className="font-mono font-semibold" style={{ color: p.color as string }}>
+                            {p.name as string}: £{(p.value as number).toLocaleString()}
+                          </p>
+                        ))}
+                      </div>
+                    );
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="income" name="Income" fill="#22c55e" radius={[3, 3, 0, 0]} maxBarSize={40} />
+                <Bar dataKey="expenses" name="Expenses" fill="#ef4444" radius={[3, 3, 0, 0]} maxBarSize={40} />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Autopilot card */}
       <Card>
@@ -223,8 +455,8 @@ export default function DashboardPage() {
           <CardHeader>
             <div className="flex justify-between items-center">
               <CardTitle>Recent Ledger</CardTitle>
-              <span className={`text-sm font-mono font-semibold ${ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0) >= 0 ? "text-green-600" : "text-destructive"}`}>
-                net {ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0) >= 0 ? "+" : ""}£{ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0).toLocaleString()}
+              <span className={`text-sm font-mono font-semibold ${totalLedgerNet >= 0 ? "text-green-600" : "text-destructive"}`}>
+                net {totalLedgerNet >= 0 ? "+" : ""}£{totalLedgerNet.toLocaleString()}
               </span>
             </div>
           </CardHeader>
@@ -241,14 +473,41 @@ export default function DashboardPage() {
   );
 }
 
-function StatCard({ label, value }: { label: string; value: string }) {
+function StatCard({
+  label,
+  value,
+  sub,
+  icon,
+  accent = "default",
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  icon?: React.ReactNode;
+  accent?: "green" | "yellow" | "blue" | "purple" | "default";
+}) {
+  const accentClasses: Record<string, string> = {
+    green:   "bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-400",
+    yellow:  "bg-yellow-100 text-yellow-700 dark:bg-yellow-950 dark:text-yellow-400",
+    blue:    "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-400",
+    purple:  "bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-400",
+    default: "bg-muted text-muted-foreground",
+  };
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="font-medium text-muted-foreground text-sm">{label}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <p className="font-mono font-bold text-2xl">{value}</p>
+      <CardContent className="pt-6">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0 flex-1">
+            <p className="text-muted-foreground text-xs font-medium uppercase tracking-wide">{label}</p>
+            <p className="font-mono font-bold text-2xl mt-1 truncate">{value}</p>
+            {sub && <p className="text-muted-foreground text-xs mt-1">{sub}</p>}
+          </div>
+          {icon && (
+            <div className={`flex size-9 shrink-0 items-center justify-center rounded-lg ${accentClasses[accent]}`}>
+              {icon}
+            </div>
+          )}
+        </div>
       </CardContent>
     </Card>
   );
