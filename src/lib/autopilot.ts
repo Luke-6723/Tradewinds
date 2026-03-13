@@ -8,7 +8,7 @@
  *   transiting_to_sell → has cargo; sells on arrival (or posts limit order as fallback)
  *
  * Warehouse stockpiling strategy:
- *   - Auto-buys a warehouse at each port a ship docks at (if treasury > WAREHOUSE_RESERVE)
+ *   - Auto-buys a warehouse at each port a ship docks at (if available funds exceed banking cap)
  *   - Stockpiles goods on arrival when sell price <= STOCKPILE_PRICE_LEVEL ("Cheap")
  *   - Sells from warehouses each cycle when price recovers to >= MIN_SELL_PRICE_LEVEL ("Expensive")
  *   - Loads idle ships from warehouses when a profitable delivery route exists
@@ -46,11 +46,9 @@ const SELL_BATCH   = 16;
 const BUY_BATCH    = 8;
 /** Delay (ms) after docking before buying/selling. */
 const DOCK_DELAY_MS = 5_000;
-/** Minimum treasury before auto-buying a new warehouse. */
 /** Set to false to disable all warehouse stockpiling (direct-buy scan + ship-arrival stockpile). */
 const ENABLE_STOCKPILING = false;
 
-const WAREHOUSE_RESERVE = 3_000;
 /** Price level at or above which we sell from warehouse / accept as sell destination (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
 /** Price level at or below which we stockpile instead of selling / buy into warehouse (Average = 3). */
@@ -69,6 +67,10 @@ const PRICE_LEVEL: Record<string, number> = {
 };
 function priceLevelOrdinal(label: string): number {
   return PRICE_LEVEL[label] ?? 0;
+}
+const ORDINAL_LABEL = Object.fromEntries(Object.entries(PRICE_LEVEL).map(([k, v]) => [v, k]));
+function priceLevelLabel(ord: number): string {
+  return ORDINAL_LABEL[ord] ?? "unknown";
 }
 
 // ── Route pathfinding ──────────────────────────────────────────────────────────
@@ -146,18 +148,21 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   s = { ...s, claimed: activeClaims };
 
   try {
-    const [ships, allRoutes, shipTypes, allPorts, allGoods, company, allWarehouses] = await Promise.all([
+    const [ships, allRoutes, shipTypes, allPorts, allGoods, company, economy, allWarehouses] = await Promise.all([
       fleetApi.getShips().catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
       worldApi.getRoutes().catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
       worldApi.getShipTypes().catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
       worldApi.getPorts().catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
       worldApi.getGoods().catch((e: Error) => { throw new Error(`getGoods: ${e.message}`); }),
       companyApi.getCompany().catch((e: Error) => { throw new Error(`getCompany: ${e.message}`); }),
+      companyApi.getEconomy().catch(() => ({ total_upkeep: 0 } as { total_upkeep: number })),
       warehousesApi.getWarehouses().catch(() => [] as Warehouse[]),
     ]);
 
+    // Minimum treasury to keep in reserve: covers ≥1 week of upkeep + £2k buffer
+    const bankingCap = economy.total_upkeep + 2_000;
     // Track available funds across ships in this cycle to avoid over-committing
-    let availableFunds = company.treasury;
+    let availableFunds = Math.max(0, company.treasury - bankingCap);
 
     const portName = (id: string | null | undefined) =>
       allPorts.find((p: Port) => p.id === id)?.name ?? (id ?? "?").slice(0, 8);
@@ -202,12 +207,22 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       )
     ).flat();
 
-    const npcGoods      = new Map<string, Set<string>>();
-    const npcPriceLabel = new Map<string, string>();   // "portId:goodId" → "Healthy"|…
+    const npcGoods  = new Map<string, Set<string>>();
+    const npcMinOrd = new Map<string, number>(); // "portId:goodId" → cheapest price ordinal (buy)
+    const npcMaxOrd = new Map<string, number>(); // "portId:goodId" → priciest price ordinal (sell)
     for (const tp of allTraders) {
       if (!npcGoods.has(tp.port_id)) npcGoods.set(tp.port_id, new Set());
       npcGoods.get(tp.port_id)!.add(tp.good_id);
-      if (tp.price_bounds) npcPriceLabel.set(`${tp.port_id}:${tp.good_id}`, tp.price_bounds);
+      if (tp.price_bounds) {
+        const k = `${tp.port_id}:${tp.good_id}`;
+        const ord = priceLevelOrdinal(tp.price_bounds);
+        if (ord > 0) {
+          const prevMin = npcMinOrd.get(k) ?? Infinity;
+          const prevMax = npcMaxOrd.get(k) ?? 0;
+          if (ord < prevMin) npcMinOrd.set(k, ord);
+          if (ord > prevMax) npcMaxOrd.set(k, ord);
+        }
+      }
     }
 
     const dockedCount = ships.filter((sh: Ship) => sh.status !== "traveling").length;
@@ -220,8 +235,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       if (!warehouse) continue;
       for (const item of inventory) {
         if (item.quantity <= 0) continue;
-        const priceLabel = npcPriceLabel.get(`${warehouse.port_id}:${item.good_id}`);
-        const priceLevel = priceLevelOrdinal(priceLabel ?? "");
+        const priceLevel = npcMaxOrd.get(`${warehouse.port_id}:${item.good_id}`) ?? 0;
         if (priceLevel >= MIN_SELL_PRICE_LEVEL) {
           try {
             const sellQuote = await tradeApi.createQuote({
@@ -241,7 +255,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             stockPrices.delete(`${warehouseId}:${item.good_id}`);
             // Refresh live inventory after sale
             warehouseInventory.set(warehouseId, (warehouseInventory.get(warehouseId) ?? []).filter((i: WarehouseInventory) => i.good_id !== item.good_id));
-            s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sold ${item.quantity}× ${goodName(item.good_id)} @ £${sellQuote.unit_price} ("${priceLabel}") — profit +£${Math.round(profit).toLocaleString()}`);
+            s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sold ${item.quantity}× ${goodName(item.good_id)} @ £${sellQuote.unit_price} ("${priceLevelLabel(priceLevel)}") — profit +£${Math.round(profit).toLocaleString()}`);
           } catch (e: unknown) {
             s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sell failed — ${(e as Error).message}`);
           }
@@ -253,13 +267,12 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     // Every cycle, buy cheap goods directly into warehouses — no ship needed.
     // Mirrors the sell scan above: runs regardless of whether any ships are docked.
     if (ENABLE_STOCKPILING) for (const [portId, warehouse] of warehouseByPort) {
-      if (availableFunds <= WAREHOUSE_RESERVE) break;
+      if (availableFunds <= bankingCap) break;
       const portGoods = npcGoods.get(portId);
       if (!portGoods) continue;
       for (const goodId of portGoods) {
-        if (availableFunds <= WAREHOUSE_RESERVE) break;
-        const priceLabel = npcPriceLabel.get(`${portId}:${goodId}`);
-        const priceLevel = priceLevelOrdinal(priceLabel ?? "");
+        if (availableFunds <= bankingCap) break;
+        const priceLevel = npcMinOrd.get(`${portId}:${goodId}`) ?? 0;
         if (priceLevel === 0 || priceLevel > STOCKPILE_PRICE_LEVEL) continue;
         // Skip if already stockpiled at this warehouse to avoid complex price-averaging
         const wInv = warehouseInventory.get(warehouse.id) ?? [];
@@ -271,7 +284,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             quantity: MAX_UNITS,
             action: "buy",
           });
-          const maxAffordable = Math.floor((availableFunds - WAREHOUSE_RESERVE) / probeQuote.unit_price);
+          const maxAffordable = Math.floor((availableFunds - bankingCap) / probeQuote.unit_price);
           const buyQty = Math.min(MAX_UNITS, maxAffordable);
           if (buyQty < 1) continue;
           const buyQuote = buyQty < MAX_UNITS
@@ -292,7 +305,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           // Update local inventory so the sell scan can act on it next cycle
           wInv.push({ id: "", warehouse_id: warehouse.id, good_id: goodId, quantity: buyQty });
           warehouseInventory.set(warehouse.id, wInv);
-          s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpiled ${buyQty}× ${goodName(goodId)} @ £${buyQuote.unit_price} ("${priceLabel}")`);
+          s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpiled ${buyQty}× ${goodName(goodId)} @ £${buyQuote.unit_price} ("${priceLevelLabel(priceLevel)}")`);
         } catch (e: unknown) {
           s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpile buy failed (${goodName(goodId)}) — ${(e as Error).message}`);
         }
@@ -505,8 +518,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         s = appendLog(s, `${ship.name}: arrived at ${portName(ship.port_id)}, selling ${plan.quantity}× ${goodName(plan.goodId)}…`);
 
         // ── Stockpile check: if price is too low and we have a warehouse, store instead ──
-        const arrivalPriceLabel = npcPriceLabel.get(`${ship.port_id}:${plan.goodId}`);
-        const arrivalPriceLevel = priceLevelOrdinal(arrivalPriceLabel ?? "");
+        const arrivalPriceLevel = npcMaxOrd.get(`${ship.port_id}:${plan.goodId}`) ?? 0;
         const arrivalWarehouse  = warehouseByPort.get(ship.port_id);
         if (ENABLE_STOCKPILING && arrivalPriceLevel > 0 && arrivalPriceLevel <= STOCKPILE_PRICE_LEVEL && arrivalWarehouse) {
           try {
@@ -533,7 +545,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             warehouseInventory.set(arrivalWarehouse.id, existing);
             delete s.claimed[claimKey(plan.goodId, plan.sellPortId)];
             s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
-            s = appendLog(s, `${ship.name}: price "${arrivalPriceLabel}" too low — stockpiled ${plan.quantity}× ${goodName(plan.goodId)} in warehouse at ${portName(ship.port_id)}`);
+            s = appendLog(s, `${ship.name}: price "${priceLevelLabel(arrivalPriceLevel)}" too low — stockpiled ${plan.quantity}× ${goodName(plan.goodId)} in warehouse at ${portName(ship.port_id)}`);
             continue;
           } catch (e: unknown) {
             s = appendLog(s, `${ship.name}: stockpile failed (${(e as Error).message}) — attempting NPC sell`);
@@ -589,7 +601,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         const portId   = ship.port_id!;
 
         // ── Auto-buy warehouse at this port if none exists ────────────────────
-        if (!warehouseByPort.has(portId) && availableFunds > WAREHOUSE_RESERVE) {
+        if (!warehouseByPort.has(portId) && availableFunds > bankingCap) {
           try {
             const newWarehouse = await warehousesApi.buyWarehouse({ port_id: portId });
             warehouseByPort.set(portId, newWarehouse);
@@ -611,8 +623,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             let bestSellPath: typeof sellPaths[0] | null = null;
             let bestLevel = 0;
             for (const sp of sellPaths) {
-              const label = npcPriceLabel.get(`${sp.destPortId}:${item.good_id}`);
-              const level = priceLevelOrdinal(label ?? "");
+              const level = npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0;
               if (level >= MIN_SELL_PRICE_LEVEL && level > bestLevel) {
                 bestLevel = level;
                 bestSellPath = sp;
@@ -735,8 +746,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               if (!destGoods.has(goodId)) continue;
               if (s.claimed[claimKey(goodId, buyPortId)] &&
                   s.claimed[claimKey(goodId, buyPortId)] !== ship.id) continue;
-              const destOrd = priceLevelOrdinal(npcPriceLabel.get(`${sellPath.destPortId}:${goodId}`) ?? "");
-              const srcOrd  = priceLevelOrdinal(npcPriceLabel.get(`${buyPortId}:${goodId}`) ?? "");
+              const destOrd = npcMaxOrd.get(`${sellPath.destPortId}:${goodId}`) ?? 0;
+              const srcOrd  = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
               // Score purely on price level spread — no distance bias
               const prescore = destOrd - srcOrd;
               if (prescore <= 0) continue; // skip same-level or inverted pairs
@@ -764,8 +775,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           const k = `${c.goodId}:${c.sellPortId}`;
           if (seenGoodDest.has(k)) continue;
           seenGoodDest.add(k);
-          const srcLabel  = npcPriceLabel.get(`${c.buyPortId}:${c.goodId}`)  ?? "unknown";
-          const destLabel = npcPriceLabel.get(`${c.sellPortId}:${c.goodId}`) ?? "unknown";
+          const srcLabel  = priceLevelLabel(npcMinOrd.get(`${c.buyPortId}:${c.goodId}`)  ?? 0);
+          const destLabel = priceLevelLabel(npcMaxOrd.get(`${c.sellPortId}:${c.goodId}`) ?? 0);
           const tag = c.toLegsBuy.length > 0 ? ` (travel to buy @ ${portName(c.buyPortId)})` : "";
           s = appendLog(s, `  ${goodName(c.goodId)}: buy@${portName(c.buyPortId)}="${srcLabel}" → sell@${portName(c.sellPortId)}="${destLabel}"${tag}`);
         }
