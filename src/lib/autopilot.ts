@@ -246,6 +246,56 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
     }
 
+    // ── Warehouse direct-buy scan ──────────────────────────────────────────────
+    // Every cycle, buy cheap goods directly into warehouses — no ship needed.
+    // Mirrors the sell scan above: runs regardless of whether any ships are docked.
+    for (const [portId, warehouse] of warehouseByPort) {
+      if (availableFunds <= WAREHOUSE_RESERVE) break;
+      const portGoods = npcGoods.get(portId);
+      if (!portGoods) continue;
+      for (const goodId of portGoods) {
+        if (availableFunds <= WAREHOUSE_RESERVE) break;
+        const priceLabel = npcPriceLabel.get(`${portId}:${goodId}`);
+        const priceLevel = priceLevelOrdinal(priceLabel ?? "");
+        if (priceLevel === 0 || priceLevel > STOCKPILE_PRICE_LEVEL) continue;
+        // Skip if already stockpiled at this warehouse to avoid complex price-averaging
+        const wInv = warehouseInventory.get(warehouse.id) ?? [];
+        if (wInv.some((i: WarehouseInventory) => i.good_id === goodId && i.quantity > 0)) continue;
+        try {
+          const probeQuote = await tradeApi.createQuote({
+            port_id: portId,
+            good_id: goodId,
+            quantity: MAX_UNITS,
+            action: "buy",
+          });
+          const maxAffordable = Math.floor((availableFunds - WAREHOUSE_RESERVE) / probeQuote.unit_price);
+          const buyQty = Math.min(MAX_UNITS, maxAffordable);
+          if (buyQty < 1) continue;
+          const buyQuote = buyQty < MAX_UNITS
+            ? await tradeApi.createQuote({ port_id: portId, good_id: goodId, quantity: buyQty, action: "buy" })
+            : probeQuote;
+          await tradeApi.executeQuote({
+            token: buyQuote.token,
+            destinations: [{ type: "warehouse", id: warehouse.id, quantity: buyQty }],
+          });
+          availableFunds -= buyQty * buyQuote.unit_price;
+          await upsertWarehouseStock(companyId, {
+            warehouseId: warehouse.id,
+            portId,
+            goodId,
+            goodName: goodName(goodId),
+            avgBuyPrice: buyQuote.unit_price,
+          });
+          // Update local inventory so the sell scan can act on it next cycle
+          wInv.push({ id: "", warehouse_id: warehouse.id, good_id: goodId, quantity: buyQty });
+          warehouseInventory.set(warehouse.id, wInv);
+          s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpiled ${buyQty}× ${goodName(goodId)} @ £${buyQuote.unit_price} ("${priceLabel}")`);
+        } catch (e: unknown) {
+          s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpile buy failed (${goodName(goodId)}) — ${(e as Error).message}`);
+        }
+      }
+    }
+
     // Pre-fetch inventory for all docked idle ships so we can sell any untracked cargo
     const idleDockedShips = ships.filter(
       (sh: Ship) => sh.status === "docked" && sh.port_id && (s.ships[sh.id]?.phase ?? "idle") === "idle",
