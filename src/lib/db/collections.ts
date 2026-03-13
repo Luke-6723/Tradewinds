@@ -5,6 +5,7 @@
  *   events            – SSE events (world + per-company), capped at 500 per scope
  *   autopilot_states  – one doc per company, stores the full AutopilotState
  *   warehouse_stocks  – autopilot-managed stockpile avg buy prices (per company/warehouse/good)
+ *   ledger_entries    – accumulated ledger history (upserted by entry ID)
  */
 
 import { getDb } from "./mongodb";
@@ -153,4 +154,52 @@ export async function removeWarehouseStock(
   await db
     .collection<StoredWarehouseStock>("warehouse_stocks")
     .deleteOne({ companyId, warehouseId, goodId });
+}
+
+// ── Ledger entries ─────────────────────────────────────────────────────────────
+
+export interface StoredLedgerEntry {
+  companyId: string;
+  entryId: string;
+  amount: number;
+  description: string;
+  occurredAt: Date;
+}
+
+export async function upsertLedgerEntries(
+  companyId: string,
+  entries: Array<{ id: string; amount: number; description: string; occurred_at: string }>,
+): Promise<void> {
+  const db = await getDb();
+  if (!db || entries.length === 0) return;
+
+  const col = db.collection<StoredLedgerEntry>("ledger_entries");
+  await Promise.all(
+    entries.map((e) =>
+      col.updateOne(
+        { companyId, entryId: e.id },
+        {
+          $setOnInsert: {
+            companyId,
+            entryId: e.id,
+            amount: e.amount,
+            description: e.description,
+            occurredAt: new Date(e.occurred_at),
+          },
+        },
+        { upsert: true },
+      ),
+    ),
+  );
+}
+
+export async function getLedgerEntries(companyId: string): Promise<StoredLedgerEntry[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  return db
+    .collection<StoredLedgerEntry>("ledger_entries")
+    .find({ companyId })
+    .sort({ occurredAt: 1 })
+    .toArray();
 }

@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { COOKIE_COMPANY, COOKIE_TOKEN, UPSTREAM } from "@/lib/auth-cookies";
-import { saveEvent } from "@/lib/db/collections";
+import { saveEvent, upsertLedgerEntries } from "@/lib/db/collections";
 
 export async function GET(req: NextRequest) {
   const token     = req.cookies.get(COOKIE_TOKEN)?.value   ?? process.env.TRADEWINDS_TOKEN;
@@ -32,8 +32,19 @@ export async function GET(req: NextRequest) {
         if (!line.startsWith("data:")) continue;
         const raw = line.slice(5).trim();
         try {
-          const data = JSON.parse(raw) as Record<string, unknown>;
-          void saveEvent({ scope: "company", companyId, data });
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          void saveEvent({ scope: "company", companyId, data: parsed });
+
+          // Persist ledger_entry events directly into the ledger collection
+          if (parsed.type === "ledger_entry") {
+            const d = parsed.data as Record<string, unknown>;
+            void upsertLedgerEntries(companyId, [{
+              id:          d.id as string,
+              amount:      d.amount as number,
+              description: (d.reason as string | undefined) ?? "",
+              occurred_at: d.occurred_at as string,
+            }]);
+          }
         } catch { /* non-JSON line — skip */ }
       }
     },

@@ -54,7 +54,7 @@ export default function DashboardPage() {
     Promise.all([
       companyApi.getCompany(),
       companyApi.getEconomy(),
-      companyApi.getLedger(),
+      fetch("/api/ledger").then((r) => r.json()).catch(() => []),
       fleetApi.getShips().catch(() => []),
       worldApi.getPorts().catch(() => []),
       worldApi.getGoods().catch(() => []),
@@ -135,7 +135,7 @@ export default function DashboardPage() {
     : [];
   const PIE_COLORS = ["#6366f1", "#f59e0b"];
 
-  const totalLedgerNet = ledger.slice(0, 20).reduce((s, e) => s + e.amount, 0);
+  const totalLedgerNet = ledger.reduce((s, e) => s + e.amount, 0);
 
   return (
     <div className="space-y-6">
@@ -462,7 +462,7 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent className="p-0">
             <div className="divide-y">
-              {ledger.slice(0, 20).map((entry) => (
+              {[...ledger].reverse().slice(0, 20).map((entry) => (
                 <LedgerRow key={entry.id} entry={entry} />
               ))}
             </div>
