@@ -13,20 +13,22 @@ import {
   ShipIcon,
   ShoppingCartIcon,
   StoreIcon,
+  TableIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { EventsFeed } from "@/components/layout/events-feed";
 
 const nav = [
-  { href: "/dashboard",  label: "Dashboard",  icon: LayoutDashboardIcon },
-  { href: "/map",        label: "Map",         icon: Globe2Icon },
-  { href: "/ports",      label: "Ports",       icon: MapIcon },
-  { href: "/trade",      label: "Trade",       icon: StoreIcon },
-  { href: "/quotes",     label: "Quotes",      icon: ClipboardListIcon },
-  { href: "/market",     label: "Market",      icon: BarChart3Icon },
-  { href: "/fleet",      label: "Fleet",       icon: ShipIcon },
-  { href: "/warehouses", label: "Warehouses",  icon: AnchorIcon },
-  { href: "/goods",      label: "Goods",       icon: PackageIcon },
+  { href: "/dashboard",    label: "Dashboard",    icon: LayoutDashboardIcon },
+  { href: "/map",          label: "Map",           icon: Globe2Icon },
+  { href: "/ports",        label: "Ports",         icon: MapIcon },
+  { href: "/trade",        label: "Trade",         icon: StoreIcon },
+  { href: "/quotes",       label: "Quotes",        icon: ClipboardListIcon },
+  { href: "/quote-board",  label: "Quote Board",   icon: TableIcon },
+  { href: "/market",       label: "Market",        icon: BarChart3Icon },
+  { href: "/fleet",        label: "Fleet",         icon: ShipIcon },
+  { href: "/warehouses",   label: "Warehouses",    icon: AnchorIcon },
+  { href: "/goods",        label: "Goods",         icon: PackageIcon },
 ];
 
 export function Sidebar() {
