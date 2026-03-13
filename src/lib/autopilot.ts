@@ -41,9 +41,9 @@ export * from "@/lib/autopilot-types";
 const MIN_MARGIN   = 0.08;
 const MAX_UNITS    = 50;
 /** Sell-quote batch size (probes this many (destPort, good) pairs per scan). */
-const SELL_BATCH   = 8;
+const SELL_BATCH   = 16;
 /** Buy-quote batch size (validates top N sell-scored candidates). */
-const BUY_BATCH    = 5;
+const BUY_BATCH    = 8;
 /** Delay (ms) after docking before buying/selling. */
 const DOCK_DELAY_MS = 5_000;
 /** Minimum treasury before auto-buying a new warehouse. */
@@ -685,6 +685,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               const srcOrd  = priceLevelOrdinal(npcPriceLabel.get(`${buyPortId}:${goodId}`) ?? "");
               // Score purely on price level spread — no distance bias
               const prescore = destOrd - srcOrd;
+              if (prescore <= 0) continue; // skip same-level or inverted pairs
               allCandidates.push({
                 buyPortId,
                 sellPortId: sellPath.destPortId,
@@ -750,8 +751,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           scored.push({ ...c, npcSellPrice: item.quote.unit_price });
         }
 
-        // Sort by raw sell price — buy quotes will give us true margin
-        scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice);
+        // Sort by prescore (price-level spread) — buy quotes will give us true margin.
+        // Raw sell price is a poor proxy: a £1000 good with 1% margin beats out a
+        // £50 good with 50% margin when sorted by price, which is wrong.
+        scored.sort((a, b) => b.prescore - a.prescore);
 
         if (scored.length === 0) {
           s = appendLog(s, `${ship.name}: no sell quotes succeeded`);
