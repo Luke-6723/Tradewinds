@@ -195,24 +195,21 @@ export default function DashboardPage() {
                       </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
-                    <XAxis dataKey="label" hide />
+                    <XAxis
+                      dataKey="label"
+                      tick={false}
+                      axisLine={false}
+                      tickLine={false}
+                    />
                     <YAxis
-                      tickFormatter={(v) => `£${(v as number / 1000).toFixed(0)}k`}
+                      tickFormatter={(v: number) => `£${(v / 1000).toFixed(0)}k`}
                       tick={{ fontSize: 11 }}
                       width={52}
-                      className="fill-muted-foreground"
                     />
                     <Tooltip
-                      content={({ active, payload }) => {
-                        if (!active || !payload?.length) return null;
-                        const d = payload[0].payload as { label: string; balance: number };
-                        return (
-                          <div className="bg-popover border rounded-lg px-3 py-2 shadow-md text-sm">
-                            <p className="text-muted-foreground text-xs mb-1">{d.label}</p>
-                            <p className="font-mono font-semibold">£{d.balance.toLocaleString()}</p>
-                          </div>
-                        );
-                      }}
+                      formatter={(value) => [`£${Number(value).toLocaleString()}`, "Balance"]}
+                      labelFormatter={(label) => String(label)}
+                      contentStyle={{ fontSize: 13, borderRadius: 8 }}
                     />
                     <Area
                       type="monotone"
@@ -221,7 +218,7 @@ export default function DashboardPage() {
                       strokeWidth={2}
                       fill="url(#treasuryGrad)"
                       dot={false}
-                      activeDot={{ r: 4, fill: "#6366f1" }}
+                      activeDot={{ r: 5, fill: "#6366f1", strokeWidth: 0 }}
                     />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -252,16 +249,8 @@ export default function DashboardPage() {
                       ))}
                     </Pie>
                     <Tooltip
-                      content={({ active, payload }) => {
-                        if (!active || !payload?.length) return null;
-                        const d = payload[0].payload as { name: string; value: number };
-                        return (
-                          <div className="bg-popover border rounded-lg px-3 py-2 shadow-md text-sm">
-                            <p className="text-muted-foreground text-xs">{d.name}</p>
-                            <p className="font-mono font-semibold">£{d.value.toLocaleString()}</p>
-                          </div>
-                        );
-                      }}
+                      formatter={(value, name) => [`£${Number(value).toLocaleString()}`, String(name)]}
+                      contentStyle={{ fontSize: 13, borderRadius: 8 }}
                     />
                   </PieChart>
                 </ResponsiveContainer>
@@ -297,19 +286,9 @@ export default function DashboardPage() {
                   className="fill-muted-foreground"
                 />
                 <Tooltip
-                  content={({ active, payload, label }) => {
-                    if (!active || !payload?.length) return null;
-                    return (
-                      <div className="bg-popover border rounded-lg px-3 py-2 shadow-md text-sm space-y-1">
-                        <p className="text-muted-foreground text-xs font-medium">{label as string}</p>
-                        {payload.map((p) => (
-                          <p key={p.name as string} className="font-mono font-semibold" style={{ color: p.color as string }}>
-                            {p.name as string}: £{(p.value as number).toLocaleString()}
-                          </p>
-                        ))}
-                      </div>
-                    );
-                  }}
+                  formatter={(value, name) => [`£${Number(value).toLocaleString()}`, String(name)]}
+                  labelFormatter={(label) => String(label)}
+                  contentStyle={{ fontSize: 13, borderRadius: 8 }}
                 />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="income" name="Income" fill="#22c55e" radius={[3, 3, 0, 0]} maxBarSize={40} />
