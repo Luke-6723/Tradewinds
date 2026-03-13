@@ -47,7 +47,7 @@ const BUY_BATCH    = 8;
 /** Delay (ms) after docking before buying/selling. */
 const DOCK_DELAY_MS = 5_000;
 /** Minimum treasury before auto-buying a new warehouse. */
-const WAREHOUSE_RESERVE = 10_000;
+const WAREHOUSE_RESERVE = 3_000;
 /** Price level at or above which we sell from warehouse / accept as sell destination (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
 /** Price level at or below which we stockpile instead of selling / buy into warehouse (Average = 3). */
