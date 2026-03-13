@@ -23,10 +23,19 @@ export interface ShipPlan {
 }
 
 export interface AutopilotShipState {
-  phase: "idle" | "transiting_to_buy" | "transiting_to_sell";
+  phase: "idle" | "transiting_to_buy" | "waiting_at_buy" | "transiting_to_sell";
   plan?: ShipPlan;
-  /** ISO timestamp of when the ship first entered idle — used for roam timeout. */
-  idleSince?: string;
+}
+
+/** Fleet-level trade plan shared by all ships in convoy mode. */
+export interface FleetPlan {
+  goodId: string;
+  goodName: string;
+  buyPortId: string;
+  sellPortId: string;
+  estimatedSellPrice: number;
+  /** ISO — used to enforce GATHER_TIMEOUT so one straggler can't stall the fleet. */
+  createdAt: string;
 }
 
 export interface LogEntry {
@@ -37,17 +46,25 @@ export interface LogEntry {
 export interface AutopilotState {
   enabled: boolean;
   ships: Record<string, AutopilotShipState>;
-  /** `${goodId}@${sourcePortId}` → shipId */
+  /** `${goodId}@${sourcePortId}` → shipId (kept for sell-phase dedup) */
   claimed: Record<string, string>;
   profitAccrued: number;
   log: LogEntry[];
   lastCycleAt: string | null;
   /** Port IDs where the company owns a warehouse (refreshed each cycle). */
   warehousedPortIds: string[];
+  /** Current fleet convoy phase. null = not started yet. */
+  fleetPhase: "scanning" | "gathering" | "selling" | null;
+  /** Active trade that all ships are executing together. */
+  fleetPlan?: FleetPlan;
 }
 
 export function blank(): AutopilotState {
-  return { enabled: false, ships: {}, claimed: {}, profitAccrued: 0, log: [], lastCycleAt: null, warehousedPortIds: [] };
+  return {
+    enabled: false, ships: {}, claimed: {}, profitAccrued: 0,
+    log: [], lastCycleAt: null, warehousedPortIds: [],
+    fleetPhase: null, fleetPlan: undefined,
+  };
 }
 
 export function appendLog(s: AutopilotState, message: string): AutopilotState {

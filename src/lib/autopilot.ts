@@ -136,18 +136,11 @@ function dedupBestPerGood(candidates: RawCandidate[], limit: number): RawCandida
 
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
+/** How long to wait for stragglers before proceeding with whoever is at the buy port. */
+const GATHER_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+
 export async function runCycle(s: AutopilotState, companyId: string): Promise<AutopilotState> {
   s = { ...s, lastCycleAt: new Date().toISOString() };
-
-  // Purge stale claims
-  const activeClaims: Record<string, string> = {};
-  for (const [key, shipId] of Object.entries(s.claimed)) {
-    const phase = s.ships[shipId]?.phase;
-    if (phase === "transiting_to_sell" || phase === "transiting_to_buy") {
-      activeClaims[key] = shipId;
-    }
-  }
-  s = { ...s, claimed: activeClaims };
 
   try {
     const [ships, allRoutes, shipTypes, allPorts, allGoods, company, economy, allWarehouses] = await Promise.all([
@@ -161,9 +154,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       warehousesApi.getWarehouses().catch(() => [] as Warehouse[]),
     ]);
 
-    // Minimum treasury to keep in reserve: covers ≥1 week of upkeep + £2k buffer
     const bankingCap = economy.total_upkeep + 2_000;
-    // Track available funds across ships in this cycle to avoid over-committing
     let availableFunds = Math.max(0, company.treasury - bankingCap);
 
     const portName = (id: string | null | undefined) =>
@@ -176,13 +167,11 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     const warehouseByPort = new Map<string, Warehouse>(allWarehouses.map((w: Warehouse) => [w.port_id, w]));
     s = { ...s, warehousedPortIds: allWarehouses.map((w: Warehouse) => w.port_id) };
 
-    // Fetch live inventory for all warehouses + reconcile MongoDB avg-price records
     const warehouseInventory = new Map<string, WarehouseInventory[]>();
     await Promise.all(
       allWarehouses.map(async (w: Warehouse) => {
         try {
-          const inv = await warehousesApi.getInventory(w.id);
-          warehouseInventory.set(w.id, inv);
+          warehouseInventory.set(w.id, await warehousesApi.getInventory(w.id));
         } catch {
           warehouseInventory.set(w.id, []);
         }
@@ -190,19 +179,17 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     );
 
     const mongoStocks = await getWarehouseStocks(companyId).catch(() => []);
-    const stockPrices = new Map<string, number>(); // "warehouseId:goodId" → avgBuyPrice
+    const stockPrices = new Map<string, number>();
     for (const ms of mongoStocks) {
       stockPrices.set(`${ms.warehouseId}:${ms.goodId}`, ms.avgBuyPrice);
-
-      // Reconcile: remove MongoDB record if the warehouse no longer has this good
       const liveInv = warehouseInventory.get(ms.warehouseId) ?? [];
-      const stillPresent = liveInv.some((item: WarehouseInventory) => item.good_id === ms.goodId && item.quantity > 0);
-      if (!stillPresent) {
+      if (!liveInv.some((i: WarehouseInventory) => i.good_id === ms.goodId && i.quantity > 0)) {
         await removeWarehouseStock(companyId, ms.warehouseId, ms.goodId).catch(() => {});
         stockPrices.delete(`${ms.warehouseId}:${ms.goodId}`);
       }
     }
 
+    // ── NPC trader positions ───────────────────────────────────────────────────
     const allTraders = (
       await Promise.all(
         allPorts.map((p: Port) => tradeApi.getTraderPositions(p.id).catch(() => [])),
@@ -210,8 +197,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     ).flat();
 
     const npcGoods  = new Map<string, Set<string>>();
-    const npcMinOrd = new Map<string, number>(); // "portId:goodId" → cheapest price ordinal (buy)
-    const npcMaxOrd = new Map<string, number>(); // "portId:goodId" → priciest price ordinal (sell)
+    const npcMinOrd = new Map<string, number>();
+    const npcMaxOrd = new Map<string, number>();
     for (const tp of allTraders) {
       if (!npcGoods.has(tp.port_id)) npcGoods.set(tp.port_id, new Set());
       npcGoods.get(tp.port_id)!.add(tp.good_id);
@@ -219,745 +206,467 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         const k = `${tp.port_id}:${tp.good_id}`;
         const ord = priceLevelOrdinal(tp.price_bounds);
         if (ord > 0) {
-          const prevMin = npcMinOrd.get(k) ?? Infinity;
-          const prevMax = npcMaxOrd.get(k) ?? 0;
-          if (ord < prevMin) npcMinOrd.set(k, ord);
-          if (ord > prevMax) npcMaxOrd.set(k, ord);
+          if (ord < (npcMinOrd.get(k) ?? Infinity)) npcMinOrd.set(k, ord);
+          if (ord > (npcMaxOrd.get(k) ?? 0))        npcMaxOrd.set(k, ord);
         }
       }
     }
 
     const dockedCount = ships.filter((sh: Ship) => sh.status !== "traveling").length;
-    s = appendLog(s, `⟳ Cycle — ${ships.length} ship(s), ${dockedCount} docked, ${allWarehouses.length} warehouse(s)`);
+    s = appendLog(s, `⟳ ${ships.length} ship(s) / ${dockedCount} docked / £${Math.round(availableFunds).toLocaleString()} available | phase: ${s.fleetPhase ?? "none"}`);
 
-    // ── Warehouse sell scan ────────────────────────────────────────────────────
-    // Check all warehouses for goods that can be sold at a good price — no ship needed
+    // ── Warehouse sell scan (runs every cycle, independent of fleet phase) ─────
     for (const [warehouseId, inventory] of warehouseInventory) {
       const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
       if (!warehouse) continue;
       for (const item of inventory) {
         if (item.quantity <= 0) continue;
         const priceLevel = npcMaxOrd.get(`${warehouse.port_id}:${item.good_id}`) ?? 0;
-        if (priceLevel >= MIN_SELL_PRICE_LEVEL) {
-          try {
-            const sellQuote = await tradeApi.createQuote({
-              port_id: warehouse.port_id,
-              good_id: item.good_id,
-              quantity: item.quantity,
-              action: "sell",
-            });
-            await tradeApi.executeQuote({
-              token: sellQuote.token,
-              destinations: [{ type: "warehouse", id: warehouseId, quantity: item.quantity }],
-            });
-            const avgBuy = stockPrices.get(`${warehouseId}:${item.good_id}`) ?? 0;
-            const profit = (sellQuote.unit_price - avgBuy) * item.quantity;
-            s.profitAccrued += profit;
-            await removeWarehouseStock(companyId, warehouseId, item.good_id).catch(() => {});
-            stockPrices.delete(`${warehouseId}:${item.good_id}`);
-            // Refresh live inventory after sale
-            warehouseInventory.set(warehouseId, (warehouseInventory.get(warehouseId) ?? []).filter((i: WarehouseInventory) => i.good_id !== item.good_id));
-            s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sold ${item.quantity}× ${goodName(item.good_id)} @ £${sellQuote.unit_price} ("${priceLevelLabel(priceLevel)}") — profit +£${Math.round(profit).toLocaleString()}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sell failed — ${(e as Error).message}`);
+        if (priceLevel < MIN_SELL_PRICE_LEVEL) continue;
+        try {
+          const sq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
+          await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: item.quantity }] });
+          const avgBuy = stockPrices.get(`${warehouseId}:${item.good_id}`) ?? 0;
+          const profit = (sq.unit_price - avgBuy) * item.quantity;
+          s.profitAccrued += profit;
+          await removeWarehouseStock(companyId, warehouseId, item.good_id).catch(() => {});
+          warehouseInventory.set(warehouseId, (warehouseInventory.get(warehouseId) ?? []).filter((i: WarehouseInventory) => i.good_id !== item.good_id));
+          s = appendLog(s, `🏭 Sold ${item.quantity}× ${goodName(item.good_id)} from warehouse @ £${sq.unit_price} (+£${Math.round(profit).toLocaleString()})`);
+        } catch (e: unknown) {
+          s = appendLog(s, `🏭 Warehouse sell failed (${goodName(item.good_id)}) — ${(e as Error).message}`);
+        }
+      }
+    }
+
+    // ── Fleet convoy state machine ─────────────────────────────────────────────
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE: scanning — find best global trade, buy warehouse, dispatch fleet
+    // ══════════════════════════════════════════════════════════════════════════
+    if (!s.fleetPhase || s.fleetPhase === "scanning") {
+
+      // Build all (buyPortId, good, sellPortId) candidate pairs across the whole map
+      const allCandidates: RawCandidate[] = [];
+      for (const buyPortId of npcGoods.keys()) {
+        const buyGoods = npcGoods.get(buyPortId)!;
+        const sellPaths = findPaths(buyPortId, allRoutes, 99);
+        for (const sp of sellPaths) {
+          const destGoods = npcGoods.get(sp.destPortId);
+          if (!destGoods) continue;
+          for (const goodId of buyGoods) {
+            if (!destGoods.has(goodId)) continue;
+            const destOrd  = npcMaxOrd.get(`${sp.destPortId}:${goodId}`) ?? 0;
+            const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
+            const prescore = destOrd - srcOrd;
+            if (prescore < 0) continue;
+            allCandidates.push({ buyPortId, sellPortId: sp.destPortId, sellLegs: sp.legs, toLegsBuy: [], goodId, prescore });
           }
         }
       }
-    }
 
-    // ── Warehouse direct-buy scan ──────────────────────────────────────────────
-    // Every cycle, buy cheap goods directly into warehouses — no ship needed.
-    // Mirrors the sell scan above: runs regardless of whether any ships are docked.
-    if (ENABLE_STOCKPILING) for (const [portId, warehouse] of warehouseByPort) {
-      if (availableFunds <= bankingCap) break;
-      const portGoods = npcGoods.get(portId);
-      if (!portGoods) continue;
-      for (const goodId of portGoods) {
-        if (availableFunds <= bankingCap) break;
-        const priceLevel = npcMinOrd.get(`${portId}:${goodId}`) ?? 0;
-        if (priceLevel === 0 || priceLevel > STOCKPILE_PRICE_LEVEL) continue;
-        // Skip if already stockpiled at this warehouse to avoid complex price-averaging
-        const wInv = warehouseInventory.get(warehouse.id) ?? [];
-        if (wInv.some((i: WarehouseInventory) => i.good_id === goodId && i.quantity > 0)) continue;
+      if (allCandidates.length === 0) {
+        s = appendLog(s, "Scanning: no arbitrage candidates — check trader position data");
+        return s;
+      }
+
+      // Sell-quote batch to get real prices
+      const sellBatch = dedupBestPerGood(allCandidates.sort((a, b) => b.prescore - a.prescore), SELL_BATCH);
+      s = appendLog(s, `Scanning: probing ${sellBatch.length} sell quote(s) across ${npcGoods.size} port(s)…`);
+
+      let batchSellItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+      try {
+        batchSellItems = await tradeApi.batchCreateQuotes({
+          requests: sellBatch.map((c) => ({ port_id: c.sellPortId, good_id: c.goodId, quantity: MAX_UNITS, action: "sell" as const })),
+        });
+      } catch (e: unknown) {
+        s = appendLog(s, `Scanning: sell batch failed — ${(e as Error).message}`);
+        return s;
+      }
+
+      // Score by actual sell price and verify margin with a real buy quote
+      const scored: ScoredCandidate[] = [];
+      for (let i = 0; i < sellBatch.length; i++) {
+        const item = batchSellItems[i];
+        const c    = sellBatch[i];
+        if (!item || item.status !== "success" || !item.quote) continue;
+        scored.push({ ...c, npcSellPrice: item.quote.unit_price });
+      }
+      scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice);
+
+      if (scored.length === 0) {
+        s = appendLog(s, "Scanning: no successful sell quotes");
+        return s;
+      }
+
+      // Log top 5 candidates for visibility
+      for (const c of scored.slice(0, 5)) {
+        s = appendLog(s, `  ${goodName(c.goodId)}: buy@${portName(c.buyPortId)} → sell@${portName(c.sellPortId)}=£${c.npcSellPrice} (prescore ${c.prescore})`);
+      }
+
+      // Find first candidate with a viable margin
+      let best: (ScoredCandidate & { buyPrice: number }) | null = null;
+      for (const c of scored) {
         try {
-          const probeQuote = await tradeApi.createQuote({
-            port_id: portId,
-            good_id: goodId,
-            quantity: MAX_UNITS,
-            action: "buy",
-          });
-          const maxAffordable = Math.floor((availableFunds - bankingCap) / probeQuote.unit_price);
-          const buyQty = Math.min(MAX_UNITS, maxAffordable);
-          if (buyQty < 1) continue;
-          const buyQuote = buyQty < MAX_UNITS
-            ? await tradeApi.createQuote({ port_id: portId, good_id: goodId, quantity: buyQty, action: "buy" })
-            : probeQuote;
-          await tradeApi.executeQuote({
-            token: buyQuote.token,
-            destinations: [{ type: "warehouse", id: warehouse.id, quantity: buyQty }],
-          });
-          availableFunds -= buyQty * buyQuote.unit_price;
-          await upsertWarehouseStock(companyId, {
-            warehouseId: warehouse.id,
-            portId,
-            goodId,
-            goodName: goodName(goodId),
-            avgBuyPrice: buyQuote.unit_price,
-          });
-          // Update local inventory so the sell scan can act on it next cycle
-          wInv.push({ id: "", warehouse_id: warehouse.id, good_id: goodId, quantity: buyQty });
-          warehouseInventory.set(warehouse.id, wInv);
-          s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpiled ${buyQty}× ${goodName(goodId)} @ £${buyQuote.unit_price} ("${priceLevelLabel(priceLevel)}")`);
+          const bq = await tradeApi.createQuote({ port_id: c.buyPortId, good_id: c.goodId, quantity: MAX_UNITS, action: "buy" });
+          const margin = (c.npcSellPrice - bq.unit_price) / bq.unit_price;
+          s = appendLog(s, `  Checking ${goodName(c.goodId)} buy@${portName(c.buyPortId)}=£${bq.unit_price} → sell@${portName(c.sellPortId)}=£${c.npcSellPrice}: margin ${(margin * 100).toFixed(1)}%`);
+          if (margin >= MIN_MARGIN) {
+            best = { ...c, buyPrice: bq.unit_price };
+            break;
+          }
         } catch (e: unknown) {
-          s = appendLog(s, `🏭 Warehouse ${portName(portId)}: stockpile buy failed (${goodName(goodId)}) — ${(e as Error).message}`);
+          s = appendLog(s, `  Buy quote failed for ${goodName(c.goodId)} @ ${portName(c.buyPortId)} — ${(e as Error).message}`);
         }
       }
-    }
 
-    // Pre-fetch inventory for all docked idle ships so we can sell any untracked cargo
-    const idleDockedShips = ships.filter(
-      (sh: Ship) => sh.status === "docked" && sh.port_id && (s.ships[sh.id]?.phase ?? "idle") === "idle",
-    );
-    const idleCargoMap = new Map<string, Array<{ good_id: string; quantity: number }>>();
-    await Promise.all(
-      idleDockedShips.map(async (sh: Ship) => {
+      if (!best) {
+        s = appendLog(s, "Scanning: no candidate clears minimum margin — waiting");
+        return s;
+      }
+
+      s = appendLog(s, `✅ Trade selected: ${goodName(best.goodId)} | buy@${portName(best.buyPortId)}=£${best.buyPrice} → sell@${portName(best.sellPortId)}=£${best.npcSellPrice} (${((best.npcSellPrice - best.buyPrice) / best.buyPrice * 100).toFixed(1)}%)`);
+
+      // ── Ensure warehouse exists at buy port ────────────────────────────────
+      let buyWarehouse = warehouseByPort.get(best.buyPortId);
+      if (!buyWarehouse) {
         try {
-          const inv = await fleetApi.getInventory(sh.id);
-          if (inv.length > 0) idleCargoMap.set(sh.id, inv);
-        } catch {
-          // Non-critical — skip if inventory fetch fails
+          buyWarehouse = await warehousesApi.buyWarehouse({ port_id: best.buyPortId });
+          warehouseByPort.set(best.buyPortId, buyWarehouse);
+          s = { ...s, warehousedPortIds: [...s.warehousedPortIds, best.buyPortId] };
+          warehouseInventory.set(buyWarehouse.id, []);
+          s = appendLog(s, `🏗️ Bought warehouse at ${portName(best.buyPortId)}`);
+        } catch (e: unknown) {
+          s = appendLog(s, `⚠️ No warehouse at ${portName(best.buyPortId)} — ${(e as Error).message}. Will buy directly.`);
         }
-      }),
-    );
+      }
 
-    // ── Pre-scan: build sell-quote pool once per unique idle port ──────────────
-    // Shares one batch of sell quotes across all ships at the same port, eliminating
-    // N redundant API round-trips for N idle ships. Claims are NOT filtered here —
-    // they are applied per-ship in the loop below.
-    const portScanCache = new Map<string, ScoredCandidate[]>();
-    {
-      const idleDocked = ships.filter(
-        (sh: Ship) => sh.status !== "traveling" && sh.port_id && (s.ships[sh.id]?.phase ?? "idle") === "idle",
-      );
-      for (const portId of [...new Set(idleDocked.map((sh: Ship) => sh.port_id!))]) {
-        const allCandidates: RawCandidate[] = [];
-        const toBuyPaths = findPaths(portId, allRoutes, 99);
-        const buyLocations: Array<{ buyPortId: string; toLegsBuy: RouteLeg[] }> = [
-          { buyPortId: portId, toLegsBuy: [] },
-          ...toBuyPaths.map((p) => ({ buyPortId: p.destPortId, toLegsBuy: p.legs })),
-        ];
-        for (const { buyPortId, toLegsBuy } of buyLocations) {
-          const buyGoods = npcGoods.get(buyPortId);
-          if (!buyGoods) continue;
-          const fromBuyPaths = findPaths(buyPortId, allRoutes, 99);
-          for (const sellPath of fromBuyPaths) {
-            const destGoods = npcGoods.get(sellPath.destPortId);
-            if (!destGoods) continue;
-            for (const goodId of buyGoods) {
-              if (!destGoods.has(goodId)) continue;
-              const destOrd  = npcMaxOrd.get(`${sellPath.destPortId}:${goodId}`) ?? 0;
-              const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
-              const prescore = destOrd - srcOrd;
-              if (prescore < 0) continue;
-              allCandidates.push({ buyPortId, sellPortId: sellPath.destPortId, sellLegs: sellPath.legs, toLegsBuy, goodId, prescore });
+      // ── Pre-buy fleet capacity into warehouse ──────────────────────────────
+      if (buyWarehouse && availableFunds > bankingCap) {
+        const totalCap = ships.reduce((acc, sh: Ship) => acc + Math.min(stMap.get(sh.ship_type_id)?.capacity ?? 20, MAX_UNITS), 0);
+        const maxAffordable = Math.floor((availableFunds - bankingCap) / best.buyPrice);
+        const preBuyQty = Math.min(totalCap, maxAffordable);
+        if (preBuyQty > 0) {
+          try {
+            const preBuyQ = await tradeApi.createQuote({ port_id: best.buyPortId, good_id: best.goodId, quantity: preBuyQty, action: "buy" });
+            await tradeApi.executeQuote({ token: preBuyQ.token, destinations: [{ type: "warehouse", id: buyWarehouse.id, quantity: preBuyQty }] });
+            availableFunds -= preBuyQty * preBuyQ.unit_price;
+            const existing = warehouseInventory.get(buyWarehouse.id) ?? [];
+            existing.push({ id: "", warehouse_id: buyWarehouse.id, good_id: best.goodId, quantity: preBuyQty });
+            warehouseInventory.set(buyWarehouse.id, existing);
+            await upsertWarehouseStock(companyId, { warehouseId: buyWarehouse.id, portId: best.buyPortId, goodId: best.goodId, goodName: goodName(best.goodId), avgBuyPrice: preBuyQ.unit_price });
+            stockPrices.set(`${buyWarehouse.id}:${best.goodId}`, preBuyQ.unit_price);
+            s = appendLog(s, `🏭 Pre-bought ${preBuyQty}× ${goodName(best.goodId)} @ £${preBuyQ.unit_price} into warehouse at ${portName(best.buyPortId)}`);
+          } catch (e: unknown) {
+            s = appendLog(s, `Pre-buy failed — ${(e as Error).message}`);
+          }
+        }
+      }
+
+      // ── Set fleet plan ─────────────────────────────────────────────────────
+      s = {
+        ...s,
+        fleetPhase: "gathering",
+        fleetPlan: {
+          goodId: best.goodId, goodName: goodName(best.goodId),
+          buyPortId: best.buyPortId, sellPortId: best.sellPortId,
+          estimatedSellPrice: best.npcSellPrice,
+          createdAt: new Date().toISOString(),
+        },
+      };
+
+      // ── Dispatch all idle docked ships toward buy port ─────────────────────
+      let dispatched = 0;
+      for (const ship of ships) {
+        const ss = s.ships[ship.id] ?? { phase: "idle" };
+        if (ss.phase !== "idle") continue;
+        if (ship.status === "traveling") continue;
+        if (!ship.port_id) continue;
+
+        if (ship.port_id === best.buyPortId) {
+          s.ships = { ...s.ships, [ship.id]: { phase: "waiting_at_buy" } };
+          s = appendLog(s, `${ship.name}: already at ${portName(best.buyPortId)}, waiting`);
+          dispatched++;
+          continue;
+        }
+
+        const paths = findPaths(ship.port_id, allRoutes, 99);
+        const toPath = paths.find((p) => p.destPortId === best.buyPortId);
+        if (!toPath) {
+          s = appendLog(s, `${ship.name}: no route to ${portName(best.buyPortId)}`);
+          continue;
+        }
+        try {
+          await fleetApi.transit(ship.id, { route_id: toPath.legs[0].routeId });
+          s.ships = {
+            ...s.ships,
+            [ship.id]: {
+              phase: "transiting_to_buy",
+              plan: {
+                goodId: best.goodId, goodName: goodName(best.goodId),
+                quantity: 0, actualBuyPrice: 0,
+                legs: toPath.legs.slice(1),
+                buyPortId: best.buyPortId, sellPortId: best.sellPortId, sellLegs: [], sellPrice: best.npcSellPrice,
+              },
+            },
+          };
+          s = appendLog(s, `${ship.name}: dispatched → ${portName(best.buyPortId)}`);
+          dispatched++;
+        } catch (e: unknown) {
+          s = appendLog(s, `${ship.name}: dispatch failed — ${(e as Error).message}`);
+        }
+      }
+      s = appendLog(s, `Fleet: ${dispatched} ship(s) heading to ${portName(best.buyPortId)}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE: gathering — wait for fleet at buy port, then buy + dispatch to sell
+    // ══════════════════════════════════════════════════════════════════════════
+    } else if (s.fleetPhase === "gathering") {
+      const fp = s.fleetPlan!;
+      const elapsedMs = Date.now() - new Date(fp.createdAt).getTime();
+
+      for (const ship of ships) {
+        const ss = s.ships[ship.id] ?? { phase: "idle" };
+        if (ship.status === "traveling") continue;
+        if (!ship.port_id) continue;
+
+        if (ss.phase === "transiting_to_buy") {
+          const plan = ss.plan!;
+          if (plan.legs.length > 0 && ship.port_id !== fp.buyPortId) {
+            // Advance waypoint
+            try {
+              await fleetApi.transit(ship.id, { route_id: plan.legs[0].routeId });
+              s.ships = { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } };
+              s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
+            } catch (e: unknown) {
+              s = appendLog(s, `${ship.name}: waypoint failed — ${(e as Error).message}`);
+            }
+            continue;
+          }
+          if (ship.port_id === fp.buyPortId) {
+            s.ships = { ...s.ships, [ship.id]: { phase: "waiting_at_buy" } };
+            s = appendLog(s, `${ship.name}: arrived at ${portName(fp.buyPortId)}, waiting for fleet`);
+          }
+          continue;
+        }
+
+        // Late idle ships — send them toward buy port too
+        if (ss.phase === "idle") {
+          if (ship.port_id === fp.buyPortId) {
+            s.ships = { ...s.ships, [ship.id]: { phase: "waiting_at_buy" } };
+          } else {
+            const paths = findPaths(ship.port_id, allRoutes, 99);
+            const toPath = paths.find((p) => p.destPortId === fp.buyPortId);
+            if (toPath) {
+              try {
+                await fleetApi.transit(ship.id, { route_id: toPath.legs[0].routeId });
+                s.ships = { ...s.ships, [ship.id]: { phase: "transiting_to_buy", plan: { goodId: fp.goodId, goodName: fp.goodName, quantity: 0, actualBuyPrice: 0, legs: toPath.legs.slice(1), buyPortId: fp.buyPortId, sellPortId: fp.sellPortId, sellLegs: [], sellPrice: fp.estimatedSellPrice } } };
+                s = appendLog(s, `${ship.name}: late dispatch → ${portName(fp.buyPortId)}`);
+              } catch { /* ignore */ }
             }
           }
         }
-        if (allCandidates.length === 0) continue;
+      }
 
-        const sellBatch      = dedupBestPerGood(allCandidates.sort((a, b) => b.prescore - a.prescore), SELL_BATCH);
-        const portShipNames  = idleDocked.filter((sh: Ship) => sh.port_id === portId).map((sh: Ship) => sh.name).join(", ");
-        s = appendLog(s, `Port ${portName(portId)}: scanning [${portShipNames}] — ${sellBatch.length} sell quote(s)…`);
+      const waitingShips   = ships.filter((sh: Ship) => (s.ships[sh.id]?.phase ?? "idle") === "waiting_at_buy");
+      const stillTraveling = ships.filter((sh: Ship) => sh.status === "traveling" && (s.ships[sh.id]?.phase ?? "idle") === "transiting_to_buy");
+      const timedOut       = elapsedMs > GATHER_TIMEOUT_MS;
 
-        let batchSellItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+      s = appendLog(s, `Gathering: ${waitingShips.length} waiting, ${stillTraveling.length} en route${timedOut ? " [TIMEOUT — proceeding]" : ""}`);
+
+      if (waitingShips.length > 0 && (stillTraveling.length === 0 || timedOut)) {
+        // ── Re-evaluate sell price ───────────────────────────────────────────
+        let sellPortId = fp.sellPortId;
+        let sellPrice  = fp.estimatedSellPrice;
         try {
-          batchSellItems = await tradeApi.batchCreateQuotes({
-            requests: sellBatch.map((c) => ({
-              port_id:  c.sellPortId,
-              good_id:  c.goodId,
-              quantity: MAX_UNITS,
-              action:   "sell" as const,
-            })),
-          });
-        } catch (e: unknown) {
-          s = appendLog(s, `Port ${portName(portId)}: sell batch failed — ${(e as Error).message}`);
-          continue;
+          const freshSell = await tradeApi.createQuote({ port_id: fp.sellPortId, good_id: fp.goodId, quantity: MAX_UNITS, action: "sell" });
+          sellPrice = freshSell.unit_price;
+          s = appendLog(s, `Re-evaluated sell: £${sellPrice} @ ${portName(sellPortId)}`);
+        } catch { /* use estimate */ }
+
+        // ── Find route buyPort → sellPort ────────────────────────────────────
+        const sellPaths = findPaths(fp.buyPortId, allRoutes, 99);
+        const sellPath  = sellPaths.find((p) => p.destPortId === sellPortId);
+        if (!sellPath) {
+          s = appendLog(s, `⚠️ No route ${portName(fp.buyPortId)} → ${portName(sellPortId)} — aborting trade`);
+          for (const sh of waitingShips) s.ships = { ...s.ships, [sh.id]: { phase: "idle" } };
+          s = { ...s, fleetPhase: "scanning", fleetPlan: undefined };
+          return s;
         }
 
-        const scored: ScoredCandidate[] = [];
-        for (let i = 0; i < sellBatch.length; i++) {
-          const item = batchSellItems[i];
-          const c    = sellBatch[i];
-          if (!item || item.status !== "success" || !item.quote) continue;
-          scored.push({ ...c, npcSellPrice: item.quote.unit_price });
-        }
-        scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice);
-        portScanCache.set(portId, scored);
-      }
-    }
+        const buyWarehouse = warehouseByPort.get(fp.buyPortId);
+        let warehouseQty = buyWarehouse
+          ? (warehouseInventory.get(buyWarehouse.id) ?? []).find((i: WarehouseInventory) => i.good_id === fp.goodId)?.quantity ?? 0
+          : 0;
+        const avgBuy = buyWarehouse ? (stockPrices.get(`${buyWarehouse.id}:${fp.goodId}`) ?? 0) : 0;
 
-    for (const ship of ships) {
-      const ss = s.ships[ship.id] ?? { phase: "idle" };
-
-      // ── Traveling ──────────────────────────────────────────────────────────
-      if (ship.status === "traveling") {
-        if (ss.plan) {
-          const dest = ss.phase === "transiting_to_buy"
-            ? ss.plan.buyPortId
-            : (ss.plan.legs[0]?.toPortId ?? ss.plan.sellPortId);
-          s = appendLog(s, `${ship.name}: ✈ ${ss.phase === "transiting_to_buy" ? "heading to buy port" : "traveling to sell"} → ${portName(dest)}`);
-        }
-        continue;
-      }
-
-      if (!ship.port_id) continue;
-
-      // ── Arrived at buy port ─────────────────────────────────────────────────
-      if (ss.phase === "transiting_to_buy" && ss.plan) {
-        const plan = ss.plan;
-
-        // Waypoint en route to buy port
-        if (plan.legs.length > 0 && ship.port_id !== plan.buyPortId) {
-          const nextLeg = plan.legs[0];
-          try {
-            await fleetApi.transit(ship.id, { route_id: nextLeg.routeId });
-            s.ships = { ...s.ships, [ship.id]: { phase: "transiting_to_buy", plan: { ...plan, legs: plan.legs.slice(1) } } };
-            s = appendLog(s, `${ship.name}: waypoint ${portName(ship.port_id)} → ${portName(nextLeg.toPortId)} (en route to buy)`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: waypoint transit failed — ${(e as Error).message}`);
-          }
-          continue;
-        }
-
-        if (ship.port_id !== plan.buyPortId) {
-          s = appendLog(s, `${ship.name}: unexpected port ${portName(ship.port_id)}, resetting`);
-          if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
-          s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
-          continue;
-        }
-
-        // Roaming arrival — reset to idle so next cycle re-scans from new port
-        if (plan.goodId === "roaming") {
-          s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
-          s = appendLog(s, `${ship.name}: arrived at roam destination ${portName(ship.port_id)}, scanning next cycle…`);
-          continue;
-        }
-
-        // Arrived — buy the goods
-        s = appendLog(s, `${ship.name}: arrived at buy port ${portName(ship.port_id)}, buying ${plan.quantity}× ${goodName(plan.goodId)}…`);
         await sleep(DOCK_DELAY_MS);
-        try {
-          // First quote: get the unit price to compute what we can afford
-          const priceQuote = await tradeApi.createQuote({
-            port_id: ship.port_id,
-            good_id: plan.goodId,
-            quantity: plan.quantity,
-            action: "buy",
-          });
 
-          const maxAffordable = Math.floor(availableFunds / priceQuote.unit_price);
-          const actualQty = Math.min(plan.quantity, maxAffordable);
-          if (actualQty < 1) {
-            s = appendLog(s, `${ship.name}: insufficient funds (£${availableFunds.toLocaleString()} < £${priceQuote.unit_price}/unit), resetting`);
-            if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
+        for (const ship of waitingShips) {
+          const capacity = stMap.get(ship.ship_type_id)?.capacity ?? 20;
+          const qty = Math.min(capacity, MAX_UNITS);
+          let boughtQty    = 0;
+          let actualBuyPrice = 0;
+
+          // Load from warehouse first
+          if (buyWarehouse && warehouseQty > 0) {
+            const fromWh = Math.min(qty, warehouseQty);
+            try {
+              await warehousesApi.transferToShip(buyWarehouse.id, { ship_id: ship.id, good_id: fp.goodId, quantity: fromWh });
+              warehouseQty -= fromWh;
+              boughtQty    = fromWh;
+              actualBuyPrice = avgBuy;
+              s = appendLog(s, `${ship.name}: loaded ${fromWh}× ${fp.goodName} from warehouse`);
+            } catch (e: unknown) {
+              s = appendLog(s, `${ship.name}: warehouse load failed — ${(e as Error).message}`);
+            }
+          }
+
+          // Buy remainder from NPC
+          const remaining = qty - boughtQty;
+          if (remaining > 0 && availableFunds > 0) {
+            try {
+              const bq = await tradeApi.createQuote({ port_id: fp.buyPortId, good_id: fp.goodId, quantity: remaining, action: "buy" });
+              const affordable = Math.floor(availableFunds / bq.unit_price);
+              const buyQty = Math.min(remaining, affordable);
+              if (buyQty > 0) {
+                const execQ = buyQty < remaining
+                  ? await tradeApi.createQuote({ port_id: fp.buyPortId, good_id: fp.goodId, quantity: buyQty, action: "buy" })
+                  : bq;
+                await tradeApi.executeQuote({ token: execQ.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
+                availableFunds -= buyQty * execQ.unit_price;
+                actualBuyPrice = boughtQty > 0
+                  ? (actualBuyPrice * boughtQty + execQ.unit_price * buyQty) / (boughtQty + buyQty)
+                  : execQ.unit_price;
+                boughtQty += buyQty;
+                s = appendLog(s, `${ship.name}: bought ${buyQty}× ${fp.goodName} @ £${execQ.unit_price}`);
+              }
+            } catch (e: unknown) {
+              s = appendLog(s, `${ship.name}: NPC buy failed — ${(e as Error).message}`);
+            }
+          }
+
+          if (boughtQty === 0) {
+            s = appendLog(s, `${ship.name}: nothing to load — resetting to idle`);
             s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
             continue;
           }
-          if (actualQty < plan.quantity) {
-            s = appendLog(s, `${ship.name}: funds capped — buying ${actualQty}× instead of ${plan.quantity}×`);
+
+          // Dispatch to sell port
+          try {
+            await fleetApi.transit(ship.id, { route_id: sellPath.legs[0].routeId });
+            s.ships = {
+              ...s.ships,
+              [ship.id]: {
+                phase: "transiting_to_sell",
+                plan: {
+                  goodId: fp.goodId, goodName: fp.goodName,
+                  quantity: boughtQty, actualBuyPrice,
+                  legs: sellPath.legs.slice(1), sellPortId, sellPrice,
+                },
+              },
+            };
+            const estProfit = (sellPrice - actualBuyPrice) * boughtQty;
+            s = appendLog(s, `${ship.name}: → ${portName(sellPortId)} with ${boughtQty}× ${fp.goodName} (est. +£${Math.round(estProfit).toLocaleString()})`);
+          } catch (e: unknown) {
+            s = appendLog(s, `${ship.name}: sell dispatch failed — ${(e as Error).message}`);
+            s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
           }
-
-          // If quantity changed, get a fresh quote so the token matches the execute quantity exactly
-          const buyQuote = actualQty < plan.quantity
-            ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: actualQty, action: "buy" })
-            : priceQuote;
-
-          // Verify affordability against the fresh quote's price (may differ from priceQuote)
-          if (actualQty * buyQuote.unit_price > availableFunds) {
-            const finalQty = Math.floor(availableFunds / buyQuote.unit_price);
-            if (finalQty < 1) {
-              s = appendLog(s, `${ship.name}: insufficient funds after re-quote, resetting`);
-              if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
-              s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
-              continue;
-            }
-            // One final re-quote for the verified affordable amount
-            const finalQuote = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: finalQty, action: "buy" });
-            await tradeApi.executeQuote({ token: finalQuote.token, destinations: [{ type: "ship", id: ship.id, quantity: finalQty }] });
-            availableFunds -= finalQty * finalQuote.unit_price;
-            const sellLegs = plan.sellLegs ?? [];
-            const newPlan: ShipPlan = { goodId: plan.goodId, goodName: plan.goodName, quantity: finalQty, actualBuyPrice: finalQuote.unit_price, legs: sellLegs.slice(1), sellPortId: plan.sellPortId, sellPrice: plan.sellPrice };
-            s.ships = { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan: newPlan } };
-            if (sellLegs.length > 0) await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
-            if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
-            s.claimed = { ...s.claimed, [claimKey(plan.goodId, plan.sellPortId)]: ship.id };
-            s = appendLog(s, `${ship.name}: bought ${finalQty}× ${goodName(plan.goodId)} @ £${finalQuote.unit_price} → ${portName(plan.sellPortId)}`);
-            continue;
-          }
-
-          await tradeApi.executeQuote({
-            token: buyQuote.token,
-            destinations: [{ type: "ship", id: ship.id, quantity: actualQty }],
-          });
-          availableFunds -= actualQty * buyQuote.unit_price;
-
-          const sellLegs = plan.sellLegs ?? [];
-          const newPlan: ShipPlan = {
-            goodId:          plan.goodId,
-            goodName:        plan.goodName,
-            quantity:        actualQty,
-            actualBuyPrice:  buyQuote.unit_price,
-            legs:            sellLegs.slice(1),
-            sellPortId:      plan.sellPortId,
-            sellPrice:       plan.sellPrice,
-          };
-          s.ships = { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan: newPlan } };
-
-          if (sellLegs.length > 0) {
-            await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
-          }
-
-          if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
-          s.claimed = { ...s.claimed, [claimKey(plan.goodId, plan.sellPortId)]: ship.id };
-
-          const estProfit = (plan.sellPrice - buyQuote.unit_price) * actualQty;
-          s = appendLog(s, `${ship.name}: bought ${actualQty}× ${goodName(plan.goodId)} @ £${buyQuote.unit_price} → ${portName(plan.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
-        } catch (e: unknown) {
-          s = appendLog(s, `${ship.name}: buy failed — ${(e as Error).message}, resetting`);
-          if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
-          s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
         }
-        continue;
+
+        // Clean up warehouse inventory
+        if (buyWarehouse) {
+          const inv = warehouseInventory.get(buyWarehouse.id) ?? [];
+          const idx = inv.findIndex((i: WarehouseInventory) => i.good_id === fp.goodId);
+          if (idx >= 0) {
+            if (warehouseQty <= 0) {
+              inv.splice(idx, 1);
+              await removeWarehouseStock(companyId, buyWarehouse.id, fp.goodId).catch(() => {});
+            } else {
+              inv[idx] = { ...inv[idx], quantity: warehouseQty };
+            }
+            warehouseInventory.set(buyWarehouse.id, inv);
+          }
+        }
+
+        s = { ...s, fleetPhase: "selling" };
+        s = appendLog(s, `Fleet: convoy dispatched to ${portName(sellPortId)}`);
       }
 
-      // ── Arrived at sell port (or waypoint) ─────────────────────────────────
-      if (ss.phase === "transiting_to_sell" && ss.plan) {
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE: selling — advance ships, sell on arrival, reset when done
+    // ══════════════════════════════════════════════════════════════════════════
+    } else if (s.fleetPhase === "selling") {
+      const fp = s.fleetPlan!;
+
+      for (const ship of ships) {
+        const ss = s.ships[ship.id] ?? { phase: "idle" };
+        if (ss.phase !== "transiting_to_sell" || !ss.plan) continue;
+        if (ship.status === "traveling") continue;
+        if (!ship.port_id) continue;
+
         const plan = ss.plan;
 
+        // Waypoint
         if (plan.legs.length > 0 && ship.port_id !== plan.sellPortId) {
-          const nextLeg = plan.legs[0];
           try {
-            await fleetApi.transit(ship.id, { route_id: nextLeg.routeId });
-            s.ships = { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan: { ...plan, legs: plan.legs.slice(1) } } };
-            s = appendLog(s, `${ship.name}: waypoint ${portName(ship.port_id)} → ${portName(nextLeg.toPortId)}`);
+            await fleetApi.transit(ship.id, { route_id: plan.legs[0].routeId });
+            s.ships = { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } };
+            s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
           } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: waypoint transit failed — ${(e as Error).message}`);
+            s = appendLog(s, `${ship.name}: waypoint failed — ${(e as Error).message}`);
           }
           continue;
         }
 
         if (ship.port_id !== plan.sellPortId) {
-          s = appendLog(s, `${ship.name}: unexpected port ${portName(ship.port_id)} (expected ${portName(plan.sellPortId)}) — attempting sell here`);
-          // Try selling at the current port before giving up
-          let soldAtUnexpected = false;
-          try {
-            const uSellQuote = await tradeApi.createQuote({
-              port_id: ship.port_id,
-              good_id: plan.goodId,
-              quantity: plan.quantity,
-              action: "sell",
-            });
-            await tradeApi.executeQuote({
-              token: uSellQuote.token,
-              destinations: [{ type: "ship", id: ship.id, quantity: plan.quantity }],
-            });
-            const uProfit = (uSellQuote.unit_price - plan.actualBuyPrice) * plan.quantity;
-            s.profitAccrued += uProfit;
-            s = appendLog(s, `${ship.name}: sold ${plan.quantity}× @ £${uSellQuote.unit_price} at unexpected port — profit +£${Math.round(uProfit).toLocaleString()}`);
-            soldAtUnexpected = true;
-          } catch {
-            // NPC sell failed — try market order
-            try {
-              const askPrice = Math.round(plan.actualBuyPrice * 1.15);
-              await marketApi.createOrder({
-                port_id: ship.port_id,
-                good_id: plan.goodId,
-                total: plan.quantity,
-                price: askPrice,
-                side: "sell",
-              });
-              s = appendLog(s, `${ship.name}: posted sell order — ${plan.quantity}× ${goodName(plan.goodId)} @ £${askPrice}`);
-              soldAtUnexpected = true;
-            } catch (e2: unknown) {
-              s = appendLog(s, `${ship.name}: sell failed at unexpected port — ${(e2 as Error).message}`);
-            }
-          }
-          if (!soldAtUnexpected) {
-            s = appendLog(s, `${ship.name}: could not sell at unexpected port, resetting`);
-          }
-          delete s.claimed[claimKey(plan.goodId, plan.sellPortId)];
+          s = appendLog(s, `${ship.name}: at ${portName(ship.port_id)}, expected ${portName(plan.sellPortId)} — resetting`);
           s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
           continue;
         }
 
-        s = appendLog(s, `${ship.name}: arrived at ${portName(ship.port_id)}, selling ${plan.quantity}× ${goodName(plan.goodId)}…`);
-
-        // ── Stockpile check: if price is too low and we have a warehouse, store instead ──
-        const arrivalPriceLevel = npcMaxOrd.get(`${ship.port_id}:${plan.goodId}`) ?? 0;
-        const arrivalWarehouse  = warehouseByPort.get(ship.port_id);
-        if (ENABLE_STOCKPILING && arrivalPriceLevel > 0 && arrivalPriceLevel <= STOCKPILE_PRICE_LEVEL && arrivalWarehouse) {
-          try {
-            await fleetApi.transferToWarehouse(ship.id, {
-              warehouse_id: arrivalWarehouse.id,
-              good_id:      plan.goodId,
-              quantity:     plan.quantity,
-            });
-            await upsertWarehouseStock(companyId, {
-              warehouseId:  arrivalWarehouse.id,
-              portId:       ship.port_id,
-              goodId:       plan.goodId,
-              goodName:     plan.goodName,
-              avgBuyPrice:  plan.actualBuyPrice,
-            });
-            // Update local inventory map so warehouse sell scan sees it next cycle
-            const existing = warehouseInventory.get(arrivalWarehouse.id) ?? [];
-            const idx = existing.findIndex((i: WarehouseInventory) => i.good_id === plan.goodId);
-            if (idx >= 0) {
-              existing[idx] = { ...existing[idx], quantity: existing[idx].quantity + plan.quantity };
-            } else {
-              existing.push({ id: "", warehouse_id: arrivalWarehouse.id, good_id: plan.goodId, quantity: plan.quantity });
-            }
-            warehouseInventory.set(arrivalWarehouse.id, existing);
-            delete s.claimed[claimKey(plan.goodId, plan.sellPortId)];
-            s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
-            s = appendLog(s, `${ship.name}: price "${priceLevelLabel(arrivalPriceLevel)}" too low — stockpiled ${plan.quantity}× ${goodName(plan.goodId)} in warehouse at ${portName(ship.port_id)}`);
-            continue;
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: stockpile failed (${(e as Error).message}) — attempting NPC sell`);
-          }
-        }
+        // Arrived — sell
+        s = appendLog(s, `${ship.name}: arrived at ${portName(plan.sellPortId)}, selling ${plan.quantity}× ${plan.goodName}…`);
+        await sleep(DOCK_DELAY_MS);
 
         let sold = false;
-
         try {
-          const sellQuote = await tradeApi.createQuote({
-            port_id: ship.port_id,
-            good_id: plan.goodId,
-            quantity: plan.quantity,
-            action: "sell",
-          });
-          await tradeApi.executeQuote({
-            token: sellQuote.token,
-            destinations: [{ type: "ship", id: ship.id, quantity: plan.quantity }],
-          });
-          const profit = (sellQuote.unit_price - plan.actualBuyPrice) * plan.quantity;
+          const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: plan.quantity, action: "sell" });
+          await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: plan.quantity }] });
+          const profit = (sq.unit_price - plan.actualBuyPrice) * plan.quantity;
           s.profitAccrued += profit;
-          s = appendLog(s, `${ship.name}: sold ${plan.quantity}× @ £${sellQuote.unit_price} — profit +£${Math.round(profit).toLocaleString()}`);
+          s = appendLog(s, `${ship.name}: sold ${plan.quantity}× @ £${sq.unit_price} — profit +£${Math.round(profit).toLocaleString()}`);
           sold = true;
         } catch (e: unknown) {
-          s = appendLog(s, `${ship.name}: NPC sell failed (${(e as Error).message}) — posting sell order`);
+          s = appendLog(s, `${ship.name}: NPC sell failed (${(e as Error).message}) — posting market order`);
         }
 
         if (!sold) {
           try {
             const askPrice = Math.round(plan.actualBuyPrice * 1.15);
-            await marketApi.createOrder({
-              port_id: ship.port_id,
-              good_id: plan.goodId,
-              total: plan.quantity,
-              price: askPrice,
-              side: "sell",
-            });
-            s = appendLog(s, `${ship.name}: posted sell order — ${plan.quantity}× ${goodName(plan.goodId)} @ £${askPrice}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: all sell attempts failed — ${(e as Error).message}`);
+            await marketApi.createOrder({ port_id: ship.port_id, good_id: plan.goodId, total: plan.quantity, price: askPrice, side: "sell" });
+            s = appendLog(s, `${ship.name}: posted sell order ${plan.quantity}× @ £${askPrice}`);
+          } catch (e2: unknown) {
+            s = appendLog(s, `${ship.name}: market order also failed — ${(e2 as Error).message}`);
           }
         }
 
-        delete s.claimed[claimKey(plan.goodId, plan.sellPortId)];
         s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
-        continue;
       }
 
-      // ── Idle: scan for arbitrage ────────────────────────────────────────────
-      if (ss.phase === "idle") {
-        const capacity = stMap.get(ship.ship_type_id)?.capacity ?? 20;
-        const qty      = Math.min(capacity, MAX_UNITS);
-        const portId   = ship.port_id!;
+      // Check if all ships are done selling
+      const stillSelling = ships.filter((sh: Ship) => {
+        const ss = s.ships[sh.id] ?? { phase: "idle" };
+        return ss.phase === "transiting_to_sell" || sh.status === "traveling";
+      });
 
-        // ── Auto-buy warehouse at this port if none exists ────────────────────
-        if (!warehouseByPort.has(portId) && availableFunds > bankingCap) {
-          try {
-            const newWarehouse = await warehousesApi.buyWarehouse({ port_id: portId });
-            warehouseByPort.set(portId, newWarehouse);
-            s = { ...s, warehousedPortIds: [...s.warehousedPortIds, portId] };
-            s = appendLog(s, `🏗️ ${ship.name}: bought warehouse at ${portName(portId)}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: warehouse purchase at ${portName(portId)} failed — ${(e as Error).message}`);
-          }
-        }
-
-        // ── Warehouse pickup: load stockpiled goods from local warehouse ──────
-        const localWarehouse = warehouseByPort.get(portId);
-        if (localWarehouse) {
-          const localInv = warehouseInventory.get(localWarehouse.id) ?? [];
-          for (const item of localInv) {
-            if (item.quantity <= 0) continue;
-            // Find the best sell destination for this good
-            const sellPaths = findPaths(portId, allRoutes, 99);
-            let bestSellPath: typeof sellPaths[0] | null = null;
-            let bestLevel = 0;
-            for (const sp of sellPaths) {
-              const level = npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0;
-              if (level >= MIN_SELL_PRICE_LEVEL && level > bestLevel) {
-                bestLevel = level;
-                bestSellPath = sp;
-              }
-            }
-            if (!bestSellPath) continue;
-
-            // Check margin using avgBuyPrice from MongoDB
-            const avgBuy = stockPrices.get(`${localWarehouse.id}:${item.good_id}`);
-            if (!avgBuy) continue;
-            // Get actual sell quote to verify
-            let sellQuotePrice = 0;
-            try {
-              const sq = await tradeApi.createQuote({ port_id: bestSellPath.destPortId, good_id: item.good_id, quantity: item.quantity, action: "sell" });
-              sellQuotePrice = sq.unit_price;
-            } catch { continue; }
-            const margin = (sellQuotePrice - avgBuy) / avgBuy;
-            if (margin < MIN_MARGIN) continue;
-
-            // Load from warehouse onto ship
-            try {
-              await warehousesApi.transferToShip(localWarehouse.id, { ship_id: ship.id, good_id: item.good_id, quantity: item.quantity });
-              await removeWarehouseStock(companyId, localWarehouse.id, item.good_id).catch(() => {});
-              stockPrices.delete(`${localWarehouse.id}:${item.good_id}`);
-              // Update local inventory map
-              warehouseInventory.set(localWarehouse.id, (warehouseInventory.get(localWarehouse.id) ?? []).filter((i: WarehouseInventory) => i.good_id !== item.good_id));
-
-              const sellLegs = bestSellPath.legs;
-              s.ships = {
-                ...s.ships,
-                [ship.id]: {
-                  phase: "transiting_to_sell",
-                  plan: {
-                    goodId:         item.good_id,
-                    goodName:       goodName(item.good_id),
-                    quantity:       item.quantity,
-                    actualBuyPrice: avgBuy,
-                    legs:           sellLegs.slice(1),
-                    sellPortId:     bestSellPath.destPortId,
-                    sellPrice:      sellQuotePrice,
-                  },
-                },
-              };
-              if (sellLegs.length > 0) await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
-              const estProfit = (sellQuotePrice - avgBuy) * item.quantity;
-              s = appendLog(s, `${ship.name}: loaded ${item.quantity}× ${goodName(item.good_id)} from warehouse → ${portName(bestSellPath.destPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
-              break; // one pickup per ship per cycle
-            } catch (e: unknown) {
-              s = appendLog(s, `${ship.name}: warehouse pickup failed — ${(e as Error).message}`);
-            }
-          }
-          // If ship now has a plan from warehouse pickup, skip NPC scan
-          if ((s.ships[ship.id]?.phase ?? "idle") !== "idle") continue;
-        }
-
-        // ── Sell untracked cargo first ────────────────────────────────────────
-        const existingCargo = idleCargoMap.get(ship.id);
-        if (existingCargo && existingCargo.length > 0) {
-          s = appendLog(s, `${ship.name}: found untracked cargo (${existingCargo.map(c => `${c.quantity}× ${goodName(c.good_id)}`).join(", ")}) — selling`);
-          for (const cargoItem of existingCargo) {
-            try {
-              const sellQuote = await tradeApi.createQuote({
-                port_id: portId,
-                good_id: cargoItem.good_id,
-                quantity: cargoItem.quantity,
-                action: "sell",
-              });
-              await tradeApi.executeQuote({
-                token: sellQuote.token,
-                destinations: [{ type: "ship", id: ship.id, quantity: cargoItem.quantity }],
-              });
-              s = appendLog(s, `${ship.name}: sold untracked ${cargoItem.quantity}× ${goodName(cargoItem.good_id)} @ £${sellQuote.unit_price}`);
-            } catch {
-              // NPC won't buy — try market order
-              try {
-                await marketApi.createOrder({
-                  port_id: portId,
-                  good_id: cargoItem.good_id,
-                  total: cargoItem.quantity,
-                  price: 1,
-                  side: "sell",
-                });
-                s = appendLog(s, `${ship.name}: posted market sell for untracked ${cargoItem.quantity}× ${goodName(cargoItem.good_id)}`);
-              } catch (e2: unknown) {
-                s = appendLog(s, `${ship.name}: could not sell untracked ${goodName(cargoItem.good_id)} — ${(e2 as Error).message}`);
-              }
-            }
-          }
-          // Re-fetch treasury after unexpected sales
-          try {
-            const refreshed = await companyApi.getCompany();
-            availableFunds = refreshed.treasury;
-          } catch { /* ignore */ }
-        }
-
-        // ── Idle: pick from pre-computed sell-quote pool ──────────────────────
-        // Track when the ship first became idle (resets when dispatched)
-        if (!ss.idleSince) {
-          s.ships = { ...s.ships, [ship.id]: { ...ss, idleSince: new Date().toISOString() } };
-        }
-        const idleMs   = ss.idleSince ? Date.now() - new Date(ss.idleSince).getTime() : 0;
-        const portPool = portScanCache.get(portId) ?? [];
-        // Filter out routes already claimed by another ship this cycle
-        const available = portPool.filter(
-          (c) => !s.claimed[claimKey(c.goodId, c.buyPortId)] ||
-                  s.claimed[claimKey(c.goodId, c.buyPortId)] === ship.id,
-        );
-
-        // ── Idle timeout: roam if stuck too long ──────────────────────────────
-        if (available.length === 0) {
-          if (idleMs > IDLE_TIMEOUT_MS) {
-            const roamPaths = findPaths(portId, allRoutes, 99)
-              .filter((p) => p.destPortId !== portId && npcGoods.has(p.destPortId))
-              .sort((a, b) => a.totalDistance - b.totalDistance);
-            const roamTarget = roamPaths[0];
-            if (roamTarget) {
-              try {
-                await fleetApi.transit(ship.id, { route_id: roamTarget.legs[0].routeId });
-                s.ships = {
-                  ...s.ships,
-                  [ship.id]: {
-                    phase: "transiting_to_buy",
-                    plan: {
-                      goodId: "roaming", goodName: "roaming", quantity: 0,
-                      actualBuyPrice: 0, legs: roamTarget.legs.slice(1),
-                      buyPortId: roamTarget.destPortId,
-                      sellPortId: roamTarget.destPortId, sellLegs: [], sellPrice: 0,
-                    },
-                  },
-                };
-                s = appendLog(s, `${ship.name}: idle ${Math.round(idleMs / 60_000)}min at ${portName(portId)}, no trades — roaming to ${portName(roamTarget.destPortId)}`);
-              } catch (e: unknown) {
-                s = appendLog(s, `${ship.name}: roam transit failed — ${(e as Error).message}`);
-              }
-            } else {
-              s = appendLog(s, `${ship.name}: idle ${Math.round(idleMs / 60_000)}min — no profitable trade and no roam targets`);
-            }
-          } else {
-            s = appendLog(s, `${ship.name}: no profitable trade found this cycle`);
-          }
-          continue;
-        }
-
-        // ── Batch buy quotes for top available candidates ─────────────────────
-        const buyBatch = available.slice(0, BUY_BATCH);
-        s = appendLog(s, `${ship.name}: 🔍 checking ${buyBatch.length} candidate(s) (pool: ${available.length})…`);
-
-        let batchBuyItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
-        try {
-          batchBuyItems = await tradeApi.batchCreateQuotes({
-            requests: buyBatch.map((c) => ({
-              port_id:  c.buyPortId,
-              good_id:  c.goodId,
-              quantity: qty,
-              action:   "buy" as const,
-            })),
-          });
-        } catch (e: unknown) {
-          s = appendLog(s, `${ship.name}: batch buy quote failed — ${(e as Error).message}`);
-          continue;
-        }
-
-        let executed = false;
-        for (let ci = 0; ci < buyBatch.length; ci++) {
-          const buyItem = batchBuyItems[ci];
-          const c       = buyBatch[ci];
-          if (!buyItem || buyItem.status !== "success" || !buyItem.quote || !buyItem.token) {
-            const msg = buyItem?.status === "error" ? buyItem.message : "no response";
-            s = appendLog(s, `  [buy] ${goodName(c.goodId)} @ ${portName(c.buyPortId)}: ✗ ${msg}`);
-            continue;
-          }
-          const margin   = (c.npcSellPrice - buyItem.quote.unit_price) / buyItem.quote.unit_price;
-          const isGlobal = c.toLegsBuy.length > 0;
-          s = appendLog(
-            s,
-            `  [buy] ${goodName(c.goodId)}: buy@${portName(c.buyPortId)}=£${buyItem.quote.unit_price} sell@${portName(c.sellPortId)}=£${c.npcSellPrice} margin=${(margin * 100).toFixed(1)}% ${margin >= MIN_MARGIN ? "✓" : `✗ (< ${(MIN_MARGIN * 100).toFixed(0)}%)`}${isGlobal ? " [global]" : ""}`,
-          );
-
-          if (margin < MIN_MARGIN) continue;
-
-          if (availableFunds < buyItem.quote.unit_price) {
-            s = appendLog(s, `${ship.name}: insufficient funds (£${availableFunds.toLocaleString()} < £${buyItem.quote.unit_price}/unit for ${goodName(c.goodId)}), skipping`);
-            continue;
-          }
-
-          try {
-            if (isGlobal) {
-              const maxAffordable = Math.floor(availableFunds / buyItem.quote.unit_price);
-              const reserveQty    = Math.min(qty, maxAffordable);
-              await fleetApi.transit(ship.id, { route_id: c.toLegsBuy[0].routeId });
-              s.claimed = { ...s.claimed, [claimKey(c.goodId, c.buyPortId)]: ship.id };
-              s.ships = {
-                ...s.ships,
-                [ship.id]: {
-                  phase: "transiting_to_buy",
-                  plan: {
-                    goodId:         c.goodId,
-                    goodName:       goodName(c.goodId),
-                    quantity:       reserveQty,
-                    actualBuyPrice: 0,
-                    legs:           c.toLegsBuy.slice(1),
-                    buyPortId:      c.buyPortId,
-                    sellPortId:     c.sellPortId,
-                    sellLegs:       c.sellLegs,
-                    sellPrice:      c.npcSellPrice,
-                  },
-                },
-              };
-              availableFunds -= reserveQty * buyItem.quote.unit_price;
-              const estProfit = (c.npcSellPrice - buyItem.quote.unit_price) * reserveQty;
-              s = appendLog(s, `${ship.name}: heading to ${portName(c.buyPortId)} to buy ${reserveQty}× ${goodName(c.goodId)}, then → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
-            } else {
-              const freshQuote = await tradeApi.createQuote({ port_id: portId, good_id: c.goodId, quantity: qty, action: "buy" });
-              const freshAffordable = Math.floor(availableFunds / freshQuote.unit_price);
-              const buyQty = Math.min(qty, freshAffordable);
-              if (buyQty < 1) {
-                s = appendLog(s, `${ship.name}: insufficient funds after fresh quote (£${availableFunds.toLocaleString()} at £${freshQuote.unit_price}/unit), skipping`);
-                continue;
-              }
-              if (buyQty < qty) {
-                s = appendLog(s, `${ship.name}: funds capped — buying ${buyQty}× instead of ${qty}×`);
-              }
-              const buyToken = buyQty < qty
-                ? (await tradeApi.createQuote({ port_id: portId, good_id: c.goodId, quantity: buyQty, action: "buy" })).token
-                : freshQuote.token;
-              await tradeApi.executeQuote({ token: buyToken, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
-              availableFunds -= buyQty * freshQuote.unit_price;
-              await fleetApi.transit(ship.id, { route_id: c.sellLegs[0].routeId });
-              s.claimed = { ...s.claimed, [claimKey(c.goodId, portId)]: ship.id };
-              s.ships = {
-                ...s.ships,
-                [ship.id]: {
-                  phase: "transiting_to_sell",
-                  plan: {
-                    goodId:         c.goodId,
-                    goodName:       goodName(c.goodId),
-                    quantity:       buyQty,
-                    actualBuyPrice: freshQuote.unit_price,
-                    legs:           c.sellLegs.slice(1),
-                    sellPortId:     c.sellPortId,
-                    sellPrice:      c.npcSellPrice,
-                  },
-                },
-              };
-              const estProfit = (c.npcSellPrice - freshQuote.unit_price) * buyQty;
-              s = appendLog(s, `${ship.name}: bought ${buyQty}× ${goodName(c.goodId)} @ £${freshQuote.unit_price} → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
-            }
-            executed = true;
-            break;
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: dispatch failed — ${(e as Error).message}`);
-          }
-        }
-
-        if (!executed) {
-          s = appendLog(s, `${ship.name}: all buy candidates exhausted this cycle`);
-        }
+      if (stillSelling.length === 0) {
+        s = appendLog(s, `Fleet: all sold at ${portName(fp.sellPortId)} — scanning for next trade`);
+        s = { ...s, fleetPhase: "scanning", fleetPlan: undefined, claimed: {} };
+      } else {
+        s = appendLog(s, `Selling: ${stillSelling.length} ship(s) still in transit`);
       }
     }
+
   } catch (e: unknown) {
     s = appendLog(s, `Cycle error: ${(e as Error).message}`);
   }

@@ -341,6 +341,34 @@ export default function DashboardPage() {
             )}
           </div>
 
+          {/* Fleet convoy status banner */}
+          {ap.enabled && ap.fleetPhase && (
+            <div className="rounded-lg border bg-muted/40 px-3 py-2 text-sm space-y-1">
+              <div className="flex items-center gap-2">
+                <Badge
+                  variant={ap.fleetPhase === "gathering" ? "info" : ap.fleetPhase === "selling" ? "warning" : "secondary"}
+                  className="uppercase text-xs tracking-wide"
+                >
+                  {ap.fleetPhase}
+                </Badge>
+                {ap.fleetPlan && (
+                  <span className="font-medium">
+                    {ap.fleetPlan.goodName}
+                  </span>
+                )}
+              </div>
+              {ap.fleetPlan && (
+                <p className="text-xs text-muted-foreground">
+                  Buy @ {ports.find((p) => p.id === ap.fleetPlan!.buyPortId)?.name ?? ap.fleetPlan.buyPortId.slice(0, 8)}
+                  {" → "}
+                  Sell @ {ports.find((p) => p.id === ap.fleetPlan!.sellPortId)?.name ?? ap.fleetPlan.sellPortId.slice(0, 8)}
+                  {" · "}
+                  Est. £{ap.fleetPlan.estimatedSellPrice}/unit
+                </p>
+              )}
+            </div>
+          )}
+
           {/* Per-ship status */}
           {ships.length > 0 && (
             <div className="border rounded-lg divide-y text-sm">
@@ -370,11 +398,13 @@ export default function DashboardPage() {
                         <Countdown to={ship.arriving_at} />
                       )}
                       {ap.enabled && (
-                        <Badge variant={phase === "idle" ? "secondary" : "warning"} className="text-xs">
+                        <Badge variant={phase === "idle" ? "secondary" : phase === "waiting_at_buy" ? "info" : "warning"} className="text-xs">
                           {phase === "transiting_to_sell"
                             ? `→ sell @ ${portName(ss?.plan?.sellPortId ?? null)}`
                             : phase === "transiting_to_buy"
-                            ? `→ buy ${goodName(ss?.plan?.goodId)}`
+                            ? `→ buy port`
+                            : phase === "waiting_at_buy"
+                            ? "⏳ waiting at buy port"
                             : phase}
                         </Badge>
                       )}
