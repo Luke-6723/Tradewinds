@@ -7,10 +7,10 @@ import type {
 import { api } from "./client";
 
 export const marketApi = {
-  getOrders: (portId?: string, goodId?: string, side?: "buy" | "sell") => {
+  getOrders: (portIds?: string[], goodIds?: string[], side?: "buy" | "sell") => {
     const params = new URLSearchParams();
-    if (portId) params.set("port_id", portId);
-    if (goodId) params.set("good_id", goodId);
+    for (const id of portIds ?? []) params.append("port_ids[]", id);
+    for (const id of goodIds ?? []) params.append("good_ids[]", id);
     if (side) params.set("side", side);
     const qs = params.toString();
     return api.get<MarketOrder[]>(`/market/orders${qs ? `?${qs}` : ""}`);

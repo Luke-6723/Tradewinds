@@ -40,10 +40,12 @@ export interface AutopilotState {
   profitAccrued: number;
   log: LogEntry[];
   lastCycleAt: string | null;
+  /** Port IDs where the company owns a warehouse (refreshed each cycle). */
+  warehousedPortIds: string[];
 }
 
 export function blank(): AutopilotState {
-  return { enabled: false, ships: {}, claimed: {}, profitAccrued: 0, log: [], lastCycleAt: null };
+  return { enabled: false, ships: {}, claimed: {}, profitAccrued: 0, log: [], lastCycleAt: null, warehousedPortIds: [] };
 }
 
 export function appendLog(s: AutopilotState, message: string): AutopilotState {

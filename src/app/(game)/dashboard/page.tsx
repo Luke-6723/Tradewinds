@@ -5,13 +5,14 @@ import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
 import type { Cargo, Company, CompanyEconomy, Good, LedgerEntry, Port, Ship } from "@/lib/types";
+import type { StoredWarehouseStock } from "@/lib/db/collections";
 import { useAutopilot } from "@/hooks/use-autopilot";
 import { CYCLE_MS } from "@/lib/autopilot-types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
-import { BotIcon, TrendingDownIcon, TrendingUpIcon } from "lucide-react";
+import { BotIcon, PackageIcon, TrendingDownIcon, TrendingUpIcon } from "lucide-react";
 
 export default function DashboardPage() {
   const [company, setCompany] = useState<Company | null>(null);
@@ -21,6 +22,7 @@ export default function DashboardPage() {
   const [ports, setPorts] = useState<Port[]>([]);
   const [goods, setGoods] = useState<Good[]>([]);
   const [shipCargo, setShipCargo] = useState<Record<string, Cargo[]>>({});
+  const [warehouseStocks, setWarehouseStocks] = useState<StoredWarehouseStock[]>([]);
   const [loading, setLoading] = useState(true);
   const { state: ap, toggle: toggleAp } = useAutopilot();
 
@@ -32,14 +34,16 @@ export default function DashboardPage() {
       fleetApi.getShips().catch(() => []),
       worldApi.getPorts().catch(() => []),
       worldApi.getGoods().catch(() => []),
+      fetch("/api/warehouses/stocks").then((r) => r.json()).catch(() => []),
     ])
-      .then(([c, e, l, s, p, g]) => {
+      .then(([c, e, l, s, p, g, stocks]) => {
         setCompany(c);
         setEconomy(e);
         setLedger(l);
         setShips(s as Ship[]);
         setPorts(p as Port[]);
         setGoods(g as Good[]);
+        setWarehouseStocks(stocks as StoredWarehouseStock[]);
         // Fetch cargo for all ships in parallel
         const ships = s as Ship[];
         Promise.all(
@@ -166,6 +170,31 @@ export default function DashboardPage() {
               })}
             </div>
           )}
+
+          {/* Warehouse stockpile summary */}
+          {ap.enabled && warehouseStocks.length > 0 && (() => {
+            const byPort = warehouseStocks.reduce<Record<string, StoredWarehouseStock[]>>((acc, s) => {
+              (acc[s.portId] ??= []).push(s);
+              return acc;
+            }, {});
+            return (
+              <div>
+                <p className="text-xs text-muted-foreground mb-1 flex items-center gap-1">
+                  <PackageIcon className="size-3" /> Warehouse stockpile
+                </p>
+                <div className="border rounded-lg divide-y text-sm">
+                  {Object.entries(byPort).map(([portId, items]) => (
+                    <div key={portId} className="flex justify-between items-start px-3 py-2 gap-2">
+                      <span className="font-medium shrink-0">{ports.find((p) => p.id === portId)?.name ?? portId.slice(0, 8)}</span>
+                      <span className="text-muted-foreground text-xs text-right">
+                        {items.map((i) => `${goods.find((g) => g.id === i.goodId)?.name ?? i.goodName}`).join(", ")}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Log */}
           {ap.log.length > 0 && (

@@ -6,7 +6,7 @@ async function main() {
   s = { ...s, enabled: true };
 
   console.log("Running autopilot cycle...\n");
-  const result = await runCycle(s);
+  const result = await runCycle(s, process.env.TRADEWINDS_COMPANY_ID ?? "debug");
 
   console.log("=== LOG (oldest first) ===");
   for (const entry of [...result.log].reverse()) {

@@ -6,13 +6,20 @@
  *   idle              → scan local port first, then global; dispatch to buy or sell
  *   transiting_to_buy → traveling empty to a buy port; buys on arrival then switches phase
  *   transiting_to_sell → has cargo; sells on arrival (or posts limit order as fallback)
+ *
+ * Warehouse stockpiling strategy:
+ *   - Auto-buys a warehouse at each port a ship docks at (if treasury > WAREHOUSE_RESERVE)
+ *   - Stockpiles goods on arrival when sell price <= STOCKPILE_PRICE_LEVEL ("Cheap")
+ *   - Sells from warehouses each cycle when price recovers to >= MIN_SELL_PRICE_LEVEL ("Expensive")
+ *   - Loads idle ships from warehouses when a profitable delivery route exists
  */
 
-import type { Good, Port, Route, Ship, ShipType } from "@/lib/types";
+import type { Good, Port, Route, Ship, ShipType, WarehouseInventory, Warehouse } from "@/lib/types";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { marketApi } from "@/lib/api/market";
 import { tradeApi } from "@/lib/api/trade";
+import { warehousesApi } from "@/lib/api/warehouses";
 import { worldApi } from "@/lib/api/world";
 import {
   appendLog,
@@ -21,6 +28,11 @@ import {
   type RouteLeg,
   type ShipPlan,
 } from "@/lib/autopilot-types";
+import {
+  getWarehouseStocks,
+  removeWarehouseStock,
+  upsertWarehouseStock,
+} from "@/lib/db/collections";
 
 export * from "@/lib/autopilot-types";
 
@@ -34,6 +46,12 @@ const SELL_BATCH   = 8;
 const BUY_BATCH    = 5;
 /** Delay (ms) after docking before buying/selling. */
 const DOCK_DELAY_MS = 5_000;
+/** Minimum treasury before auto-buying a new warehouse. */
+const WAREHOUSE_RESERVE = 10_000;
+/** Price level at or above which we sell from warehouse / accept as sell destination (Expensive = 4). */
+const MIN_SELL_PRICE_LEVEL = 4;
+/** Price level at or below which we stockpile instead of selling (Cheap = 2). */
+const STOCKPILE_PRICE_LEVEL = 2;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -110,7 +128,7 @@ function dedupBestPerSellPort(candidates: RawCandidate[], limit: number): RawCan
 
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
-export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
+export async function runCycle(s: AutopilotState, companyId: string): Promise<AutopilotState> {
   s = { ...s, lastCycleAt: new Date().toISOString() };
 
   // Purge stale claims
@@ -124,13 +142,14 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
   s = { ...s, claimed: activeClaims };
 
   try {
-    const [ships, allRoutes, shipTypes, allPorts, allGoods, company] = await Promise.all([
+    const [ships, allRoutes, shipTypes, allPorts, allGoods, company, allWarehouses] = await Promise.all([
       fleetApi.getShips().catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
       worldApi.getRoutes().catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
       worldApi.getShipTypes().catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
       worldApi.getPorts().catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
       worldApi.getGoods().catch((e: Error) => { throw new Error(`getGoods: ${e.message}`); }),
       companyApi.getCompany().catch((e: Error) => { throw new Error(`getCompany: ${e.message}`); }),
+      warehousesApi.getWarehouses().catch(() => [] as Warehouse[]),
     ]);
 
     // Track available funds across ships in this cycle to avoid over-committing
@@ -141,6 +160,37 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
     const goodName = (id: string) =>
       allGoods.find((g: Good) => g.id === id)?.name ?? id.slice(0, 8);
     const stMap = new Map<string, ShipType>(shipTypes.map((t: ShipType) => [t.id, t]));
+
+    // ── Warehouse maps ─────────────────────────────────────────────────────────
+    const warehouseByPort = new Map<string, Warehouse>(allWarehouses.map((w: Warehouse) => [w.port_id, w]));
+    s = { ...s, warehousedPortIds: allWarehouses.map((w: Warehouse) => w.port_id) };
+
+    // Fetch live inventory for all warehouses + reconcile MongoDB avg-price records
+    const warehouseInventory = new Map<string, WarehouseInventory[]>();
+    await Promise.all(
+      allWarehouses.map(async (w: Warehouse) => {
+        try {
+          const inv = await warehousesApi.getInventory(w.id);
+          warehouseInventory.set(w.id, inv);
+        } catch {
+          warehouseInventory.set(w.id, []);
+        }
+      }),
+    );
+
+    const mongoStocks = await getWarehouseStocks(companyId).catch(() => []);
+    const stockPrices = new Map<string, number>(); // "warehouseId:goodId" → avgBuyPrice
+    for (const ms of mongoStocks) {
+      stockPrices.set(`${ms.warehouseId}:${ms.goodId}`, ms.avgBuyPrice);
+
+      // Reconcile: remove MongoDB record if the warehouse no longer has this good
+      const liveInv = warehouseInventory.get(ms.warehouseId) ?? [];
+      const stillPresent = liveInv.some((item: WarehouseInventory) => item.good_id === ms.goodId && item.quantity > 0);
+      if (!stillPresent) {
+        await removeWarehouseStock(companyId, ms.warehouseId, ms.goodId).catch(() => {});
+        stockPrices.delete(`${ms.warehouseId}:${ms.goodId}`);
+      }
+    }
 
     const allTraders = (
       await Promise.all(
@@ -157,7 +207,43 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
     }
 
     const dockedCount = ships.filter((sh: Ship) => sh.status !== "traveling").length;
-    s = appendLog(s, `⟳ Cycle — ${ships.length} ship(s), ${dockedCount} docked`);
+    s = appendLog(s, `⟳ Cycle — ${ships.length} ship(s), ${dockedCount} docked, ${allWarehouses.length} warehouse(s)`);
+
+    // ── Warehouse sell scan ────────────────────────────────────────────────────
+    // Check all warehouses for goods that can be sold at a good price — no ship needed
+    for (const [warehouseId, inventory] of warehouseInventory) {
+      const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
+      if (!warehouse) continue;
+      for (const item of inventory) {
+        if (item.quantity <= 0) continue;
+        const priceLabel = npcPriceLabel.get(`${warehouse.port_id}:${item.good_id}`);
+        const priceLevel = priceLevelOrdinal(priceLabel ?? "");
+        if (priceLevel >= MIN_SELL_PRICE_LEVEL) {
+          try {
+            const sellQuote = await tradeApi.createQuote({
+              port_id: warehouse.port_id,
+              good_id: item.good_id,
+              quantity: item.quantity,
+              action: "sell",
+            });
+            await tradeApi.executeQuote({
+              token: sellQuote.token,
+              destinations: [{ type: "warehouse", id: warehouseId, quantity: item.quantity }],
+            });
+            const avgBuy = stockPrices.get(`${warehouseId}:${item.good_id}`) ?? 0;
+            const profit = (sellQuote.unit_price - avgBuy) * item.quantity;
+            s.profitAccrued += profit;
+            await removeWarehouseStock(companyId, warehouseId, item.good_id).catch(() => {});
+            stockPrices.delete(`${warehouseId}:${item.good_id}`);
+            // Refresh live inventory after sale
+            warehouseInventory.set(warehouseId, (warehouseInventory.get(warehouseId) ?? []).filter((i: WarehouseInventory) => i.good_id !== item.good_id));
+            s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sold ${item.quantity}× ${goodName(item.good_id)} @ £${sellQuote.unit_price} ("${priceLabel}") — profit +£${Math.round(profit).toLocaleString()}`);
+          } catch (e: unknown) {
+            s = appendLog(s, `🏭 Warehouse ${portName(warehouse.port_id)}: sell failed — ${(e as Error).message}`);
+          }
+        }
+      }
+    }
 
     // Pre-fetch inventory for all docked idle ships so we can sell any untracked cargo
     const idleDockedShips = ships.filter(
@@ -363,6 +449,43 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
         }
 
         s = appendLog(s, `${ship.name}: arrived at ${portName(ship.port_id)}, selling ${plan.quantity}× ${goodName(plan.goodId)}…`);
+
+        // ── Stockpile check: if price is too low and we have a warehouse, store instead ──
+        const arrivalPriceLabel = npcPriceLabel.get(`${ship.port_id}:${plan.goodId}`);
+        const arrivalPriceLevel = priceLevelOrdinal(arrivalPriceLabel ?? "");
+        const arrivalWarehouse  = warehouseByPort.get(ship.port_id);
+        if (arrivalPriceLevel > 0 && arrivalPriceLevel <= STOCKPILE_PRICE_LEVEL && arrivalWarehouse) {
+          try {
+            await fleetApi.transferToWarehouse(ship.id, {
+              warehouse_id: arrivalWarehouse.id,
+              good_id:      plan.goodId,
+              quantity:     plan.quantity,
+            });
+            await upsertWarehouseStock(companyId, {
+              warehouseId:  arrivalWarehouse.id,
+              portId:       ship.port_id,
+              goodId:       plan.goodId,
+              goodName:     plan.goodName,
+              avgBuyPrice:  plan.actualBuyPrice,
+            });
+            // Update local inventory map so warehouse sell scan sees it next cycle
+            const existing = warehouseInventory.get(arrivalWarehouse.id) ?? [];
+            const idx = existing.findIndex((i: WarehouseInventory) => i.good_id === plan.goodId);
+            if (idx >= 0) {
+              existing[idx] = { ...existing[idx], quantity: existing[idx].quantity + plan.quantity };
+            } else {
+              existing.push({ id: "", warehouse_id: arrivalWarehouse.id, good_id: plan.goodId, quantity: plan.quantity });
+            }
+            warehouseInventory.set(arrivalWarehouse.id, existing);
+            delete s.claimed[claimKey(plan.goodId, plan.sellPortId)];
+            s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
+            s = appendLog(s, `${ship.name}: price "${arrivalPriceLabel}" too low — stockpiled ${plan.quantity}× ${goodName(plan.goodId)} in warehouse at ${portName(ship.port_id)}`);
+            continue;
+          } catch (e: unknown) {
+            s = appendLog(s, `${ship.name}: stockpile failed (${(e as Error).message}) — attempting NPC sell`);
+          }
+        }
+
         let sold = false;
 
         try {
@@ -410,6 +533,86 @@ export async function runCycle(s: AutopilotState): Promise<AutopilotState> {
         const capacity = stMap.get(ship.ship_type_id)?.capacity ?? 20;
         const qty      = Math.min(capacity, MAX_UNITS);
         const portId   = ship.port_id!;
+
+        // ── Auto-buy warehouse at this port if none exists ────────────────────
+        if (!warehouseByPort.has(portId) && availableFunds > WAREHOUSE_RESERVE) {
+          try {
+            const newWarehouse = await warehousesApi.buyWarehouse({ port_id: portId });
+            warehouseByPort.set(portId, newWarehouse);
+            s = { ...s, warehousedPortIds: [...s.warehousedPortIds, portId] };
+            s = appendLog(s, `🏗️ ${ship.name}: bought warehouse at ${portName(portId)}`);
+          } catch (e: unknown) {
+            s = appendLog(s, `${ship.name}: warehouse purchase at ${portName(portId)} failed — ${(e as Error).message}`);
+          }
+        }
+
+        // ── Warehouse pickup: load stockpiled goods from local warehouse ──────
+        const localWarehouse = warehouseByPort.get(portId);
+        if (localWarehouse) {
+          const localInv = warehouseInventory.get(localWarehouse.id) ?? [];
+          for (const item of localInv) {
+            if (item.quantity <= 0) continue;
+            // Find the best sell destination for this good
+            const sellPaths = findPaths(portId, allRoutes, 99);
+            let bestSellPath: typeof sellPaths[0] | null = null;
+            let bestLevel = 0;
+            for (const sp of sellPaths) {
+              const label = npcPriceLabel.get(`${sp.destPortId}:${item.good_id}`);
+              const level = priceLevelOrdinal(label ?? "");
+              if (level >= MIN_SELL_PRICE_LEVEL && level > bestLevel) {
+                bestLevel = level;
+                bestSellPath = sp;
+              }
+            }
+            if (!bestSellPath) continue;
+
+            // Check margin using avgBuyPrice from MongoDB
+            const avgBuy = stockPrices.get(`${localWarehouse.id}:${item.good_id}`);
+            if (!avgBuy) continue;
+            // Get actual sell quote to verify
+            let sellQuotePrice = 0;
+            try {
+              const sq = await tradeApi.createQuote({ port_id: bestSellPath.destPortId, good_id: item.good_id, quantity: item.quantity, action: "sell" });
+              sellQuotePrice = sq.unit_price;
+            } catch { continue; }
+            const margin = (sellQuotePrice - avgBuy) / avgBuy;
+            if (margin < MIN_MARGIN) continue;
+
+            // Load from warehouse onto ship
+            try {
+              await warehousesApi.transferToShip(localWarehouse.id, { ship_id: ship.id, good_id: item.good_id, quantity: item.quantity });
+              await removeWarehouseStock(companyId, localWarehouse.id, item.good_id).catch(() => {});
+              stockPrices.delete(`${localWarehouse.id}:${item.good_id}`);
+              // Update local inventory map
+              warehouseInventory.set(localWarehouse.id, (warehouseInventory.get(localWarehouse.id) ?? []).filter((i: WarehouseInventory) => i.good_id !== item.good_id));
+
+              const sellLegs = bestSellPath.legs;
+              s.ships = {
+                ...s.ships,
+                [ship.id]: {
+                  phase: "transiting_to_sell",
+                  plan: {
+                    goodId:         item.good_id,
+                    goodName:       goodName(item.good_id),
+                    quantity:       item.quantity,
+                    actualBuyPrice: avgBuy,
+                    legs:           sellLegs.slice(1),
+                    sellPortId:     bestSellPath.destPortId,
+                    sellPrice:      sellQuotePrice,
+                  },
+                },
+              };
+              if (sellLegs.length > 0) await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
+              const estProfit = (sellQuotePrice - avgBuy) * item.quantity;
+              s = appendLog(s, `${ship.name}: loaded ${item.quantity}× ${goodName(item.good_id)} from warehouse → ${portName(bestSellPath.destPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
+              break; // one pickup per ship per cycle
+            } catch (e: unknown) {
+              s = appendLog(s, `${ship.name}: warehouse pickup failed — ${(e as Error).message}`);
+            }
+          }
+          // If ship now has a plan from warehouse pickup, skip NPC scan
+          if ((s.ships[ship.id]?.phase ?? "idle") !== "idle") continue;
+        }
 
         // ── Sell untracked cargo first ────────────────────────────────────────
         const existingCargo = idleCargoMap.get(ship.id);

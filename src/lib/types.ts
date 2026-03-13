@@ -242,6 +242,13 @@ export interface Warehouse {
   updated_at: ISO8601;
 }
 
+export interface WarehouseInventory {
+  id: UUID;
+  warehouse_id: UUID;
+  good_id: UUID;
+  quantity: number;
+}
+
 export interface BuyWarehouseRequest {
   port_id: UUID;
 }

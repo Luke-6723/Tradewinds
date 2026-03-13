@@ -27,7 +27,7 @@ function sendState(): void {
 async function tick(): Promise<void> {
   if (!state.enabled) return;
   try {
-    state = await runCycle(state);
+    state = await runCycle(state, companyId);
   } catch (e: unknown) {
     state = appendLog(state, `Fatal cycle error: ${(e as Error).message}`);
   }

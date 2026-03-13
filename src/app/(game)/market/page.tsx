@@ -35,7 +35,7 @@ export default function MarketPage() {
   const [message, setMessage] = useState("");
 
   const loadOrders = () => {
-    marketApi.getOrders(filterPort || undefined, filterGood || undefined)
+    marketApi.getOrders(filterPort ? [filterPort] : undefined, filterGood ? [filterGood] : undefined)
       .then(setOrders)
       .catch(console.error);
   };

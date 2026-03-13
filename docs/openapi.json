@@ -251,6 +251,26 @@
         "title": "ShipType",
         "type": "object"
       },
+      "WarehouseInventoryResponse": {
+        "description": "Response schema for a paginated list of warehouse inventory.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/WarehouseInventory"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "WarehouseInventoryResponse",
+        "type": "object"
+      },
       "QuoteRequest": {
         "description": "Request to get a quote from a trader.",
         "properties": {
@@ -540,11 +560,23 @@
           "name": {
             "type": "string"
           },
+          "outgoing_routes": {
+            "items": {
+              "$ref": "#/components/schemas/Route"
+            },
+            "type": "array"
+          },
           "shortcode": {
             "type": "string"
           },
           "tax_rate_bps": {
             "type": "integer"
+          },
+          "traders": {
+            "items": {
+              "$ref": "#/components/schemas/Trader"
+            },
+            "type": "array"
           },
           "updated_at": {
             "format": "date-time",
@@ -943,6 +975,35 @@
           "ship_type_id"
         ],
         "title": "PurchaseShipRequest",
+        "type": "object"
+      },
+      "WarehouseInventory": {
+        "description": "An inventory item in a warehouse.",
+        "properties": {
+          "good_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "quantity": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warehouse_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "warehouse_id",
+          "good_id",
+          "quantity"
+        ],
+        "title": "WarehouseInventory",
         "type": "object"
       },
       "Good": {
@@ -3386,13 +3447,13 @@
     "/api/v1/trade/trader-positions": {
       "get": {
         "callbacks": {},
-        "description": "Returns a list of goods a trader is buying or selling optionally filtered by port..",
+        "description": "Returns a list of goods a trader is buying or selling optionally filtered by trader..",
         "operationId": "traderPositions",
         "parameters": [
           {
-            "description": "Port ID",
+            "description": "Trader ID",
             "in": "query",
-            "name": "port_id",
+            "name": "trader_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -4438,6 +4499,102 @@
         "summary": "Execute a signed quote",
         "tags": [
           "Trade"
+        ]
+      }
+    },
+    "/api/v1/warehouses/{warehouse_id}/inventory": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a paginated list of inventory items stored in a specific warehouse.",
+        "operationId": "warehouseInventory",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Warehouse ID",
+            "in": "path",
+            "name": "warehouse_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseInventoryResponse"
+                }
+              }
+            },
+            "description": "List of inventory items"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List warehouse inventory",
+        "tags": [
+          "Logistics"
         ]
       }
     },

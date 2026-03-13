@@ -2,8 +2,9 @@
  * Typed MongoDB collection helpers.
  *
  * Collections:
- *   events          – SSE events (world + per-company), capped at 500 per scope
- *   autopilot_states – one doc per company, stores the full AutopilotState
+ *   events            – SSE events (world + per-company), capped at 500 per scope
+ *   autopilot_states  – one doc per company, stores the full AutopilotState
+ *   warehouse_stocks  – autopilot-managed stockpile avg buy prices (per company/warehouse/good)
  */
 
 import { getDb } from "./mongodb";
@@ -25,6 +26,17 @@ export interface StoredAutopilotState {
   companyId: string;
   state: AutopilotState;
   updatedAt: Date;
+}
+
+/** Tracks the avg buy price for goods the autopilot has stockpiled in warehouses.
+ *  Quantities are not stored here — the backend API is the source of truth. */
+export interface StoredWarehouseStock {
+  companyId: string;
+  warehouseId: string;
+  portId: string;
+  goodId: string;
+  goodName: string;
+  avgBuyPrice: number;
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -100,4 +112,45 @@ export async function loadAutopilotState(
     .collection<StoredAutopilotState>("autopilot_states")
     .findOne({ companyId });
   return doc?.state ?? null;
+}
+
+// ── Warehouse stocks ───────────────────────────────────────────────────────────
+
+export async function upsertWarehouseStock(
+  companyId: string,
+  stock: Omit<StoredWarehouseStock, "companyId">,
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+
+  await db.collection<StoredWarehouseStock>("warehouse_stocks").updateOne(
+    { companyId, warehouseId: stock.warehouseId, goodId: stock.goodId },
+    { $set: { companyId, ...stock } },
+    { upsert: true },
+  );
+}
+
+export async function getWarehouseStocks(
+  companyId: string,
+): Promise<StoredWarehouseStock[]> {
+  const db = await getDb();
+  if (!db) return [];
+
+  return db
+    .collection<StoredWarehouseStock>("warehouse_stocks")
+    .find({ companyId })
+    .toArray();
+}
+
+export async function removeWarehouseStock(
+  companyId: string,
+  warehouseId: string,
+  goodId: string,
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+
+  await db
+    .collection<StoredWarehouseStock>("warehouse_stocks")
+    .deleteOne({ companyId, warehouseId, goodId });
 }

@@ -39,7 +39,7 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
         // Load optional data in parallel; don't let failures hide the port
         Promise.all([
           tradeApi.getTraderPositions(id).catch(() => []),
-          marketApi.getOrders(id).catch(() => []),
+          marketApi.getOrders([id]).catch(() => []),
           worldApi.getShipTypes().catch(() => []),
         ]).then(([t, o, st]) => {
           setTraders(t as TraderPosition[]);
