@@ -41,9 +41,9 @@ export * from "@/lib/autopilot-types";
 const MIN_MARGIN   = 0.01;  // accept any profit (>1% to cover fees/rounding)
 const MAX_UNITS    = 50;
 /** Sell-quote batch size (probes this many (destPort, good) pairs per scan). */
-const SELL_BATCH   = 16;
+const SELL_BATCH   = 32;
 /** Buy-quote batch size (validates top N sell-scored candidates). */
-const BUY_BATCH    = 8;
+const BUY_BATCH    = 16;
 /** Delay (ms) after docking before buying/selling. */
 const DOCK_DELAY_MS = 5_000;
 /** Set to false to disable all warehouse stockpiling (direct-buy scan + ship-arrival stockpile). */
@@ -120,13 +120,13 @@ interface ScoredCandidate extends RawCandidate {
   npcSellPrice: number;
 }
 
-/** Keep the single best candidate per good (highest prescore across all sell ports).
- *  This guarantees every good gets a sell-quote slot in the batch regardless of
- *  how many sell ports it could reach. */
+/** Keep the single best candidate per (buyPort, good) pair (highest prescore sell port).
+ *  Keying on buyPort×good ensures every buy-location gets a slot, not just the
+ *  globally best sell port for each good. */
 function dedupBestPerGood(candidates: RawCandidate[], limit: number): RawCandidate[] {
   const seen = new Map<string, RawCandidate>();
   for (const c of candidates) {
-    const k = c.goodId;
+    const k = `${c.buyPortId}:${c.goodId}`;
     if (!seen.has(k) || c.prescore > seen.get(k)!.prescore) seen.set(k, c);
   }
   return [...seen.values()].sort((a, b) => b.prescore - a.prescore).slice(0, limit);
@@ -750,7 +750,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               const srcOrd  = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
               // Score purely on price level spread — no distance bias
               const prescore = destOrd - srcOrd;
-              if (prescore <= 0) continue; // skip same-level or inverted pairs
+              if (prescore < 0) continue; // skip clearly inverted pairs
               allCandidates.push({
                 buyPortId,
                 sellPortId: sellPath.destPortId,
@@ -816,10 +816,9 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           scored.push({ ...c, npcSellPrice: item.quote.unit_price });
         }
 
-        // Sort by prescore (price-level spread) — buy quotes will give us true margin.
-        // Raw sell price is a poor proxy: a £1000 good with 1% margin beats out a
-        // £50 good with 50% margin when sorted by price, which is wrong.
-        scored.sort((a, b) => b.prescore - a.prescore);
+        // Sort by actual NPC sell price (highest revenue first) — we have real quotes now,
+        // no need to fall back to the abstract prescore proxy.
+        scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice);
 
         if (scored.length === 0) {
           s = appendLog(s, `${ship.name}: no sell quotes succeeded`);
