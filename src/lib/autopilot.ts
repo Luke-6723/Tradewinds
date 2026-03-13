@@ -47,6 +47,9 @@ const BUY_BATCH    = 8;
 /** Delay (ms) after docking before buying/selling. */
 const DOCK_DELAY_MS = 5_000;
 /** Minimum treasury before auto-buying a new warehouse. */
+/** Set to false to disable all warehouse stockpiling (direct-buy scan + ship-arrival stockpile). */
+const ENABLE_STOCKPILING = false;
+
 const WAREHOUSE_RESERVE = 3_000;
 /** Price level at or above which we sell from warehouse / accept as sell destination (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
@@ -249,7 +252,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     // ── Warehouse direct-buy scan ──────────────────────────────────────────────
     // Every cycle, buy cheap goods directly into warehouses — no ship needed.
     // Mirrors the sell scan above: runs regardless of whether any ships are docked.
-    for (const [portId, warehouse] of warehouseByPort) {
+    if (ENABLE_STOCKPILING) for (const [portId, warehouse] of warehouseByPort) {
       if (availableFunds <= WAREHOUSE_RESERVE) break;
       const portGoods = npcGoods.get(portId);
       if (!portGoods) continue;
@@ -505,7 +508,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         const arrivalPriceLabel = npcPriceLabel.get(`${ship.port_id}:${plan.goodId}`);
         const arrivalPriceLevel = priceLevelOrdinal(arrivalPriceLabel ?? "");
         const arrivalWarehouse  = warehouseByPort.get(ship.port_id);
-        if (arrivalPriceLevel > 0 && arrivalPriceLevel <= STOCKPILE_PRICE_LEVEL && arrivalWarehouse) {
+        if (ENABLE_STOCKPILING && arrivalPriceLevel > 0 && arrivalPriceLevel <= STOCKPILE_PRICE_LEVEL && arrivalWarehouse) {
           try {
             await fleetApi.transferToWarehouse(ship.id, {
               warehouse_id: arrivalWarehouse.id,
