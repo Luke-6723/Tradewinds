@@ -9,33 +9,18 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTab, TabsPanel } from "@/components/ui/tabs";
-import { PackageIcon } from "lucide-react";
+import { PackageIcon, RefreshCwIcon } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-
-const PRICE_LEVELS: Record<string, number> = {
-  "Very Cheap": 1,
-  "Cheap": 2,
-  "Average": 3,
-  "Expensive": 4,
-  "Very Expensive": 5,
-};
 
 function priceCellClass(label: string | undefined): string {
   switch (label) {
-    case "Very Cheap":   return "bg-emerald-500/20 text-emerald-400";
-    case "Cheap":        return "bg-green-500/20 text-green-400";
-    case "Average":      return "bg-yellow-500/20 text-yellow-400";
-    case "Expensive":    return "bg-orange-500/20 text-orange-400";
+    case "Very Cheap":     return "bg-emerald-500/20 text-emerald-400";
+    case "Cheap":          return "bg-green-500/20 text-green-400";
+    case "Average":        return "bg-yellow-500/20 text-yellow-400";
+    case "Expensive":      return "bg-orange-500/20 text-orange-400";
     case "Very Expensive": return "bg-red-500/20 text-red-400";
-    default:             return "text-muted-foreground/40";
-  }
-}
-
-function priceShort(label: string | undefined): string {
-  switch (label) {
-    case "Very Cheap":     return "V.Cheap";
-    case "Very Expensive": return "V.Exp";
-    default:               return label ?? "N / A";
+    default:               return "text-muted-foreground/40";
   }
 }
 
@@ -45,6 +30,11 @@ export default function GoodsPage() {
   const [positions, setPositions] = useState<TraderPosition[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+
+  // Actual £ prices fetched via batch quotes: portId → goodId → unit_price
+  const [actualPrices, setActualPrices] = useState<Map<string, Map<string, number>>>(new Map());
+  const [loadingPrices, setLoadingPrices] = useState(false);
+  const [pricesError, setPricesError] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -61,11 +51,40 @@ export default function GoodsPage() {
       .finally(() => setLoading(false));
   }, []);
 
-  // Build lookup: portId → goodId → price_bounds label
-  const priceMatrix = new Map<string, Map<string, string>>();
+  async function fetchActualPrices(positionList: TraderPosition[]) {
+    if (positionList.length === 0) return;
+    setLoadingPrices(true);
+    setPricesError(null);
+    try {
+      const requests = positionList.map((p) => ({
+        port_id: p.port_id,
+        good_id: p.good_id,
+        quantity: 1,
+        action: "buy" as const,
+      }));
+      const results = await tradeApi.batchCreateQuotes({ requests });
+      const map = new Map<string, Map<string, number>>();
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        const req = requests[i];
+        if (r.status === "success" && r.quote) {
+          if (!map.has(req.port_id)) map.set(req.port_id, new Map());
+          map.get(req.port_id)!.set(req.good_id, r.quote.unit_price);
+        }
+      }
+      setActualPrices(map);
+    } catch (e: unknown) {
+      setPricesError((e as Error).message);
+    } finally {
+      setLoadingPrices(false);
+    }
+  }
+
+  // Build label lookup: portId → goodId → price_bounds label
+  const labelMatrix = new Map<string, Map<string, string>>();
   for (const pos of positions) {
-    if (!priceMatrix.has(pos.port_id)) priceMatrix.set(pos.port_id, new Map());
-    priceMatrix.get(pos.port_id)!.set(pos.good_id, pos.price_bounds);
+    if (!labelMatrix.has(pos.port_id)) labelMatrix.set(pos.port_id, new Map());
+    labelMatrix.get(pos.port_id)!.set(pos.good_id, pos.price_bounds);
   }
 
   const filtered = goods.filter((g) =>
@@ -92,7 +111,9 @@ export default function GoodsPage() {
       <Tabs defaultValue="catalog" className="flex-1 min-h-0">
         <TabsList>
           <TabsTab value="catalog">Catalog</TabsTab>
-          <TabsTab value="prices">Prices</TabsTab>
+          <TabsTab value="prices" onClick={() => { if (actualPrices.size === 0 && !loadingPrices) fetchActualPrices(positions); }}>
+            Prices
+          </TabsTab>
         </TabsList>
 
         {/* ── Catalog tab ── */}
@@ -134,69 +155,99 @@ export default function GoodsPage() {
         </TabsPanel>
 
         {/* ── Prices tab ── */}
-        <TabsPanel value="prices" className="overflow-auto pt-2">
-          <table className="min-w-max border-separate border-spacing-0 text-sm">
-            <thead>
-              <tr>
-                <th className="sticky left-0 top-0 z-20 bg-card px-3 py-2 text-left font-semibold border-b border-r">
-                  Good
-                </th>
-                {ports.map((port) => (
-                  <th
-                    key={port.id}
-                    className="sticky top-0 z-10 bg-card px-2 py-2 text-center font-mono text-xs font-semibold border-b min-w-[72px]"
-                    title={port.name}
-                  >
-                    {port.shortcode}
+        <TabsPanel value="prices" className="flex flex-col gap-3 pt-2 min-h-0">
+          <div className="flex items-center gap-3">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={loadingPrices}
+              onClick={() => fetchActualPrices(positions)}
+            >
+              {loadingPrices
+                ? <><Spinner className="size-3 mr-1" />Loading…</>
+                : <><RefreshCwIcon className="size-3 mr-1" />Refresh prices</>}
+            </Button>
+            {pricesError && <span className="text-xs text-destructive">{pricesError}</span>}
+            {actualPrices.size > 0 && !loadingPrices && (
+              <span className="text-xs text-muted-foreground">showing actual NPC buy prices (qty 1)</span>
+            )}
+          </div>
+
+          <div className="overflow-auto flex-1">
+            <table className="min-w-max border-separate border-spacing-0 text-sm">
+              <thead>
+                <tr>
+                  <th className="sticky left-0 top-0 z-20 bg-card px-3 py-2 text-left font-semibold border-b border-r">
+                    Good
                   </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {categories.map((cat) => {
-                const catGoods = filtered.filter((g) => g.category === cat);
-                if (catGoods.length === 0) return null;
-                return (
-                  <>
-                    <tr key={`cat-${cat}`}>
-                      <td
-                        colSpan={ports.length + 1}
-                        className="sticky left-0 bg-muted/40 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground"
-                      >
-                        {cat}
-                      </td>
-                    </tr>
-                    {catGoods.map((good) => (
-                      <tr key={good.id} className="hover:bg-accent/20">
-                        <td className="sticky left-0 z-10 bg-card px-3 py-1.5 font-medium whitespace-nowrap border-r">
-                          {good.name}
+                  {ports.map((port) => (
+                    <th
+                      key={port.id}
+                      className="sticky top-0 z-10 bg-card px-2 py-2 text-center font-mono text-xs font-semibold border-b min-w-[76px]"
+                      title={port.name}
+                    >
+                      {port.shortcode}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {categories.map((cat) => {
+                  const catGoods = filtered.filter((g) => g.category === cat);
+                  if (catGoods.length === 0) return null;
+                  return (
+                    <>
+                      <tr key={`cat-${cat}`}>
+                        <td
+                          colSpan={ports.length + 1}
+                          className="sticky left-0 bg-muted/40 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground"
+                        >
+                          {cat}
                         </td>
-                        {ports.map((port) => {
-                          const label = priceMatrix.get(port.id)?.get(good.id);
-                          return (
-                            <td
-                              key={port.id}
-                              className={cn(
-                                "px-2 py-1.5 text-center text-xs rounded-sm",
-                                priceCellClass(label),
-                              )}
-                            >
-                              {priceShort(label)}
-                            </td>
-                          );
-                        })}
                       </tr>
-                    ))}
-                  </>
-                );
-              })}
-            </tbody>
-          </table>
-          {filtered.length === 0 && (
-            <p className="mt-4 text-muted-foreground">No goods match "{search}".</p>
-          )}
+                      {catGoods.map((good) => (
+                        <tr key={good.id} className="hover:bg-accent/20">
+                          <td className="sticky left-0 z-10 bg-card px-3 py-1.5 font-medium whitespace-nowrap border-r">
+                            {good.name}
+                          </td>
+                          {ports.map((port) => {
+                            const label = labelMatrix.get(port.id)?.get(good.id);
+                            const price = actualPrices.get(port.id)?.get(good.id);
+                            return (
+                              <td
+                                key={port.id}
+                                className={cn(
+                                  "px-2 py-1.5 text-center text-xs rounded-sm tabular-nums",
+                                  priceCellClass(label),
+                                )}
+                              >
+                                {loadingPrices ? (
+                                  <span className="opacity-30">…</span>
+                                ) : price !== undefined ? (
+                                  `£${price.toLocaleString()}`
+                                ) : label ? (
+                                  <span className="opacity-60 italic text-[10px]">{label === "Very Cheap" ? "V.Cheap" : label === "Very Expensive" ? "V.Exp" : label}</span>
+                                ) : (
+                                  <span className="opacity-30">N/A</span>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </>
+                  );
+                })}
+              </tbody>
+            </table>
+            {filtered.length === 0 && (
+              <p className="mt-4 text-muted-foreground">No goods match "{search}".</p>
+            )}
+          </div>
         </TabsPanel>
       </Tabs>
     </div>
   );
 }
+
+

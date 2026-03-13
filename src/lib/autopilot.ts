@@ -38,7 +38,7 @@ export * from "@/lib/autopilot-types";
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
-const MIN_MARGIN   = 0.08;
+const MIN_MARGIN   = 0.01;  // accept any profit (>1% to cover fees/rounding)
 const MAX_UNITS    = 50;
 /** Sell-quote batch size (probes this many (destPort, good) pairs per scan). */
 const SELL_BATCH   = 16;
@@ -50,8 +50,8 @@ const DOCK_DELAY_MS = 5_000;
 const WAREHOUSE_RESERVE = 10_000;
 /** Price level at or above which we sell from warehouse / accept as sell destination (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
-/** Price level at or below which we stockpile instead of selling (Cheap = 2). */
-const STOCKPILE_PRICE_LEVEL = 2;
+/** Price level at or below which we stockpile instead of selling / buy into warehouse (Average = 3). */
+const STOCKPILE_PRICE_LEVEL = 3;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
