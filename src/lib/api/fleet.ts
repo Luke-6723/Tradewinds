@@ -7,10 +7,10 @@ import type {
   TransitLog,
   TransitRequest,
 } from "@/lib/types";
-import { api } from "./client";
+import { api, fetchAllPages } from "./client";
 
 export const fleetApi = {
-  getShips: () => api.get<Ship[]>("/ships"),
+  getShips: (): Promise<Ship[]> => fetchAllPages<Ship>("/ships"),
   getShip: (id: string) => api.get<Ship>(`/ships/${id}`),
   getInventory: (id: string) => api.get<Cargo[]>(`/ships/${id}/inventory`),
   getTransitLogs: (id: string) =>

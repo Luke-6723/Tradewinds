@@ -128,6 +128,23 @@ export async function requestRaw<T>(path: string, options: RequestInit = {}): Pr
   return res.json();
 }
 
+type Paginated<T> = { data: T[]; metadata?: { after?: string | null } };
+
+/** Fetch all pages of a cursor-paginated endpoint, returning a flat array. */
+export async function fetchAllPages<T>(baseUrl: string): Promise<T[]> {
+  const results: T[] = [];
+  let after: string | null = null;
+  do {
+    const url: string = after
+      ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}after=${encodeURIComponent(after)}`
+      : baseUrl;
+    const page = await requestRaw<Paginated<T>>(url);
+    results.push(...page.data);
+    after = page.metadata?.after ?? null;
+  } while (after);
+  return results;
+}
+
 export const api = {
   get: <T>(path: string, options?: RequestInit) =>
     request<T>(path, { method: "GET", ...options }),
