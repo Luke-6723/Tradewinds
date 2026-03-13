@@ -25,6 +25,8 @@ export interface ShipPlan {
 export interface AutopilotShipState {
   phase: "idle" | "transiting_to_buy" | "transiting_to_sell";
   plan?: ShipPlan;
+  /** ISO timestamp of when the ship first entered idle — used for roam timeout. */
+  idleSince?: string;
 }
 
 export interface LogEntry {

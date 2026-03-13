@@ -48,6 +48,8 @@ const BUY_BATCH    = 16;
 const DOCK_DELAY_MS = 5_000;
 /** Set to false to disable all warehouse stockpiling (direct-buy scan + ship-arrival stockpile). */
 const ENABLE_STOCKPILING = false;
+/** Ships idle for longer than this (ms) with no viable trade will roam to a new port. */
+const IDLE_TIMEOUT_MS = 90_000;
 
 /** Price level at or above which we sell from warehouse / accept as sell destination (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
@@ -328,6 +330,72 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }),
     );
 
+    // ── Pre-scan: build sell-quote pool once per unique idle port ──────────────
+    // Shares one batch of sell quotes across all ships at the same port, eliminating
+    // N redundant API round-trips for N idle ships. Claims are NOT filtered here —
+    // they are applied per-ship in the loop below.
+    const portScanCache = new Map<string, ScoredCandidate[]>();
+    {
+      const idleDocked = ships.filter(
+        (sh: Ship) => sh.status !== "traveling" && sh.port_id && (s.ships[sh.id]?.phase ?? "idle") === "idle",
+      );
+      for (const portId of [...new Set(idleDocked.map((sh: Ship) => sh.port_id!))]) {
+        const allCandidates: RawCandidate[] = [];
+        const toBuyPaths = findPaths(portId, allRoutes, 99);
+        const buyLocations: Array<{ buyPortId: string; toLegsBuy: RouteLeg[] }> = [
+          { buyPortId: portId, toLegsBuy: [] },
+          ...toBuyPaths.map((p) => ({ buyPortId: p.destPortId, toLegsBuy: p.legs })),
+        ];
+        for (const { buyPortId, toLegsBuy } of buyLocations) {
+          const buyGoods = npcGoods.get(buyPortId);
+          if (!buyGoods) continue;
+          const fromBuyPaths = findPaths(buyPortId, allRoutes, 99);
+          for (const sellPath of fromBuyPaths) {
+            const destGoods = npcGoods.get(sellPath.destPortId);
+            if (!destGoods) continue;
+            for (const goodId of buyGoods) {
+              if (!destGoods.has(goodId)) continue;
+              const destOrd  = npcMaxOrd.get(`${sellPath.destPortId}:${goodId}`) ?? 0;
+              const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
+              const prescore = destOrd - srcOrd;
+              if (prescore < 0) continue;
+              allCandidates.push({ buyPortId, sellPortId: sellPath.destPortId, sellLegs: sellPath.legs, toLegsBuy, goodId, prescore });
+            }
+          }
+        }
+        if (allCandidates.length === 0) continue;
+
+        const sellBatch      = dedupBestPerGood(allCandidates.sort((a, b) => b.prescore - a.prescore), SELL_BATCH);
+        const portShipNames  = idleDocked.filter((sh: Ship) => sh.port_id === portId).map((sh: Ship) => sh.name).join(", ");
+        s = appendLog(s, `Port ${portName(portId)}: scanning [${portShipNames}] — ${sellBatch.length} sell quote(s)…`);
+
+        let batchSellItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+        try {
+          batchSellItems = await tradeApi.batchCreateQuotes({
+            requests: sellBatch.map((c) => ({
+              port_id:  c.sellPortId,
+              good_id:  c.goodId,
+              quantity: MAX_UNITS,
+              action:   "sell" as const,
+            })),
+          });
+        } catch (e: unknown) {
+          s = appendLog(s, `Port ${portName(portId)}: sell batch failed — ${(e as Error).message}`);
+          continue;
+        }
+
+        const scored: ScoredCandidate[] = [];
+        for (let i = 0; i < sellBatch.length; i++) {
+          const item = batchSellItems[i];
+          const c    = sellBatch[i];
+          if (!item || item.status !== "success" || !item.quote) continue;
+          scored.push({ ...c, npcSellPrice: item.quote.unit_price });
+        }
+        scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice);
+        portScanCache.set(portId, scored);
+      }
+    }
+
     for (const ship of ships) {
       const ss = s.ships[ship.id] ?? { phase: "idle" };
 
@@ -365,6 +433,13 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           s = appendLog(s, `${ship.name}: unexpected port ${portName(ship.port_id)}, resetting`);
           if (plan.buyPortId) delete s.claimed[claimKey(plan.goodId, plan.buyPortId)];
           s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
+          continue;
+        }
+
+        // Roaming arrival — reset to idle so next cycle re-scans from new port
+        if (plan.goodId === "roaming") {
+          s.ships = { ...s.ships, [ship.id]: { phase: "idle" } };
+          s = appendLog(s, `${ship.name}: arrived at roam destination ${portName(ship.port_id)}, scanning next cycle…`);
           continue;
         }
 
@@ -719,114 +794,58 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           } catch { /* ignore */ }
         }
 
-        // ── Build candidate list ──────────────────────────────────────────────
-        // Check EVERY reachable port as a potential buy port, and every port
-        // reachable from there as a potential sell port. No distance penalty —
-        // we just want the best price spread and will travel wherever needed.
-
-        const allCandidates: RawCandidate[] = [];
-
-        // All ports reachable from current port (these are candidate buy ports).
-        // Current port itself is also a valid buy port (toLegsBuy = []).
-        const toBuyPaths = findPaths(portId, allRoutes, 99);
-        const buyLocations: Array<{ buyPortId: string; toLegsBuy: RouteLeg[] }> = [
-          { buyPortId: portId, toLegsBuy: [] },
-          ...toBuyPaths.map((p) => ({ buyPortId: p.destPortId, toLegsBuy: p.legs })),
-        ];
-
-        for (const { buyPortId, toLegsBuy } of buyLocations) {
-          const buyGoods = npcGoods.get(buyPortId);
-          if (!buyGoods) continue;
-          // All ports reachable from this buy port (candidate sell ports)
-          const fromBuyPaths = findPaths(buyPortId, allRoutes, 99);
-          for (const sellPath of fromBuyPaths) {
-            const destGoods = npcGoods.get(sellPath.destPortId);
-            if (!destGoods) continue;
-            for (const goodId of buyGoods) {
-              if (!destGoods.has(goodId)) continue;
-              if (s.claimed[claimKey(goodId, buyPortId)] &&
-                  s.claimed[claimKey(goodId, buyPortId)] !== ship.id) continue;
-              const destOrd = npcMaxOrd.get(`${sellPath.destPortId}:${goodId}`) ?? 0;
-              const srcOrd  = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
-              // Score purely on price level spread — no distance bias
-              const prescore = destOrd - srcOrd;
-              if (prescore < 0) continue; // skip clearly inverted pairs
-              allCandidates.push({
-                buyPortId,
-                sellPortId: sellPath.destPortId,
-                sellLegs:   sellPath.legs,
-                toLegsBuy,
-                goodId,
-                prescore,
-              });
-            }
-          }
+        // ── Idle: pick from pre-computed sell-quote pool ──────────────────────
+        // Track when the ship first became idle (resets when dispatched)
+        if (!ss.idleSince) {
+          s.ships = { ...s.ships, [ship.id]: { ...ss, idleSince: new Date().toISOString() } };
         }
-
-        if (allCandidates.length === 0) {
-          s = appendLog(s, `${ship.name}: no reachable arbitrage candidates from ${portName(portId)}`);
-          continue;
-        }
-
-        // ── Debug: price_bounds dump ──────────────────────────────────────────
-        s = appendLog(s, `${ship.name}: 🔍 ${allCandidates.length} candidate(s) from ${portName(portId)} — price_bounds dump:`);
-        const seenGoodDest = new Set<string>();
-        for (const c of [...allCandidates].sort((a, b) => b.prescore - a.prescore).slice(0, 10)) {
-          const k = `${c.goodId}:${c.sellPortId}`;
-          if (seenGoodDest.has(k)) continue;
-          seenGoodDest.add(k);
-          const srcLabel  = priceLevelLabel(npcMinOrd.get(`${c.buyPortId}:${c.goodId}`)  ?? 0);
-          const destLabel = priceLevelLabel(npcMaxOrd.get(`${c.sellPortId}:${c.goodId}`) ?? 0);
-          const tag = c.toLegsBuy.length > 0 ? ` (travel to buy @ ${portName(c.buyPortId)})` : "";
-          s = appendLog(s, `  ${goodName(c.goodId)}: buy@${portName(c.buyPortId)}="${srcLabel}" → sell@${portName(c.sellPortId)}="${destLabel}"${tag}`);
-        }
-
-        // ── Batch sell quotes to get actual NPC prices ────────────────────────
-        // Deduplicate to one best candidate per (buyPort, good) before batching
-        const sellBatch = dedupBestPerGood(
-          allCandidates.sort((a, b) => b.prescore - a.prescore),
-          SELL_BATCH,
+        const idleMs   = ss.idleSince ? Date.now() - new Date(ss.idleSince).getTime() : 0;
+        const portPool = portScanCache.get(portId) ?? [];
+        // Filter out routes already claimed by another ship this cycle
+        const available = portPool.filter(
+          (c) => !s.claimed[claimKey(c.goodId, c.buyPortId)] ||
+                  s.claimed[claimKey(c.goodId, c.buyPortId)] === ship.id,
         );
-        s = appendLog(s, `${ship.name}: fetching sell quotes (batch ${sellBatch.length})…`);
 
-        let batchSellItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
-        try {
-          batchSellItems = await tradeApi.batchCreateQuotes({
-            requests: sellBatch.map((c) => ({
-              port_id:  c.sellPortId,
-              good_id:  c.goodId,
-              quantity: qty,
-              action:   "sell" as const,
-            })),
-          });
-        } catch (e: unknown) {
-          s = appendLog(s, `${ship.name}: batch sell quote failed — ${(e as Error).message}`);
-        }
-
-        const scored: ScoredCandidate[] = [];
-        for (let i = 0; i < sellBatch.length; i++) {
-          const item = batchSellItems[i];
-          const c    = sellBatch[i];
-          if (!item || item.status !== "success" || !item.quote) {
-            const msg = item?.status === "error" ? item.message : "no response";
-            s = appendLog(s, `  [sell] ${goodName(c.goodId)} @ ${portName(c.sellPortId)}: ✗ ${msg}`);
-            continue;
+        // ── Idle timeout: roam if stuck too long ──────────────────────────────
+        if (available.length === 0) {
+          if (idleMs > IDLE_TIMEOUT_MS) {
+            const roamPaths = findPaths(portId, allRoutes, 99)
+              .filter((p) => p.destPortId !== portId && npcGoods.has(p.destPortId))
+              .sort((a, b) => a.totalDistance - b.totalDistance);
+            const roamTarget = roamPaths[0];
+            if (roamTarget) {
+              try {
+                await fleetApi.transit(ship.id, { route_id: roamTarget.legs[0].routeId });
+                s.ships = {
+                  ...s.ships,
+                  [ship.id]: {
+                    phase: "transiting_to_buy",
+                    plan: {
+                      goodId: "roaming", goodName: "roaming", quantity: 0,
+                      actualBuyPrice: 0, legs: roamTarget.legs.slice(1),
+                      buyPortId: roamTarget.destPortId,
+                      sellPortId: roamTarget.destPortId, sellLegs: [], sellPrice: 0,
+                    },
+                  },
+                };
+                s = appendLog(s, `${ship.name}: idle ${Math.round(idleMs / 60_000)}min at ${portName(portId)}, no trades — roaming to ${portName(roamTarget.destPortId)}`);
+              } catch (e: unknown) {
+                s = appendLog(s, `${ship.name}: roam transit failed — ${(e as Error).message}`);
+              }
+            } else {
+              s = appendLog(s, `${ship.name}: idle ${Math.round(idleMs / 60_000)}min — no profitable trade and no roam targets`);
+            }
+          } else {
+            s = appendLog(s, `${ship.name}: no profitable trade found this cycle`);
           }
-          s = appendLog(s, `  [sell] ${goodName(c.goodId)} @ ${portName(c.sellPortId)}: NPC pays £${item.quote.unit_price}`);
-          scored.push({ ...c, npcSellPrice: item.quote.unit_price });
-        }
-
-        // Sort by actual NPC sell price (highest revenue first) — we have real quotes now,
-        // no need to fall back to the abstract prescore proxy.
-        scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice);
-
-        if (scored.length === 0) {
-          s = appendLog(s, `${ship.name}: no sell quotes succeeded`);
           continue;
         }
 
-        // ── Batch buy quotes for top sell-scored candidates ───────────────────
-        const buyBatch = scored.slice(0, BUY_BATCH);
+        // ── Batch buy quotes for top available candidates ─────────────────────
+        const buyBatch = available.slice(0, BUY_BATCH);
+        s = appendLog(s, `${ship.name}: 🔍 checking ${buyBatch.length} candidate(s) (pool: ${available.length})…`);
+
         let batchBuyItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
         try {
           batchBuyItems = await tradeApi.batchCreateQuotes({
@@ -839,20 +858,19 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           });
         } catch (e: unknown) {
           s = appendLog(s, `${ship.name}: batch buy quote failed — ${(e as Error).message}`);
+          continue;
         }
 
         let executed = false;
         for (let ci = 0; ci < buyBatch.length; ci++) {
           const buyItem = batchBuyItems[ci];
           const c       = buyBatch[ci];
-
           if (!buyItem || buyItem.status !== "success" || !buyItem.quote || !buyItem.token) {
             const msg = buyItem?.status === "error" ? buyItem.message : "no response";
             s = appendLog(s, `  [buy] ${goodName(c.goodId)} @ ${portName(c.buyPortId)}: ✗ ${msg}`);
             continue;
           }
-
-          const margin = (c.npcSellPrice - buyItem.quote.unit_price) / buyItem.quote.unit_price;
+          const margin   = (c.npcSellPrice - buyItem.quote.unit_price) / buyItem.quote.unit_price;
           const isGlobal = c.toLegsBuy.length > 0;
           s = appendLog(
             s,
@@ -861,7 +879,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
           if (margin < MIN_MARGIN) continue;
 
-          // Affordability check using batch quote price as a fast pre-filter
           if (availableFunds < buyItem.quote.unit_price) {
             s = appendLog(s, `${ship.name}: insufficient funds (£${availableFunds.toLocaleString()} < £${buyItem.quote.unit_price}/unit for ${goodName(c.goodId)}), skipping`);
             continue;
@@ -869,7 +886,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
           try {
             if (isGlobal) {
-              // Travel empty to buy port — quantity capped by rough affordability estimate
               const maxAffordable = Math.floor(availableFunds / buyItem.quote.unit_price);
               const reserveQty    = Math.min(qty, maxAffordable);
               await fleetApi.transit(ship.id, { route_id: c.toLegsBuy[0].routeId });
@@ -891,18 +907,11 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                   },
                 },
               };
-              // Speculative reservation so other ships don't over-commit to the same funds
               availableFunds -= reserveQty * buyItem.quote.unit_price;
               const estProfit = (c.npcSellPrice - buyItem.quote.unit_price) * reserveQty;
               s = appendLog(s, `${ship.name}: heading to ${portName(c.buyPortId)} to buy ${reserveQty}× ${goodName(c.goodId)}, then → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
             } else {
-              // Buy immediately here — get a fresh individual quote for the real price
-              const freshQuote = await tradeApi.createQuote({
-                port_id: portId,
-                good_id: c.goodId,
-                quantity: qty,
-                action:   "buy",
-              });
+              const freshQuote = await tradeApi.createQuote({ port_id: portId, good_id: c.goodId, quantity: qty, action: "buy" });
               const freshAffordable = Math.floor(availableFunds / freshQuote.unit_price);
               const buyQty = Math.min(qty, freshAffordable);
               if (buyQty < 1) {
@@ -912,14 +921,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               if (buyQty < qty) {
                 s = appendLog(s, `${ship.name}: funds capped — buying ${buyQty}× instead of ${qty}×`);
               }
-              // If the affordable amount differs, get a precise quote for that exact quantity
               const buyToken = buyQty < qty
                 ? (await tradeApi.createQuote({ port_id: portId, good_id: c.goodId, quantity: buyQty, action: "buy" })).token
                 : freshQuote.token;
-              await tradeApi.executeQuote({
-                token:        buyToken,
-                destinations: [{ type: "ship", id: ship.id, quantity: buyQty }],
-              });
+              await tradeApi.executeQuote({ token: buyToken, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
               availableFunds -= buyQty * freshQuote.unit_price;
               await fleetApi.transit(ship.id, { route_id: c.sellLegs[0].routeId });
               s.claimed = { ...s.claimed, [claimKey(c.goodId, portId)]: ship.id };
@@ -941,7 +946,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               const estProfit = (c.npcSellPrice - freshQuote.unit_price) * buyQty;
               s = appendLog(s, `${ship.name}: bought ${buyQty}× ${goodName(c.goodId)} @ £${freshQuote.unit_price} → ${portName(c.sellPortId)} (est. +£${Math.round(estProfit).toLocaleString()})`);
             }
-
             executed = true;
             break;
           } catch (e: unknown) {
@@ -950,7 +954,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         }
 
         if (!executed) {
-          s = appendLog(s, `${ship.name}: no profitable trade found this cycle`);
+          s = appendLog(s, `${ship.name}: all buy candidates exhausted this cycle`);
         }
       }
     }
