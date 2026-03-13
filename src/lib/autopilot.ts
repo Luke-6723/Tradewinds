@@ -115,12 +115,13 @@ interface ScoredCandidate extends RawCandidate {
   npcSellPrice: number;
 }
 
-/** Pick the best prescore candidate per (buyPortId, goodId) to cap batch size. */
-/** Keep best candidate per sell-port (ensures we probe different destinations). */
-function dedupBestPerSellPort(candidates: RawCandidate[], limit: number): RawCandidate[] {
+/** Keep the single best candidate per good (highest prescore across all sell ports).
+ *  This guarantees every good gets a sell-quote slot in the batch regardless of
+ *  how many sell ports it could reach. */
+function dedupBestPerGood(candidates: RawCandidate[], limit: number): RawCandidate[] {
   const seen = new Map<string, RawCandidate>();
   for (const c of candidates) {
-    const k = `${c.sellPortId}:${c.goodId}`;
+    const k = c.goodId;
     if (!seen.has(k) || c.prescore > seen.get(k)!.prescore) seen.set(k, c);
   }
   return [...seen.values()].sort((a, b) => b.prescore - a.prescore).slice(0, limit);
@@ -718,7 +719,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         // ── Batch sell quotes to get actual NPC prices ────────────────────────
         // Deduplicate to one best candidate per (buyPort, good) before batching
-        const sellBatch = dedupBestPerSellPort(
+        const sellBatch = dedupBestPerGood(
           allCandidates.sort((a, b) => b.prescore - a.prescore),
           SELL_BATCH,
         );
