@@ -39,8 +39,11 @@ export const fleetApi = {
     api.get<{ data: TransitLog[]; metadata: PageMetadata }>(`/ships/${id}/transit-logs`),
   renameShip: (id: string, data: RenameShipRequest) =>
     api.patch<Ship>(`/ships/${id}`, data),
-  transit: (id: string, data: TransitRequest) =>
-    api.post<Ship>(`/ships/${id}/transit`, data),
+  transit: async (id: string, data: TransitRequest) => {
+    // Bust cached inventory before departure — cargo may have changed since last cache
+    invalidateCache(`inventory_${id}`);
+    return api.post<Ship>(`/ships/${id}/transit`, data);
+  },
   transferToWarehouse: async (id: string, data: TransferToWarehouseRequest) => {
     const result = await api.post<void>(`/ships/${id}/transfer-to-warehouse`, data);
     invalidateCache(`inventory_${id}`);
