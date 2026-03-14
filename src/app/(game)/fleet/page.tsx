@@ -87,7 +87,7 @@ export default function FleetPage() {
                   </CardContent>
                 </Link>
 
-                {isDocked && (
+                {ship.status === "docked" && (
                   <div className="px-6 pb-4 pt-0">
                     {ss.phase === "idle" && (
                       <Button

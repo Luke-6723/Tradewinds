@@ -140,7 +140,7 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
               <TabsTrigger value="cargo">Cargo</TabsTrigger>
               <TabsTrigger value="transit">Transit</TabsTrigger>
               <TabsTrigger value="rename">Rename</TabsTrigger>
-              {ship.status === "docked" && ship.port_id && (
+              {ship.status === "docked" && (
                 <TabsTrigger value="sell">Sell Ship</TabsTrigger>
               )}
             </TabsList>
@@ -217,7 +217,7 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
               </Card>
             </TabsContent>
 
-            {ship.status === "docked" && ship.port_id && (
+            {ship.status === "docked" && (
               <TabsContent value="sell" className="mt-4">
                 <Card className="max-w-sm">
                   <CardHeader><CardTitle>Sell Ship</CardTitle></CardHeader>
