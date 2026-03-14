@@ -109,8 +109,8 @@ function startEventStream(): void {
 async function init(): Promise<void> {
   const saved = await loadAutopilotState(companyId);
   if (saved) {
-    // Restore ship plans but start disabled — the user must re-enable explicitly
-    state = { ...saved, enabled: false };
+    // Merge with blank() so any new fields added after the last save get their defaults
+    state = { ...blank(), ...saved, enabled: false };
     state = appendLog(state, "↩ Restored state from database");
     sendState();
   }

@@ -210,15 +210,16 @@ async function runFleetManagement(
   economy: { total_upkeep: number },
   availableFunds: number,
 ): Promise<AutopilotState> {
-  if (!s.fleetMgmt.enabled) return s;
+  const fleetMgmt = s.fleetMgmt ?? { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] };
+  if (!fleetMgmt.enabled) return s;
 
   const now = Date.now();
   const stMap = new Map<string, ShipType>(shipTypes.map((t: ShipType) => [t.id, t]));
 
   // ── SELL: idle ships that have been stuck for 3+ minutes ─────────────────
   const canSell =
-    !s.fleetMgmt.lastSellAt ||
-    now - new Date(s.fleetMgmt.lastSellAt).getTime() > SELL_COOLDOWN_MS;
+    !fleetMgmt.lastSellAt ||
+    now - new Date(fleetMgmt.lastSellAt).getTime() > SELL_COOLDOWN_MS;
 
   if (canSell && ships.length > MIN_FLEET_SIZE) {
     for (const ship of ships) {
@@ -228,13 +229,13 @@ async function runFleetManagement(
 
       try {
         const sy = await shipyardsApi.getPortShipyard(ship.port_id);
-        if (!s.fleetMgmt.knownShipyardPortIds.includes(ship.port_id)) {
-          s = { ...s, fleetMgmt: { ...s.fleetMgmt, knownShipyardPortIds: [...s.fleetMgmt.knownShipyardPortIds, ship.port_id] } };
+        if (!fleetMgmt.knownShipyardPortIds.includes(ship.port_id)) {
+          s = { ...s, fleetMgmt: { ...fleetMgmt, knownShipyardPortIds: [...fleetMgmt.knownShipyardPortIds, ship.port_id] } };
         }
         const result = await shipyardsApi.sellShip(sy.id, ship.id);
         s.profitAccrued += result.price;
         const { [ship.id]: _, ...remainingShips } = s.ships;
-        s = { ...s, ships: remainingShips, fleetMgmt: { ...s.fleetMgmt, lastSellAt: new Date().toISOString() } };
+        s = { ...s, ships: remainingShips, fleetMgmt: { ...fleetMgmt, lastSellAt: new Date().toISOString() } };
         s = appendLog(s, `💰 Sold ${ship.name} @ £${result.price.toLocaleString()} (idle ${ss.cyclesIdle} cycles)`);
         break; // one sell per cycle
       } catch { /* no shipyard at this port — try next */ }
@@ -243,8 +244,8 @@ async function runFleetManagement(
 
   // ── BUY: expand fleet when profitable and unbalanced ─────────────────────
   const canBuy =
-    !s.fleetMgmt.lastBuyAt ||
-    now - new Date(s.fleetMgmt.lastBuyAt).getTime() > BUY_COOLDOWN_MS;
+    !fleetMgmt.lastBuyAt ||
+    now - new Date(fleetMgmt.lastBuyAt).getTime() > BUY_COOLDOWN_MS;
 
   if (canBuy) {
     const paxShips = ships.filter((sh: Ship) => (stMap.get(sh.ship_type_id)?.passengers ?? 0) > 0).length;
@@ -254,7 +255,8 @@ async function runFleetManagement(
     if (paxRatio < 0.4) preferPassengers = true;
     else if (paxRatio > 0.6) preferPassengers = false;
 
-    const lastProfit = s.profitHistory.length > 0 ? s.profitHistory[s.profitHistory.length - 1].cycleProfit : 0;
+    const prevPH = s.profitHistory ?? [];
+    const lastProfit = prevPH.length > 0 ? prevPH[prevPH.length - 1].cycleProfit : 0;
     const perCycleUpkeep = economy.total_upkeep * (CYCLE_MS / 3_600_000);
 
     if (lastProfit > 2 * perCycleUpkeep) {
@@ -263,8 +265,8 @@ async function runFleetManagement(
         try {
           const sy = await shipyardsApi.getPortShipyard(portId);
           const inventoryItems = await shipyardsApi.getInventory(sy.id);
-          if (!s.fleetMgmt.knownShipyardPortIds.includes(portId)) {
-            s = { ...s, fleetMgmt: { ...s.fleetMgmt, knownShipyardPortIds: [...s.fleetMgmt.knownShipyardPortIds, portId] } };
+          if (!fleetMgmt.knownShipyardPortIds.includes(portId)) {
+            s = { ...s, fleetMgmt: { ...(s.fleetMgmt ?? fleetMgmt), knownShipyardPortIds: [...fleetMgmt.knownShipyardPortIds, portId] } };
           }
           if (inventoryItems.length === 0) continue;
 
@@ -288,7 +290,7 @@ async function runFleetManagement(
           if (availableFunds < BUY_RESERVE_MULTIPLIER * chosen.item.cost) continue;
 
           const newShip = await shipyardsApi.purchaseShip(sy.id, { ship_type_id: chosen.type.id });
-          s = { ...s, fleetMgmt: { ...s.fleetMgmt, lastBuyAt: new Date().toISOString() } };
+          s = { ...s, fleetMgmt: { ...(s.fleetMgmt ?? fleetMgmt), lastBuyAt: new Date().toISOString() } };
           s = appendLog(s, `🚢 Bought ${newShip.name} (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
           break;
         } catch { /* no shipyard or insufficient funds — try next ship's port */ }
@@ -839,14 +841,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   }
 
   // ── Profit & treasury history snapshots ───────────────────────────────────
-  const prevCumulative = s.profitHistory.length > 0 ? s.profitHistory[s.profitHistory.length - 1].cumulative : 0;
+  const prevHistory = s.profitHistory ?? [];
+  const prevCumulative = prevHistory.length > 0 ? prevHistory[prevHistory.length - 1].cumulative : 0;
   const cycleProfit = s.profitAccrued - prevCumulative;
   const snapshot = { at: new Date().toISOString(), cumulative: s.profitAccrued, cycleProfit };
-  const profitHistory = [...s.profitHistory, snapshot].slice(-MAX_PROFIT_HISTORY);
+  const profitHistory = [...prevHistory, snapshot].slice(-MAX_PROFIT_HISTORY);
 
+  const prevTreasury = s.treasuryHistory ?? [];
   const treasuryHistory = treasuryBalance !== null
-    ? [...(s.treasuryHistory ?? []), { at: new Date().toISOString(), balance: treasuryBalance }].slice(-MAX_PROFIT_HISTORY)
-    : (s.treasuryHistory ?? []);
+    ? [...prevTreasury, { at: new Date().toISOString(), balance: treasuryBalance }].slice(-MAX_PROFIT_HISTORY)
+    : prevTreasury;
 
   s = { ...s, profitHistory, treasuryHistory, cyclesRun: s.cyclesRun + 1 };
 
