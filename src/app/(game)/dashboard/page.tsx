@@ -72,7 +72,7 @@ export default function DashboardPage() {
         const ships = s as Ship[];
         Promise.all(
           ships.map((ship) =>
-            fleetApi.getInventory(ship.id).then((cargo) => ({ id: ship.id, cargo })).catch(() => ({ id: ship.id, cargo: [] as Cargo[] }))
+            fleetApi.getInventoryCached(ship).then((cargo) => ({ id: ship.id, cargo })).catch(() => ({ id: ship.id, cargo: [] as Cargo[] }))
           )
         ).then((results) => {
           setShipCargo(Object.fromEntries(results.map(({ id, cargo }) => [id, cargo])));

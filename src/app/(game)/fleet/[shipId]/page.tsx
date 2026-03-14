@@ -55,22 +55,23 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
       fleetApi.getShip(shipId),
       worldApi.getPorts().catch(() => []),
       warehousesApi.getWarehouses().catch(() => []),
-      fleetApi.getInventory(shipId).catch(() => []),
       worldApi.getGoods().catch(() => []),
     ])
-      .then(([s, p, w, c, g]) => {
+      .then(([s, p, w, g]) => {
         setShip(s);
         setNewName(s.name);
         setPorts(p as Port[]);
         setWarehouses(w as Warehouse[]);
-        setCargo(c as Cargo[]);
         setGoods(g as Good[]);
-        if (s.port_id) {
-          return worldApi.getRoutes(s.port_id).catch(() => []);
-        }
-        return [];
+        return Promise.all([
+          fleetApi.getInventoryCached(s).catch(() => []),
+          s.port_id ? worldApi.getRoutes(s.port_id).catch(() => []) : Promise.resolve([]),
+        ]);
       })
-      .then((r) => setRoutes(r as Route[]))
+      .then(([c, r]) => {
+        setCargo(c as Cargo[]);
+        setRoutes(r as Route[]);
+      })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [shipId]);
