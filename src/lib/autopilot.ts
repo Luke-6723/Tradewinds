@@ -14,7 +14,7 @@
  * Passenger delivery is automatic server-side on arrival at destination_port_id.
  */
 
-import type { Good, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, Warehouse, WarehouseInventory } from "@/lib/types";
+import type { Cargo, Good, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, Warehouse, WarehouseInventory } from "@/lib/types";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { marketApi } from "@/lib/api/market";
@@ -436,6 +436,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     // ── Per-ship independent routing ───────────────────────────────────────────
 
+    // Lazy per-cycle inventory cache — avoids re-fetching within the same cycle
+    const shipInventoryCache = new Map<string, Cargo[]>();
+    const fetchShipInv = async (shipId: string): Promise<Cargo[]> => {
+      if (!shipInventoryCache.has(shipId)) {
+        try { shipInventoryCache.set(shipId, await fleetApi.getInventory(shipId)); }
+        catch { shipInventoryCache.set(shipId, []); }
+      }
+      return shipInventoryCache.get(shipId)!;
+    };
+
     for (const ship of ships) {
       if (ship.status === "traveling") {
         // Ship is en route — keep metrics ticking but don't idle-count it
@@ -449,11 +459,57 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       const shipType = stMap.get(ship.ship_type_id);
       const capacity = Math.min(shipType?.capacity ?? 20, MAX_UNITS);
 
+      // Actual remaining cargo space — prevents "Capacity exceeded" on buy
+      const shipInv = await fetchShipInv(ship.id);
+      const usedCapacity = shipInv.reduce((sum, c) => sum + c.quantity, 0);
+      const freeCapacity = Math.max(0, capacity - usedCapacity);
+
       // ══════════════════════════════════════════════════════════════════════════
       // IDLE — board passengers + scan for cargo, then dispatch
       // ══════════════════════════════════════════════════════════════════════════
       if (ss.phase === "idle") {
         await sleep(DOCK_DELAY_MS);
+
+        // ── 0. Clear leftover cargo before buying/boarding ─────────────────────
+        // A ship can end up idle-with-cargo after a failed sell or state reset.
+        // Try to sell at current port; if that fails, dispatch to the best sell port.
+        if (usedCapacity > 0) {
+          let dispatched = false;
+          for (const item of shipInv.filter((c) => c.quantity > 0)) {
+            try {
+              const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
+              await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: item.quantity }] });
+              s.profitAccrued += sq.unit_price * item.quantity;
+              s = appendLog(s, `${ship.name}: 🧹 cleared ${item.quantity}× ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
+              shipInventoryCache.delete(ship.id); // invalidate so freeCapacity is recalculated if needed
+            } catch {
+              // Can't sell here — find best sell port and dispatch
+              const sellPaths = findPaths(ship.port_id, allRoutes, 99);
+              const bestSellPath = sellPaths
+                .filter((sp) => (npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0) >= MIN_SELL_PRICE_LEVEL)
+                .sort((a, b) => (npcMaxOrd.get(`${b.destPortId}:${item.good_id}`) ?? 0) - (npcMaxOrd.get(`${a.destPortId}:${item.good_id}`) ?? 0))[0];
+              if (bestSellPath && bestSellPath.legs.length > 0) {
+                const plan: ShipPlan = {
+                  goodId: item.good_id, goodName: goodNameFn(item.good_id),
+                  quantity: item.quantity, actualBuyPrice: 0,
+                  sellPortId: bestSellPath.destPortId, legs: bestSellPath.legs.slice(1),
+                };
+                try {
+                  await fleetApi.transit(ship.id, { route_id: bestSellPath.legs[0].routeId });
+                  s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+                  s = appendLog(s, `${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${item.quantity}× ${goodNameFn(item.good_id)}`);
+                  dispatched = true;
+                } catch (e: unknown) {
+                  s = appendLog(s, `${ship.name}: leftover dispatch failed — ${(e as Error).message}`);
+                }
+              } else {
+                s = appendLog(s, `${ship.name}: ⚠️ stuck with ${item.quantity}× ${goodNameFn(item.good_id)} — no sell route`);
+              }
+              if (dispatched) break;
+            }
+          }
+          if (dispatched) continue;
+        }
 
         const paths = findPaths(ship.port_id, allRoutes, 99);
 
@@ -579,13 +635,13 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           let cargoBuyPrice = 0;
           let cargoSellPrice: number | undefined;
 
-          if (bestCargo && availableFunds > 0) {
+          if (bestCargo && availableFunds > 0 && freeCapacity > 0) {
             try {
-              const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: capacity, action: "buy" });
+              const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
               const affordable = Math.floor(availableFunds / bq.unit_price);
-              const buyQty = Math.min(capacity, affordable);
+              const buyQty = Math.min(freeCapacity, affordable);
               if (buyQty > 0) {
-                const eq = buyQty < capacity
+                const eq = buyQty < freeCapacity
                   ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
                   : bq;
                 await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
@@ -628,14 +684,14 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               continue;
             }
             try {
-              const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: capacity, action: "buy" });
+              const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
               const affordable = Math.floor(availableFunds / bq.unit_price);
-              const buyQty = Math.min(capacity, affordable);
+              const buyQty = Math.min(freeCapacity, affordable);
               if (buyQty <= 0) {
                 s = appendLog(s, `${ship.name}: insufficient funds for ${goodNameFn(bestCargo.goodId)}`);
                 continue;
               }
-              const eq = buyQty < capacity
+              const eq = buyQty < freeCapacity
                 ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
                 : bq;
               await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
@@ -712,13 +768,13 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         let boughtQty = 0;
         let actualBuyPrice = 0;
 
-        if (availableFunds > 0) {
+        if (availableFunds > 0 && freeCapacity > 0) {
           try {
-            const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: capacity, action: "buy" });
+            const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: freeCapacity, action: "buy" });
             const affordable = Math.floor(availableFunds / bq.unit_price);
-            const buyQty = Math.min(capacity, affordable);
+            const buyQty = Math.min(freeCapacity, affordable);
             if (buyQty > 0) {
-              const eq = buyQty < capacity
+              const eq = buyQty < freeCapacity
                 ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: buyQty, action: "buy" })
                 : bq;
               await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
@@ -795,30 +851,36 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         // Arrived at destination
         await sleep(DOCK_DELAY_MS);
 
-        // Sell cargo if any
-        if (plan.goodId && (plan.quantity ?? 0) > 0) {
-          let sold = false;
-          try {
-            const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: plan.quantity!, action: "sell" });
-            await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: plan.quantity! }] });
-            const profit = (sq.unit_price - (plan.actualBuyPrice ?? 0)) * plan.quantity!;
-            s.profitAccrued += profit;
-            const updSs = s.ships[ship.id] ?? defaultShipState();
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...updSs, cargoTrips: updSs.cargoTrips + 1, lifetimeProfit: updSs.lifetimeProfit + profit } } };
-            s = appendLog(s, `${ship.name}: sold ${plan.quantity}× ${plan.goodName} @ £${sq.unit_price} (+£${Math.round(profit).toLocaleString()})`);
-            sold = true;
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: NPC sell failed — ${(e as Error).message}`);
-          }
-
-          if (!sold) {
+        // Sell cargo if any — use ACTUAL inventory to avoid "Cargo not found"
+        if (plan.goodId) {
+          const actualItem = shipInv.find((c) => c.good_id === plan.goodId);
+          const sellQty = actualItem?.quantity ?? 0;
+          if (sellQty > 0) {
+            let sold = false;
             try {
-              const askPrice = Math.round((plan.actualBuyPrice ?? 0) * 1.15);
-              await marketApi.createOrder({ port_id: ship.port_id, good_id: plan.goodId, total: plan.quantity!, price: askPrice, side: "sell" });
-              s = appendLog(s, `${ship.name}: posted sell order ${plan.quantity}× @ £${askPrice}`);
-            } catch (e2: unknown) {
-              s = appendLog(s, `${ship.name}: market order also failed — ${(e2 as Error).message}`);
+              const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: sellQty, action: "sell" });
+              await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: sellQty }] });
+              const profit = (sq.unit_price - (plan.actualBuyPrice ?? 0)) * sellQty;
+              s.profitAccrued += profit;
+              const updSs = s.ships[ship.id] ?? defaultShipState();
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...updSs, cargoTrips: updSs.cargoTrips + 1, lifetimeProfit: updSs.lifetimeProfit + profit } } };
+              s = appendLog(s, `${ship.name}: sold ${sellQty}× ${plan.goodName} @ £${sq.unit_price} (+£${Math.round(profit).toLocaleString()})`);
+              sold = true;
+            } catch (e: unknown) {
+              s = appendLog(s, `${ship.name}: NPC sell failed — ${(e as Error).message}`);
             }
+
+            if (!sold) {
+              try {
+                const askPrice = Math.round((plan.actualBuyPrice ?? 0) * 1.15);
+                await marketApi.createOrder({ port_id: ship.port_id, good_id: plan.goodId, total: sellQty, price: askPrice, side: "sell" });
+                s = appendLog(s, `${ship.name}: posted sell order ${sellQty}× @ £${askPrice}`);
+              } catch (e2: unknown) {
+                s = appendLog(s, `${ship.name}: market order also failed — ${(e2 as Error).message}`);
+              }
+            }
+          } else if ((plan.quantity ?? 0) > 0) {
+            s = appendLog(s, `${ship.name}: ⚠️ cargo gone (${plan.goodName}) — skipping sell`);
           }
         }
 
