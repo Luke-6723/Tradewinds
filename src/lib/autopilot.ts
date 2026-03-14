@@ -104,10 +104,16 @@ function pickShipName(usedNames: string[]): string {
   return `${base} II`;
 }
 
-/** Returns true if the name looks like an auto-generated default (single letter, or plain "Ship"). */
+/** Returns true if the name looks like an auto-generated default (single letter, plain "Ship", or "Type - hexid"). */
 function isDefaultName(name: string): boolean {
   const t = name.trim();
-  return t.length <= 2 || /^ship\s*\d*$/i.test(t) || /^vessel\s*\d*$/i.test(t) || /^new ship\s*\d*$/i.test(t);
+  return (
+    t.length <= 2 ||
+    /^ship\s*\d*$/i.test(t) ||
+    /^vessel\s*\d*$/i.test(t) ||
+    /^new ship\s*\d*$/i.test(t) ||
+    /^.+\s*-\s*[0-9a-f]{6,}$/i.test(t)
+  );
 }
 
 // ── Price-level helpers ────────────────────────────────────────────────────────
