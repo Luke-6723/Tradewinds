@@ -14,17 +14,17 @@
  * Passenger delivery is automatic server-side on arrival at destination_port_id.
  */
 
-import type { Good, Port, Route, Ship, ShipType, Warehouse, WarehouseInventory } from "@/lib/types";
-import type { Passenger } from "@/lib/types";
+import type { Good, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, Warehouse, WarehouseInventory } from "@/lib/types";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { marketApi } from "@/lib/api/market";
 import { passengersApi } from "@/lib/api/passengers";
+import { shipyardsApi } from "@/lib/api/shipyards";
 import { tradeApi } from "@/lib/api/trade";
 import { warehousesApi } from "@/lib/api/warehouses";
 import { worldApi } from "@/lib/api/world";
-import { appendLog, type AutopilotState, type RouteLeg, type ShipPlan } from "@/lib/autopilot-types";
-import { getWarehouseStocks, removeWarehouseStock } from "@/lib/db/collections";
+import { appendLog, CYCLE_MS, MAX_PROFIT_HISTORY, type AutopilotState, type AutopilotShipState, type RouteLeg, type ShipPlan } from "@/lib/autopilot-types";
+import { getWarehouseStocks, removeWarehouseStock, upsertWarehouseStock } from "@/lib/db/collections";
 
 export * from "@/lib/autopilot-types";
 
@@ -38,6 +38,26 @@ const SCAN_BATCH   = 16;
 const DOCK_DELAY_MS = 5_000;
 /** Price level at or above which we sell from warehouse (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
+
+// ── Fleet management constants ─────────────────────────────────────────────
+/** Cycles a ship must be consecutively idle before it's a sell candidate. */
+const SELL_IDLE_CYCLES = 18;       // 3 min at 10s cycle
+/** Minimum fleet size — never sell below this. */
+const MIN_FLEET_SIZE = 2;
+/** Available-funds multiplier required before buying a ship. */
+const BUY_RESERVE_MULTIPLIER = 3;
+/** Cooldown between automated buys. */
+const BUY_COOLDOWN_MS  = 5 * 60_000;
+/** Cooldown between automated sells. */
+const SELL_COOLDOWN_MS = 2 * 60_000;
+
+// ── Warehouse buy constants ────────────────────────────────────────────────
+/** Maximum price level at which we buy for warehouse stockpiling (Cheap = 2). */
+const MAX_BUY_PRICE_LEVEL = 2;
+/** Maximum units of a single good type to hold per warehouse. */
+const MAX_WAREHOUSE_STOCK = 100;
+/** Maximum distinct good types to stock per warehouse. */
+const MAX_WAREHOUSE_GOODS = 2;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -113,10 +133,177 @@ function dedupBestPerGood(candidates: RawCandidate[], limit: number): RawCandida
     .slice(0, limit);
 }
 
+/** Default per-ship state for newly tracked ships. */
+function defaultShipState(): AutopilotShipState {
+  return { phase: "idle", cyclesIdle: 0, lifetimeProfit: 0, cargoTrips: 0, paxTrips: 0, cyclesActive: 0 };
+}
+
+// ── SSE passenger event handler ───────────────────────────────────────────────
+
+/**
+ * Immediately boards a passenger that just appeared via the world events SSE stream.
+ * Runs outside the main cycle (triggered by the worker's event listener).
+ */
+export async function handlePassengerEvent(
+  s: AutopilotState,
+  _companyId: string,
+  eventData: {
+    id: string;
+    origin_port_id: string;
+    destination_port_id: string;
+    bid: number;
+    count: number;
+    expires_at: string;
+  },
+): Promise<AutopilotState> {
+  if (new Date(eventData.expires_at) <= new Date()) return s;
+
+  try {
+    const [ships, shipTypes] = await Promise.all([
+      fleetApi.getShips().catch(() => [] as Ship[]),
+      worldApi.getShipTypes().catch(() => [] as ShipType[]),
+    ]);
+    const stMap = new Map<string, ShipType>(shipTypes.map((t: ShipType) => [t.id, t]));
+
+    const eligible = ships.filter(
+      (sh: Ship) =>
+        sh.status !== "traveling" &&
+        sh.port_id === eventData.origin_port_id &&
+        (stMap.get(sh.ship_type_id)?.passengers ?? 0) > 0 &&
+        (s.ships[sh.id]?.phase ?? "idle") === "idle",
+    );
+
+    for (const ship of eligible) {
+      try {
+        await passengersApi.boardPassenger(eventData.id, { ship_id: ship.id });
+        const ss = s.ships[ship.id] ?? defaultShipState();
+        s = {
+          ...s,
+          profitAccrued: s.profitAccrued + eventData.bid,
+          ships: {
+            ...s.ships,
+            [ship.id]: {
+              ...ss,
+              lifetimeProfit: ss.lifetimeProfit + eventData.bid,
+              paxTrips: ss.paxTrips + 1,
+            },
+          },
+        };
+        s = appendLog(s, `⚡ ${ship.name}: 🧳 instant pax → ${eventData.destination_port_id.slice(0, 8)} (£${eventData.bid})`);
+        break;
+      } catch (e: unknown) {
+        s = appendLog(s, `⚡ pax board failed (${ship.name}) — ${(e as Error).message}`);
+      }
+    }
+  } catch (e: unknown) {
+    s = appendLog(s, `⚡ pax event error — ${(e as Error).message}`);
+  }
+  return s;
+}
+
+// ── Fleet management ──────────────────────────────────────────────────────────
+
+async function runFleetManagement(
+  s: AutopilotState,
+  ships: Ship[],
+  shipTypes: ShipType[],
+  economy: { total_upkeep: number },
+  availableFunds: number,
+): Promise<AutopilotState> {
+  if (!s.fleetMgmt.enabled) return s;
+
+  const now = Date.now();
+  const stMap = new Map<string, ShipType>(shipTypes.map((t: ShipType) => [t.id, t]));
+
+  // ── SELL: idle ships that have been stuck for 3+ minutes ─────────────────
+  const canSell =
+    !s.fleetMgmt.lastSellAt ||
+    now - new Date(s.fleetMgmt.lastSellAt).getTime() > SELL_COOLDOWN_MS;
+
+  if (canSell && ships.length > MIN_FLEET_SIZE) {
+    for (const ship of ships) {
+      if (ship.status === "traveling" || !ship.port_id) continue;
+      const ss = s.ships[ship.id];
+      if (!ss || ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
+
+      try {
+        const sy = await shipyardsApi.getPortShipyard(ship.port_id);
+        if (!s.fleetMgmt.knownShipyardPortIds.includes(ship.port_id)) {
+          s = { ...s, fleetMgmt: { ...s.fleetMgmt, knownShipyardPortIds: [...s.fleetMgmt.knownShipyardPortIds, ship.port_id] } };
+        }
+        const result = await shipyardsApi.sellShip(sy.id, ship.id);
+        s.profitAccrued += result.price;
+        const { [ship.id]: _, ...remainingShips } = s.ships;
+        s = { ...s, ships: remainingShips, fleetMgmt: { ...s.fleetMgmt, lastSellAt: new Date().toISOString() } };
+        s = appendLog(s, `💰 Sold ${ship.name} @ £${result.price.toLocaleString()} (idle ${ss.cyclesIdle} cycles)`);
+        break; // one sell per cycle
+      } catch { /* no shipyard at this port — try next */ }
+    }
+  }
+
+  // ── BUY: expand fleet when profitable and unbalanced ─────────────────────
+  const canBuy =
+    !s.fleetMgmt.lastBuyAt ||
+    now - new Date(s.fleetMgmt.lastBuyAt).getTime() > BUY_COOLDOWN_MS;
+
+  if (canBuy) {
+    const paxShips = ships.filter((sh: Ship) => (stMap.get(sh.ship_type_id)?.passengers ?? 0) > 0).length;
+    const paxRatio = ships.length > 0 ? paxShips / ships.length : 0.5;
+
+    let preferPassengers: boolean | null = null;
+    if (paxRatio < 0.4) preferPassengers = true;
+    else if (paxRatio > 0.6) preferPassengers = false;
+
+    const lastProfit = s.profitHistory.length > 0 ? s.profitHistory[s.profitHistory.length - 1].cycleProfit : 0;
+    const perCycleUpkeep = economy.total_upkeep * (CYCLE_MS / 3_600_000);
+
+    if (lastProfit > 2 * perCycleUpkeep) {
+      for (const ship of ships.filter((sh: Ship) => sh.status !== "traveling" && sh.port_id)) {
+        const portId = ship.port_id!;
+        try {
+          const sy = await shipyardsApi.getPortShipyard(portId);
+          const inventoryItems = await shipyardsApi.getInventory(sy.id);
+          if (!s.fleetMgmt.knownShipyardPortIds.includes(portId)) {
+            s = { ...s, fleetMgmt: { ...s.fleetMgmt, knownShipyardPortIds: [...s.fleetMgmt.knownShipyardPortIds, portId] } };
+          }
+          if (inventoryItems.length === 0) continue;
+
+          const candidates = inventoryItems
+            .map((item: ShipyardInventoryItem) => ({ item, type: stMap.get(item.ship_type_id) }))
+            .filter((c): c is { item: ShipyardInventoryItem; type: ShipType } => c.type != null);
+
+          let chosen: { item: ShipyardInventoryItem; type: ShipType } | null = null;
+          if (preferPassengers === true) {
+            chosen = candidates
+              .filter((c) => c.type.passengers > 0)
+              .sort((a, b) => b.type.passengers - a.type.passengers)[0] ?? null;
+          } else if (preferPassengers === false) {
+            chosen = candidates
+              .filter((c) => c.type.passengers === 0)
+              .sort((a, b) => b.type.capacity - a.type.capacity)[0] ?? null;
+          }
+          if (!chosen) chosen = candidates.sort((a, b) => a.item.cost - b.item.cost)[0] ?? null;
+          if (!chosen) continue;
+
+          if (availableFunds < BUY_RESERVE_MULTIPLIER * chosen.item.cost) continue;
+
+          const newShip = await shipyardsApi.purchaseShip(sy.id, { ship_type_id: chosen.type.id });
+          s = { ...s, fleetMgmt: { ...s.fleetMgmt, lastBuyAt: new Date().toISOString() } };
+          s = appendLog(s, `🚢 Bought ${newShip.name} (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
+          break;
+        } catch { /* no shipyard or insufficient funds — try next ship's port */ }
+      }
+    }
+  }
+
+  return s;
+}
+
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
 export async function runCycle(s: AutopilotState, companyId: string): Promise<AutopilotState> {
   s = { ...s, lastCycleAt: new Date().toISOString() };
+  let treasuryBalance: number | null = null;
 
   try {
     const [ships, allRoutes, shipTypes, allPorts, allGoods, company, economy, allWarehouses, allPassengers, allTraderPositions] = await Promise.all([
@@ -134,6 +321,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     const bankingCap = economy.total_upkeep + 2_000;
     let availableFunds = Math.max(0, company.treasury - bankingCap);
+    treasuryBalance = company.treasury;
 
     const portName = (id: string | null | undefined) =>
       allPorts.find((p: Port) => p.id === id)?.name ?? (id ?? "?").slice(0, 8);
@@ -205,13 +393,57 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
     }
 
+    // ── Warehouse buy scan (opportunistic stockpiling) ────────────────────────
+    for (const [warehouseId, inventory] of warehouseInventory) {
+      const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
+      if (!warehouse) continue;
+
+      const stockedGoods = inventory.filter((i) => i.quantity > 0).map((i) => i.good_id);
+      if (stockedGoods.length >= MAX_WAREHOUSE_GOODS) continue;
+
+      const portGoods = npcGoods.get(warehouse.port_id);
+      if (!portGoods) continue;
+
+      for (const goodId of portGoods) {
+        if (stockedGoods.includes(goodId)) continue;
+
+        const priceOrd = npcMinOrd.get(`${warehouse.port_id}:${goodId}`) ?? 0;
+        if (priceOrd === 0 || priceOrd > MAX_BUY_PRICE_LEVEL) continue;
+
+        const existingQty = inventory.find((i) => i.good_id === goodId)?.quantity ?? 0;
+        const toBuy = MAX_WAREHOUSE_STOCK - existingQty;
+        if (toBuy <= 0) continue;
+
+        try {
+          const bq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: goodId, quantity: toBuy, action: "buy" });
+          if (bq.unit_price * toBuy > availableFunds) continue;
+          await tradeApi.executeQuote({ token: bq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: toBuy }] });
+          availableFunds -= bq.unit_price * toBuy;
+          await upsertWarehouseStock(companyId, {
+            warehouseId, portId: warehouse.port_id,
+            goodId, goodName: goodNameFn(goodId), avgBuyPrice: bq.unit_price,
+          }).catch(() => {});
+          s = appendLog(s, `🏭 Stocked ${toBuy}× ${goodNameFn(goodId)} @ £${bq.unit_price} (level ${priceOrd})`);
+          stockedGoods.push(goodId);
+          if (stockedGoods.length >= MAX_WAREHOUSE_GOODS) break;
+        } catch (e: unknown) {
+          s = appendLog(s, `🏭 Warehouse stock failed (${goodNameFn(goodId)}) — ${(e as Error).message}`);
+        }
+      }
+    }
+
     // ── Per-ship independent routing ───────────────────────────────────────────
 
     for (const ship of ships) {
-      if (ship.status === "traveling") continue;
+      if (ship.status === "traveling") {
+        // Ship is en route — keep metrics ticking but don't idle-count it
+        const tss = s.ships[ship.id] ?? defaultShipState();
+        s = { ...s, ships: { ...s.ships, [ship.id]: { ...tss, cyclesActive: tss.cyclesActive + 1, cyclesIdle: 0 } } };
+        continue;
+      }
       if (!ship.port_id) continue;
 
-      const ss = s.ships[ship.id] ?? { phase: "idle" as const };
+      const ss = s.ships[ship.id] ?? defaultShipState();
       const shipType = stMap.get(ship.ship_type_id);
       const capacity = Math.min(shipType?.capacity ?? 20, MAX_UNITS);
 
@@ -246,6 +478,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               await passengersApi.boardPassenger(p.id, { ship_id: ship.id });
               boardedPaxDestination = p.destination_port_id;
               boardedPaxBid = p.bid;
+              s.profitAccrued += p.bid; // accrue at boarding — delivery is automatic
               s = appendLog(s, `${ship.name}: 🧳 boarded ${p.count} pax → ${portName(p.destination_port_id)} (£${p.bid})`);
               break;
             } catch (e: unknown) {
@@ -333,7 +566,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           const destPath = paths.find((p) => p.destPortId === boardedPaxDestination);
           if (!destPath || destPath.legs.length === 0) {
             s = appendLog(s, `${ship.name}: ⚠️ no route to pax destination ${portName(boardedPaxDestination)} — resetting`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
             continue;
           }
 
@@ -376,7 +609,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
           try {
             await fleetApi.transit(ship.id, { route_id: destPath.legs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
             s = appendLog(s, `${ship.name}: → ${portName(boardedPaxDestination)} (pax £${boardedPaxBid}${cargoQty > 0 ? ` + ${cargoQty}× ${cargoGoodName}` : ""})`);
           } catch (e: unknown) {
             s = appendLog(s, `${ship.name}: pax dispatch failed — ${(e as Error).message}`);
@@ -412,7 +645,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                 sellPortId: bestCargo.sellPortId, legs: destPath.legs.slice(1),
               };
               await fleetApi.transit(ship.id, { route_id: destPath.legs[0].routeId });
-              s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan } } };
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
               s = appendLog(s, `${ship.name}: 📦 ${buyQty}× ${plan.goodName} → ${portName(bestCargo.sellPortId)} (£${eq.unit_price}→£${bestCargo.npcSellPrice}, ${((bestCargo.npcSellPrice - eq.unit_price) / eq.unit_price * 100).toFixed(1)}%)`);
             } catch (e: unknown) {
               s = appendLog(s, `${ship.name}: local buy failed — ${(e as Error).message}`);
@@ -435,7 +668,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             };
             try {
               await fleetApi.transit(ship.id, { route_id: toBuyPath.legs[0].routeId });
-              s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "transiting_to_buy", plan } } };
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
               s = appendLog(s, `${ship.name}: → ${portName(bestCargo.buyPortId)} to buy ${goodNameFn(bestCargo.goodId)}`);
             } catch (e: unknown) {
               s = appendLog(s, `${ship.name}: remote dispatch failed — ${(e as Error).message}`);
@@ -444,6 +677,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         } else {
           s = appendLog(s, `${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesIdle: ss.cyclesIdle + 1, cyclesActive: ss.cyclesActive + 1 } } };
         }
 
       // ══════════════════════════════════════════════════════════════════════════
@@ -466,7 +700,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         if (ship.port_id !== plan.buyPortId) {
           s = appendLog(s, `${ship.name}: ⚠️ lost in transit (expected ${portName(plan.buyPortId)}) — resetting`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
           continue;
         }
 
@@ -498,7 +732,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         if (boughtQty === 0) {
           s = appendLog(s, `${ship.name}: nothing bought at ${portName(ship.port_id)} — resetting`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
           continue;
         }
 
@@ -507,11 +741,11 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         if (sellLegs.length > 0) {
           try {
             await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: sellLegs.slice(1) } } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: sellLegs.slice(1) }, cyclesIdle: 0 } } };
             s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
           } catch (e: unknown) {
             s = appendLog(s, `${ship.name}: sell dispatch failed — ${(e as Error).message}`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
           }
         } else {
           // Rare: sellLegs was empty (same port buy/sell?), re-find path
@@ -519,16 +753,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           const toSell = sellPaths.find((p) => p.destPortId === plan.sellPortId);
           if (!toSell || toSell.legs.length === 0) {
             s = appendLog(s, `${ship.name}: ⚠️ no sell route from ${portName(ship.port_id)} — resetting`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
             continue;
           }
           try {
             await fleetApi.transit(ship.id, { route_id: toSell.legs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: toSell.legs.slice(1) } } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: toSell.legs.slice(1) }, cyclesIdle: 0 } } };
             s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
           } catch (e: unknown) {
             s = appendLog(s, `${ship.name}: sell dispatch failed — ${(e as Error).message}`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
           }
         }
 
@@ -552,7 +786,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         if (ship.port_id !== plan.sellPortId) {
           s = appendLog(s, `${ship.name}: ⚠️ at ${portName(ship.port_id)}, expected ${portName(plan.sellPortId)} — resetting`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
           continue;
         }
 
@@ -567,6 +801,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: plan.quantity! }] });
             const profit = (sq.unit_price - (plan.actualBuyPrice ?? 0)) * plan.quantity!;
             s.profitAccrued += profit;
+            const updSs = s.ships[ship.id] ?? defaultShipState();
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...updSs, cargoTrips: updSs.cargoTrips + 1, lifetimeProfit: updSs.lifetimeProfit + profit } } };
             s = appendLog(s, `${ship.name}: sold ${plan.quantity}× ${plan.goodName} @ £${sq.unit_price} (+£${Math.round(profit).toLocaleString()})`);
             sold = true;
           } catch (e: unknown) {
@@ -585,17 +821,34 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         }
 
         if (plan.passengerBid) {
+          const paxSs = s.ships[ship.id] ?? defaultShipState();
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...paxSs, paxTrips: paxSs.paxTrips + 1, lifetimeProfit: paxSs.lifetimeProfit + plan.passengerBid } } };
           s = appendLog(s, `${ship.name}: 🧳 pax delivered to ${portName(ship.port_id)} (+£${plan.passengerBid} at boarding)`);
         }
 
         // Back to idle — will re-scan next cycle
-        s = { ...s, ships: { ...s.ships, [ship.id]: { phase: "idle" } } };
+        s = { ...s, ships: { ...s.ships, [ship.id]: { ...(s.ships[ship.id] ?? defaultShipState()), phase: "idle", cyclesIdle: 0 } } };
       }
     }
+
+    // ── Fleet management ───────────────────────────────────────────────────────
+    s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds);
 
   } catch (e: unknown) {
     s = appendLog(s, `Cycle error: ${(e as Error).message}`);
   }
+
+  // ── Profit & treasury history snapshots ───────────────────────────────────
+  const prevCumulative = s.profitHistory.length > 0 ? s.profitHistory[s.profitHistory.length - 1].cumulative : 0;
+  const cycleProfit = s.profitAccrued - prevCumulative;
+  const snapshot = { at: new Date().toISOString(), cumulative: s.profitAccrued, cycleProfit };
+  const profitHistory = [...s.profitHistory, snapshot].slice(-MAX_PROFIT_HISTORY);
+
+  const treasuryHistory = treasuryBalance !== null
+    ? [...(s.treasuryHistory ?? []), { at: new Date().toISOString(), balance: treasuryBalance }].slice(-MAX_PROFIT_HISTORY)
+    : (s.treasuryHistory ?? []);
+
+  s = { ...s, profitHistory, treasuryHistory, cyclesRun: s.cyclesRun + 1 };
 
   return s;
 }

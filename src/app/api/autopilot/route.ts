@@ -21,7 +21,11 @@ export async function POST(req: NextRequest) {
   if (!token || !companyId) {
     return NextResponse.json({ error: "No credentials" }, { status: 401 });
   }
-  const { enabled } = await req.json() as { enabled: boolean };
-  const state = autopilotManager.setEnabled(companyId, token, enabled);
+  const body = await req.json() as { enabled?: boolean; fleetMgmt?: boolean };
+  if (body.fleetMgmt !== undefined) {
+    const state = autopilotManager.setFleetMgmtEnabled(companyId, token, body.fleetMgmt);
+    return NextResponse.json(state);
+  }
+  const state = autopilotManager.setEnabled(companyId, token, body.enabled ?? false);
   return NextResponse.json(state);
 }

@@ -48,7 +48,7 @@ export default function DashboardPage() {
   const [shipCargo, setShipCargo] = useState<Record<string, Cargo[]>>({});
   const [warehouseStocks, setWarehouseStocks] = useState<StoredWarehouseStock[]>([]);
   const [loading, setLoading] = useState(true);
-  const { state: ap, toggle: toggleAp } = useAutopilot();
+  const { state: ap, toggle: toggleAp, toggleFleetMgmt } = useAutopilot();
 
   useEffect(() => {
     Promise.all([
@@ -100,10 +100,24 @@ export default function DashboardPage() {
   // Ledger is already oldest-first from the DB — filter out any entries with invalid dates
   const validLedger = ledger.filter((e) => e.occurred_at && !isNaN(new Date(e.occurred_at).getTime()));
 
-  // Treasury balance over time (oldest → newest, running total)
+  // Autopilot profit history chart data
+  const profitChartData = (ap.profitHistory ?? []).map((snap) => ({
+    label: new Date(snap.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    cumulative: snap.cumulative,
+    cycleProfit: snap.cycleProfit,
+  }));
+
+  // Treasury balance history — prefer autopilot per-cycle snapshots, fall back to ledger
   const treasuryChartData = (() => {
+    const snaps = ap.treasuryHistory ?? [];
+    if (snaps.length > 1) {
+      return snaps.map((snap) => ({
+        label: new Date(snap.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        balance: snap.balance,
+      }));
+    }
     if (!company || validLedger.length === 0) return [];
-    const baseline = company.treasury - validLedger.reduce((s, e) => s + e.amount, 0);
+    const baseline = company.treasury - validLedger.reduce((sum, e) => sum + e.amount, 0);
     let running = baseline;
     return validLedger.map((e) => {
       running += e.amount;
@@ -180,11 +194,56 @@ export default function DashboardPage() {
       </div>
 
       {/* Charts row */}
-      {(treasuryChartData.length > 1 || upkeepData.length > 0) && (
+      {(profitChartData.length > 1 || treasuryChartData.length > 1 || upkeepData.length > 0) && (
         <div className="gap-4 grid lg:grid-cols-3">
-          {/* Treasury over time */}
-          {treasuryChartData.length > 1 && (
+          {/* Autopilot profit over time */}
+          {profitChartData.length > 1 && (
             <Card className="lg:col-span-2">
+              <CardHeader>
+                <CardTitle className="text-sm font-medium text-muted-foreground">Autopilot Profit</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={200}>
+                  <AreaChart data={profitChartData} margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="profitGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#22c55e" stopOpacity={0.25} />
+                        <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
+                    <XAxis dataKey="label" tick={false} axisLine={false} tickLine={false} />
+                    <YAxis
+                      tickFormatter={(v: number) => `£${(v / 1000).toFixed(0)}k`}
+                      tick={{ fontSize: 11 }}
+                      width={52}
+                    />
+                    <Tooltip
+                      formatter={(value, name) => [
+                        `£${Number(value).toLocaleString()}`,
+                        name === "cumulative" ? "Total profit" : "+this cycle",
+                      ]}
+                      labelFormatter={(label) => String(label)}
+                      contentStyle={{ fontSize: 13, borderRadius: 8 }}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="cumulative"
+                      stroke="#22c55e"
+                      strokeWidth={2}
+                      fill="url(#profitGrad)"
+                      dot={false}
+                      activeDot={{ r: 5, fill: "#22c55e", strokeWidth: 0 }}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Treasury balance over time */}
+          {treasuryChartData.length > 1 && (
+            <Card className={profitChartData.length <= 1 ? "lg:col-span-2" : ""}>
               <CardHeader>
                 <CardTitle className="text-sm font-medium text-muted-foreground">Treasury Balance</CardTitle>
               </CardHeader>
@@ -198,12 +257,7 @@ export default function DashboardPage() {
                       </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
-                    <XAxis
-                      dataKey="label"
-                      tick={false}
-                      axisLine={false}
-                      tickLine={false}
-                    />
+                    <XAxis dataKey="label" tick={false} axisLine={false} tickLine={false} />
                     <YAxis
                       tickFormatter={(v: number) => `£${(v / 1000).toFixed(0)}k`}
                       tick={{ fontSize: 11 }}
@@ -333,12 +387,59 @@ export default function DashboardPage() {
                 £{Math.round(ap.profitAccrued).toLocaleString()}
               </span>
             </span>
+            {ap.cyclesRun > 0 && (
+              <span className="text-muted-foreground text-xs self-center">
+                {ap.cyclesRun} cycles
+              </span>
+            )}
             {ap.enabled && (
-              <span className="text-muted-foreground text-xs">
+              <span className="text-muted-foreground text-xs self-center">
                 Cycles every {CYCLE_MS / 1000}s
                 {ap.lastCycleAt && ` · last ran ${new Date(ap.lastCycleAt).toLocaleTimeString()}`}
               </span>
             )}
+          </div>
+
+          {/* Fleet management */}
+          <div className="flex flex-wrap items-center gap-3 p-3 border rounded-lg text-sm">
+            <div className="flex items-center gap-2 flex-1">
+              <ShipIcon className="size-3.5 text-muted-foreground" />
+              <span className="font-medium">Fleet Management</span>
+              <Badge variant={(ap.fleetMgmt?.enabled ?? true) ? "success" : "secondary"} className="text-xs">
+                {(ap.fleetMgmt?.enabled ?? true) ? "On" : "Off"}
+              </Badge>
+            </div>
+            {(() => {
+              const paxShips = ships.filter((sh) => {
+                const ss = ap.ships[sh.id];
+                return ss && ss.paxTrips > 0;
+              }).length;
+              const paxRatio = ships.length > 0 ? Math.round((paxShips / ships.length) * 100) : 0;
+              return (
+                <span className="text-muted-foreground text-xs">
+                  Pax ships: {paxRatio}%{" "}
+                  <span className="inline-block w-16 h-1.5 bg-muted rounded-full align-middle ml-1">
+                    <span
+                      className="block h-full bg-indigo-500 rounded-full"
+                      style={{ width: `${paxRatio}%` }}
+                    />
+                  </span>
+                </span>
+              );
+            })()}
+            {ap.fleetMgmt?.lastBuyAt && (
+              <span className="text-muted-foreground text-xs">
+                Last buy: {new Date(ap.fleetMgmt.lastBuyAt).toLocaleTimeString()}
+              </span>
+            )}
+            {ap.fleetMgmt?.lastSellAt && (
+              <span className="text-muted-foreground text-xs">
+                Last sell: {new Date(ap.fleetMgmt.lastSellAt).toLocaleTimeString()}
+              </span>
+            )}
+            <Button size="sm" variant="outline" className="text-xs h-6 px-2" onClick={toggleFleetMgmt}>
+              {(ap.fleetMgmt?.enabled ?? true) ? "Disable" : "Enable"}
+            </Button>
           </div>
 
 

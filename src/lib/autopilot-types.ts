@@ -1,5 +1,6 @@
-﻿export const CYCLE_MS = 30_000;
+export const CYCLE_MS = 10_000;
 export const MAX_LOG = 30;
+export const MAX_PROFIT_HISTORY = 200;
 
 export interface RouteLeg {
   toPortId: string;
@@ -34,11 +35,40 @@ export type ShipPhase = "idle" | "transiting_to_buy" | "transiting_to_sell";
 export interface AutopilotShipState {
   phase: ShipPhase;
   plan?: ShipPlan;
+  /** Consecutive cycles this ship has been idle without dispatching. Reset on dispatch. */
+  cyclesIdle: number;
+  /** Net profit earned by this ship since it was added to autopilot. */
+  lifetimeProfit: number;
+  /** Number of completed cargo runs. */
+  cargoTrips: number;
+  /** Number of completed passenger runs. */
+  paxTrips: number;
+  /** Total cycles this ship has been tracked. */
+  cyclesActive: number;
 }
 
 export interface LogEntry {
   at: string;
   message: string;
+}
+
+export interface ProfitSnapshot {
+  at: string;
+  cumulative: number;
+  cycleProfit: number;
+}
+
+export interface TreasurySnapshot {
+  at: string;
+  balance: number;
+}
+
+export interface FleetMgmtState {
+  enabled: boolean;
+  lastBuyAt: string | null;
+  lastSellAt: string | null;
+  /** Ports confirmed to have a shipyard — populated lazily during fleet mgmt. */
+  knownShipyardPortIds: string[];
 }
 
 export interface AutopilotState {
@@ -47,10 +77,26 @@ export interface AutopilotState {
   profitAccrued: number;
   log: LogEntry[];
   lastCycleAt: string | null;
+  /** Rolling profit history — one entry per cycle, capped at MAX_PROFIT_HISTORY entries. */
+  profitHistory: ProfitSnapshot[];
+  /** Rolling treasury balance history — one entry per cycle, capped at MAX_PROFIT_HISTORY entries. */
+  treasuryHistory: TreasurySnapshot[];
+  fleetMgmt: FleetMgmtState;
+  cyclesRun: number;
 }
 
 export function blank(): AutopilotState {
-  return { enabled: false, ships: {}, profitAccrued: 0, log: [], lastCycleAt: null };
+  return {
+    enabled: false,
+    ships: {},
+    profitAccrued: 0,
+    log: [],
+    lastCycleAt: null,
+    profitHistory: [],
+    treasuryHistory: [],
+    fleetMgmt: { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] },
+    cyclesRun: 0,
+  };
 }
 
 export function appendLog(s: AutopilotState, message: string): AutopilotState {

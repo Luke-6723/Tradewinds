@@ -104,4 +104,12 @@ export const autopilotManager = {
     entry.state = { ...entry.state, enabled };
     return entry.state;
   },
+
+  /** Enable or disable fleet auto-management (buy/sell ships). */
+  setFleetMgmtEnabled(companyId: string, token: string, enabled: boolean): AutopilotState {
+    const entry = ensureWorker(companyId, token);
+    entry.worker.send({ type: "setFleetMgmt", enabled });
+    entry.state = { ...entry.state, fleetMgmt: { ...entry.state.fleetMgmt, enabled } };
+    return entry.state;
+  },
 };
