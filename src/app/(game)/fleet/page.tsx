@@ -16,6 +16,7 @@ type SellState =
   | { phase: "idle" }
   | { phase: "confirming" }
   | { phase: "loading" }
+  | { phase: "error"; message: string }
   | { phase: "sold"; price: number };
 
 export default function FleetPage() {
@@ -46,8 +47,12 @@ export default function FleetPage() {
       const result = await shipyardsApi.sellShip(shipyard.id, ship.id);
       setSellState((s) => ({ ...s, [ship.id]: { phase: "sold", price: result.price } }));
       setShips((prev) => prev.filter((s) => s.id !== ship.id));
-    } catch {
-      setSellState((s) => ({ ...s, [ship.id]: { phase: "idle" } }));
+    } catch (e: unknown) {
+      const msg = (e as Error).message ?? "Sale failed";
+      const friendly = msg.toLowerCase().includes("shipyard not found")
+        ? "No shipyard at this port."
+        : msg;
+      setSellState((s) => ({ ...s, [ship.id]: { phase: "error", message: friendly } }));
     }
   };
 
@@ -117,6 +122,14 @@ export default function FleetPage() {
                             Cancel
                           </Button>
                         </div>
+                      </div>
+                    )}
+                    {ss.phase === "error" && (
+                      <div className="space-y-2">
+                        <p className="text-xs text-destructive text-center">{ss.message}</p>
+                        <Button size="sm" variant="outline" className="w-full" onClick={() => setSellState((s) => ({ ...s, [ship.id]: { phase: "idle" } }))}>
+                          Dismiss
+                        </Button>
                       </div>
                     )}
                   </div>

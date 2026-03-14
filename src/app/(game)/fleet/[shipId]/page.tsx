@@ -5,7 +5,7 @@ import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
 import { warehousesApi } from "@/lib/api/warehouses";
 import { shipyardsApi } from "@/lib/api/shipyards";
-import type { Cargo, Good, Port, Route, Ship, Warehouse } from "@/lib/types";
+import type { Cargo, Good, Port, Route, Ship, Shipyard, Warehouse } from "@/lib/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -23,6 +23,7 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [cargo, setCargo] = useState<Cargo[]>([]);
   const [goods, setGoods] = useState<Good[]>([]);
+  const [shipyard, setShipyard] = useState<Shipyard | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [newName, setNewName] = useState("");
@@ -66,11 +67,15 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
         return Promise.all([
           fleetApi.getInventoryCached(s).catch(() => []),
           s.port_id ? worldApi.getRoutes(s.port_id).catch(() => []) : Promise.resolve([]),
+          s.port_id && s.status === "docked"
+            ? shipyardsApi.getPortShipyard(s.port_id).catch(() => null)
+            : Promise.resolve(null),
         ]);
       })
-      .then(([c, r]) => {
+      .then(([c, r, sy]) => {
         setCargo(c as Cargo[]);
         setRoutes(r as Route[]);
+        setShipyard(sy as Shipyard | null);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -222,10 +227,11 @@ export default function ShipDetailPage({ params }: { params: Promise<{ shipId: s
                 <Card className="max-w-sm">
                   <CardHeader><CardTitle>Sell Ship</CardTitle></CardHeader>
                   <CardContent className="space-y-4">
-                    <p className="text-sm text-muted-foreground">
-                      Sell <span className="font-semibold text-foreground">{ship.name}</span> back to the shipyard at a variable loss. This cannot be undone.
-                    </p>
-                    {!sellConfirm ? (
+                    {!shipyard ? (
+                      <p className="text-sm text-muted-foreground">
+                        No shipyard at this port. Sail to a port with a shipyard to sell this ship.
+                      </p>
+                    ) : !sellConfirm ? (
                       <Button variant="destructive" onClick={() => setSellConfirm(true)}>
                         Sell Ship
                       </Button>
