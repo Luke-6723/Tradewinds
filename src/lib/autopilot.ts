@@ -61,6 +61,55 @@ const MAX_WAREHOUSE_GOODS = 2;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+// ── Ship names ─────────────────────────────────────────────────────────────────
+
+const SHIP_NAMES = [
+  "Adriatic Star", "Albatross", "Amber Wave", "Anchor's Rest", "Andromeda",
+  "Arcadia", "Arctic Tern", "Astral Tide", "Atlantic Rose", "Aurora Borealis",
+  "Barnacle Bill", "Bay Wanderer", "Black Coral", "Blue Horizon", "Bounty Hunter",
+  "Brig of Dawn", "Bristol Belle", "Cape Endeavour", "Capella", "Celestial Wind",
+  "Channel Rover", "Compass Rose", "Copper Sky", "Coral Queen", "Corsair's Dream",
+  "Crimson Sail", "Dawnbreaker", "Deep Current", "Dockside Dreamer", "Duchess of York",
+  "East India Maid", "Endeavour", "Evening Star", "Expedition", "Fair Winds",
+  "Far Horizon", "Flying Dutchman", "Foam Crest", "Fortuna", "Free Spirit",
+  "Gallant Heart", "Gibraltar", "Golden Anchor", "Golden Fleece", "Good Fortune",
+  "Grace of the Sea", "Grand Traverse", "Gull's Wing", "Harbour Light", "Hermes",
+  "High Tide", "HMS Resolute", "Horizon Chaser", "Humdrum", "Indigo Passage",
+  "Iron Duke", "Isle Trader", "Jade Compass", "Jubilee", "Kingston Belle",
+  "Lady of the Mist", "Leviathan", "Lion of the Seas", "Lisbon Star", "Lucky Mariner",
+  "Maiden Voyage", "Marigold", "Maritime Dream", "Medway Merchant", "Mercury",
+  "Midnight Blue", "Misty Harbour", "Monsoon", "Morning Glory", "Neptune's Bounty",
+  "Night Passage", "Northern Light", "Ocean Tempest", "Old Salt", "Olympia",
+  "Open Water", "Pacific Lass", "Peregrine", "Pilgrim Spirit", "Polaris",
+  "Portsmouth Pride", "Privateer", "Providence", "Queen of Spades", "Rampant Lion",
+  "Red Ensign", "Resolute", "Rising Sun", "River Dragon", "Roaring Forties",
+  "Rogue Wave", "Royal Charter", "Rum Runner", "Sable Wind", "Sailor's Delight",
+  "Salt & Pepper", "Sapphire Sky", "Sea Breeze", "Sea Hawk", "Sea Serpent",
+  "Seafarer's Joy", "Silver Lining", "Sirocco", "South Sea Dreamer", "Sovereign",
+  "Spice Trader", "Spirit of Adventure", "Stormbreaker", "Sundown", "Swift Passage",
+  "Tempest", "The Intrepid", "Tidal Grace", "Trade Wind", "Tradewinds",
+  "Triton", "True Compass", "Twilight Voyager", "Two Harbours", "Tyrant Sea",
+  "Ulysses", "Vagabond", "Venture Capital", "Victory", "Viking Spirit",
+  "Wandering Star", "Wayfarer", "West India Queen", "Whispering Wind", "Wild Goose",
+  "Windswept", "Windy City", "Wolfhound", "Zephyr", "Zenith",
+];
+
+/** Pick the next unused name; cycles back through if all are taken. */
+function pickShipName(usedNames: string[]): string {
+  const usedSet = new Set(usedNames.map((n) => n.toLowerCase()));
+  const available = SHIP_NAMES.find((n) => !usedSet.has(n.toLowerCase()));
+  if (available) return available;
+  // All names used — generate a unique suffix variant
+  const base = SHIP_NAMES[Math.floor(Math.random() * SHIP_NAMES.length)];
+  return `${base} II`;
+}
+
+/** Returns true if the name looks like an auto-generated default (single letter, or plain "Ship"). */
+function isDefaultName(name: string): boolean {
+  const t = name.trim();
+  return t.length <= 2 || /^ship\s*\d*$/i.test(t) || /^vessel\s*\d*$/i.test(t) || /^new ship\s*\d*$/i.test(t);
+}
+
 // ── Price-level helpers ────────────────────────────────────────────────────────
 
 const PRICE_LEVEL: Record<string, number> = {
@@ -291,7 +340,14 @@ async function runFleetManagement(
 
           const newShip = await shipyardsApi.purchaseShip(sy.id, { ship_type_id: chosen.type.id });
           s = { ...s, fleetMgmt: { ...(s.fleetMgmt ?? fleetMgmt), lastBuyAt: new Date().toISOString() } };
-          s = appendLog(s, `🚢 Bought ${newShip.name} (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
+          // Give the new ship a unique name
+          const chosenName = pickShipName(ships.map((sh) => sh.name));
+          try {
+            await fleetApi.renameShip(newShip.id, { name: chosenName });
+            s = appendLog(s, `🚢 Bought & named "${chosenName}" (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
+          } catch {
+            s = appendLog(s, `🚢 Bought ${newShip.name} (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
+          }
           break;
         } catch { /* no shipyard or insufficient funds — try next ship's port */ }
       }
@@ -897,6 +953,17 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     // ── Fleet management ───────────────────────────────────────────────────────
     s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds);
+
+    // ── Rename default-named ships (one per cycle to limit API calls) ──────────
+    const allNames = ships.map((sh) => sh.name);
+    const needsRename = ships.find((sh) => sh.status !== "traveling" && isDefaultName(sh.name));
+    if (needsRename) {
+      const newName = pickShipName(allNames);
+      try {
+        await fleetApi.renameShip(needsRename.id, { name: newName });
+        s = appendLog(s, `✏️ Renamed "${needsRename.name}" → "${newName}"`);
+      } catch { /* non-fatal */ }
+    }
 
   } catch (e: unknown) {
     s = appendLog(s, `Cycle error: ${(e as Error).message}`);
