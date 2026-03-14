@@ -7,6 +7,7 @@ import { worldApi } from "@/lib/api/world";
 import type { Cargo, Company, CompanyEconomy, Good, LedgerEntry, Port, Ship } from "@/lib/types";
 import type { StoredWarehouseStock } from "@/lib/db/collections";
 import { useAutopilot } from "@/hooks/use-autopilot";
+import { useSse } from "@/hooks/use-sse";
 import { CYCLE_MS } from "@/lib/autopilot-types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -81,6 +82,28 @@ export default function DashboardPage() {
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
+
+  // ── React to ship_docked / ship_transit_started events ────────────────────
+  const { events: companyEvents } = useSse<{ type: string; data: Record<string, unknown> }>(
+    "/api/events/company",
+    !loading,
+  );
+
+  useEffect(() => {
+    if (companyEvents.length === 0) return;
+    const latest = companyEvents[0];
+    if (latest.type === "ship_docked") {
+      const { ship_id, port_id } = latest.data as { ship_id: string; port_id: string };
+      setShips((prev) =>
+        prev.map((s) => s.id === ship_id ? { ...s, status: "docked", port_id, route_id: null, arriving_at: null } : s)
+      );
+    } else if (latest.type === "ship_transit_started") {
+      const { ship_id, route_id, arriving_at } = latest.data as { ship_id: string; route_id: string; arriving_at: string };
+      setShips((prev) =>
+        prev.map((s) => s.id === ship_id ? { ...s, status: "traveling", route_id, arriving_at } : s)
+      );
+    }
+  }, [companyEvents]);
 
   if (loading) {
     return (
