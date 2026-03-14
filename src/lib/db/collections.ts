@@ -162,13 +162,13 @@ export interface StoredLedgerEntry {
   companyId: string;
   entryId: string;
   amount: number;
-  description: string;
+  reason: string;
   occurredAt: Date;
 }
 
 export async function upsertLedgerEntries(
   companyId: string,
-  entries: Array<{ id: string; amount: number; description: string; occurred_at: string }>,
+  entries: Array<{ id: string; amount: number; reason: string; occurred_at: string }>,
 ): Promise<void> {
   const db = await getDb();
   if (!db || entries.length === 0) return;
@@ -183,7 +183,7 @@ export async function upsertLedgerEntries(
             companyId,
             entryId: e.id,
             amount: e.amount,
-            description: e.description,
+            reason: e.reason,
             occurredAt: new Date(e.occurred_at),
           },
         },

@@ -37,14 +37,18 @@ export async function GET(req: NextRequest) {
 
   const stored = await getLedgerEntries(companyId);
 
-  // Map to LedgerEntry shape for the client
-  const entries: LedgerEntry[] = stored.map((s) => ({
+  // Map to a minimal LedgerEntry shape for the client (only fields needed for display)
+  const entries = stored.map((s) => ({
     id: s.entryId,
     company_id: companyId,
     amount: s.amount,
-    description: s.description,
+    reason: s.reason as LedgerEntry["reason"],
+    reference_type: "system" as const,
+    reference_id: s.entryId,
+    idempotency_key: s.entryId,
     occurred_at: s.occurredAt.toISOString(),
-  }));
+    inserted_at: s.occurredAt.toISOString(),
+  })) satisfies LedgerEntry[];
 
   return NextResponse.json(entries);
 }

@@ -547,6 +547,21 @@ function Countdown({ to }: { to: string }) {
   return <span className="font-mono">{label}</span>;
 }
 
+const REASON_LABELS: Record<string, string> = {
+  initial_deposit: "Initial Deposit",
+  transfer: "Transfer",
+  ship_purchase: "Ship Purchase",
+  tax: "Tax",
+  market_trade: "Market Trade",
+  market_listing_fee: "Market Listing Fee",
+  market_penalty_fine: "Market Penalty",
+  warehouse_upgrade: "Warehouse Upgrade",
+  warehouse_upkeep: "Warehouse Upkeep",
+  ship_upkeep: "Ship Upkeep",
+  npc_trade: "NPC Trade",
+  bailout: "Bailout",
+};
+
 function LedgerRow({ entry }: { entry: LedgerEntry }) {
   const positive = entry.amount >= 0;
   const Icon = positive ? TrendingUpIcon : TrendingDownIcon;
@@ -555,6 +570,7 @@ function LedgerRow({ entry }: { entry: LedgerEntry }) {
   const dateLabel = isToday
     ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : date.toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const label = REASON_LABELS[entry.reason] ?? entry.reason.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
   return (
     <div className="group flex items-center gap-3 hover:bg-muted/40 px-4 py-3 transition-colors">
@@ -562,7 +578,7 @@ function LedgerRow({ entry }: { entry: LedgerEntry }) {
         <Icon className="size-4" />
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-sm truncate">{entry.description}</p>
+        <p className="text-sm truncate">{label}</p>
         <p className="tabular-nums text-muted-foreground text-xs">{dateLabel}</p>
       </div>
       <span className={`text-sm font-mono font-semibold shrink-0 ${positive ? "text-green-600 dark:text-green-400" : "text-destructive"}`}>

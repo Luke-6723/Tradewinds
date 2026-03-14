@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
             void upsertLedgerEntries(companyId, [{
               id:          d.id as string,
               amount:      d.amount as number,
-              description: (d.reason as string | undefined) ?? "",
+              reason:      (d.reason as string | undefined) ?? "",
               occurred_at: d.occurred_at as string,
             }]);
           }

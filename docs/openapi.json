@@ -1,4 +1,4 @@
-{
+﻿{
   "components": {
     "responses": {},
     "schemas": {
@@ -441,6 +441,26 @@
           "requests"
         ],
         "title": "BatchExecuteQuoteRequest",
+        "type": "object"
+      },
+      "SellShipResponse": {
+        "example": {
+          "data": {
+            "price": 2700
+          }
+        },
+        "properties": {
+          "data": {
+            "properties": {
+              "price": {
+                "description": "The buy-back price received",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "title": "SellShipResponse",
         "type": "object"
       },
       "ShipyardResponse": {
@@ -1288,6 +1308,79 @@
         "title": "BatchQuoteResponse",
         "type": "object"
       },
+      "PassengerResponse": {
+        "description": "A single passenger record.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Passenger"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "PassengerResponse",
+        "type": "object"
+      },
+      "Passenger": {
+        "description": "A passenger group request or boarded group.",
+        "properties": {
+          "bid": {
+            "type": "integer"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "destination_port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inserted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "origin_port_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ship_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "available",
+              "boarded"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "count",
+          "bid",
+          "status",
+          "expires_at",
+          "origin_port_id",
+          "destination_port_id",
+          "inserted_at",
+          "updated_at"
+        ],
+        "title": "Passenger",
+        "type": "object"
+      },
       "ShipTypeResponse": {
         "description": "Response schema for a single ship type.",
         "properties": {
@@ -1854,6 +1947,21 @@
         "title": "CompaniesResponse",
         "type": "object"
       },
+      "BoardPassengerRequest": {
+        "description": "Request to board a passenger group onto a ship.",
+        "properties": {
+          "ship_id": {
+            "description": "ID of the ship to board onto",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ship_id"
+        ],
+        "title": "BoardPassengerRequest",
+        "type": "object"
+      },
       "ShipsResponse": {
         "description": "Response schema for a list of ships.",
         "properties": {
@@ -1872,6 +1980,23 @@
           "metadata"
         ],
         "title": "ShipsResponse",
+        "type": "object"
+      },
+      "SellShipRequest": {
+        "example": {
+          "ship_id": "7488a646-e31f-495c-ad5d-7538bc100574"
+        },
+        "properties": {
+          "ship_id": {
+            "description": "Ship ID to sell",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ship_id"
+        ],
+        "title": "SellShipRequest",
         "type": "object"
       },
       "Route": {
@@ -1953,6 +2078,26 @@
           "data"
         ],
         "title": "InventoryResponse",
+        "type": "object"
+      },
+      "PassengersResponse": {
+        "description": "Response schema for a list of passengers.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Passenger"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PageMetadata"
+          }
+        },
+        "required": [
+          "data",
+          "metadata"
+        ],
+        "title": "PassengersResponse",
         "type": "object"
       },
       "ChangesetResponse": {
@@ -2326,6 +2471,185 @@
         ]
       }
     },
+    "/api/v1/passengers": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a paginated list of all currently available or boarded passengers.",
+        "operationId": "listPassengers",
+        "parameters": [
+          {
+            "description": "Cursor for next page",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for previous page",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Number of items per page",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by status (available, boarded)",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by origin port ID",
+            "in": "query",
+            "name": "port_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by ship ID",
+            "in": "query",
+            "name": "ship_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassengersResponse"
+                }
+              }
+            },
+            "description": "List of passengers"
+          }
+        },
+        "summary": "List all passengers",
+        "tags": [
+          "Passengers"
+        ]
+      }
+    },
+    "/api/v1/shipyards/{shipyard_id}/sell": {
+      "post": {
+        "callbacks": {},
+        "description": "Sells a ship back to the shipyard at a variable loss.",
+        "operationId": "sellShip",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Shipyard ID",
+            "in": "path",
+            "name": "shipyard_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SellShipRequest"
+              }
+            }
+          },
+          "description": "Sell details",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SellShipResponse"
+                }
+              }
+            },
+            "description": "Ship sold successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized or ship not at shipyard"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Shipyard or ship not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangesetResponse"
+                }
+              }
+            },
+            "description": "Validation error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Sell a ship",
+        "tags": [
+          "Shipyards"
+        ]
+      }
+    },
     "/api/v1/auth/revoke": {
       "post": {
         "callbacks": {},
@@ -2671,7 +2995,157 @@
         ]
       }
     },
+    "/api/v1/passengers/{passenger_id}/board": {
+      "post": {
+        "callbacks": {},
+        "description": "Boards an available passenger group onto a docked ship at the same port.",
+        "operationId": "boardPassenger",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Passenger ID",
+            "in": "path",
+            "name": "passenger_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BoardPassengerRequest"
+              }
+            }
+          },
+          "description": "Board request",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassengerResponse"
+                }
+              }
+            },
+            "description": "Boarded passenger details"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Boarding failed"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Board a passenger onto a ship",
+        "tags": [
+          "Passengers"
+        ]
+      }
+    },
     "/api/v1/warehouses/{warehouse_id}": {
+      "delete": {
+        "callbacks": {},
+        "description": "Deletes a warehouse if it is empty.",
+        "operationId": "deleteWarehouse",
+        "parameters": [
+          {
+            "description": "Company ID",
+            "in": "header",
+            "name": "tradewinds-company-id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Warehouse ID",
+            "in": "path",
+            "name": "warehouse_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Warehouse deleted successfully"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid or expired token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Warehouse not empty"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a warehouse",
+        "tags": [
+          "Logistics"
+        ]
+      },
       "get": {
         "callbacks": {},
         "description": "Returns the details of a specific warehouse owned by the current company.",
@@ -4431,6 +4905,68 @@
         ]
       }
     },
+    "/api/v1/shipyards/{shipyard_id}/sell-quote": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns the estimated buy-back price for a ship if sold to this shipyard.",
+        "operationId": "sellQuote",
+        "parameters": [
+          {
+            "description": "Shipyard ID",
+            "in": "path",
+            "name": "shipyard_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship ID",
+            "in": "query",
+            "name": "ship_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ship Type ID",
+            "in": "query",
+            "name": "ship_type_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SellShipResponse"
+                }
+              }
+            },
+            "description": "Sell quote"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Shipyard, ship, or ship type not found"
+          }
+        },
+        "summary": "Get a sell quote for a ship",
+        "tags": [
+          "Shipyards"
+        ]
+      }
+    },
     "/api/v1/trade/quotes/execute": {
       "post": {
         "callbacks": {},
@@ -4729,6 +5265,50 @@
         "summary": "Get good details",
         "tags": [
           "World"
+        ]
+      }
+    },
+    "/api/v1/passengers/{id}": {
+      "get": {
+        "callbacks": {},
+        "description": "Returns a single passenger by ID.",
+        "operationId": "getPassenger",
+        "parameters": [
+          {
+            "description": "Passenger ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassengerResponse"
+                }
+              }
+            },
+            "description": "Passenger details"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Passenger not found"
+          }
+        },
+        "summary": "Get a passenger",
+        "tags": [
+          "Passengers"
         ]
       }
     },

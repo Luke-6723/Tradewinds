@@ -6,13 +6,14 @@ export type ISO8601 = string;
 
 // ─── Account / Auth ────────────────────────────────────────────────────────
 export interface RegisterRequest {
-  username: string;
-  password: string;
+  name: string;
   email: string;
+  password: string;
+  discord_id?: string;
 }
 
 export interface LoginRequest {
-  username: string;
+  email: string;
   password: string;
 }
 
@@ -47,12 +48,18 @@ export interface LedgerEntry {
   id: UUID;
   company_id: UUID;
   amount: number;
-  description: string;
+  reason: "initial_deposit" | "transfer" | "ship_purchase" | "tax" | "market_trade" | "market_listing_fee" | "market_penalty_fine" | "warehouse_upgrade" | "warehouse_upkeep" | "ship_upkeep" | "npc_trade" | "bailout";
+  reference_type: "market" | "ship" | "warehouse" | "order" | "system";
+  reference_id: UUID;
+  idempotency_key: string;
+  meta?: Record<string, unknown>;
   occurred_at: ISO8601;
+  inserted_at: ISO8601;
 }
 
 export interface CreateCompanyRequest {
   name: string;
+  ticker: string;
   home_port_id: UUID;
 }
 
@@ -91,12 +98,20 @@ export interface ShipType {
   name: string;
   description?: string;
   capacity: number;
+  passengers: number;
   speed: number;
   upkeep: number;
   base_price: number;
 }
 
 // ─── Trade ─────────────────────────────────────────────────────────────────
+export interface Trader {
+  id: UUID;
+  name: string;
+  inserted_at: ISO8601;
+  updated_at: ISO8601;
+}
+
 export interface TraderPosition {
   id: UUID;
   trader_id: UUID;
@@ -139,12 +154,11 @@ export interface ExecuteQuoteRequest {
   destinations: TradeDestination[];
 }
 
-export interface DirectTradeRequest {
-  trader_id: UUID;
+export interface ExecuteTradeRequest {
+  port_id: UUID;
   good_id: UUID;
-  quantity: number;
-  direction: "buy" | "sell";
-  warehouse_id?: UUID;
+  action: "buy" | "sell";
+  destinations: TradeDestination[];
 }
 
 // ─── Market (Order Book) ───────────────────────────────────────────────────
@@ -175,7 +189,6 @@ export interface CreateOrderRequest {
 
 export interface FillOrderRequest {
   quantity: number;
-  warehouse_id?: UUID;
 }
 
 export interface BlendedPrice {
@@ -279,7 +292,32 @@ export interface ShipyardInventoryItem {
 
 export interface PurchaseShipRequest {
   ship_type_id: UUID;
-  name: string;
+}
+
+export interface SellShipRequest {
+  ship_id: UUID;
+}
+
+export interface SellShipResponse {
+  price: number;
+}
+
+// ─── Passengers ────────────────────────────────────────────────────────────
+export interface Passenger {
+  id: UUID;
+  count: number;
+  bid: number;
+  status: "available" | "boarded";
+  expires_at: ISO8601;
+  origin_port_id: UUID;
+  destination_port_id: UUID;
+  ship_id?: UUID | null;
+  inserted_at: ISO8601;
+  updated_at: ISO8601;
+}
+
+export interface BoardPassengerRequest {
+  ship_id: UUID;
 }
 
 // ─── SSE Events ────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useState } from "react";
 import { use } from "react";
@@ -6,11 +6,9 @@ import { worldApi } from "@/lib/api/world";
 import { tradeApi } from "@/lib/api/trade";
 import { marketApi } from "@/lib/api/market";
 import { shipyardsApi } from "@/lib/api/shipyards";
-import type { MarketOrder, Port, Shipyard, ShipyardInventoryItem, ShipType, TraderPosition } from "@/lib/types";
+import type { Good, MarketOrder, Port, Shipyard, ShipyardInventoryItem, ShipType, TraderPosition } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -18,31 +16,30 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
   const { id } = use(params);
   const [port, setPort] = useState<Port | null>(null);
   const [traders, setTraders] = useState<TraderPosition[]>([]);
+  const [goods, setGoods] = useState<Good[]>([]);
   const [orders, setOrders] = useState<MarketOrder[]>([]);
   const [shipyard, setShipyard] = useState<Shipyard | null>(null);
   const [inventory, setInventory] = useState<ShipyardInventoryItem[]>([]);
   const [shipTypes, setShipTypes] = useState<Map<string, ShipType>>(new Map());
   const [loading, setLoading] = useState(true);
 
-  // Purchase flow state
   const [purchasingItemId, setPurchasingItemId] = useState<string | null>(null);
-  const [shipName, setShipName] = useState("");
   const [purchasing, setPurchasing] = useState(false);
   const [purchaseError, setPurchaseError] = useState<string | null>(null);
-  const [purchasedName, setPurchasedName] = useState<string | null>(null);
+  const [purchasedShipName, setPurchasedShipName] = useState<string | null>(null);
 
   useEffect(() => {
-    // Load port first — failures here mean the port truly doesn't exist
     worldApi.getPort(id)
       .then((p) => {
         setPort(p);
-        // Load optional data in parallel; don't let failures hide the port
         Promise.all([
-          tradeApi.getTraderPositions(id).catch(() => []),
-          marketApi.getOrders([id]).catch(() => []),
-          worldApi.getShipTypes().catch(() => []),
-        ]).then(([t, o, st]) => {
-          setTraders(t as TraderPosition[]);
+          tradeApi.getTraderPositions().catch(() => [] as TraderPosition[]),
+          worldApi.getGoods().catch(() => [] as Good[]),
+          marketApi.getOrders([id]).catch(() => [] as MarketOrder[]),
+          worldApi.getShipTypes().catch(() => [] as ShipType[]),
+        ]).then(([allPositions, g, o, st]) => {
+          setTraders((allPositions as TraderPosition[]).filter((tp) => tp.port_id === id));
+          setGoods(g as Good[]);
           setOrders(o as MarketOrder[]);
           setShipTypes(new Map((st as ShipType[]).map((s) => [s.id, s])));
           return shipyardsApi.getPortShipyard(id).catch(() => null);
@@ -59,35 +56,17 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
       .finally(() => setLoading(false));
   }, [id]);
 
-  function openPurchaseForm(itemId: string) {
-    setPurchasingItemId(itemId);
-    setShipName("");
-    setPurchaseError(null);
-    setPurchasedName(null);
-  }
-
-  function cancelPurchase() {
-    setPurchasingItemId(null);
-    setShipName("");
-    setPurchaseError(null);
-  }
-
   async function confirmPurchase(item: ShipyardInventoryItem) {
-    if (!shipyard || !shipName.trim()) return;
+    if (!shipyard) return;
     setPurchasing(true);
     setPurchaseError(null);
     try {
-      const ship = await shipyardsApi.purchaseShip(shipyard.id, {
-        ship_type_id: item.ship_type_id,
-        name: shipName.trim(),
-      });
+      const ship = await shipyardsApi.purchaseShip(shipyard.id, { ship_type_id: item.ship_type_id });
       setInventory((prev) => prev.filter((i) => i.id !== item.id));
       setPurchasingItemId(null);
-      setShipName("");
-      setPurchasedName(ship.name);
+      setPurchasedShipName(ship.name);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Purchase failed. Please try again.";
-      setPurchaseError(message);
+      setPurchaseError(err instanceof Error ? err.message : "Purchase failed.");
     } finally {
       setPurchasing(false);
     }
@@ -117,12 +96,18 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
           <div className="divide-y rounded-lg border">
             {traders.length === 0 ? (
               <p className="p-4 text-muted-foreground text-sm">No traders at this port.</p>
-            ) : traders.map((t) => (
-              <div key={t.id} className="flex items-center justify-between px-4 py-3 text-sm">
-                <span className="font-medium font-mono text-xs text-muted-foreground">{t.good_id}</span>
-                <span className="text-muted-foreground">{t.stock_bounds}</span>
-              </div>
-            ))}
+            ) : traders.map((t) => {
+              const good = goods.find((g) => g.id === t.good_id);
+              return (
+                <div key={t.id} className="flex items-center justify-between px-4 py-3 text-sm">
+                  <span className="font-medium">{good?.name ?? t.good_id.slice(0, 8)}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs text-muted-foreground">{t.stock_bounds}</span>
+                    <Badge variant="outline" className="text-xs">{t.price_bounds}</Badge>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </TabsContent>
 
@@ -132,11 +117,9 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
               <p className="p-4 text-muted-foreground text-sm">No orders at this port.</p>
             ) : orders.map((o) => (
               <div key={o.id} className="flex items-center justify-between px-4 py-3 text-sm">
-                <span className="font-medium font-mono text-xs text-muted-foreground">{o.good_id}</span>
+                <span className="font-medium">{goods.find((g) => g.id === o.good_id)?.name ?? o.good_id.slice(0, 8)}</span>
                 <div className="flex items-center gap-3">
-                  <Badge variant={o.side === "sell" ? "info" : "success"}>
-                    {o.side === "sell" ? "Sell" : "Buy"}
-                  </Badge>
+                  <Badge variant={o.side === "sell" ? "info" : "success"}>{o.side === "sell" ? "Sell" : "Buy"}</Badge>
                   <span className="font-mono">£{o.price.toLocaleString()}</span>
                   <span className="text-muted-foreground">{o.remaining}/{o.total}</span>
                 </div>
@@ -148,12 +131,11 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
         {shipyard && (
           <TabsContent value="shipyard" className="mt-4">
             <div className="space-y-2">
-              {purchasedName && (
+              {purchasedShipName && (
                 <p className="text-sm text-green-600 font-medium px-1">
-                  ✓ <span className="font-semibold">{purchasedName}</span> purchased and added to your fleet.
+                  ✓ <span className="font-semibold">{purchasedShipName}</span> purchased and added to your fleet.
                 </p>
               )}
-
               {inventory.length === 0 ? (
                 <div className="rounded-lg border">
                   <p className="p-4 text-muted-foreground text-sm">No ships available for purchase.</p>
@@ -163,61 +145,39 @@ export default function PortDetailPage({ params }: { params: Promise<{ id: strin
                   {inventory.map((item) => {
                     const shipType = shipTypes.get(item.ship_type_id);
                     const isExpanded = purchasingItemId === item.id;
-
                     return (
                       <div key={item.id} className="px-4 py-3 text-sm">
                         <div className="flex items-center justify-between">
                           <div className="space-y-0.5">
-                            <p className="font-semibold">
-                              {shipType?.name ?? <span className="font-mono text-xs text-muted-foreground">{item.ship_type_id}</span>}
-                            </p>
+                            <p className="font-semibold">{shipType?.name ?? item.ship_type_id.slice(0, 8)}</p>
                             {shipType && (
                               <p className="text-xs text-muted-foreground">
-                                Capacity {shipType.capacity} · Speed {shipType.speed} · Upkeep £{shipType.upkeep.toLocaleString()}/wk
+                                Capacity {shipType.capacity}
+                                {shipType.passengers > 0 && ` · ${shipType.passengers} passengers`}
+                                {" · "}Speed {shipType.speed} · Upkeep £{shipType.upkeep.toLocaleString()}/wk
                               </p>
                             )}
                           </div>
                           <div className="flex items-center gap-3">
                             <span className="font-mono font-semibold">£{item.cost.toLocaleString()}</span>
                             {!isExpanded && (
-                              <Button size="sm" onClick={() => openPurchaseForm(item.id)}>
+                              <Button size="sm" onClick={() => { setPurchasingItemId(item.id); setPurchaseError(null); setPurchasedShipName(null); }}>
                                 Purchase
                               </Button>
                             )}
                           </div>
                         </div>
-
                         {isExpanded && (
                           <div className="mt-3 space-y-3 rounded-md border bg-muted/40 p-3">
-                            <div className="space-y-1">
-                              <Label htmlFor={`ship-name-${item.id}`}>Name your ship</Label>
-                              <Input
-                                id={`ship-name-${item.id}`}
-                                placeholder="e.g. The Wandering Star"
-                                value={shipName}
-                                onChange={(e) => setShipName(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") confirmPurchase(item);
-                                  if (e.key === "Escape") cancelPurchase();
-                                }}
-                                disabled={purchasing}
-                                autoFocus
-                              />
-                            </div>
-
-                            {purchaseError && (
-                              <p className="text-xs text-destructive">{purchaseError}</p>
-                            )}
-
+                            <p className="text-xs text-muted-foreground">
+                              Confirm purchase of <span className="font-medium">{shipType?.name ?? "this ship"}</span> for £{item.cost.toLocaleString()}. The ship will be named by the shipyard.
+                            </p>
+                            {purchaseError && <p className="text-xs text-destructive">{purchaseError}</p>}
                             <div className="flex gap-2">
-                              <Button
-                                size="sm"
-                                onClick={() => confirmPurchase(item)}
-                                disabled={purchasing || !shipName.trim()}
-                              >
+                              <Button size="sm" onClick={() => confirmPurchase(item)} disabled={purchasing}>
                                 {purchasing ? <Spinner className="size-3" /> : "Confirm Purchase"}
                               </Button>
-                              <Button size="sm" variant="outline" onClick={cancelPurchase} disabled={purchasing}>
+                              <Button size="sm" variant="outline" onClick={() => setPurchasingItemId(null)} disabled={purchasing}>
                                 Cancel
                               </Button>
                             </div>

@@ -1,6 +1,6 @@
 import type {
-  DirectTradeRequest,
   ExecuteQuoteRequest,
+  ExecuteTradeRequest,
   Quote,
   QuoteRequest,
   TraderPosition,
@@ -57,9 +57,11 @@ export type BatchExecuteItem =
   | { status: "error"; message: string; token?: never; execution?: never };
 
 export const tradeApi = {
-  getTraderPositions: (portId?: string) =>
+  getTraders: () =>
+    api.get<{ id: string; name: string; inserted_at: string; updated_at: string }[]>("/trade/traders"),
+  getTraderPositions: (traderId?: string) =>
     api.get<TraderPosition[]>(
-      portId ? `/trade/trader-positions?port_id=${portId}` : "/trade/trader-positions",
+      traderId ? `/trade/trader-positions?trader_id=${traderId}` : "/trade/trader-positions",
     ),
   createQuote: (data: QuoteRequest): Promise<Quote> =>
     api.post<RawQuoteData>("/trade/quote", data).then(({ token, quote }) => ({
@@ -69,7 +71,7 @@ export const tradeApi = {
     })),
   executeQuote: (data: ExecuteQuoteRequest) =>
     api.post<void>("/trade/quotes/execute", data),
-  executeDirect: (data: DirectTradeRequest) =>
+  executeDirect: (data: ExecuteTradeRequest) =>
     api.post<void>("/trade/execute", data),
   batchCreateQuotes: (data: { requests: QuoteRequest[] }): Promise<BatchQuoteItem[]> =>
     api.post<BatchQuoteItem[]>("/trade/quotes/batch", data),

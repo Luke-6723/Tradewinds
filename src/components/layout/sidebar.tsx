@@ -14,6 +14,7 @@ import {
   ShoppingCartIcon,
   StoreIcon,
   TableIcon,
+  UsersIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { EventsFeed } from "@/components/layout/events-feed";
@@ -29,6 +30,7 @@ const nav = [
   { href: "/fleet",        label: "Fleet",         icon: ShipIcon },
   { href: "/warehouses",   label: "Warehouses",    icon: AnchorIcon },
   { href: "/goods",        label: "Goods",         icon: PackageIcon },
+  { href: "/passengers",   label: "Passengers",    icon: UsersIcon },
 ];
 
 export function Sidebar() {
