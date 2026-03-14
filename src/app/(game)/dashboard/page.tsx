@@ -54,11 +54,11 @@ export default function DashboardPage() {
     Promise.all([
       companyApi.getCompany(),
       companyApi.getEconomy(),
-      fetch("/api/ledger").then((r) => r.json()).catch(() => []),
+      fetch("/api/ledger").then((r) => r.ok ? r.json() : []).catch(() => []),
       fleetApi.getShips().catch(() => []),
       worldApi.getPorts().catch(() => []),
       worldApi.getGoods().catch(() => []),
-      fetch("/api/warehouses/stocks").then((r) => r.json()).catch(() => []),
+      fetch("/api/warehouses/stocks").then((r) => r.ok ? r.json() : []).catch(() => []),
     ])
       .then(([c, e, l, s, p, g, stocks]) => {
         setCompany(c);
@@ -548,7 +548,7 @@ function LedgerRow({ entry }: { entry: LedgerEntry }) {
   const dateLabel = isToday
     ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : date.toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-  const label = REASON_LABELS[entry.reason] ?? entry.reason.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  const label = REASON_LABELS[entry.reason] ?? (entry.reason ?? "unknown").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
   return (
     <div className="group flex items-center gap-3 hover:bg-muted/40 px-4 py-3 transition-colors">
