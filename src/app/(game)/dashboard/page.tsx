@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
@@ -124,44 +124,47 @@ export default function DashboardPage() {
   const treasury = company?.treasury ?? 0;
 
   // Cargo in transit: sum sell value (or cost basis) for all ships with cargo plans
-  const cargoInTransitValue = ships.reduce((sum, ship) => {
+  const cargoInTransitValue = useMemo(() => ships.reduce((sum, ship) => {
     const ss = ap.ships[ship.id];
     if (!ss?.plan?.goodId) return sum;
     const qty = ss.plan.quantity ?? 0;
     const price = ss.plan.sellPrice ?? ss.plan.actualBuyPrice ?? 0;
     return sum + qty * price;
-  }, 0);
+  }, 0), [ships, ap.ships]);
 
   // PAX bids in transit: ships in transiting_to_sell with a passenger bid
-  const paxInTransit = ships.reduce((sum, ship) => {
+  const paxInTransit = useMemo(() => ships.reduce((sum, ship) => {
     const ss = ap.ships[ship.id];
     if (ss?.phase === "transiting_to_sell" && ss.plan?.passengerBid) {
       return sum + ss.plan.passengerBid;
     }
     return sum;
-  }, 0);
+  }, 0), [ships, ap.ships]);
 
   const netProfit = ap.profitAccrued;
 
   // Total assets: treasury + cargo in transit (at cost) + pax bids
-  const cargoAtCost = ships.reduce((sum, ship) => {
+  const cargoAtCost = useMemo(() => ships.reduce((sum, ship) => {
     const ss = ap.ships[ship.id];
     if (!ss?.plan?.goodId) return sum;
     return sum + (ss.plan.actualBuyPrice ?? 0) * (ss.plan.quantity ?? 0);
-  }, 0);
+  }, 0), [ships, ap.ships]);
   const totalAssets = treasury + cargoAtCost + paxInTransit;
 
   // ── Chart data ─────────────────────────────────────────────────────────────
 
-  const validLedger = ledger.filter((e) => e.occurred_at && !isNaN(new Date(e.occurred_at).getTime()));
+  const validLedger = useMemo(
+    () => ledger.filter((e) => e.occurred_at && !isNaN(new Date(e.occurred_at).getTime())),
+    [ledger],
+  );
 
-  const profitChartData = (ap.profitHistory ?? []).map((snap) => ({
+  const profitChartData = useMemo(() => (ap.profitHistory ?? []).map((snap) => ({
     label: new Date(snap.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     cumulative: snap.cumulative,
     cycleProfit: snap.cycleProfit,
-  }));
+  })), [ap.profitHistory]);
 
-  const treasuryChartData = (() => {
+  const treasuryChartData = useMemo(() => {
     const snaps = ap.treasuryHistory ?? [];
     if (snaps.length > 1) {
       return snaps.map((snap) => ({
@@ -181,9 +184,9 @@ export default function DashboardPage() {
         balance: running,
       };
     });
-  })();
+  }, [ap.treasuryHistory, company, validLedger]);
 
-  const dailyPnlData = (() => {
+  const dailyPnlData = useMemo(() => {
     const byDay: Record<string, { day: string; income: number; expenses: number }> = {};
     for (const e of validLedger) {
       const d = new Date(e.occurred_at);
@@ -193,20 +196,20 @@ export default function DashboardPage() {
       else byDay[day].expenses += Math.abs(e.amount);
     }
     return Object.values(byDay);
-  })();
+  }, [validLedger]);
 
-  const upkeepData = economy && (economy.ship_upkeep + economy.warehouse_upkeep) > 0
+  const upkeepData = useMemo(() => economy && (economy.ship_upkeep + economy.warehouse_upkeep) > 0
     ? [
         { name: "Ships", value: economy.ship_upkeep },
         { name: "Warehouses", value: economy.warehouse_upkeep },
       ]
-    : [];
+    : [], [economy]);
   const PIE_COLORS = ["#6366f1", "#f59e0b"];
 
-  const totalLedgerNet = ledger.reduce((s, e) => s + e.amount, 0);
+  const totalLedgerNet = useMemo(() => ledger.reduce((s, e) => s + e.amount, 0), [ledger]);
 
-  const shipsInTransit = ships.filter((s) => s.status === "traveling").length;
-  const shipsDocked = ships.filter((s) => s.status !== "traveling").length;
+  const shipsInTransit = useMemo(() => ships.filter((s) => s.status === "traveling").length, [ships]);
+  const shipsDocked = useMemo(() => ships.filter((s) => s.status !== "traveling").length, [ships]);
 
   return (
     <div className="space-y-6 pb-8">

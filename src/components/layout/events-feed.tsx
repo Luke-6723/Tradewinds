@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSse } from "@/hooks/use-sse";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -26,15 +26,18 @@ export function EventsFeed({ type, className, compact }: EventsFeedProps) {
 
   // Merge: live events (newest first) + history (as background)
   // De-duplicate by timestamp+type to avoid showing the same event twice
-  const seen = new Set<string>();
-  const merged: Record<string, unknown>[] = [];
-  for (const evt of [...liveEvents, ...history]) {
-    const key = `${String(evt.type ?? "")}|${String(evt.timestamp ?? evt.receivedAt ?? "")}|${JSON.stringify(evt.data ?? evt).slice(0, 64)}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      merged.push(evt);
+  const merged = useMemo(() => {
+    const seen = new Set<string>();
+    const result: Record<string, unknown>[] = [];
+    for (const evt of [...liveEvents, ...history]) {
+      const key = `${String(evt.type ?? "")}|${String(evt.timestamp ?? evt.receivedAt ?? "")}|${JSON.stringify(evt.data ?? evt).slice(0, 64)}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push(evt);
+      }
     }
-  }
+    return result;
+  }, [liveEvents, history]);
 
   return (
     <div className={cn("flex flex-col gap-1", className)}>
