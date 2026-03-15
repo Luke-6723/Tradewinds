@@ -44,7 +44,7 @@ const SHIP_WINDOW_SIZE = 50;
 
 // ── Fleet management constants ─────────────────────────────────────────────
 /** Cycles a ship must be consecutively idle before it's a sell candidate. */
-const SELL_IDLE_CYCLES = 18;       // 3 min at 10s cycle
+const SELL_IDLE_CYCLES = 9;        // 3 min at 20s cycle
 /** Minimum fleet size — never sell below this. */
 const MIN_FLEET_SIZE = 2;
 /** Available-funds multiplier required before buying a ship. */
