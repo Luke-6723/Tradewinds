@@ -35,7 +35,7 @@ const MAX_UNITS    = 50;
 /** Sell-quote batch size per ship scan. */
 const SCAN_BATCH   = 16;
 /** Delay (ms) after docking before buying/selling (lets server process the dock). */
-const DOCK_DELAY_MS = 5_000;
+const DOCK_DELAY_MS = 0;
 /** Price level at or above which we sell from warehouse (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
 

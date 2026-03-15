@@ -26,11 +26,11 @@ function buildHeaders(init?: HeadersInit): HeadersInit {
 }
 
 
-// API limit: 300 req/60s. We target 4 req/s (240/min) for headroom.
-const RATE_LIMIT_RPS = 4;
-const REFILL_INTERVAL_MS = 1000 / RATE_LIMIT_RPS; // 250ms per token
+// API limit: ~900 req/60s = 15 req/s. We target 10 req/s for headroom.
+const RATE_LIMIT_RPS = 10;
+const REFILL_INTERVAL_MS = 1000 / RATE_LIMIT_RPS; // 125ms per token
 
-let tokens = RATE_LIMIT_RPS * 2; // start with a small burst allowance
+let tokens = RATE_LIMIT_RPS * 3; // start with a small burst allowance
 let lastRefill = Date.now();
 const waitQueue: Array<() => void> = [];
 
@@ -38,7 +38,7 @@ function refillTokens() {
   const now = Date.now();
   const newTokens = Math.floor((now - lastRefill) / REFILL_INTERVAL_MS);
   if (newTokens > 0) {
-    tokens = Math.min(tokens + newTokens, RATE_LIMIT_RPS * 2);
+    tokens = Math.min(tokens + newTokens, RATE_LIMIT_RPS * 3);
     lastRefill += newTokens * REFILL_INTERVAL_MS;
   }
 }
