@@ -169,6 +169,23 @@ async function checkCommands(): Promise<void> {
     }
 
     if (wantsEnabled && !state.enabled) {
+      // If we started before credentials were stored, try acquiring the token now
+      if (!token) {
+        try {
+          token = await doRefreshToken();
+          process.env.TRADEWINDS_TOKEN = token;
+          console.log(`[autopilot:${companyId.slice(0, 8)}] token acquired on enable`);
+        } catch (e: unknown) {
+          const msg = `⚠️ Cannot enable — token refresh failed: ${(e as Error).message}`;
+          state = appendLog(state, msg);
+          sendState();
+          return;
+        }
+      }
+      // Also resolve company ID if it was unknown at startup
+      if (companyId === "unknown") {
+        try { companyId = await resolveCompanyId(); } catch { /* keep unknown */ }
+      }
       state = { ...state, enabled: true };
       state = appendLog(state, "▶ Autopilot enabled");
       sendState();
