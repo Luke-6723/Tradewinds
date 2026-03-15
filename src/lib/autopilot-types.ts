@@ -47,6 +47,8 @@ export interface AutopilotShipState {
   cyclesActive: number;
   /** Role derived each cycle from ship type name. */
   role?: "ferry" | "multi";
+  /** When set, the ship is being routed toward a shipyard at this portId for sale. */
+  relocatingToPortId?: string;
 }
 
 export interface LogEntry {
@@ -71,8 +73,9 @@ export interface FleetMgmtState {
   lastSellAt: string | null;
   /** Ports confirmed to have a shipyard — populated lazily during fleet mgmt. */
   knownShipyardPortIds: string[];
-  /** Number of ships acquired from the secondary market (other companies' ship_sold events). */
-
+  /** Target fleet size. When ships.length > fleetTarget, idle ships are routed
+   *  to shipyard ports for sale. When ships.length < fleetTarget, buying is allowed. */
+  fleetTarget?: number;
 }
 
 export interface AutopilotState {

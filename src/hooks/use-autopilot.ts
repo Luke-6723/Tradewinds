@@ -43,6 +43,17 @@ export function useAutopilot() {
     } catch { /* ignore */ }
   }, [state.fleetMgmt?.enabled]);
 
-  return { state, toggle, toggleFleetMgmt };
+  const setFleetTarget = useCallback(async (target: number | null) => {
+    try {
+      const res = await fetch("/api/autopilot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fleetTarget: target }),
+      });
+      if (res.ok) setState(await res.json() as AutopilotState);
+    } catch { /* ignore */ }
+  }, []);
+
+  return { state, toggle, toggleFleetMgmt, setFleetTarget };
 }
 

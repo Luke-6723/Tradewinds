@@ -72,7 +72,7 @@ export default function DashboardPage() {
   const [kpis, setKpis] = useState<DashboardKpis | null>(null);
   const [credentialsStored, setCredentialsStored] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
-  const { state: ap, toggle: toggleAp, toggleFleetMgmt } = useAutopilot();
+  const { state: ap, toggle: toggleAp, toggleFleetMgmt, setFleetTarget } = useAutopilot();
 
   const fetchShipsPage = useCallback((page: number) => {
     setShipsLoading(true);
@@ -501,6 +501,12 @@ export default function DashboardPage() {
               </span>
             )}
 
+            <FleetTargetInput
+              value={ap.fleetMgmt?.fleetTarget ?? null}
+              totalShips={shipMeta.total}
+              onSave={setFleetTarget}
+            />
+
           </div>
         </CardHeader>
 
@@ -686,6 +692,55 @@ export default function DashboardPage() {
             </div>
           </CardContent>
         </Card>
+      )}
+    </div>
+  );
+}
+
+function FleetTargetInput({
+  value,
+  totalShips,
+  onSave,
+}: {
+  value: number | null;
+  totalShips: number;
+  onSave: (target: number | null) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState(value?.toString() ?? "");
+  const [saving, setSaving] = useState(false);
+
+  // Sync when remote value changes (e.g. after another tab saves)
+  useEffect(() => { setDraft(value?.toString() ?? ""); }, [value]);
+
+  const handleSave = async () => {
+    const parsed = draft.trim() === "" ? null : parseInt(draft, 10);
+    if (parsed !== null && (isNaN(parsed) || parsed < 1)) return;
+    setSaving(true);
+    await onSave(parsed);
+    setSaving(false);
+  };
+
+  const overTarget = value !== null && totalShips > value;
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-muted-foreground text-xs shrink-0">Fleet target:</span>
+      <input
+        type="number"
+        min={1}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") void handleSave(); }}
+        placeholder="no limit"
+        className="w-24 h-6 rounded border border-input bg-background px-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"
+      />
+      <Button size="sm" variant="outline" className="text-xs h-6 px-2" onClick={() => void handleSave()} disabled={saving}>
+        {saving ? "…" : "Set"}
+      </Button>
+      {value !== null && (
+        <span className={`text-xs ${overTarget ? "text-amber-500 font-semibold" : "text-muted-foreground"}`}>
+          {totalShips}/{value} {overTarget ? "⚠ over" : "✓"}
+        </span>
       )}
     </div>
   );

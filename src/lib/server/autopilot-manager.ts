@@ -45,6 +45,17 @@ export const autopilotManager = {
     return next;
   },
 
+  /** Set or clear the fleet size target. Pass undefined to remove the limit. */
+  async setFleetTarget(companyId: string, fleetTarget: number | undefined): Promise<AutopilotState> {
+    const current = await loadAutopilotState(companyId) ?? blank();
+    const next: AutopilotState = {
+      ...current,
+      fleetMgmt: { ...current.fleetMgmt, fleetTarget },
+    };
+    await saveAutopilotState(companyId, next);
+    return next;
+  },
+
   /** True when the standalone has an active command doc. */
   async isConfigured(companyId: string): Promise<boolean> {
     return (await getAutopilotCommand(companyId)) !== null;

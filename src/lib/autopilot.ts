@@ -78,6 +78,7 @@ const MIN_PAX_EXPIRY_BUFFER_MS = 2 * 60_000;  // 2 minutes (exact ETA now availa
 const MAX_PAX_CHASE_HOPS = 3;
 /** Ship type name pattern that designates a "ferry" (passenger-only) role. */
 const FERRY_TYPE_PATTERN = /caravel/i;
+const COG_TYPE_PATTERN   = /cog/i;
 
 /** Estimate travel time in ms for a given distance and ship speed. */
 function travelTimeMs(distance: number, shipSpeed: number): number {
@@ -236,45 +237,70 @@ async function runFleetManagement(
   availableFunds: number,
   allPassengers: Passenger[],
 ): Promise<AutopilotState> {
-  const fleetMgmt = s.fleetMgmt ?? { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [], secondaryBuys: 0 };
+  const fleetMgmt = s.fleetMgmt ?? { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] };
   if (!fleetMgmt.enabled) return s;
 
   const now = Date.now();
   const stMap = new Map<string, ShipType>(shipTypes.map((t: ShipType) => [t.id, t]));
+  const fleetTarget = fleetMgmt.fleetTarget ?? Infinity;
+  const overTarget = ships.length > fleetTarget;
 
-  // ── SELL: idle ships that have been stuck for 3+ minutes ─────────────────
+  // ── SELL: idle ships at shipyard ports ────────────────────────────────────
+  // When over fleet target: sell any idle ship immediately (no idle-cycle requirement).
+  // When at/under target: only sell ships that have been idle for SELL_IDLE_CYCLES.
   const canSell =
     !fleetMgmt.lastSellAt ||
     now - new Date(fleetMgmt.lastSellAt).getTime() > SELL_COOLDOWN_MS;
 
   if (canSell && ships.length > MIN_FLEET_SIZE) {
-    for (const ship of ships) {
-      if (ship.status === "traveling" || !ship.port_id) continue;
+    // Prioritise Cogs for selling; never sell ferries
+    const sellCandidates = ships
+      .filter((sh) => sh.status !== "traveling" && sh.port_id)
+      .sort((a, b) => {
+        const aCog = COG_TYPE_PATTERN.test(stMap.get(a.ship_type_id)?.name ?? "") ? 0 : 1;
+        const bCog = COG_TYPE_PATTERN.test(stMap.get(b.ship_type_id)?.name ?? "") ? 0 : 1;
+        return aCog - bCog;
+      });
+    for (const ship of sellCandidates) {
+      if (!ship.port_id) continue;
       const ss = s.ships[ship.id];
       if (!ss || ss.role === "ferry") continue; // ferries are never auto-sold
-      if (ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
+      if (!overTarget && ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
 
       try {
         const sy = await shipyardsApi.getPortShipyard(ship.port_id);
         if (!fleetMgmt.knownShipyardPortIds.includes(ship.port_id)) {
-          s = { ...s, fleetMgmt: { ...fleetMgmt, knownShipyardPortIds: [...fleetMgmt.knownShipyardPortIds, ship.port_id] } };
+          s = { ...s, fleetMgmt: { ...s.fleetMgmt!, knownShipyardPortIds: [...fleetMgmt.knownShipyardPortIds, ship.port_id] } };
         }
         const result = await shipyardsApi.sellShip(sy.id, ship.id);
         s.profitAccrued += result.price;
         const { [ship.id]: _, ...remainingShips } = s.ships;
-        s = { ...s, ships: remainingShips, fleetMgmt: { ...fleetMgmt, lastSellAt: new Date().toISOString() } };
-        s = appendLog(s, `💰 Sold ${ship.name} @ £${result.price.toLocaleString()} (idle ${ss.cyclesIdle} cycles)`);
+        s = { ...s, ships: remainingShips, fleetMgmt: { ...s.fleetMgmt!, lastSellAt: new Date().toISOString() } };
+        const reason = overTarget ? `over target (${ships.length}/${fleetTarget})` : `idle ${ss.cyclesIdle} cycles`;
+        s = appendLog(s, `💰 Sold ${ship.name} @ £${result.price.toLocaleString()} (${reason})`);
         break; // one sell per cycle
       } catch { /* no shipyard at this port — try next */ }
     }
   }
 
-  // ── BUY: expand fleet when profitable and unbalanced ─────────────────────
+  // ── RELOCATE: tag idle ships at non-shipyard ports toward a shipyard ──────
+  // Handled in runCycle (where getPathsFrom is in scope) via runRelocations().
+  // Here we only clear stale tags when back under target.
+  if (!overTarget) {
+    const updatedShips = { ...s.ships };
+    let cleared = false;
+    for (const [id, ss] of Object.entries(updatedShips)) {
+      if (ss.relocatingToPortId) { updatedShips[id] = { ...ss, relocatingToPortId: undefined }; cleared = true; }
+    }
+    if (cleared) s = { ...s, ships: updatedShips };
+  }
+
+  // ── BUY: expand fleet when profitable, unbalanced, and under target ─────────────────────
   const canBuy =
     !fleetMgmt.lastBuyAt ||
     now - new Date(fleetMgmt.lastBuyAt).getTime() > BUY_COOLDOWN_MS;
 
-  if (canBuy) {
+  if (canBuy && !overTarget) {
     const stMap2 = stMap; // already defined above
     const ferryCount = ships.filter((sh: Ship) => FERRY_TYPE_PATTERN.test(stMap2.get(sh.ship_type_id)?.name ?? "")).length;
     const activePortCount = new Set(allPassengers.map((p) => p.origin_port_id)).size;
@@ -751,6 +777,37 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
     console.log(`[runCycle:cands] ${uniqueDockedPorts.size} ports pre-computed in ${((Date.now() - candidatesT0) / 1000).toFixed(1)}s`);
 
+    // ── Tag ships for relocation when over fleet target ────────────────────
+    // Must run after getPathsFrom is available. Cogs first; ferries excluded.
+    {
+      const fm = s.fleetMgmt;
+      const fleetTarget = fm?.fleetTarget ?? Infinity;
+      if (ships.length > fleetTarget && (fm?.knownShipyardPortIds.length ?? 0) > 0) {
+        const knownYards = fm!.knownShipyardPortIds;
+        const relocCandidates = ships
+          .filter((sh) => sh.status !== "traveling" && sh.port_id)
+          .sort((a, b) => {
+            const aCog = COG_TYPE_PATTERN.test(stMap.get(a.ship_type_id)?.name ?? "") ? 0 : 1;
+            const bCog = COG_TYPE_PATTERN.test(stMap.get(b.ship_type_id)?.name ?? "") ? 0 : 1;
+            return aCog - bCog;
+          });
+        for (const sh of relocCandidates) {
+          if (!sh.port_id) continue;
+          const ss = s.ships[sh.id];
+          if (!ss || ss.role === "ferry") continue;
+          if (knownYards.includes(sh.port_id)) continue;
+          if (ss.relocatingToPortId) continue;
+          const nearest = knownYards
+            .map((pid) => ({ portId: pid, path: getPathsFrom(sh.port_id!).find((p) => p.destPortId === pid) }))
+            .filter((x): x is { portId: string; path: NonNullable<typeof x.path> } => x.path != null)
+            .sort((a, b) => a.path.totalDistance - b.path.totalDistance)[0];
+          if (!nearest) continue;
+          s = { ...s, ships: { ...s.ships, [sh.id]: { ...ss, relocatingToPortId: nearest.portId } } };
+          s = appendLog(s, `🏴 ${sh.name}: queued for relocation → ${portName(nearest.portId)} (fleet ${ships.length}/${fleetTarget})`);
+        }
+      }
+    }
+
     // Inline inventory fetch helper — now just reads from the pre-populated cache
     const fetchShipInv = (shipId: string): Cargo[] => shipInventoryCache.get(shipId) ?? [];
 
@@ -791,6 +848,28 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       const shipInv = fetchShipInv(ship.id);
       const usedCapacity = shipInv.reduce((sum, c) => sum + c.quantity, 0);
       const freeCapacity = Math.max(0, capacity - usedCapacity);
+
+      // ── RELOCATION: route ship toward a shipyard port for sale ───────────
+      if (ss.phase === "idle" && ss.relocatingToPortId) {
+        const targetPortId = ss.relocatingToPortId;
+        const relocPaths = getPathsFrom(ship.port_id);
+        const relocPath = relocPaths.find((p) => p.destPortId === targetPortId);
+        if (relocPath && relocPath.legs.length > 0) {
+          const ssBeforeReloc = ss;
+          const relocPlan: ShipPlan = { sellPortId: targetPortId, legs: relocPath.legs.slice(1) };
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: relocPlan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+          s = appendLog(s, `🏴 ${ship.name}: relocating → ${portName(targetPortId)} for sale`);
+          await dispatchTransit(ship.id, relocPath.legs[0].routeId, (msg) => {
+            s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeReloc } };
+            s = appendLog(s, `${ship.name}: relocation dispatch failed — ${msg}`);
+          });
+          shipsActioned++;
+          continue;
+        } else if (ship.port_id === targetPortId) {
+          // Arrived — clear the tag, let fleet management sell it next cycle
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, relocatingToPortId: undefined } } };
+        }
+      }
 
       // ══════════════════════════════════════════════════════════════════════════
       // IDLE — board passengers + scan for cargo, then dispatch
