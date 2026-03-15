@@ -164,6 +164,7 @@ async function checkCommands(): Promise<void> {
     }
 
     const cmd = await getAutopilotCommand(companyId);
+    console.log(`[debug:poll] companyId=${companyId}, cmd=${cmd ? `enabled=${cmd.enabled}, updatedAt=${cmd.updatedAt.toISOString()}` : "null"}`);
     if (!cmd) return;
 
     // Skip if nothing changed
@@ -217,6 +218,18 @@ setInterval(() => void checkCommands(), 2_000);
 // ── Init ───────────────────────────────────────────────────────────────────────
 
 async function init(): Promise<void> {
+  // [DEBUG] Log MongoDB URI presence without revealing value
+  console.log(`[debug] MONGODB_URI set: ${!!process.env.MONGODB_URI} (length: ${(process.env.MONGODB_URI ?? "").length})`);
+
+  // [DEBUG] Test raw DB connection
+  const { getDb: getDbDebug } = await import("@/lib/db/mongodb");
+  const dbDebug = await getDbDebug();
+  console.log(`[debug] getDb() returned: ${dbDebug ? "connected (db=" + dbDebug.databaseName + ")" : "null"}`);
+
+  // [DEBUG] Test credential lookup directly
+  const rawCreds = await getAutopilotCredentials();
+  console.log(`[debug] getAutopilotCredentials() returned: ${rawCreds ? `email=${rawCreds.email}, companyId=${rawCreds.companyId ?? "(none)"}` : "null"}`);
+
   // Resolve company ID from env or MongoDB
   try {
     companyId = await resolveCompanyId();
