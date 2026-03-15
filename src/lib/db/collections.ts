@@ -202,6 +202,7 @@ export interface AutopilotCommand {
   companyId: string;
   enabled: boolean;
   fleetMgmt: { enabled: boolean };
+  fleetTarget?: number | null;
   updatedAt: Date;
 }
 
@@ -227,6 +228,19 @@ export async function saveAutopilotCommandFleetMgmt(
   await db.collection<AutopilotCommand>("autopilot_commands").updateOne(
     { companyId },
     { $set: { companyId, fleetMgmt, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
+export async function saveAutopilotCommandFleetTarget(
+  companyId: string,
+  fleetTarget: number | null | undefined,
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<AutopilotCommand>("autopilot_commands").updateOne(
+    { companyId },
+    { $set: { companyId, fleetTarget: fleetTarget ?? null, updatedAt: new Date() } },
     { upsert: true },
   );
 }

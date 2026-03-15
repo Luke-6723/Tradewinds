@@ -12,6 +12,7 @@ import {
   saveAutopilotState,
   saveAutopilotCommandEnabled,
   saveAutopilotCommandFleetMgmt,
+  saveAutopilotCommandFleetTarget,
   getAutopilotCommand,
 } from "@/lib/db/collections";
 import { blank, type AutopilotState } from "@/lib/autopilot-types";
@@ -45,15 +46,12 @@ export const autopilotManager = {
     return next;
   },
 
-  /** Set or clear the fleet size target. Pass undefined to remove the limit. */
+  /** Set or clear the fleet size target. Written to the command doc so the
+   *  standalone picks it up within 2 s without losing its in-memory state. */
   async setFleetTarget(companyId: string, fleetTarget: number | undefined): Promise<AutopilotState> {
-    const current = await loadAutopilotState(companyId) ?? blank();
-    const next: AutopilotState = {
-      ...current,
-      fleetMgmt: { ...current.fleetMgmt, fleetTarget },
-    };
-    await saveAutopilotState(companyId, next);
-    return next;
+    await saveAutopilotCommandFleetTarget(companyId, fleetTarget ?? null);
+    // Return current state so the dashboard can update optimistically
+    return (await loadAutopilotState(companyId)) ?? blank();
   },
 
   /** True when the standalone has an active command doc. */

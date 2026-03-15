@@ -185,6 +185,13 @@ async function checkCommands(): Promise<void> {
       sendState();
     }
 
+    // Apply fleet target from command doc (dashboard writes here; worker owns state)
+    const wantsFleetTarget: number | undefined = cmd.fleetTarget ?? undefined;
+    if (wantsFleetTarget !== state.fleetMgmt?.fleetTarget) {
+      state = { ...state, fleetMgmt: { ...state.fleetMgmt, fleetTarget: wantsFleetTarget } };
+      sendState();
+    }
+
     if (wantsEnabled && !state.enabled) {
       // If we started before credentials were stored, try acquiring the token now
       if (!token) {
