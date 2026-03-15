@@ -47,7 +47,9 @@ const C = {
   capeWrath:      [58.6,  -5.0] as [number, number], // Cape Wrath, NW Scotland
   northScotSea:   [58.2,  -2.5] as [number, number], // NE of Scotland, open North Sea
   humberMouth:    [53.6,   0.1] as [number, number], // off Humber mouth, North Sea
-  // Iberian / Med
+  // Iberian / Atlantic / Med
+  ushant:         [48.5,  -5.5] as [number, number], // off Ushant/Finistère, NW France
+  bayOfBiscay:    [44.5,  -9.0] as [number, number], // Bay of Biscay, well clear of Spain
   caboCape:       [37.0,  -9.5] as [number, number], // Cape St Vincent, SW Iberia
   gibraltarStr:   [35.9,  -5.4] as [number, number], // Strait of Gibraltar
   gulfOfLion:     [42.5,   3.5] as [number, number], // Gulf of Lion
@@ -138,6 +140,39 @@ export const SEA_LANE_WAYPOINTS: Record<string, Array<[number, number]>> = {
 };
 
 /** Return waypoints for a route between two named ports, regardless of order. */
+
+// Per North Sea port: waypoints from that port out to the Atlantic (near Ushant)
+const NS_TO_ATLANTIC: Record<string, Array<[number, number]>> = {
+  Hamburg:    [C.doverStrait, C.westChannel, C.ushant],
+  Bremen:     [C.doverStrait, C.westChannel, C.ushant],
+  Amsterdam:  [C.doverStrait, C.westChannel, C.ushant],
+  Antwerp:    [C.doverStrait, C.westChannel, C.ushant],
+  Calais:     [C.westChannel, C.ushant],
+  Dunkirk:    [C.westChannel, C.ushant],
+  Rotterdam:  [C.westChannel, C.ushant],
+  London:     [C.westChannel, C.ushant],
+  Portsmouth: [C.westChannel, C.ushant],
+  Hull:       [C.humberMouth, C.doverStrait, C.westChannel, C.ushant],
+  Plymouth:   [C.lizardPoint, C.ushant],
+  Bristol:    [C.bristolChannel, C.celticSea, C.ushant],
+  Dublin:     [C.offSEIreland, C.celticSea, C.ushant],
+  Edinburgh:  [C.northScotSea, C.humberMouth, C.doverStrait, C.westChannel, C.ushant],
+  Glasgow:    [C.northChannel, C.offSEIreland, C.celticSea, C.ushant],
+};
+
+// Per Mediterranean port: waypoints from Gibraltar heading east into that port
+const GIB_TO_MED: Record<string, Array<[number, number]>> = {
+  Barcelona:  [C.gulfOfLion],
+  Cartagena:  [],                             // Alboran Sea — all water, no waypoints needed
+  Marseille:  [C.gulfOfLion],
+  Genoa:      [C.gulfOfLion],
+  Naples:     [C.sardiniaCh],
+  Venice:     [C.sardiniaCh, C.adriaticS],
+  Piraeus:    [C.sardiniaCh, C.aegeanS],
+  Istanbul:   [C.sardiniaCh, C.aegeanS],
+  Alexandria: [C.sardiniaCh, C.aegeanS],
+};
+
 export function seaLaneWaypoints(
   fromName: string,
   toName: string,
@@ -145,9 +180,35 @@ export function seaLaneWaypoints(
   const key1 = `${fromName}:${toName}`;
   const key2 = `${toName}:${fromName}`;
   const pts = SEA_LANE_WAYPOINTS[key1] ?? SEA_LANE_WAYPOINTS[key2];
-  if (!pts) return [];
-  // If direction is reversed, reverse the waypoints too
-  return SEA_LANE_WAYPOINTS[key2] && !SEA_LANE_WAYPOINTS[key1] ? [...pts].reverse() : pts;
+  if (pts) {
+    return SEA_LANE_WAYPOINTS[key2] && !SEA_LANE_WAYPOINTS[key1] ? [...pts].reverse() : pts;
+  }
+
+  const fromIsNS = fromName in NS_TO_ATLANTIC;
+  const toIsNS   = toName   in NS_TO_ATLANTIC;
+  const fromMedWpts = GIB_TO_MED[fromName];
+  const toMedWpts   = GIB_TO_MED[toName];
+
+  // North Sea ↔ Lisbon (Lisbon is Atlantic-facing; no Gibraltar needed)
+  if (fromIsNS && toName === "Lisbon") {
+    return [...NS_TO_ATLANTIC[fromName], C.bayOfBiscay, C.caboCape];
+  }
+  if (fromName === "Lisbon" && toIsNS) {
+    return [C.caboCape, C.bayOfBiscay, ...[...NS_TO_ATLANTIC[toName]].reverse()];
+  }
+
+  // North Sea → Mediterranean (via Bay of Biscay + Gibraltar)
+  if (fromIsNS && toMedWpts !== undefined) {
+    return [...NS_TO_ATLANTIC[fromName], C.bayOfBiscay, C.caboCape, C.gibraltarStr, ...toMedWpts];
+  }
+
+  // Mediterranean → North Sea (reverse of the above)
+  if (fromMedWpts !== undefined && toIsNS) {
+    const medToGib = [...fromMedWpts].reverse() as Array<[number, number]>;
+    return [...medToGib, C.gibraltarStr, C.caboCape, C.bayOfBiscay, ...[...NS_TO_ATLANTIC[toName]].reverse()];
+  }
+
+  return [];
 }
 
 export function buildMST(routes: Route[]): Set<string> {
