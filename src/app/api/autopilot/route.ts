@@ -23,9 +23,9 @@ export async function POST(req: NextRequest) {
   }
   const body = await req.json() as { enabled?: boolean; fleetMgmt?: boolean };
   if (body.fleetMgmt !== undefined) {
-    const state = autopilotManager.setFleetMgmtEnabled(companyId, token, body.fleetMgmt);
+    const state = await autopilotManager.setFleetMgmtEnabled(companyId, token, body.fleetMgmt);
     return NextResponse.json(state);
   }
-  const state = autopilotManager.setEnabled(companyId, token, body.enabled ?? false);
+  const state = await autopilotManager.setEnabled(companyId, token, body.enabled ?? false);
   return NextResponse.json(state);
 }

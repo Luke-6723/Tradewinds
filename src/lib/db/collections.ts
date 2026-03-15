@@ -163,6 +163,7 @@ export interface StoredCredentials {
   key: "singleton";
   email: string;
   password: string;
+  companyId?: string;
   updatedAt: Date;
 }
 
@@ -171,12 +172,22 @@ export async function saveAutopilotCredentials(email: string, password: string):
   if (!db) return;
   await db.collection<StoredCredentials>("autopilot_credentials").updateOne(
     { key: "singleton" },
-    { $set: { key: "singleton", email, password, updatedAt: new Date() } },
+    { $set: { email, password, updatedAt: new Date() } },
     { upsert: true },
   );
 }
 
-export async function getAutopilotCredentials(): Promise<{ email: string; password: string } | null> {
+export async function saveAutopilotCompanyId(companyId: string): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<StoredCredentials>("autopilot_credentials").updateOne(
+    { key: "singleton" },
+    { $set: { companyId, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
+export async function getAutopilotCredentials(): Promise<{ email: string; password: string; companyId?: string } | null> {
   const db = await getDb();
   if (!db) return null;
   const doc = await db.collection<StoredCredentials>("autopilot_credentials").findOne({ key: "singleton" });
