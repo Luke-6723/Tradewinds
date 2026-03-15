@@ -59,6 +59,12 @@ const MAX_WAREHOUSE_STOCK = 100;
 /** Maximum distinct good types to stock per warehouse. */
 const MAX_WAREHOUSE_GOODS = 2;
 
+// ── Passenger-chasing constants ────────────────────────────────────────────
+/** Minimum time remaining on a passenger before we bother chasing them (ms). */
+const MIN_PAX_EXPIRY_BUFFER_MS = 10 * 60_000;  // 10 minutes
+/** Maximum route hops an idle ship will travel to reach passengers. */
+const MAX_PAX_CHASE_HOPS = 3;
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ── Ship names ─────────────────────────────────────────────────────────────────
@@ -878,8 +884,50 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           }
 
         } else {
-          s = appendLog(s, `${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesIdle: ss.cyclesIdle + 1, cyclesActive: ss.cyclesActive + 1 } } };
+          // ── No cargo opportunity — try chasing passengers at nearby ports ────
+          let chasedPax = false;
+          if ((shipType?.passengers ?? 0) > 0) {
+            const now = Date.now();
+            const paxPaths = findPaths(ship.port_id, allRoutes, MAX_PAX_CHASE_HOPS);
+
+            // Collect remote passengers with enough time remaining, scored by bid/distance
+            const candidates = allPassengers
+              .filter((p) =>
+                p.origin_port_id !== ship.port_id &&
+                new Date(p.expires_at).getTime() - now > MIN_PAX_EXPIRY_BUFFER_MS,
+              )
+              .map((p) => {
+                const path = paxPaths.find((pa) => pa.destPortId === p.origin_port_id);
+                if (!path) return null;
+                return { pax: p, path, score: p.bid / path.totalDistance };
+              })
+              .filter((c): c is NonNullable<typeof c> => c !== null)
+              .sort((a, b) => b.score - a.score);
+
+            const best = candidates[0];
+            if (best) {
+              try {
+                await fleetApi.transit(ship.id, { route_id: best.path.legs[0].routeId });
+                s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan: {
+                  goodId: "", goodName: "",
+                  quantity: 0, actualBuyPrice: 0,
+                  buyPortId: best.pax.origin_port_id,
+                  sellPortId: best.pax.destination_port_id, sellPrice: 0,
+                  sellLegs: [], legs: best.path.legs.slice(1),
+                  passengerBid: best.pax.bid,
+                }, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+                s = appendLog(s, `${ship.name}: 🧳 chasing pax → ${portName(best.pax.origin_port_id)} (£${best.pax.bid}, ${Math.round((new Date(best.pax.expires_at).getTime() - now) / 60000)}m left)`);
+                chasedPax = true;
+              } catch (e: unknown) {
+                s = appendLog(s, `${ship.name}: pax-chase dispatch failed — ${(e as Error).message}`);
+              }
+            }
+          }
+
+          if (!chasedPax) {
+            s = appendLog(s, `${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesIdle: ss.cyclesIdle + 1, cyclesActive: ss.cyclesActive + 1 } } };
+          }
         }
 
       // ══════════════════════════════════════════════════════════════════════════
@@ -908,6 +956,14 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         // Arrived at buy port
         await sleep(DOCK_DELAY_MS);
+
+        // Passenger-chase: arrived at origin port — reset to idle so the passenger
+        // boarding logic in the idle branch picks them up this cycle.
+        if (!plan.goodId) {
+          s = appendLog(s, `${ship.name}: arrived at ${portName(ship.port_id)} to board pax`);
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
+          continue;
+        }
 
         let boughtQty = 0;
         let actualBuyPrice = 0;
