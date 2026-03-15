@@ -5,19 +5,17 @@
  * Uses CartoDB Dark Matter tiles — no API key needed.
  */
 
-import { useEffect, useRef } from "react";
 import {
   MapContainer,
   TileLayer,
   CircleMarker,
   Polyline,
   Tooltip,
-  useMap,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import type { Port, Route, Ship } from "@/lib/types";
 import type { AutopilotState } from "@/lib/autopilot-types";
-import { PORT_COORDS } from "@/lib/map-data";
+import { PORT_COORDS, seaLaneWaypoints } from "@/lib/map-data";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 interface Props {
@@ -65,26 +63,6 @@ function shipLatLng(
   return null;
 }
 
-// ── Sub-component: fly to hovered ship ────────────────────────────────────
-function FlyToHovered({ ships, portById, routeById, hovered }: {
-  ships: Ship[];
-  portById: Map<string, Port>;
-  routeById: Map<string, Route>;
-  hovered: string | null;
-}) {
-  const map = useMap();
-  const prev = useRef<string | null>(null);
-  useEffect(() => {
-    if (!hovered || hovered === prev.current) return;
-    prev.current = hovered;
-    const ship = ships.find((s) => s.id === hovered);
-    if (!ship) return;
-    const pos = shipLatLng(ship, portById, routeById);
-    if (pos) map.flyTo(pos, map.getZoom(), { duration: 0.6 });
-  }, [hovered, ships, portById, routeById, map]);
-  return null;
-}
-
 // ── Resolve coords for an ordered list of port IDs ────────────────────────
 function portChain(
   portIds: string[],
@@ -122,10 +100,6 @@ export default function LeafletMap({
         url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
       />
 
-      <FlyToHovered
-        ships={ships} portById={portById} routeById={routeById} hovered={hovered}
-      />
-
       {/* Route lines — full network always visible; active routes highlighted */}
       {routes.map((r) => {
         const isActive      = activeRouteIds.has(r.id);
@@ -139,10 +113,13 @@ export default function LeafletMap({
         const to   = PORT_COORDS[toPort.name];
         if (!from || !to) return null;
 
+        const via = seaLaneWaypoints(fromPort.name, toPort.name);
+        const positions: Array<[number, number]> = [from, ...via, to];
+
         return (
           <Polyline
             key={r.id}
-            positions={[from, to]}
+            positions={positions}
             pathOptions={
               isActive
                 ? { color: "#7dd3fc", weight: 2.5, dashArray: "8 6", opacity: 0.85 }
