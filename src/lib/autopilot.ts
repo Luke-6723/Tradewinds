@@ -390,7 +390,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     const windowOffset = dockedShips.length > 0 ? (s.shipWindowOffset ?? 0) % dockedShips.length : 0;
     const windowEnd = Math.min(windowOffset + SHIP_WINDOW_SIZE, dockedShips.length);
     const windowShips = dockedShips.slice(windowOffset, windowEnd);
-    const windowShipIds = new Set(windowShips.map((sh) => sh.id));
     const nextWindowOffset = windowEnd >= dockedShips.length ? 0 : windowEnd;
     console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, window=${windowOffset}–${windowEnd - 1}, companyId=${companyId}`);
     console.log(`[runCycle:fetch] data ready in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
@@ -678,25 +677,24 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     const shipLoopStart = Date.now();
     let shipsActioned = 0;
-    let loopIdx = 0;
+
+    // Pass 1: traveling ships — cheap metric tick over all ships (no API calls)
     for (const ship of ships) {
-      loopIdx++;
-      if (loopIdx % 50 === 0) {
-        console.log(`[runCycle:loop] ${loopIdx}/${ships.length} ships, ${shipsActioned} actioned, ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
-      }
-      if (ship.status === "traveling") {
-        // Ship is en route — keep metrics ticking but don't idle-count it.
-        // Also set role here so it's visible even when the ship never docks.
-        const tss = s.ships[ship.id] ?? defaultShipState();
-        const travelingShipType = stMap.get(ship.ship_type_id);
-        const travelingRole: "ferry" | "multi" = FERRY_TYPE_PATTERN.test(travelingShipType?.name ?? "") ? "ferry" : "multi";
-        s = { ...s, ships: { ...s.ships, [ship.id]: { ...tss, role: travelingRole, cyclesActive: tss.cyclesActive + 1, cyclesIdle: 0 } } };
-        continue;
+      if (ship.status !== "traveling") continue;
+      const tss = s.ships[ship.id] ?? defaultShipState();
+      const travelingShipType = stMap.get(ship.ship_type_id);
+      const travelingRole: "ferry" | "multi" = FERRY_TYPE_PATTERN.test(travelingShipType?.name ?? "") ? "ferry" : "multi";
+      s = { ...s, ships: { ...s.ships, [ship.id]: { ...tss, role: travelingRole, cyclesActive: tss.cyclesActive + 1, cyclesIdle: 0 } } };
+    }
+
+    // Pass 2: docked ships in the current window — full routing logic
+    let windowIdx = 0;
+    for (const ship of windowShips) {
+      windowIdx++;
+      if (windowIdx % 10 === 0) {
+        console.log(`[runCycle:loop] ${windowIdx}/${windowShips.length} window ships, ${shipsActioned} actioned, ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
       }
       if (!ship.port_id) continue;
-
-      // Skip docked ships outside the current window — they'll be handled in a future cycle
-      if (!windowShipIds.has(ship.id)) continue;
 
       const ss = s.ships[ship.id] ?? defaultShipState();
       const shipType = stMap.get(ship.ship_type_id);
