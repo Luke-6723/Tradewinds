@@ -5,6 +5,7 @@
  * Uses CartoDB Dark Matter tiles — no API key needed.
  */
 
+import { useState, useEffect } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -31,11 +32,44 @@ interface Props {
   onPortHover:  (id: string | null) => void;
 }
 
+/** Interpolate a position at fraction t along a polyline (0 = start, 1 = end). */
+function interpolatePolyline(
+  coords: Array<[number, number]>,
+  t: number,
+): [number, number] {
+  if (coords.length === 0) return [0, 0];
+  if (t <= 0) return coords[0];
+  if (t >= 1) return coords[coords.length - 1];
+
+  const segLens: number[] = [];
+  let totalLen = 0;
+  for (let i = 1; i < coords.length; i++) {
+    const d = Math.hypot(coords[i][0] - coords[i - 1][0], coords[i][1] - coords[i - 1][1]);
+    segLens.push(d);
+    totalLen += d;
+  }
+
+  let acc = 0;
+  const target = t * totalLen;
+  for (let i = 0; i < segLens.length; i++) {
+    if (acc + segLens[i] >= target) {
+      const segT = segLens[i] > 0 ? (target - acc) / segLens[i] : 0;
+      return [
+        coords[i][0] + segT * (coords[i + 1][0] - coords[i][0]),
+        coords[i][1] + segT * (coords[i + 1][1] - coords[i][1]),
+      ];
+    }
+    acc += segLens[i];
+  }
+  return coords[coords.length - 1];
+}
+
 // ── Ship position helper ───────────────────────────────────────────────────
 function shipLatLng(
   ship: Ship,
   portById: Map<string, Port>,
   routeById: Map<string, Route>,
+  geoRoutes: Map<string, Array<[number, number]>>,
 ): [number, number] | null {
   if (ship.port_id) {
     const port = portById.get(ship.port_id);
@@ -58,6 +92,14 @@ function shipLatLng(
       const estTotalMs = route.distance * 60_000;
       t = Math.max(0, Math.min(1, 1 - remMs / estTotalMs));
     }
+
+    // Use GeoJSON polyline for accurate sea-lane position if available
+    const coords =
+      geoRoutes.get(`${fromPort.name}:${toPort.name}`) ??
+      geoRoutes.get(`${toPort.name}:${fromPort.name}`)?.slice().reverse() as
+        Array<[number, number]> | undefined;
+
+    if (coords && coords.length >= 2) return interpolatePolyline(coords, t);
     return [from[0] + t * (to[0] - from[0]), from[1] + t * (to[1] - from[1])];
   }
   return null;
@@ -81,6 +123,31 @@ export default function LeafletMap({
   ports, routes, ships, portById, routeById, ap,
   hovered, onHover, hoveredPort, onPortHover,
 }: Props) {
+
+  // Keyed "FromPort:ToPort" → [lat, lon][] from the server GeoJSON
+  const [geoRoutes, setGeoRoutes] = useState<Map<string, Array<[number, number]>>>(new Map());
+
+  useEffect(() => {
+    fetch("https://tradewinds.fly.dev/assets/routes.json")
+      .then((r) => r.json())
+      .then((fc: {
+        features: Array<{
+          properties: { from: string; to: string };
+          geometry:   { coordinates: number[][] };
+        }>;
+      }) => {
+        const map = new Map<string, Array<[number, number]>>();
+        for (const f of fc.features) {
+          // GeoJSON stores [lon, lat]; Leaflet needs [lat, lon]
+          map.set(
+            `${f.properties.from}:${f.properties.to}`,
+            f.geometry.coordinates.map(([lon, lat]) => [lat, lon] as [number, number]),
+          );
+        }
+        setGeoRoutes(map);
+      })
+      .catch(() => { /* fall back to seaLaneWaypoints */ });
+  }, []);
 
   // Set of route IDs actively being traveled
   const activeRouteIds = new Set(ships.map((s) => s.route_id).filter(Boolean) as string[]);
@@ -115,8 +182,15 @@ export default function LeafletMap({
         const to   = PORT_COORDS[toPort.name];
         if (!from || !to) return null;
 
-        const via = seaLaneWaypoints(fromPort.name, toPort.name);
-        const positions: Array<[number, number]> = [from, ...via, to];
+        // Prefer GeoJSON sea-lane coords; fall back to manual waypoints
+        const geoCoords =
+          geoRoutes.get(`${fromPort.name}:${toPort.name}`) ??
+          geoRoutes.get(`${toPort.name}:${fromPort.name}`)?.slice().reverse() as
+            Array<[number, number]> | undefined;
+
+        const positions: Array<[number, number]> = geoCoords && geoCoords.length >= 2
+          ? geoCoords
+          : [from, ...seaLaneWaypoints(fromPort.name, toPort.name), to];
 
         return (
           <Polyline
@@ -209,7 +283,7 @@ export default function LeafletMap({
 
       {/* Ship markers */}
       {ships.map((ship) => {
-        const pos    = shipLatLng(ship, portById, routeById);
+        const pos    = shipLatLng(ship, portById, routeById, geoRoutes);
         if (!pos) return null;
         const docked  = !!ship.port_id;
         const isHov   = hovered === ship.id;
@@ -259,3 +333,5 @@ export default function LeafletMap({
     </MapContainer>
   );
 }
+
+
