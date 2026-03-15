@@ -109,9 +109,9 @@ export default function LeafletMap({
 
   return (
     <MapContainer
-      center={[53, 2]}
-      zoom={5}
-      minZoom={4}
+      center={[44, 8]}
+      zoom={4}
+      minZoom={3}
       maxZoom={10}
       style={{ height: "100%", width: "100%", background: "#0d1b2a" }}
       zoomControl={true}
@@ -126,13 +126,11 @@ export default function LeafletMap({
         ships={ships} portById={portById} routeById={routeById} hovered={hovered}
       />
 
-      {/* Route lines — active ships only, plus port-hover highlights */}
+      {/* Route lines — full network always visible; active routes highlighted */}
       {routes.map((r) => {
         const isActive      = activeRouteIds.has(r.id);
         const isPortHovered = hoveredPort !== null &&
           (r.from_id === hoveredPort || r.to_id === hoveredPort);
-
-        if (!isActive && !isPortHovered) return null;
 
         const fromPort = portById.get(r.from_id);
         const toPort   = portById.get(r.to_id);
@@ -146,11 +144,11 @@ export default function LeafletMap({
             key={r.id}
             positions={[from, to]}
             pathOptions={
-              isPortHovered && !isActive
-                ? { color: "#a78bfa", weight: 2, dashArray: "6 5", opacity: 0.75 }
-                : isActive
+              isActive
                 ? { color: "#7dd3fc", weight: 2.5, dashArray: "8 6", opacity: 0.85 }
-                : { color: "#a78bfa", weight: 1.5, dashArray: "6 5", opacity: 0.6 }
+                : isPortHovered
+                ? { color: "#a78bfa", weight: 2, dashArray: "6 5", opacity: 0.75 }
+                : { color: "#334155", weight: 1, dashArray: undefined, opacity: 0.6 }
             }
           />
         );
