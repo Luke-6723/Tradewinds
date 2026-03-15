@@ -1,4 +1,4 @@
-export const CYCLE_MS = 10_000;
+export const CYCLE_MS = 20_000;
 export const MAX_LOG = 30;
 export const MAX_PROFIT_HISTORY = 200;
 
