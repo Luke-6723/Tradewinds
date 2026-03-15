@@ -1,5 +1,7 @@
 import type { ApiError } from "@/lib/types";
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 // ── Environment detection ────────────────────────────────────────────────────
 // In the browser: use the Next.js proxy at /api (it adds auth headers).
 // In Node.js (worker process): call the upstream API directly with auth headers.
@@ -88,20 +90,38 @@ function formatErrors(errors: Record<string, string | string[]> | undefined): st
     .join("; ");
 }
 
-const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RETRIES = 2;
 
 async function requestCore(
   path: string,
   options: RequestInit = {},
+  attempt = 0,
 ): Promise<Response> {
   await acquireToken();
 
   const url = `${BASE_URL}${path}`;
-  const res = await fetch(url, {
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    headers: buildHeaders(options.headers),
-    ...options,
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: buildHeaders(options.headers),
+      ...options,
+    });
+  } catch (e) {
+    // Timeout or network error — retry on idempotent methods
+    if (attempt < MAX_RETRIES && (!options.method || options.method === "GET")) {
+      await sleep(1_000 * (attempt + 1));
+      return requestCore(path, options, attempt + 1);
+    }
+    throw e;
+  }
+
+  // Retry on 5xx for idempotent methods
+  if (res.status >= 500 && attempt < MAX_RETRIES && (!options.method || options.method === "GET")) {
+    await sleep(1_000 * (attempt + 1));
+    return requestCore(path, options, attempt + 1);
+  }
 
   if (!res.ok) {
     let body: ApiError;
