@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { blank, type AutopilotState } from "@/lib/autopilot-types";
 
-const POLL_MS = 3_000;
+import { CYCLE_MS } from "@/lib/autopilot-types";
 
 export function useAutopilot() {
   const [state, setState] = useState<AutopilotState>(blank);
@@ -17,7 +17,7 @@ export function useAutopilot() {
 
   useEffect(() => {
     void fetchState();
-    const id = setInterval(() => void fetchState(), POLL_MS);
+    const id = setInterval(() => void fetchState(), CYCLE_MS);
     return () => clearInterval(id);
   }, [fetchState]);
 

@@ -106,24 +106,8 @@ export default function DashboardPage() {
     }
   }, [companyEvents]);
 
-  if (loading) {
-    return (
-      <div className="flex justify-center items-center h-full">
-        <Spinner className="size-8 text-muted-foreground" />
-      </div>
-    );
-  }
+  // ── KPI computations (hooks must be before any early return) ──────────────
 
-  const portName = (id: string | null) =>
-    id ? (ports.find((p) => p.id === id)?.name ?? id.slice(0, 8)) : "at sea";
-  const goodName = (id: string | null | undefined) =>
-    id ? (goods.find((g) => g.id === id)?.name ?? id.slice(0, 8)) : "?";
-
-  // ── KPI computations ───────────────────────────────────────────────────────
-
-  const treasury = company?.treasury ?? 0;
-
-  // Cargo in transit: sum sell value (or cost basis) for all ships with cargo plans
   const cargoInTransitValue = useMemo(() => ships.reduce((sum, ship) => {
     const ss = ap.ships[ship.id];
     if (!ss?.plan?.goodId) return sum;
@@ -132,7 +116,6 @@ export default function DashboardPage() {
     return sum + qty * price;
   }, 0), [ships, ap.ships]);
 
-  // PAX bids in transit: ships in transiting_to_sell with a passenger bid
   const paxInTransit = useMemo(() => ships.reduce((sum, ship) => {
     const ss = ap.ships[ship.id];
     if (ss?.phase === "transiting_to_sell" && ss.plan?.passengerBid) {
@@ -141,17 +124,11 @@ export default function DashboardPage() {
     return sum;
   }, 0), [ships, ap.ships]);
 
-  const netProfit = ap.profitAccrued;
-
-  // Total assets: treasury + cargo in transit (at cost) + pax bids
   const cargoAtCost = useMemo(() => ships.reduce((sum, ship) => {
     const ss = ap.ships[ship.id];
     if (!ss?.plan?.goodId) return sum;
     return sum + (ss.plan.actualBuyPrice ?? 0) * (ss.plan.quantity ?? 0);
   }, 0), [ships, ap.ships]);
-  const totalAssets = treasury + cargoAtCost + paxInTransit;
-
-  // ── Chart data ─────────────────────────────────────────────────────────────
 
   const validLedger = useMemo(
     () => ledger.filter((e) => e.occurred_at && !isNaN(new Date(e.occurred_at).getTime())),
@@ -204,12 +181,30 @@ export default function DashboardPage() {
         { name: "Warehouses", value: economy.warehouse_upkeep },
       ]
     : [], [economy]);
-  const PIE_COLORS = ["#6366f1", "#f59e0b"];
 
   const totalLedgerNet = useMemo(() => ledger.reduce((s, e) => s + e.amount, 0), [ledger]);
-
   const shipsInTransit = useMemo(() => ships.filter((s) => s.status === "traveling").length, [ships]);
-  const shipsDocked = useMemo(() => ships.filter((s) => s.status !== "traveling").length, [ships]);
+  const shipsDocked    = useMemo(() => ships.filter((s) => s.status !== "traveling").length, [ships]);
+
+  if (loading) {
+    return (
+      <div className="flex justify-center items-center h-full">
+        <Spinner className="size-8 text-muted-foreground" />
+      </div>
+    );
+  }
+
+  const portName = (id: string | null) =>
+    id ? (ports.find((p) => p.id === id)?.name ?? id.slice(0, 8)) : "at sea";
+  const goodName = (id: string | null | undefined) =>
+    id ? (goods.find((g) => g.id === id)?.name ?? id.slice(0, 8)) : "?";
+
+  // ── Derived values ─────────────────────────────────────────────────────────
+
+  const treasury = company?.treasury ?? 0;
+  const netProfit = ap.profitAccrued;
+  const totalAssets = treasury + cargoAtCost + paxInTransit;
+  const PIE_COLORS = ["#6366f1", "#f59e0b"];
 
   return (
     <div className="space-y-6 pb-8">
