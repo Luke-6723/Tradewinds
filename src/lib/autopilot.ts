@@ -54,6 +54,9 @@ const BUY_RESERVE_MULTIPLIER = 20;
 const BUY_COOLDOWN_MS  = 60 * 60_000; // 1 hour
 /** Cooldown between automated sells. */
 const SELL_COOLDOWN_MS = 2 * 60_000;
+/** Minimum treasury balance to maintain at all times.
+ *  Cargo buying stops when treasury is at or below this floor. */
+const MIN_TREASURY_FLOOR = 1_500_000;
 
 // ── Warehouse buy constants ────────────────────────────────────────────────
 /** Maximum price level at which we buy for warehouse stockpiling (Cheap = 2). */
@@ -470,7 +473,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, window=${windowOffset}–${windowEnd - 1}, companyId=${companyId}`);
     console.log(`[runCycle:fetch] data ready in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
 
-    const bankingCap = economy.total_upkeep + 2_000;
+    const bankingCap = Math.max(MIN_TREASURY_FLOOR, economy.total_upkeep * 2 + 2_000);
     let availableFunds = Math.max(0, company.treasury - bankingCap);
     treasuryBalance = company.treasury;
 
