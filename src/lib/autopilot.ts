@@ -244,6 +244,7 @@ async function runFleetManagement(
   const stMap = new Map<string, ShipType>(shipTypes.map((t: ShipType) => [t.id, t]));
   const fleetTarget = fleetMgmt.fleetTarget ?? Infinity;
   const overTarget = ships.length > fleetTarget;
+  console.log(`[fleetMgmt] ships=${ships.length} target=${fleetTarget === Infinity ? "∞" : fleetTarget} overTarget=${overTarget} enabled=${fleetMgmt.enabled}`);
 
   // ── SELL: idle ships at shipyard ports ────────────────────────────────────
   // When over fleet target: sell any idle ship immediately (no idle-cycle requirement).
@@ -261,12 +262,14 @@ async function runFleetManagement(
         const bCog = COG_TYPE_PATTERN.test(stMap.get(b.ship_type_id)?.name ?? "") ? 0 : 1;
         return aCog - bCog;
       });
+    console.log(`[fleetMgmt:sell] canSell=true candidates=${sellCandidates.length} overTarget=${overTarget}`);
     for (const ship of sellCandidates) {
       if (!ship.port_id) continue;
       const ss = s.ships[ship.id];
       if (!ss || ss.role === "ferry") continue; // ferries are never auto-sold
       if (!overTarget && ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
 
+      console.log(`[fleetMgmt:sell] trying ${ship.name} @ port=${ship.port_id} cyclesIdle=${ss.cyclesIdle}`);
       try {
         const sy = await shipyardsApi.getPortShipyard(ship.port_id);
         if (!fleetMgmt.knownShipyardPortIds.includes(ship.port_id)) {
@@ -278,9 +281,14 @@ async function runFleetManagement(
         s = { ...s, ships: remainingShips, fleetMgmt: { ...s.fleetMgmt!, lastSellAt: new Date().toISOString() } };
         const reason = overTarget ? `over target (${ships.length}/${fleetTarget})` : `idle ${ss.cyclesIdle} cycles`;
         s = appendLog(s, `💰 Sold ${ship.name} @ £${result.price.toLocaleString()} (${reason})`);
+        console.log(`[fleetMgmt:sell] ✓ sold ${ship.name} for £${result.price}`);
         break; // one sell per cycle
-      } catch { /* no shipyard at this port — try next */ }
+      } catch (e: unknown) {
+        console.log(`[fleetMgmt:sell] ✗ ${ship.name} @ port=${ship.port_id} — ${(e as Error).message}`);
+      }
     }
+  } else {
+    console.log(`[fleetMgmt:sell] skipped canSell=${canSell} fleetSize=${ships.length} minFleet=${MIN_FLEET_SIZE}`);
   }
 
   // ── RELOCATE: tag idle ships at non-shipyard ports toward a shipyard ──────
@@ -782,6 +790,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     {
       const fm = s.fleetMgmt;
       const fleetTarget = fm?.fleetTarget ?? Infinity;
+      console.log(`[runCycle:reloc] ships=${ships.length} target=${fleetTarget === Infinity ? "∞" : fleetTarget} knownYards=${fm?.knownShipyardPortIds.length ?? 0}`);
       if (ships.length > fleetTarget && (fm?.knownShipyardPortIds.length ?? 0) > 0) {
         const knownYards = fm!.knownShipyardPortIds;
         const relocCandidates = ships
