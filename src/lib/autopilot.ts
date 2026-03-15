@@ -627,9 +627,12 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     for (const ship of ships) {
       if (ship.status === "traveling") {
-        // Ship is en route — keep metrics ticking but don't idle-count it
+        // Ship is en route — keep metrics ticking but don't idle-count it.
+        // Also set role here so it's visible even when the ship never docks.
         const tss = s.ships[ship.id] ?? defaultShipState();
-        s = { ...s, ships: { ...s.ships, [ship.id]: { ...tss, cyclesActive: tss.cyclesActive + 1, cyclesIdle: 0 } } };
+        const travelingShipType = stMap.get(ship.ship_type_id);
+        const travelingRole: "ferry" | "multi" = FERRY_TYPE_PATTERN.test(travelingShipType?.name ?? "") ? "ferry" : "multi";
+        s = { ...s, ships: { ...s.ships, [ship.id]: { ...tss, role: travelingRole, cyclesActive: tss.cyclesActive + 1, cyclesIdle: 0 } } };
         continue;
       }
       if (!ship.port_id) continue;
