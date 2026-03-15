@@ -4,13 +4,14 @@ import { useEffect, useState } from "react";
 import { passengersApi } from "@/lib/api/passengers";
 import { worldApi } from "@/lib/api/world";
 import { fleetApi } from "@/lib/api/fleet";
+import { useSse } from "@/hooks/use-sse";
 import type { Passenger, Port, Ship } from "@/lib/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { UsersIcon } from "lucide-react";
+import { UsersIcon, TrendingUpIcon, WalletIcon, ClockIcon } from "lucide-react";
 
 function Countdown({ to }: { to: string }) {
   const calc = () => {
@@ -36,6 +37,21 @@ export default function PassengersPage() {
   const [boarding, setBoarding] = useState<string | null>(null);
   const [shipSelections, setShipSelections] = useState<Record<string, string>>({});
   const [messages, setMessages] = useState<Record<string, string>>({});
+
+  // ── Live passenger updates via world SSE ────────────────────────────────
+  const { events: worldEvents } = useSse<{ type: string; data: Record<string, unknown> }>(
+    "/api/events/world",
+    !loading,
+  );
+
+  useEffect(() => {
+    if (worldEvents.length === 0) return;
+    const latest = worldEvents[0];
+    if (latest.type === "passenger_request_created") {
+      const pax = latest.data as unknown as Passenger;
+      setPassengers((prev) => prev.some((p) => p.id === pax.id) ? prev : [pax, ...prev]);
+    }
+  }, [worldEvents]);
 
   const portName = (id: string) => ports.find((p) => p.id === id)?.name ?? id.slice(0, 8);
 
@@ -76,14 +92,62 @@ export default function PassengersPage() {
 
   if (loading) return <div className="flex h-full items-center justify-center"><Spinner className="size-8" /></div>;
 
-  const available = passengers.filter((p) => p.status === "available");
+  const available = passengers
+    .filter((p) => p.status === "available")
+    .sort((a, b) => b.bid - a.bid);
   const boarded = passengers.filter((p) => p.status === "boarded");
+
+  // ── Analytics ─────────────────────────────────────────────────────────────
+  const totalAvailableBid = available.reduce((s, p) => s + p.bid, 0);
+  const totalAvailablePax = available.reduce((s, p) => s + p.count, 0);
+  const avgBidPerPax = totalAvailablePax > 0 ? Math.round(totalAvailableBid / totalAvailablePax) : 0;
+  const boardedRevenue = boarded.reduce((s, p) => s + p.bid, 0);
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold flex items-center gap-2"><UsersIcon className="size-6" /> Passengers</h1>
         <p className="text-sm text-muted-foreground mt-1">Board passengers onto docked ships to earn revenue.</p>
+      </div>
+
+      {/* Analytics KPIs */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-2 text-muted-foreground text-xs mb-1">
+              <UsersIcon className="size-3" /> Available pax
+            </div>
+            <p className="text-2xl font-bold">{totalAvailablePax.toLocaleString()}</p>
+            <p className="text-xs text-muted-foreground">{available.length} groups</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-2 text-muted-foreground text-xs mb-1">
+              <WalletIcon className="size-3" /> Total bid value
+            </div>
+            <p className="text-2xl font-bold">£{totalAvailableBid.toLocaleString()}</p>
+            <p className="text-xs text-muted-foreground">across available groups</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-2 text-muted-foreground text-xs mb-1">
+              <TrendingUpIcon className="size-3" /> Avg £ / pax
+            </div>
+            <p className="text-2xl font-bold">£{avgBidPerPax.toLocaleString()}</p>
+            <p className="text-xs text-muted-foreground">among available</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-2 text-muted-foreground text-xs mb-1">
+              <ClockIcon className="size-3" /> Revenue in transit
+            </div>
+            <p className="text-2xl font-bold">£{boardedRevenue.toLocaleString()}</p>
+            <p className="text-xs text-muted-foreground">{boarded.length} boarded groups</p>
+          </CardContent>
+        </Card>
       </div>
 
       <section className="space-y-3">
@@ -108,6 +172,10 @@ export default function PassengersPage() {
                     <div className="flex items-center justify-between text-muted-foreground">
                       <span>Bid</span>
                       <span className="font-mono font-semibold text-foreground">£{p.bid.toLocaleString()}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-muted-foreground">
+                      <span>£ / pax</span>
+                      <span className="font-mono text-foreground">£{Math.round(p.bid / p.count).toLocaleString()}</span>
                     </div>
                     <div className="flex items-center justify-between text-muted-foreground">
                       <span>Expires</span>
