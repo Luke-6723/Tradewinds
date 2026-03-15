@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { companyApi } from "@/lib/api/company";
-import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
 import type { Company, CompanyEconomy, Good, LedgerEntry, Port, Ship } from "@/lib/types";
 import type { StoredWarehouseStock } from "@/lib/db/collections";
@@ -40,19 +39,54 @@ import {
   YAxis,
 } from "recharts";
 
+interface DashboardKpis {
+  cargoInTransitValue: number;
+  paxInTransit: number;
+  cargoAtCost: number;
+  netProfit: number;
+  cyclesRun: number;
+}
+
+interface ShipsPage {
+  ships: Ship[];
+  total: number;
+  traveling: number;
+  docked: number;
+  page: number;
+  limit: number;
+}
+
+const SHIPS_PER_PAGE = 50;
+
 export default function DashboardPage() {
   const [company, setCompany] = useState<Company | null>(null);
   const [economy, setEconomy] = useState<CompanyEconomy | null>(null);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [ships, setShips] = useState<Ship[]>([]);
+  const [shipMeta, setShipMeta] = useState<{ total: number; traveling: number; docked: number }>({ total: 0, traveling: 0, docked: 0 });
   const [ports, setPorts] = useState<Port[]>([]);
   const [goods, setGoods] = useState<Good[]>([]);
   const [warehouseStocks, setWarehouseStocks] = useState<StoredWarehouseStock[]>([]);
   const [shipPage, setShipPage] = useState(0);
+  const [shipsLoading, setShipsLoading] = useState(true);
+  const [kpis, setKpis] = useState<DashboardKpis | null>(null);
   const [credentialsStored, setCredentialsStored] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
-  const SHIPS_PER_PAGE = 50;
   const { state: ap, toggle: toggleAp, toggleFleetMgmt } = useAutopilot();
+
+  const fetchShipsPage = useCallback((page: number) => {
+    setShipsLoading(true);
+    fetch(`/api/dashboard/ships?page=${page}&limit=${SHIPS_PER_PAGE}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((d: ShipsPage | null) => {
+        if (!d) return;
+        setShips(d.ships);
+        setShipMeta({ total: d.total, traveling: d.traveling, docked: d.docked });
+        setShipPage(d.page);
+      })
+      .catch(console.error)
+      .finally(() => setShipsLoading(false));
+  }, []);
 
   useEffect(() => {
     fetch("/api/auth/credentials-status")
@@ -61,21 +95,20 @@ export default function DashboardPage() {
       .catch(() => setCredentialsStored(false));
   }, []);
 
+  // Fast initial load: company info, economy, ledger, ports, goods, warehouse stocks
   useEffect(() => {
     Promise.all([
       companyApi.getCompany(),
       companyApi.getEconomy(),
       fetch("/api/ledger").then((r) => r.ok ? r.json() : []).catch(() => []),
-      fleetApi.getShips().catch(() => []),
       worldApi.getPorts().catch(() => []),
       worldApi.getGoods().catch(() => []),
       fetch("/api/warehouses/stocks").then((r) => r.ok ? r.json() : []).catch(() => []),
     ])
-      .then(([c, e, l, s, p, g, stocks]) => {
+      .then(([c, e, l, p, g, stocks]) => {
         setCompany(c);
         setEconomy(e);
         setLedger(l);
-        setShips(s as Ship[]);
         setPorts(p as Port[]);
         setGoods(g as Good[]);
         setWarehouseStocks(stocks as StoredWarehouseStock[]);
@@ -83,6 +116,15 @@ export default function DashboardPage() {
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
+
+  // Background: ships (server-cached, paginated) + KPIs (from autopilot state)
+  useEffect(() => {
+    fetchShipsPage(0);
+    fetch("/api/dashboard/kpis")
+      .then((r) => r.ok ? r.json() : null)
+      .then((d: DashboardKpis | null) => { if (d) setKpis(d); })
+      .catch(console.error);
+  }, [fetchShipsPage]);
 
   // ── React to ship_docked / ship_transit_started events ────────────────────
   const { events: companyEvents } = useSse<{ type: string; data: Record<string, unknown> }>(
@@ -98,37 +140,21 @@ export default function DashboardPage() {
       setShips((prev) =>
         prev.map((s) => s.id === ship_id ? { ...s, status: "docked", port_id, route_id: null, arriving_at: null } : s)
       );
+      setShipMeta((m) => ({ ...m, traveling: Math.max(0, m.traveling - 1), docked: m.docked + 1 }));
     } else if (latest.type === "ship_transit_started") {
       const { ship_id, route_id, arriving_at } = latest.data as { ship_id: string; route_id: string; arriving_at: string };
       setShips((prev) =>
         prev.map((s) => s.id === ship_id ? { ...s, status: "traveling", route_id, arriving_at } : s)
       );
+      setShipMeta((m) => ({ ...m, traveling: m.traveling + 1, docked: Math.max(0, m.docked - 1) }));
     }
   }, [companyEvents]);
 
   // ── KPI computations (hooks must be before any early return) ──────────────
 
-  const cargoInTransitValue = useMemo(() => ships.reduce((sum, ship) => {
-    const ss = ap.ships[ship.id];
-    if (!ss?.plan?.goodId) return sum;
-    const qty = ss.plan.quantity ?? 0;
-    const price = ss.plan.sellPrice ?? ss.plan.actualBuyPrice ?? 0;
-    return sum + qty * price;
-  }, 0), [ships, ap.ships]);
-
-  const paxInTransit = useMemo(() => ships.reduce((sum, ship) => {
-    const ss = ap.ships[ship.id];
-    if (ss?.phase === "transiting_to_sell" && ss.plan?.passengerBid) {
-      return sum + ss.plan.passengerBid;
-    }
-    return sum;
-  }, 0), [ships, ap.ships]);
-
-  const cargoAtCost = useMemo(() => ships.reduce((sum, ship) => {
-    const ss = ap.ships[ship.id];
-    if (!ss?.plan?.goodId) return sum;
-    return sum + (ss.plan.actualBuyPrice ?? 0) * (ss.plan.quantity ?? 0);
-  }, 0), [ships, ap.ships]);
+  const cargoInTransitValue = kpis?.cargoInTransitValue ?? 0;
+  const paxInTransit        = kpis?.paxInTransit ?? 0;
+  const cargoAtCost         = kpis?.cargoAtCost ?? 0;
 
   const validLedger = useMemo(
     () => ledger.filter((e) => e.occurred_at && !isNaN(new Date(e.occurred_at).getTime())),
@@ -183,8 +209,8 @@ export default function DashboardPage() {
     : [], [economy]);
 
   const totalLedgerNet = useMemo(() => ledger.reduce((s, e) => s + e.amount, 0), [ledger]);
-  const shipsInTransit = useMemo(() => ships.filter((s) => s.status === "traveling").length, [ships]);
-  const shipsDocked    = useMemo(() => ships.filter((s) => s.status !== "traveling").length, [ships]);
+  const shipsInTransit = shipMeta.traveling;
+  const shipsDocked    = shipMeta.docked;
 
   if (loading) {
     return (
@@ -202,8 +228,9 @@ export default function DashboardPage() {
   // ── Derived values ─────────────────────────────────────────────────────────
 
   const treasury = company?.treasury ?? 0;
-  const netProfit = ap.profitAccrued;
+  const netProfit = kpis?.netProfit ?? ap.profitAccrued;
   const totalAssets = treasury + cargoAtCost + paxInTransit;
+  const kpisReady = kpis !== null;
   const PIE_COLORS = ["#6366f1", "#f59e0b"];
 
   return (
@@ -241,28 +268,28 @@ export default function DashboardPage() {
         />
         <KpiCard
           label="Cargo in Transit"
-          value={cargoInTransitValue > 0 ? `£${Math.round(cargoInTransitValue).toLocaleString()}` : "—"}
+          value={kpisReady ? (cargoInTransitValue > 0 ? `£${Math.round(cargoInTransitValue).toLocaleString()}` : "—") : null}
           icon={<PackageIcon className="size-4" />}
           accent="blue"
           sub={`${shipsInTransit} ship${shipsInTransit !== 1 ? "s" : ""} traveling`}
         />
         <KpiCard
           label="PAX in Transit"
-          value={paxInTransit > 0 ? `£${paxInTransit.toLocaleString()}` : "—"}
+          value={kpisReady ? (paxInTransit > 0 ? `£${paxInTransit.toLocaleString()}` : "—") : null}
           icon={<UsersIcon className="size-4" />}
           accent="purple"
           sub="pending delivery"
         />
         <KpiCard
           label="Net Profit"
-          value={netProfit !== 0 ? `£${Math.round(netProfit).toLocaleString()}` : "—"}
+          value={kpisReady ? (netProfit !== 0 ? `£${Math.round(netProfit).toLocaleString()}` : "—") : null}
           icon={netProfit >= 0 ? <TrendingUpIcon className="size-4" /> : <TrendingDownIcon className="size-4" />}
           accent={netProfit >= 0 ? "emerald" : "red"}
           sub={ap.cyclesRun > 0 ? `over ${ap.cyclesRun} cycles` : "autopilot"}
         />
         <KpiCard
           label="Total Assets"
-          value={`£${Math.round(totalAssets).toLocaleString()}`}
+          value={kpisReady ? `£${Math.round(totalAssets).toLocaleString()}` : null}
           icon={<ArchiveIcon className="size-4" />}
           accent="indigo"
           sub="treasury + cargo + pax"
@@ -273,7 +300,7 @@ export default function DashboardPage() {
       <div className="flex flex-wrap gap-3 text-sm">
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted/60 text-muted-foreground">
           <ShipIcon className="size-3.5" />
-          <span>{ships.length} ships total</span>
+          <span>{shipMeta.total} ships total</span>
           <span className="text-foreground font-medium">{shipsDocked} docked</span>
           <span>·</span>
           <span>{shipsInTransit} traveling</span>
@@ -452,7 +479,7 @@ export default function DashboardPage() {
 
             {(() => {
               const paxShips = ships.filter((sh) => (ap.ships[sh.id]?.paxTrips ?? 0) > 0).length;
-              const paxRatio = ships.length > 0 ? Math.round((paxShips / ships.length) * 100) : 0;
+              const paxRatio = shipMeta.total > 0 ? Math.round((paxShips / shipMeta.total) * 100) : 0;
               return (
                 <span className="flex items-center gap-2 text-muted-foreground text-xs">
                   Pax {paxRatio}%
@@ -502,7 +529,7 @@ export default function DashboardPage() {
           )}
 
           {/* Ship table */}
-          {ships.length > 0 && (
+          {(shipsLoading || ships.length > 0) && (
             <div className="rounded-lg border overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
@@ -515,7 +542,17 @@ export default function DashboardPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {ships.slice(shipPage * SHIPS_PER_PAGE, (shipPage + 1) * SHIPS_PER_PAGE).map((ship) => {
+                  {shipsLoading
+                    ? Array.from({ length: 8 }).map((_, i) => (
+                        <tr key={i}>
+                          <td className="px-3 py-2"><div className="h-4 w-28 bg-muted animate-pulse rounded" /></td>
+                          <td className="px-3 py-2"><div className="h-4 w-16 bg-muted animate-pulse rounded" /></td>
+                          <td className="px-3 py-2 hidden sm:table-cell"><div className="h-4 w-20 bg-muted animate-pulse rounded" /></td>
+                          <td className="px-3 py-2 hidden md:table-cell"><div className="h-4 w-24 bg-muted animate-pulse rounded" /></td>
+                          <td className="px-3 py-2 hidden lg:table-cell"><div className="h-4 w-20 bg-muted animate-pulse rounded" /></td>
+                        </tr>
+                      ))
+                    : ships.map((ship) => {
                     const ss = ap.ships[ship.id];
                     const phase = ss?.phase ?? "idle";
                     const plan = ss?.plan;
@@ -584,16 +621,16 @@ export default function DashboardPage() {
                   })}
                 </tbody>
               </table>
-              {ships.length > SHIPS_PER_PAGE && (
+              {shipMeta.total > SHIPS_PER_PAGE && (
                 <div className="flex items-center justify-between px-3 py-2 border-t bg-muted/30 text-sm">
                   <span className="text-muted-foreground text-xs">
-                    {shipPage * SHIPS_PER_PAGE + 1}–{Math.min((shipPage + 1) * SHIPS_PER_PAGE, ships.length)} of {ships.length} ships
+                    {shipPage * SHIPS_PER_PAGE + 1}–{Math.min((shipPage + 1) * SHIPS_PER_PAGE, shipMeta.total)} of {shipMeta.total} ships
                   </span>
                   <div className="flex gap-2">
-                    <Button variant="outline" size="sm" disabled={shipPage === 0} onClick={() => setShipPage(p => p - 1)}>
+                    <Button variant="outline" size="sm" disabled={shipPage === 0 || shipsLoading} onClick={() => fetchShipsPage(shipPage - 1)}>
                       ← Prev
                     </Button>
-                    <Button variant="outline" size="sm" disabled={(shipPage + 1) * SHIPS_PER_PAGE >= ships.length} onClick={() => setShipPage(p => p + 1)}>
+                    <Button variant="outline" size="sm" disabled={(shipPage + 1) * SHIPS_PER_PAGE >= shipMeta.total || shipsLoading} onClick={() => fetchShipsPage(shipPage + 1)}>
                       Next →
                     </Button>
                   </div>
@@ -662,7 +699,7 @@ function KpiCard({
   accent = "default",
 }: {
   label: string;
-  value: string;
+  value: string | null;
   sub?: string;
   icon?: React.ReactNode;
   accent?: "green" | "emerald" | "yellow" | "blue" | "purple" | "indigo" | "red" | "default";
@@ -683,8 +720,14 @@ function KpiCard({
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
             <p className="text-muted-foreground text-xs font-medium uppercase tracking-wide">{label}</p>
-            <p className="font-mono font-bold text-xl mt-1 truncate">{value}</p>
-            {sub && <p className="text-muted-foreground text-xs mt-0.5 truncate">{sub}</p>}
+            {value === null
+              ? <div className="h-7 mt-1 w-24 bg-muted animate-pulse rounded" />
+              : <p className="font-mono font-bold text-xl mt-1 truncate">{value}</p>
+            }
+            {sub && (value === null
+              ? <div className="h-3 mt-1.5 w-32 bg-muted animate-pulse rounded" />
+              : <p className="text-muted-foreground text-xs mt-0.5 truncate">{sub}</p>
+            )}
           </div>
           {icon && (
             <div className={`flex size-8 shrink-0 items-center justify-center rounded-lg ${accentClasses[accent]}`}>
