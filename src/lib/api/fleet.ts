@@ -50,5 +50,5 @@ export const fleetApi = {
     return result;
   },
   /** Buy a ship listed for sale on the secondary market by another company. */
-  buySecondaryShip: (shipId: string) => api.post<Ship>(`/ships/${shipId}/buy`, {}),
+
 };

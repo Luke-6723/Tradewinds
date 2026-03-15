@@ -468,11 +468,7 @@ export default function DashboardPage() {
                 Sold: {new Date(ap.fleetMgmt.lastSellAt).toLocaleTimeString()}
               </span>
             )}
-            {(ap.fleetMgmt?.secondaryBuys ?? 0) > 0 && (
-              <span className="text-muted-foreground text-xs">
-                🏴‍☠️ Sniped: {ap.fleetMgmt!.secondaryBuys}
-              </span>
-            )}
+
           </div>
         </CardHeader>
 

@@ -11,7 +11,7 @@
  * IPC out: { type: "state", data: AutopilotState }
  */
 
-import { handlePassengerEvent, handleShipSoldEvent, runCycle } from "@/lib/autopilot";
+import { handlePassengerEvent, runCycle } from "@/lib/autopilot";
 import { appendLog, blank, CYCLE_MS, type AutopilotState } from "@/lib/autopilot-types";
 import { loadAutopilotState, saveAutopilotState } from "@/lib/db/collections";
 import { UPSTREAM } from "@/lib/auth-cookies";
@@ -52,14 +52,19 @@ async function rotateToken(): Promise<void> {
 // Schedule automatic token rotation every 16 hours
 setInterval(() => void rotateToken(), TOKEN_REFRESH_INTERVAL_MS);
 
+/** Releases cycleRunning after at most 60 s to prevent permanent deadlock. */
+const CYCLE_TIMEOUT_MS = 60_000;
+
 async function tick(): Promise<void> {
   if (!state.enabled || cycleRunning) return;
   cycleRunning = true;
+  const guard = setTimeout(() => { cycleRunning = false; }, CYCLE_TIMEOUT_MS);
   try {
     state = await runCycle(state, companyId);
   } catch (e: unknown) {
     state = appendLog(state, `Fatal cycle error: ${(e as Error).message}`);
   } finally {
+    clearTimeout(guard);
     cycleRunning = false;
   }
   sendState();
@@ -74,14 +79,6 @@ interface PassengerEventData {
   bid: number;
   count: number;
   expires_at: string;
-}
-
-interface ShipSoldEventData {
-  ship_id: string;
-  company_id: string;
-  ship_type_id: string;
-  company_name: string;
-  name: string;
 }
 
 function startEventStream(): void {
@@ -117,18 +114,11 @@ function startEventStream(): void {
             const event = JSON.parse(raw) as { type: string; data: unknown };
             if (event.type === "passenger_request_created" && state.enabled && !cycleRunning) {
               cycleRunning = true;
+              const guard = setTimeout(() => { cycleRunning = false; }, CYCLE_TIMEOUT_MS);
               try {
                 state = await handlePassengerEvent(state, companyId, event.data as PassengerEventData);
               } finally {
-                cycleRunning = false;
-              }
-              sendState();
-              void saveAutopilotState(companyId, state);
-            } else if (event.type === "ship_sold" && state.enabled && !cycleRunning) {
-              cycleRunning = true;
-              try {
-                state = await handleShipSoldEvent(state, companyId, event.data as ShipSoldEventData);
-              } finally {
+                clearTimeout(guard);
                 cycleRunning = false;
               }
               sendState();

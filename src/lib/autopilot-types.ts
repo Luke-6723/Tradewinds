@@ -72,7 +72,7 @@ export interface FleetMgmtState {
   /** Ports confirmed to have a shipyard — populated lazily during fleet mgmt. */
   knownShipyardPortIds: string[];
   /** Number of ships acquired from the secondary market (other companies' ship_sold events). */
-  secondaryBuys: number;
+
 }
 
 export interface AutopilotState {
@@ -98,7 +98,7 @@ export function blank(): AutopilotState {
     lastCycleAt: null,
     profitHistory: [],
     treasuryHistory: [],
-    fleetMgmt: { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [], secondaryBuys: 0 },
+    fleetMgmt: { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] },
     cyclesRun: 0,
   };
 }

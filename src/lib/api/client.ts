@@ -88,6 +88,8 @@ function formatErrors(errors: Record<string, string | string[]> | undefined): st
     .join("; ");
 }
 
+const REQUEST_TIMEOUT_MS = 15_000;
+
 async function requestCore(
   path: string,
   options: RequestInit = {},
@@ -96,6 +98,7 @@ async function requestCore(
 
   const url = `${BASE_URL}${path}`;
   const res = await fetch(url, {
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: buildHeaders(options.headers),
     ...options,
   });
