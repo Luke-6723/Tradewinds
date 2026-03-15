@@ -496,6 +496,11 @@ export default function DashboardPage() {
                       <tr key={ship.id} className="hover:bg-muted/30 transition-colors">
                         <td className="px-3 py-2">
                           <span className="font-medium">{ship.name}</span>
+                          {ss?.role && (
+                            <span className={`ml-1.5 text-xs font-medium px-1 py-0.5 rounded ${ss.role === "ferry" ? "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300" : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"}`}>
+                              {ss.role === "ferry" ? "⛵ ferry" : "📦 multi"}
+                            </span>
+                          )}
                           {ss && (ss.lifetimeProfit > 0) && (
                             <p className="text-xs text-muted-foreground">£{Math.round(ss.lifetimeProfit).toLocaleString()} lifetime</p>
                           )}
@@ -537,7 +542,9 @@ export default function DashboardPage() {
                               {phase === "transiting_to_sell"
                                 ? `→ ${portName(plan?.sellPortId ?? null)}${plan?.goodName ? ` (${plan.goodName})` : plan?.passengerBid ? " (pax)" : ""}`
                                 : phase === "transiting_to_buy"
-                                ? `→ buy ${plan?.goodName ?? ""}`
+                                ? plan?.goodName
+                                  ? `→ buy ${plan.goodName}`
+                                  : `⛵ → ${portName(plan?.buyPortId ?? null)}`
                                 : "idle"}
                             </Badge>
                           ) : (

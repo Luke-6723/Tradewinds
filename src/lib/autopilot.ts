@@ -60,10 +60,22 @@ const MAX_WAREHOUSE_STOCK = 100;
 const MAX_WAREHOUSE_GOODS = 2;
 
 // ── Passenger-chasing constants ────────────────────────────────────────────
+/** travel_time_ms = (distance / shipSpeed) * MS_PER_SPEED_UNIT
+ *  Derived: Cog speed 4 → 6250 ms/unit → 25_000 / 4 = 6250 ✓ */
+const MS_PER_SPEED_UNIT = 25_000;
+/** Safety buffer added on top of estimated travel time (ms). */
+const TRAVEL_BUFFER_MS = 30_000;  // 30 seconds
 /** Minimum time remaining on a passenger before we bother chasing them (ms). */
-const MIN_PAX_EXPIRY_BUFFER_MS = 10 * 60_000;  // 10 minutes
+const MIN_PAX_EXPIRY_BUFFER_MS = 2 * 60_000;  // 2 minutes (exact ETA now available)
 /** Maximum route hops an idle ship will travel to reach passengers. */
 const MAX_PAX_CHASE_HOPS = 3;
+/** Ship type name pattern that designates a "ferry" (passenger-only) role. */
+const FERRY_TYPE_PATTERN = /caravel/i;
+
+/** Estimate travel time in ms for a given distance and ship speed. */
+function travelTimeMs(distance: number, shipSpeed: number): number {
+  return (distance / shipSpeed) * MS_PER_SPEED_UNIT;
+}
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -270,6 +282,7 @@ async function runFleetManagement(
   shipTypes: ShipType[],
   economy: { total_upkeep: number },
   availableFunds: number,
+  allPassengers: Passenger[],
 ): Promise<AutopilotState> {
   const fleetMgmt = s.fleetMgmt ?? { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] };
   if (!fleetMgmt.enabled) return s;
@@ -286,7 +299,8 @@ async function runFleetManagement(
     for (const ship of ships) {
       if (ship.status === "traveling" || !ship.port_id) continue;
       const ss = s.ships[ship.id];
-      if (!ss || ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
+      if (!ss || ss.role === "ferry") continue; // ferries are never auto-sold
+      if (ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
 
       try {
         const sy = await shipyardsApi.getPortShipyard(ship.port_id);
@@ -309,11 +323,17 @@ async function runFleetManagement(
     now - new Date(fleetMgmt.lastBuyAt).getTime() > BUY_COOLDOWN_MS;
 
   if (canBuy) {
+    const stMap2 = stMap; // already defined above
+    const ferryCount = ships.filter((sh: Ship) => FERRY_TYPE_PATTERN.test(stMap2.get(sh.ship_type_id)?.name ?? "")).length;
+    const activePortCount = new Set(allPassengers.map((p) => p.origin_port_id)).size;
+    const needMoreFerries = ferryCount < activePortCount && ferryCount < Math.ceil(ships.length / 2);
+
     const paxShips = ships.filter((sh: Ship) => (stMap.get(sh.ship_type_id)?.passengers ?? 0) > 0).length;
     const paxRatio = ships.length > 0 ? paxShips / ships.length : 0.5;
 
     let preferPassengers: boolean | null = null;
-    if (paxRatio < 0.4) preferPassengers = true;
+    if (needMoreFerries) preferPassengers = true; // coverage gap — buy a passenger ship (Caravel preferred)
+    else if (paxRatio < 0.4) preferPassengers = true;
     else if (paxRatio > 0.6) preferPassengers = false;
 
     const prevPH = s.profitHistory ?? [];
@@ -336,7 +356,15 @@ async function runFleetManagement(
             .filter((c): c is { item: ShipyardInventoryItem; type: ShipType } => c.type != null);
 
           let chosen: { item: ShipyardInventoryItem; type: ShipType } | null = null;
-          if (preferPassengers === true) {
+          if (needMoreFerries) {
+            // Coverage gap — prefer a Caravel (ferry) first, fall back to any pax ship
+            chosen = candidates
+              .filter((c) => FERRY_TYPE_PATTERN.test(c.type.name) && c.type.passengers > 0)
+              .sort((a, b) => b.type.passengers - a.type.passengers)[0] ?? null;
+            if (!chosen) chosen = candidates
+              .filter((c) => c.type.passengers > 0)
+              .sort((a, b) => b.type.passengers - a.type.passengers)[0] ?? null;
+          } else if (preferPassengers === true) {
             chosen = candidates
               .filter((c) => c.type.passengers > 0)
               .sort((a, b) => b.type.passengers - a.type.passengers)[0] ?? null;
@@ -354,11 +382,12 @@ async function runFleetManagement(
           s = { ...s, fleetMgmt: { ...(s.fleetMgmt ?? fleetMgmt), lastBuyAt: new Date().toISOString() } };
           // Give the new ship a unique name
           const chosenName = pickShipName(ships.map((sh) => sh.name));
+          const buyReason = needMoreFerries ? ` | coverage ${ferryCount}/${activePortCount} ports` : ` | pax: ${Math.round(paxRatio * 100)}%`;
           try {
             await fleetApi.renameShip(newShip.id, { name: chosenName });
-            s = appendLog(s, `🚢 Bought & named "${chosenName}" (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
+            s = appendLog(s, `🚢 Bought & named "${chosenName}" (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()}${buyReason}`);
           } catch {
-            s = appendLog(s, `🚢 Bought ${newShip.name} (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()} | pax: ${Math.round(paxRatio * 100)}%`);
+            s = appendLog(s, `🚢 Bought ${newShip.name} (${chosen.type.name}) @ £${chosen.item.cost.toLocaleString()}${buyReason}`);
           }
           break;
         } catch { /* no shipyard or insufficient funds — try next ship's port */ }
@@ -607,6 +636,14 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
       const ss = s.ships[ship.id] ?? defaultShipState();
       const shipType = stMap.get(ship.ship_type_id);
+      const isFerry = FERRY_TYPE_PATTERN.test(shipType?.name ?? "");
+      const role: "ferry" | "multi" = isFerry ? "ferry" : "multi";
+
+      // Persist the role so the dashboard can display it
+      if (ss.role !== role) {
+        s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, role } } };
+      }
+
       const capacity = Math.min(shipType?.capacity ?? 20, MAX_UNITS);
 
       // Actual remaining cargo space — prevents "Capacity exceeded" on buy
@@ -695,75 +732,78 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           }
         }
 
-        // ── 2. Scan for best cargo ─────────────────────────────────────────────
-        // If passengers boarded, only consider cargo destined to the SAME port.
-        // Otherwise scan all possible routes.
-        const allCandidates: RawCandidate[] = [];
-
-        for (const buyPortId of npcGoods.keys()) {
-          const buyGoods = npcGoods.get(buyPortId)!;
-          const toBuyPath = buyPortId === ship.port_id
-            ? null
-            : paths.find((p) => p.destPortId === buyPortId);
-          if (buyPortId !== ship.port_id && !toBuyPath) continue;
-          const toBuyDist = toBuyPath?.totalDistance ?? 0;
-          const toLegsBuy = toBuyPath?.legs ?? [];
-
-          const sellPaths = findPaths(buyPortId, allRoutes, 99);
-          for (const sp of sellPaths) {
-            const destGoods = npcGoods.get(sp.destPortId);
-            if (!destGoods) continue;
-            for (const goodId of buyGoods) {
-              if (!destGoods.has(goodId)) continue;
-              const destOrd  = npcMaxOrd.get(`${sp.destPortId}:${goodId}`) ?? 0;
-              const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
-              const prescore = destOrd - srcOrd;
-              if (prescore < 0) continue;
-              allCandidates.push({
-                buyPortId, sellPortId: sp.destPortId,
-                sellLegs: sp.legs, toLegsBuy,
-                goodId, prescore,
-                totalDist: toBuyDist + sp.totalDistance,
-              });
-            }
-          }
-        }
-
-        // If pax were boarded: filter to cargo co-routable to the same destination
-        // (buy at current port, sell at pax destination = no extra detour)
-        const candidates = boardedPaxDestination
-          ? allCandidates.filter(
-              (c) => c.sellPortId === boardedPaxDestination && c.buyPortId === ship.port_id,
-            )
-          : allCandidates;
-
-        const sellBatch = dedupBestPerGood(candidates, SCAN_BATCH);
+        // ── 2. Scan for best cargo (multi-purpose ships only) ─────────────────
         let bestCargo: (ScoredCandidate & { buyPrice: number }) | null = null;
 
-        if (sellBatch.length > 0) {
-          let batchItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
-          try {
-            batchItems = await tradeApi.batchCreateQuotes({
-              requests: sellBatch.map((c) => ({
-                port_id: c.sellPortId, good_id: c.goodId, quantity: capacity, action: "sell" as const,
-              })),
-            });
-          } catch { /* proceed with empty */ }
+        if (!isFerry) {
+          // If passengers boarded, only consider cargo destined to the SAME port.
+          // Otherwise scan all possible routes.
+          const allCandidates: RawCandidate[] = [];
 
-          const scored: ScoredCandidate[] = sellBatch
-            .map((c, i) => {
-              const item = batchItems[i];
-              if (!item || item.status !== "success" || !item.quote) return null;
-              return { ...c, npcSellPrice: item.quote.unit_price };
-            })
-            .filter(Boolean) as ScoredCandidate[];
+          for (const buyPortId of npcGoods.keys()) {
+            const buyGoods = npcGoods.get(buyPortId)!;
+            const toBuyPath = buyPortId === ship.port_id
+              ? null
+              : paths.find((p) => p.destPortId === buyPortId);
+            if (buyPortId !== ship.port_id && !toBuyPath) continue;
+            const toBuyDist = toBuyPath?.totalDistance ?? 0;
+            const toLegsBuy = toBuyPath?.legs ?? [];
 
-          for (const c of scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice)) {
+            const sellPaths = findPaths(buyPortId, allRoutes, 99);
+            for (const sp of sellPaths) {
+              const destGoods = npcGoods.get(sp.destPortId);
+              if (!destGoods) continue;
+              for (const goodId of buyGoods) {
+                if (!destGoods.has(goodId)) continue;
+                const destOrd  = npcMaxOrd.get(`${sp.destPortId}:${goodId}`) ?? 0;
+                const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
+                const prescore = destOrd - srcOrd;
+                if (prescore < 0) continue;
+                allCandidates.push({
+                  buyPortId, sellPortId: sp.destPortId,
+                  sellLegs: sp.legs, toLegsBuy,
+                  goodId, prescore,
+                  totalDist: toBuyDist + sp.totalDistance,
+                });
+              }
+            }
+          }
+
+          // If pax were boarded: filter to cargo co-routable to the same destination
+          // (buy at current port, sell at pax destination = no extra detour)
+          const candidates = boardedPaxDestination
+            ? allCandidates.filter(
+                (c) => c.sellPortId === boardedPaxDestination && c.buyPortId === ship.port_id,
+              )
+            : allCandidates;
+
+          const sellBatch = dedupBestPerGood(candidates, SCAN_BATCH);
+
+          if (sellBatch.length > 0) {
+            let batchItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
             try {
-              const bq = await tradeApi.createQuote({ port_id: c.buyPortId, good_id: c.goodId, quantity: capacity, action: "buy" });
-              const margin = (c.npcSellPrice - bq.unit_price) / bq.unit_price;
-              if (margin >= MIN_MARGIN) { bestCargo = { ...c, buyPrice: bq.unit_price }; break; }
-            } catch { /* try next */ }
+              batchItems = await tradeApi.batchCreateQuotes({
+                requests: sellBatch.map((c) => ({
+                  port_id: c.sellPortId, good_id: c.goodId, quantity: capacity, action: "sell" as const,
+                })),
+              });
+            } catch { /* proceed with empty */ }
+
+            const scored: ScoredCandidate[] = sellBatch
+              .map((c, i) => {
+                const item = batchItems[i];
+                if (!item || item.status !== "success" || !item.quote) return null;
+                return { ...c, npcSellPrice: item.quote.unit_price };
+              })
+              .filter(Boolean) as ScoredCandidate[];
+
+            for (const c of scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice)) {
+              try {
+                const bq = await tradeApi.createQuote({ port_id: c.buyPortId, good_id: c.goodId, quantity: capacity, action: "buy" });
+                const margin = (c.npcSellPrice - bq.unit_price) / bq.unit_price;
+                if (margin >= MIN_MARGIN) { bestCargo = { ...c, buyPrice: bq.unit_price }; break; }
+              } catch { /* try next */ }
+            }
           }
         }
 
@@ -888,6 +928,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           let chasedPax = false;
           if ((shipType?.passengers ?? 0) > 0) {
             const now = Date.now();
+            const speed = shipType?.speed ?? 4;
             const paxPaths = findPaths(ship.port_id, allRoutes, MAX_PAX_CHASE_HOPS);
 
             // Build a set of ports already covered: a ship is docked there, or
@@ -903,10 +944,15 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               }
             }
 
-            // Group valid passengers by origin port, compute total bid per port
+            // Group valid passengers by origin port, compute total bid per port.
+            // Filter out passengers this ship cannot reach before they expire.
             const portBids = new Map<string, { total: number; best: Passenger }>();
             for (const p of allPassengers) {
-              if (new Date(p.expires_at).getTime() - now <= MIN_PAX_EXPIRY_BUFFER_MS) continue;
+              const path = paxPaths.find((pa) => pa.destPortId === p.origin_port_id);
+              if (!path) continue;
+              const eta = travelTimeMs(path.totalDistance, speed) + TRAVEL_BUFFER_MS;
+              const timeLeft = new Date(p.expires_at).getTime() - now;
+              if (timeLeft < eta + MIN_PAX_EXPIRY_BUFFER_MS) continue;
               const existing = portBids.get(p.origin_port_id);
               if (!existing || p.bid > existing.best.bid) {
                 portBids.set(p.origin_port_id, {
@@ -922,12 +968,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             const portCandidates = Array.from(portBids.entries())
               .filter(([portId]) => portId !== ship.port_id)
               .map(([portId, { total, best }]) => {
-                const path = paxPaths.find((pa) => pa.destPortId === portId);
-                if (!path) return null;
+                const path = paxPaths.find((pa) => pa.destPortId === portId)!;
                 const coverageBonus = coveredPorts.has(portId) ? 1 : 2;
                 return { portId, path, best, totalBid: total, score: (total / path.totalDistance) * coverageBonus };
               })
-              .filter((c): c is NonNullable<typeof c> => c !== null)
               .sort((a, b) => b.score - a.score);
 
             const bestPort = portCandidates[0];
@@ -943,7 +987,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                   passengerBid: bestPort.totalBid,
                 }, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
                 const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
-                s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ${Math.round((new Date(bestPort.best.expires_at).getTime() - now) / 60000)}m left)`);
+                const etaSec = Math.round(travelTimeMs(bestPort.path.totalDistance, speed) / 1000);
+                s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ETA ~${etaSec}s)`);
                 chasedPax = true;
               } catch (e: unknown) {
                 s = appendLog(s, `${ship.name}: pax-chase dispatch failed — ${(e as Error).message}`);
@@ -952,8 +997,13 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           }
 
           if (!chasedPax) {
-            s = appendLog(s, `${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesIdle: ss.cyclesIdle + 1, cyclesActive: ss.cyclesActive + 1 } } };
+            if (isFerry) {
+              s = appendLog(s, `${ship.name}: ⚓ covering ${portName(ship.port_id)}`);
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesActive: ss.cyclesActive + 1 } } };
+            } else {
+              s = appendLog(s, `${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesIdle: ss.cyclesIdle + 1, cyclesActive: ss.cyclesActive + 1 } } };
+            }
           }
         }
 
@@ -1123,7 +1173,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
 
     // ── Fleet management ───────────────────────────────────────────────────────
-    s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds);
+    s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds, allPassengers);
 
     // ── Rename default-named ships (one per cycle to limit API calls) ──────────
     const allNames = ships.map((sh) => sh.name);
