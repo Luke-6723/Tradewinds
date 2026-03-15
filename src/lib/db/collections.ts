@@ -192,7 +192,7 @@ export async function getAutopilotCredentials(): Promise<{ email: string; passwo
   if (!db) return null;
   const doc = await db.collection<StoredCredentials>("autopilot_credentials").findOne({ key: "singleton" });
   if (!doc) return null;
-  return { email: doc.email, password: doc.password };
+  return { email: doc.email, password: doc.password, companyId: doc.companyId };
 }
 
 // ── Autopilot commands ────────────────────────────────────────────────────────

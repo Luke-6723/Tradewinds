@@ -21,9 +21,8 @@ module.exports = {
     },
     {
       name: "tw-autopilot",
-      script: "./node_modules/.bin/tsx",
-      args: "src/workers/autopilot-standalone.ts",
-      env_file: ".env.local",
+      script: "node",
+      args: "--env-file=.env.local --import tsx src/workers/autopilot-standalone.ts",
       env: {
         NODE_ENV: "production",
       },
