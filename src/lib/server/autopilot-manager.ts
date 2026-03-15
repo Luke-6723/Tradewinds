@@ -47,11 +47,12 @@ export const autopilotManager = {
   },
 
   /** Set or clear the fleet size target. Written to the command doc so the
-   *  standalone picks it up within 2 s without losing its in-memory state. */
+   *  standalone picks it up within 2 s without losing its in-memory state.
+   *  Returns state with the target applied optimistically so the dashboard updates immediately. */
   async setFleetTarget(companyId: string, fleetTarget: number | undefined): Promise<AutopilotState> {
     await saveAutopilotCommandFleetTarget(companyId, fleetTarget ?? null);
-    // Return current state so the dashboard can update optimistically
-    return (await loadAutopilotState(companyId)) ?? blank();
+    const current = await loadAutopilotState(companyId) ?? blank();
+    return { ...current, fleetMgmt: { ...current.fleetMgmt, fleetTarget } };
   },
 
   /** True when the standalone has an active command doc. */
