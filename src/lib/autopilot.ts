@@ -342,19 +342,32 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   s = { ...s, lastCycleAt: new Date().toISOString() };
   let treasuryBalance: number | null = null;
 
+  const timed = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+    const t0 = Date.now();
+    s = appendLog(s, `⏳ fetching ${label}…`);
+    const result = await fn();
+    const ms = Date.now() - t0;
+    const count = Array.isArray(result) ? ` (${(result as unknown[]).length})` : "";
+    s = appendLog(s, `✓ ${label}${count} in ${(ms / 1000).toFixed(1)}s`);
+    return result;
+  };
+
   try {
+    s = appendLog(s, `── cycle start ──`);
+    const fetchStart = Date.now();
     const [ships, allRoutes, shipTypes, allPorts, allGoods, company, economy, allWarehouses, allPassengers, allTraderPositions] = await Promise.all([
-      fleetApi.getShips().catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
-      worldApi.getRoutes().catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
-      worldApi.getShipTypes().catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
-      worldApi.getPorts().catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
-      worldApi.getGoods().catch((e: Error) => { throw new Error(`getGoods: ${e.message}`); }),
-      companyApi.getCompany().catch((e: Error) => { throw new Error(`getCompany: ${e.message}`); }),
-      companyApi.getEconomy().catch(() => ({ total_upkeep: 0 } as { total_upkeep: number })),
-      warehousesApi.getWarehouses().catch(() => [] as Warehouse[]),
-      passengersApi.getPassengers({ status: "available" }).catch(() => [] as Passenger[]),
-      tradeApi.getTraderPositions().catch(() => []),  // Single call — no per-port loop
+      timed("ships", () => fleetApi.getShips()).catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
+      timed("routes", () => worldApi.getRoutes()).catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
+      timed("shipTypes", () => worldApi.getShipTypes()).catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
+      timed("ports", () => worldApi.getPorts()).catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
+      timed("goods", () => worldApi.getGoods()).catch((e: Error) => { throw new Error(`getGoods: ${e.message}`); }),
+      timed("company", () => companyApi.getCompany()).catch((e: Error) => { throw new Error(`getCompany: ${e.message}`); }),
+      timed("economy", () => companyApi.getEconomy()).catch(() => ({ total_upkeep: 0 } as { total_upkeep: number })),
+      timed("warehouses", () => warehousesApi.getWarehouses()).catch(() => [] as Warehouse[]),
+      timed("passengers", () => passengersApi.getPassengers({ status: "available" })).catch(() => [] as Passenger[]),
+      timed("traderPositions", () => tradeApi.getTraderPositions()).catch(() => []),
     ]);
+    s = appendLog(s, `📦 all data fetched in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
 
     const bankingCap = economy.total_upkeep + 2_000;
     let availableFunds = Math.max(0, company.treasury - bankingCap);
@@ -386,12 +399,15 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     // ── Warehouse maps ─────────────────────────────────────────────────────────
     const warehouseByPort = new Map<string, Warehouse>(allWarehouses.map((w: Warehouse) => [w.port_id, w]));
     const warehouseInventory = new Map<string, WarehouseInventory[]>();
+    const wInvStart = Date.now();
+    if (allWarehouses.length > 0) s = appendLog(s, `⏳ fetching warehouse inventories (${allWarehouses.length})…`);
     await Promise.all(
       allWarehouses.map(async (w: Warehouse) => {
         try { warehouseInventory.set(w.id, await warehousesApi.getInventory(w.id)); }
         catch  { warehouseInventory.set(w.id, []); }
       }),
     );
+    if (allWarehouses.length > 0) s = appendLog(s, `✓ warehouse inventories in ${((Date.now() - wInvStart) / 1000).toFixed(1)}s`);
 
     // Sync MongoDB stock records with live inventory
     const mongoStocks = await getWarehouseStocks(companyId).catch(() => []);
@@ -563,6 +579,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       return shipInventoryCache.get(shipId)!;
     };
 
+    const shipLoopStart = Date.now();
+    let shipsActioned = 0;
     for (const ship of ships) {
       if (ship.status === "traveling") {
         // Ship is en route — keep metrics ticking but don't idle-count it.
@@ -597,6 +615,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       // ══════════════════════════════════════════════════════════════════════════
       if (ss.phase === "idle") {
         await sleep(DOCK_DELAY_MS);
+        shipsActioned++;
 
         // ── 0. Clear leftover cargo before buying/boarding ─────────────────────
         // A ship can end up idle-with-cargo after a failed sell or state reset.
@@ -1112,6 +1131,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         s = { ...s, ships: { ...s.ships, [ship.id]: { ...(s.ships[ship.id] ?? defaultShipState()), phase: "idle", cyclesIdle: 0 } } };
       }
     }
+
+    s = appendLog(s, `🚢 ship loop done — ${shipsActioned} docked processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
 
     // ── Fleet management ───────────────────────────────────────────────────────
     s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds, allPassengers);

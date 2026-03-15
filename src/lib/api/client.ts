@@ -90,7 +90,7 @@ function formatErrors(errors: Record<string, string | string[]> | undefined): st
     .join("; ");
 }
 
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_RETRIES = 2;
 
 async function requestCore(
