@@ -103,7 +103,7 @@ interface Path {
   totalDistance: number;
 }
 
-function findPaths(fromPortId: string, allRoutes: Route[], maxHops: number): Path[] {
+function findPaths(fromPortId: string, adj: Map<string, Route[]>, maxHops: number): Path[] {
   const results: Path[] = [];
   const visited = new Set<string>([fromPortId]);
   const queue: Array<{ portId: string; legs: RouteLeg[]; dist: number }> = [
@@ -112,7 +112,7 @@ function findPaths(fromPortId: string, allRoutes: Route[], maxHops: number): Pat
   while (queue.length > 0) {
     const { portId, legs, dist } = queue.shift()!;
     if (legs.length >= maxHops) continue;
-    for (const r of allRoutes.filter((r) => r.from_id === portId)) {
+    for (const r of adj.get(portId) ?? []) {
       if (visited.has(r.to_id)) continue;
       visited.add(r.to_id);
       const newLegs: RouteLeg[] = [...legs, { toPortId: r.to_id, routeId: r.id, distance: r.distance }];
@@ -584,15 +584,82 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     // ── Per-ship independent routing ───────────────────────────────────────────
 
-    // Lazy per-cycle inventory cache — avoids re-fetching within the same cycle
-    const shipInventoryCache = new Map<string, Cargo[]>();
-    const fetchShipInv = async (shipId: string): Promise<Cargo[]> => {
-      if (!shipInventoryCache.has(shipId)) {
-        try { shipInventoryCache.set(shipId, await fleetApi.getInventory(shipId)); }
-        catch { shipInventoryCache.set(shipId, []); }
-      }
-      return shipInventoryCache.get(shipId)!;
+    // ① Route adjacency index — O(1) neighbour lookup instead of O(routes) filter per BFS step
+    const routeAdj = new Map<string, Route[]>();
+    for (const r of allRoutes) {
+      if (!routeAdj.has(r.from_id)) routeAdj.set(r.from_id, []);
+      routeAdj.get(r.from_id)!.push(r);
+    }
+
+    // ② Memoized path finder — results cached by (portId:maxHops) within this cycle
+    const _pathCache = new Map<string, Path[]>();
+    const getPathsFrom = (portId: string, maxHops = 99): Path[] => {
+      const key = `${portId}:${maxHops}`;
+      if (!_pathCache.has(key)) _pathCache.set(key, findPaths(portId, routeAdj, maxHops));
+      return _pathCache.get(key)!;
     };
+
+    // ③ Pre-fetch all docked ship inventories in parallel before the loop
+    //    (avoids 800 sequential awaits — the single biggest latency bottleneck)
+    const shipInventoryCache = new Map<string, Cargo[]>();
+    {
+      const toFetch = ships.filter((sh: Ship) => sh.status !== "traveling");
+      const invResults = await Promise.all(
+        toFetch.map(async (sh: Ship) => {
+          try { return [sh.id, await fleetApi.getInventory(sh.id)] as const; }
+          catch { return [sh.id, [] as Cargo[]] as const; }
+        }),
+      );
+      for (const [id, inv] of invResults) shipInventoryCache.set(id, inv);
+      s = appendLog(s, `🗃️ inventories pre-fetched for ${toFetch.length} docked ships`);
+    }
+
+    // ④ Pre-compute coveredPorts once (was O(n²) — rebuilt per ship inside the loop)
+    //    Updated incrementally when a pax-chase dispatch is pushed.
+    const coveredPorts = new Set<string>();
+    for (const sh of ships) {
+      if (sh.status === "docked" && sh.port_id) coveredPorts.add(sh.port_id);
+      const shSs = s.ships[sh.id];
+      if (shSs?.phase === "transiting_to_buy" && !shSs.plan?.goodId && shSs.plan?.buyPortId) {
+        coveredPorts.add(shSs.plan.buyPortId);
+      }
+    }
+
+    // ⑤ Pre-compute trade candidates per unique docked port (avoids recomputing per-ship)
+    //    Key: portId → RawCandidate[]  (full unfiltered list; per-ship pax filter applied below)
+    const candidatesByPort = new Map<string, RawCandidate[]>();
+    for (const portId of new Set(ships.filter((sh: Ship) => sh.status !== "traveling" && sh.port_id).map((sh: Ship) => sh.port_id!))) {
+      const paths = getPathsFrom(portId);
+      const allCandidates: RawCandidate[] = [];
+      for (const buyPortId of npcGoods.keys()) {
+        const toBuyPath = buyPortId === portId ? null : paths.find((p) => p.destPortId === buyPortId);
+        if (buyPortId !== portId && !toBuyPath) continue;
+        const toBuyDist = toBuyPath?.totalDistance ?? 0;
+        const toLegsBuy = toBuyPath?.legs ?? [];
+        const sellPaths = getPathsFrom(buyPortId);
+        for (const sp of sellPaths) {
+          const destGoods = npcGoods.get(sp.destPortId);
+          if (!destGoods) continue;
+          for (const goodId of npcGoods.get(buyPortId) ?? []) {
+            if (!destGoods.has(goodId)) continue;
+            const destOrd  = npcMaxOrd.get(`${sp.destPortId}:${goodId}`) ?? 0;
+            const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
+            const prescore = destOrd - srcOrd;
+            if (prescore < 0) continue;
+            allCandidates.push({
+              buyPortId, sellPortId: sp.destPortId,
+              sellLegs: sp.legs, toLegsBuy,
+              goodId, prescore,
+              totalDist: toBuyDist + sp.totalDistance,
+            });
+          }
+        }
+      }
+      candidatesByPort.set(portId, allCandidates);
+    }
+
+    // Inline inventory fetch helper — now just reads from the pre-populated cache
+    const fetchShipInv = (shipId: string): Cargo[] => shipInventoryCache.get(shipId) ?? [];
 
     const shipLoopStart = Date.now();
     let shipsActioned = 0;
@@ -621,7 +688,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       const capacity = Math.min(shipType?.capacity ?? 20, MAX_UNITS);
 
       // Actual remaining cargo space — prevents "Capacity exceeded" on buy
-      const shipInv = await fetchShipInv(ship.id);
+      const shipInv = fetchShipInv(ship.id);
       const usedCapacity = shipInv.reduce((sum, c) => sum + c.quantity, 0);
       const freeCapacity = Math.max(0, capacity - usedCapacity);
 
@@ -646,7 +713,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               shipInventoryCache.delete(ship.id); // invalidate so freeCapacity is recalculated if needed
             } catch {
               // Can't sell here — find best sell port and dispatch
-              const sellPaths = findPaths(ship.port_id, allRoutes, 99);
+              const sellPaths = getPathsFrom(ship.port_id);
               const bestSellPath = sellPaths
                 .filter((sp) => (npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0) >= MIN_SELL_PRICE_LEVEL)
                 .sort((a, b) => (npcMaxOrd.get(`${b.destPortId}:${item.good_id}`) ?? 0) - (npcMaxOrd.get(`${a.destPortId}:${item.good_id}`) ?? 0))[0];
@@ -676,11 +743,12 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           if (dispatched) continue;
         }
 
-        const paths = findPaths(ship.port_id, allRoutes, 99);
+        const paths = getPathsFrom(ship.port_id);
 
         // ── 1. Board best passenger at current port (always — pure profit) ─────
+        const cycleNow = new Date();
         const paxHere = allPassengers.filter((p) =>
-          p.origin_port_id === ship.port_id && new Date(p.expires_at) > new Date(),
+          p.origin_port_id === ship.port_id && new Date(p.expires_at) > cycleNow,
         );
 
         let boardedPaxDestination: string | null = null;
@@ -714,38 +782,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         let bestCargo: (ScoredCandidate & { buyPrice: number }) | null = null;
 
         if (!isFerry) {
-          // If passengers boarded, only consider cargo destined to the SAME port.
-          // Otherwise scan all possible routes.
-          const allCandidates: RawCandidate[] = [];
-
-          for (const buyPortId of npcGoods.keys()) {
-            const buyGoods = npcGoods.get(buyPortId)!;
-            const toBuyPath = buyPortId === ship.port_id
-              ? null
-              : paths.find((p) => p.destPortId === buyPortId);
-            if (buyPortId !== ship.port_id && !toBuyPath) continue;
-            const toBuyDist = toBuyPath?.totalDistance ?? 0;
-            const toLegsBuy = toBuyPath?.legs ?? [];
-
-            const sellPaths = findPaths(buyPortId, allRoutes, 99);
-            for (const sp of sellPaths) {
-              const destGoods = npcGoods.get(sp.destPortId);
-              if (!destGoods) continue;
-              for (const goodId of buyGoods) {
-                if (!destGoods.has(goodId)) continue;
-                const destOrd  = npcMaxOrd.get(`${sp.destPortId}:${goodId}`) ?? 0;
-                const srcOrd   = npcMinOrd.get(`${buyPortId}:${goodId}`) ?? 0;
-                const prescore = destOrd - srcOrd;
-                if (prescore < 0) continue;
-                allCandidates.push({
-                  buyPortId, sellPortId: sp.destPortId,
-                  sellLegs: sp.legs, toLegsBuy,
-                  goodId, prescore,
-                  totalDist: toBuyDist + sp.totalDistance,
-                });
-              }
-            }
-          }
+          // Use pre-computed candidates for this port; apply per-ship pax filter below
+          const allCandidates = candidatesByPort.get(ship.port_id) ?? [];
 
           // If pax were boarded: filter to cargo co-routable to the same destination
           // (buy at current port, sell at pax destination = no extra detour)
@@ -920,20 +958,9 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           if ((shipType?.passengers ?? 0) > 0) {
             const now = Date.now();
             const speed = shipType?.speed ?? 4;
-            const paxPaths = findPaths(ship.port_id, allRoutes, MAX_PAX_CHASE_HOPS);
+            const paxPaths = getPathsFrom(ship.port_id, MAX_PAX_CHASE_HOPS);
 
-            // Build a set of ports already covered: a ship is docked there, or
-            // another ship is in passenger-chase mode heading there.
-            const coveredPorts = new Set<string>();
-            coveredPorts.add(ship.port_id);  // current port is covered by this ship
-            for (const sh of ships) {
-              if (sh.id === ship.id) continue;
-              if (sh.status === "docked" && sh.port_id) coveredPorts.add(sh.port_id);
-              const shSs = s.ships[sh.id];
-              if (shSs?.phase === "transiting_to_buy" && !shSs.plan?.goodId && shSs.plan?.buyPortId) {
-                coveredPorts.add(shSs.plan.buyPortId);
-              }
-            }
+            // coveredPorts is pre-computed before the loop and updated incrementally
 
             // Group valid passengers by origin port, compute total bid per port.
             // Filter out passengers this ship cannot reach before they expire.
@@ -979,6 +1006,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
               const etaSec = Math.round(travelTimeMs(bestPort.path.totalDistance, speed) / 1000);
               s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ETA ~${etaSec}s)`);
+              coveredPorts.add(bestPort.portId); // incremental update — prevents next ship choosing same port
               pendingTransits.push({
                 shipId: ship.id, routeId: bestPort.path.legs[0].routeId,
                 onError: (msg) => {
@@ -1083,7 +1111,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           });
         } else {
           // Rare: sellLegs was empty (same port buy/sell?), re-find path
-          const sellPaths = findPaths(ship.port_id, allRoutes, 99);
+          const sellPaths = getPathsFrom(ship.port_id);
           const toSell = sellPaths.find((p) => p.destPortId === plan.sellPortId);
           if (!toSell || toSell.legs.length === 0) {
             s = appendLog(s, `${ship.name}: ⚠️ no sell route from ${portName(ship.port_id)} — resetting`);
