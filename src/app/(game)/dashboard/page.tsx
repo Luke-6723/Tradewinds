@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { worldApi } from "@/lib/api/world";
-import type { Cargo, Company, CompanyEconomy, Good, LedgerEntry, Port, Ship } from "@/lib/types";
+import type { Company, CompanyEconomy, Good, LedgerEntry, Port, Ship } from "@/lib/types";
 import type { StoredWarehouseStock } from "@/lib/db/collections";
 import { useAutopilot } from "@/hooks/use-autopilot";
 import { useSse } from "@/hooks/use-sse";
@@ -47,7 +47,6 @@ export default function DashboardPage() {
   const [ships, setShips] = useState<Ship[]>([]);
   const [ports, setPorts] = useState<Port[]>([]);
   const [goods, setGoods] = useState<Good[]>([]);
-  const [shipCargo, setShipCargo] = useState<Record<string, Cargo[]>>({});
   const [warehouseStocks, setWarehouseStocks] = useState<StoredWarehouseStock[]>([]);
   const [loading, setLoading] = useState(true);
   const { state: ap, toggle: toggleAp, toggleFleetMgmt } = useAutopilot();
@@ -70,14 +69,6 @@ export default function DashboardPage() {
         setPorts(p as Port[]);
         setGoods(g as Good[]);
         setWarehouseStocks(stocks as StoredWarehouseStock[]);
-        const ships = s as Ship[];
-        Promise.all(
-          ships.map((ship) =>
-            fleetApi.getInventoryCached(ship).then((cargo) => ({ id: ship.id, cargo })).catch(() => ({ id: ship.id, cargo: [] as Cargo[] }))
-          )
-        ).then((results) => {
-          setShipCargo(Object.fromEntries(results.map(({ id, cargo }) => [id, cargo])));
-        });
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -514,7 +505,6 @@ export default function DashboardPage() {
                     const ss = ap.ships[ship.id];
                     const phase = ss?.phase ?? "idle";
                     const plan = ss?.plan;
-                    const cargo = shipCargo[ship.id] ?? [];
                     const traveling = ship.status === "traveling";
                     return (
                       <tr key={ship.id} className="hover:bg-muted/30 transition-colors">
@@ -546,14 +536,14 @@ export default function DashboardPage() {
                         </td>
                         <td className="px-3 py-2 hidden md:table-cell">
                           <div className="text-xs text-muted-foreground space-y-0.5">
-                            {cargo.length > 0 && (
-                              <p>{cargo.map((c) => `${c.quantity}× ${goodName(c.good_id)}`).join(", ")}</p>
+                            {plan?.goodName && plan.quantity && (
+                              <p>{plan.quantity}× {plan.goodName}</p>
                             )}
                             {plan?.passengerBid && (
                               <p className="text-purple-600 dark:text-purple-400">🧳 £{plan.passengerBid.toLocaleString()}</p>
                             )}
-                            {cargo.length === 0 && !plan?.passengerBid && (
-                              <span className="text-muted-foreground/60">empty</span>
+                            {!plan?.goodName && !plan?.passengerBid && (
+                              <span className="text-muted-foreground/60">—</span>
                             )}
                           </div>
                         </td>
