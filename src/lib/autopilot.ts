@@ -401,7 +401,14 @@ async function cachedTraderPositions(): Promise<TraderPosition[]> {
 async function cachedShips(): Promise<Ship[]> {
   const now = Date.now();
   if (!_cachedShips || now - _shipsFetchedAt > SHIPS_TTL_MS) {
-    _cachedShips = await fleetApi.getShips();
+    const raw = await fleetApi.getShips();
+    // Deduplicate by ID (upstream cursor pagination can return the same ship twice)
+    const seen = new Set<string>();
+    _cachedShips = raw.filter((s) => {
+      if (seen.has(s.id)) return false;
+      seen.add(s.id);
+      return true;
+    });
     _shipsFetchedAt = now;
     console.log(`[cache] ships refreshed (${_cachedShips.length})`);
   }

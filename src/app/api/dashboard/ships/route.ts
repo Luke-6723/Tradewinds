@@ -22,7 +22,7 @@ async function fetchAllShips(token: string, companyId: string): Promise<ShipCach
   const cached = _cache.get(companyId);
   if (cached && now - cached.fetchedAt < SHIPS_TTL_MS) return cached;
 
-  const ships: Ship[] = [];
+  const rawShips: Ship[] = [];
   let after: string | null = null;
   do {
     const qs = after ? `?after=${encodeURIComponent(after)}` : "";
@@ -34,9 +34,17 @@ async function fetchAllShips(token: string, companyId: string): Promise<ShipCach
     });
     if (!res.ok) break;
     const page = await res.json() as { data: Ship[]; metadata?: { after?: string } };
-    ships.push(...page.data);
+    rawShips.push(...page.data);
     after = page.metadata?.after ?? null;
   } while (after);
+
+  // Deduplicate by ID (upstream cursor pagination can return the same ship twice)
+  const seen = new Set<string>();
+  const ships = rawShips.filter((s) => {
+    if (seen.has(s.id)) return false;
+    seen.add(s.id);
+    return true;
+  });
 
   const traveling = ships.filter((s) => s.status === "traveling").length;
   const docked = ships.length - traveling;
