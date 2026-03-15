@@ -153,6 +153,16 @@ let lastCommandUpdatedAt: Date | null = null;
 
 async function checkCommands(): Promise<void> {
   try {
+    // If we started before credentials were stored, retry resolving company ID
+    if (companyId === "unknown") {
+      try {
+        companyId = await resolveCompanyId();
+        console.log(`[autopilot:${companyId.slice(0, 8)}] company ID resolved`);
+      } catch {
+        return; // still no credentials — try again next poll
+      }
+    }
+
     const cmd = await getAutopilotCommand(companyId);
     if (!cmd) return;
 

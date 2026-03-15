@@ -205,6 +205,32 @@ export interface AutopilotCommand {
   updatedAt: Date;
 }
 
+export async function saveAutopilotCommandEnabled(
+  companyId: string,
+  enabled: boolean,
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<AutopilotCommand>("autopilot_commands").updateOne(
+    { companyId },
+    { $set: { companyId, enabled, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
+export async function saveAutopilotCommandFleetMgmt(
+  companyId: string,
+  fleetMgmt: AutopilotCommand["fleetMgmt"],
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<AutopilotCommand>("autopilot_commands").updateOne(
+    { companyId },
+    { $set: { companyId, fleetMgmt, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
 export async function saveAutopilotCommand(
   companyId: string,
   command: Pick<AutopilotCommand, "enabled" | "fleetMgmt">,

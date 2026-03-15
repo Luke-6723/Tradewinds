@@ -10,7 +10,8 @@
 import {
   loadAutopilotState,
   saveAutopilotState,
-  saveAutopilotCommand,
+  saveAutopilotCommandEnabled,
+  saveAutopilotCommandFleetMgmt,
   getAutopilotCommand,
 } from "@/lib/db/collections";
 import { blank, type AutopilotState } from "@/lib/autopilot-types";
@@ -27,7 +28,7 @@ export const autopilotManager = {
     const current = await loadAutopilotState(companyId) ?? blank();
     const next: AutopilotState = { ...current, enabled };
     await Promise.all([
-      saveAutopilotCommand(companyId, { enabled, fleetMgmt: current.fleetMgmt ?? { enabled: false } }),
+      saveAutopilotCommandEnabled(companyId, enabled),
       saveAutopilotState(companyId, next),
     ]);
     return next;
@@ -38,7 +39,7 @@ export const autopilotManager = {
     const current = await loadAutopilotState(companyId) ?? blank();
     const next: AutopilotState = { ...current, fleetMgmt: { ...current.fleetMgmt, enabled } };
     await Promise.all([
-      saveAutopilotCommand(companyId, { enabled: current.enabled, fleetMgmt: { enabled } }),
+      saveAutopilotCommandFleetMgmt(companyId, { enabled }),
       saveAutopilotState(companyId, next),
     ]);
     return next;
