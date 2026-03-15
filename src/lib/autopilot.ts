@@ -884,39 +884,66 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           }
 
         } else {
-          // ── No cargo opportunity — try chasing passengers at nearby ports ────
+          // ── No cargo opportunity — route ship to best uncovered passenger port ──
           let chasedPax = false;
           if ((shipType?.passengers ?? 0) > 0) {
             const now = Date.now();
             const paxPaths = findPaths(ship.port_id, allRoutes, MAX_PAX_CHASE_HOPS);
 
-            // Collect remote passengers with enough time remaining, scored by bid/distance
-            const candidates = allPassengers
-              .filter((p) =>
-                p.origin_port_id !== ship.port_id &&
-                new Date(p.expires_at).getTime() - now > MIN_PAX_EXPIRY_BUFFER_MS,
-              )
-              .map((p) => {
-                const path = paxPaths.find((pa) => pa.destPortId === p.origin_port_id);
+            // Build a set of ports already covered: a ship is docked there, or
+            // another ship is in passenger-chase mode heading there.
+            const coveredPorts = new Set<string>();
+            coveredPorts.add(ship.port_id);  // current port is covered by this ship
+            for (const sh of ships) {
+              if (sh.id === ship.id) continue;
+              if (sh.status === "docked" && sh.port_id) coveredPorts.add(sh.port_id);
+              const shSs = s.ships[sh.id];
+              if (shSs?.phase === "transiting_to_buy" && !shSs.plan?.goodId && shSs.plan?.buyPortId) {
+                coveredPorts.add(shSs.plan.buyPortId);
+              }
+            }
+
+            // Group valid passengers by origin port, compute total bid per port
+            const portBids = new Map<string, { total: number; best: Passenger }>();
+            for (const p of allPassengers) {
+              if (new Date(p.expires_at).getTime() - now <= MIN_PAX_EXPIRY_BUFFER_MS) continue;
+              const existing = portBids.get(p.origin_port_id);
+              if (!existing || p.bid > existing.best.bid) {
+                portBids.set(p.origin_port_id, {
+                  total: (existing?.total ?? 0) + p.bid,
+                  best: existing && existing.best.bid >= p.bid ? existing.best : p,
+                });
+              } else {
+                existing.total += p.bid;
+              }
+            }
+
+            // Score each reachable port: uncovered ports get a 2× multiplier
+            const portCandidates = Array.from(portBids.entries())
+              .filter(([portId]) => portId !== ship.port_id)
+              .map(([portId, { total, best }]) => {
+                const path = paxPaths.find((pa) => pa.destPortId === portId);
                 if (!path) return null;
-                return { pax: p, path, score: p.bid / path.totalDistance };
+                const coverageBonus = coveredPorts.has(portId) ? 1 : 2;
+                return { portId, path, best, totalBid: total, score: (total / path.totalDistance) * coverageBonus };
               })
               .filter((c): c is NonNullable<typeof c> => c !== null)
               .sort((a, b) => b.score - a.score);
 
-            const best = candidates[0];
-            if (best) {
+            const bestPort = portCandidates[0];
+            if (bestPort) {
               try {
-                await fleetApi.transit(ship.id, { route_id: best.path.legs[0].routeId });
+                await fleetApi.transit(ship.id, { route_id: bestPort.path.legs[0].routeId });
                 s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan: {
                   goodId: "", goodName: "",
                   quantity: 0, actualBuyPrice: 0,
-                  buyPortId: best.pax.origin_port_id,
-                  sellPortId: best.pax.destination_port_id, sellPrice: 0,
-                  sellLegs: [], legs: best.path.legs.slice(1),
-                  passengerBid: best.pax.bid,
+                  buyPortId: bestPort.portId,
+                  sellPortId: bestPort.best.destination_port_id, sellPrice: 0,
+                  sellLegs: [], legs: bestPort.path.legs.slice(1),
+                  passengerBid: bestPort.totalBid,
                 }, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-                s = appendLog(s, `${ship.name}: 🧳 chasing pax → ${portName(best.pax.origin_port_id)} (£${best.pax.bid}, ${Math.round((new Date(best.pax.expires_at).getTime() - now) / 60000)}m left)`);
+                const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
+                s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ${Math.round((new Date(bestPort.best.expires_at).getTime() - now) / 60000)}m left)`);
                 chasedPax = true;
               } catch (e: unknown) {
                 s = appendLog(s, `${ship.name}: pax-chase dispatch failed — ${(e as Error).message}`);
