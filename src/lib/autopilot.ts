@@ -14,7 +14,7 @@
  * Passenger delivery is automatic server-side on arrival at destination_port_id.
  */
 
-import type { Cargo, Good, MarketOrder, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, Warehouse, WarehouseInventory } from "@/lib/types";
+import type { Cargo, Good, MarketOrder, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, TraderPosition, Warehouse, WarehouseInventory } from "@/lib/types";
 import { api } from "@/lib/api/client";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
@@ -339,6 +339,62 @@ async function runFleetManagement(
   return s;
 }
 
+// ── Cycle data cache ───────────────────────────────────────────────────────────
+// Static game data (routes, ports, goods, ship types) almost never changes —
+// cache indefinitely until process restart to avoid burning rate-limit budget.
+// Trader positions (NPC prices) change slowly — refresh every TRADER_POS_TTL_MS.
+
+const TRADER_POS_TTL_MS = 5 * 60 * 1_000; // 5 min = 30 cycles
+
+let _cachedRoutes: Route[] | null = null;
+let _cachedShipTypes: ShipType[] | null = null;
+let _cachedPorts: Port[] | null = null;
+let _cachedGoods: Good[] | null = null;
+let _cachedTraderPositions: TraderPosition[] | null = null;
+let _traderPositionsFetchedAt = 0;
+
+async function cachedRoutes(): Promise<Route[]> {
+  if (!_cachedRoutes) {
+    _cachedRoutes = await worldApi.getRoutes();
+    console.log(`[cache] routes loaded (${_cachedRoutes.length})`);
+  }
+  return _cachedRoutes;
+}
+
+async function cachedShipTypes(): Promise<ShipType[]> {
+  if (!_cachedShipTypes) {
+    _cachedShipTypes = await worldApi.getShipTypes();
+    console.log(`[cache] shipTypes loaded (${_cachedShipTypes.length})`);
+  }
+  return _cachedShipTypes;
+}
+
+async function cachedPorts(): Promise<Port[]> {
+  if (!_cachedPorts) {
+    _cachedPorts = await worldApi.getPorts();
+    console.log(`[cache] ports loaded (${_cachedPorts.length})`);
+  }
+  return _cachedPorts;
+}
+
+async function cachedGoods(): Promise<Good[]> {
+  if (!_cachedGoods) {
+    _cachedGoods = await worldApi.getGoods();
+    console.log(`[cache] goods loaded (${_cachedGoods.length})`);
+  }
+  return _cachedGoods;
+}
+
+async function cachedTraderPositions(): Promise<TraderPosition[]> {
+  const now = Date.now();
+  if (!_cachedTraderPositions || now - _traderPositionsFetchedAt > TRADER_POS_TTL_MS) {
+    _cachedTraderPositions = await tradeApi.getTraderPositions();
+    _traderPositionsFetchedAt = now;
+    console.log(`[cache] traderPositions refreshed (${_cachedTraderPositions.length})`);
+  }
+  return _cachedTraderPositions;
+}
+
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
 export async function runCycle(s: AutopilotState, companyId: string): Promise<AutopilotState> {
@@ -368,17 +424,19 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   try {
     s = appendLog(s, `── cycle start ──`);
     const fetchStart = Date.now();
+    // Fresh each cycle: ships, company, economy, warehouses, passengers
+    // Cached: routes (forever), shipTypes (forever), ports (forever), goods (forever), traderPositions (5 min)
     const [ships, allRoutes, shipTypes, allPorts, allGoods, company, economy, allWarehouses, allPassengers, allTraderPositions] = await Promise.all([
       timed("ships", () => fleetApi.getShips()).catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
-      timed("routes", () => worldApi.getRoutes()).catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
-      timed("shipTypes", () => worldApi.getShipTypes()).catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
-      timed("ports", () => worldApi.getPorts()).catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
-      timed("goods", () => worldApi.getGoods()).catch((e: Error) => { throw new Error(`getGoods: ${e.message}`); }),
+      cachedRoutes().catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
+      cachedShipTypes().catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
+      cachedPorts().catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
+      cachedGoods().catch((e: Error) => { throw new Error(`getGoods: ${e.message}`); }),
       timed("company", () => companyApi.getCompany()).catch((e: Error) => { throw new Error(`getCompany: ${e.message}`); }),
-      timed("economy", () => companyApi.getEconomy()).catch(() => ({ total_upkeep: 0 } as { total_upkeep: number })),
+      companyApi.getEconomy().catch(() => ({ total_upkeep: 0 } as { total_upkeep: number })),
       timed("warehouses", () => warehousesApi.getWarehouses()).catch(() => [] as Warehouse[]),
       timed("passengers", () => passengersApi.getPassengers({ status: "available" })).catch(() => [] as Passenger[]),
-      timed("traderPositions", () => tradeApi.getTraderPositions()).catch(() => []),
+      cachedTraderPositions().catch(() => []),
     ]);
     s = appendLog(s, `📦 all data fetched in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
     // Sort docked ships by ID for a stable window across cycles
