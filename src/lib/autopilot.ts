@@ -15,6 +15,7 @@
  */
 
 import type { Cargo, Good, MarketOrder, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, Warehouse, WarehouseInventory } from "@/lib/types";
+import { api } from "@/lib/api/client";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
 import { marketApi } from "@/lib/api/market";
@@ -38,6 +39,8 @@ const SCAN_BATCH   = 16;
 const DOCK_DELAY_MS = 0;
 /** Price level at or above which we sell from warehouse (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
+/** Number of transit API calls to fire concurrently per batch. */
+const TRANSIT_BATCH_SIZE = 20;
 
 // ── Fleet management constants ─────────────────────────────────────────────
 /** Cycles a ship must be consecutively idle before it's a sell candidate. */
@@ -336,11 +339,21 @@ async function runFleetManagement(
   return s;
 }
 
+// ── Batch transit helpers ──────────────────────────────────────────────────────
+
+interface PendingTransit {
+  shipId: string;
+  routeId: string;
+  /** Called if the transit API call is rejected — should update `s` to undo optimistic state. */
+  onError: (msg: string) => void;
+}
+
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
 export async function runCycle(s: AutopilotState, companyId: string): Promise<AutopilotState> {
   s = { ...s, lastCycleAt: new Date().toISOString() };
   let treasuryBalance: number | null = null;
+  const pendingTransits: PendingTransit[] = [];
 
   const timed = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
     const t0 = Date.now();
@@ -641,14 +654,17 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                   quantity: item.quantity, actualBuyPrice: 0,
                   sellPortId: bestSellPath.destPortId, legs: bestSellPath.legs.slice(1),
                 };
-                try {
-                  await fleetApi.transit(ship.id, { route_id: bestSellPath.legs[0].routeId });
-                  s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-                  s = appendLog(s, `${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${item.quantity}× ${goodNameFn(item.good_id)}`);
-                  dispatched = true;
-                } catch (e: unknown) {
-                  s = appendLog(s, `${ship.name}: leftover dispatch failed — ${(e as Error).message}`);
-                }
+                const ssBeforeDispatch = ss;
+                s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+                s = appendLog(s, `${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${item.quantity}× ${goodNameFn(item.good_id)}`);
+                pendingTransits.push({
+                  shipId: ship.id, routeId: bestSellPath.legs[0].routeId,
+                  onError: (msg) => {
+                    s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeDispatch } };
+                    s = appendLog(s, `${ship.name}: leftover dispatch failed — ${msg}`);
+                  },
+                });
+                dispatched = true;
               } else {
                 s = appendLog(s, `${ship.name}: ⚠️ stuck with ${item.quantity}× ${goodNameFn(item.good_id)} — no sell route`);
               }
@@ -815,13 +831,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             ...(cargoQty > 0 ? { goodId: cargoGoodId, goodName: cargoGoodName, quantity: cargoQty, actualBuyPrice: cargoBuyPrice, sellPrice: cargoSellPrice } : {}),
           };
 
-          try {
-            await fleetApi.transit(ship.id, { route_id: destPath.legs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-            s = appendLog(s, `${ship.name}: → ${portName(boardedPaxDestination)} (pax £${boardedPaxBid}${cargoQty > 0 ? ` + ${cargoQty}× ${cargoGoodName}` : ""})`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: pax dispatch failed — ${(e as Error).message}`);
-          }
+          const ssBeforePaxDispatch = ss;
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+          s = appendLog(s, `${ship.name}: → ${portName(boardedPaxDestination)} (pax £${boardedPaxBid}${cargoQty > 0 ? ` + ${cargoQty}× ${cargoGoodName}` : ""})`);
+          pendingTransits.push({
+            shipId: ship.id, routeId: destPath.legs[0].routeId,
+            onError: (msg) => {
+              s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforePaxDispatch } };
+              s = appendLog(s, `${ship.name}: pax dispatch failed — ${msg}`);
+            },
+          });
 
         } else if (bestCargo) {
           // No passengers — execute best cargo trade
@@ -852,9 +871,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                 quantity: buyQty, actualBuyPrice: eq.unit_price, sellPrice: bestCargo.npcSellPrice,
                 sellPortId: bestCargo.sellPortId, legs: destPath.legs.slice(1),
               };
-              await fleetApi.transit(ship.id, { route_id: destPath.legs[0].routeId });
+              const ssBeforeLocalDispatch = ss;
               s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
               s = appendLog(s, `${ship.name}: 📦 ${buyQty}× ${plan.goodName} → ${portName(bestCargo.sellPortId)} (£${eq.unit_price}→£${bestCargo.npcSellPrice}, ${((bestCargo.npcSellPrice - eq.unit_price) / eq.unit_price * 100).toFixed(1)}%)`);
+              pendingTransits.push({
+                shipId: ship.id, routeId: destPath.legs[0].routeId,
+                onError: (msg) => {
+                  s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeLocalDispatch } };
+                  s = appendLog(s, `${ship.name}: local buy failed — ${msg}`);
+                },
+              });
             } catch (e: unknown) {
               s = appendLog(s, `${ship.name}: local buy failed — ${(e as Error).message}`);
             }
@@ -874,13 +900,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
               sellLegs: bestCargo.sellLegs,
               legs: toBuyPath.legs.slice(1),
             };
-            try {
-              await fleetApi.transit(ship.id, { route_id: toBuyPath.legs[0].routeId });
-              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-              s = appendLog(s, `${ship.name}: → ${portName(bestCargo.buyPortId)} to buy ${goodNameFn(bestCargo.goodId)}`);
-            } catch (e: unknown) {
-              s = appendLog(s, `${ship.name}: remote dispatch failed — ${(e as Error).message}`);
-            }
+            const ssBeforeRemoteDispatch = ss;
+            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+            s = appendLog(s, `${ship.name}: → ${portName(bestCargo.buyPortId)} to buy ${goodNameFn(bestCargo.goodId)}`);
+            pendingTransits.push({
+              shipId: ship.id, routeId: toBuyPath.legs[0].routeId,
+              onError: (msg) => {
+                s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeRemoteDispatch } };
+                s = appendLog(s, `${ship.name}: remote dispatch failed — ${msg}`);
+              },
+            });
           }
 
         } else {
@@ -936,23 +965,26 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
             const bestPort = portCandidates[0];
             if (bestPort) {
-              try {
-                await fleetApi.transit(ship.id, { route_id: bestPort.path.legs[0].routeId });
-                s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan: {
-                  goodId: "", goodName: "",
-                  quantity: 0, actualBuyPrice: 0,
-                  buyPortId: bestPort.portId,
-                  sellPortId: bestPort.best.destination_port_id, sellPrice: 0,
-                  sellLegs: [], legs: bestPort.path.legs.slice(1),
-                  passengerBid: bestPort.totalBid,
-                }, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-                const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
-                const etaSec = Math.round(travelTimeMs(bestPort.path.totalDistance, speed) / 1000);
-                s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ETA ~${etaSec}s)`);
-                chasedPax = true;
-              } catch (e: unknown) {
-                s = appendLog(s, `${ship.name}: pax-chase dispatch failed — ${(e as Error).message}`);
-              }
+              const ssBeforePaxChase = ss;
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan: {
+                goodId: "", goodName: "",
+                quantity: 0, actualBuyPrice: 0,
+                buyPortId: bestPort.portId,
+                sellPortId: bestPort.best.destination_port_id, sellPrice: 0,
+                sellLegs: [], legs: bestPort.path.legs.slice(1),
+                passengerBid: bestPort.totalBid,
+              }, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
+              const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
+              const etaSec = Math.round(travelTimeMs(bestPort.path.totalDistance, speed) / 1000);
+              s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ETA ~${etaSec}s)`);
+              pendingTransits.push({
+                shipId: ship.id, routeId: bestPort.path.legs[0].routeId,
+                onError: (msg) => {
+                  s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforePaxChase } };
+                  s = appendLog(s, `${ship.name}: pax-chase dispatch failed — ${msg}`);
+                },
+              });
+              chasedPax = true;
             }
           }
 
@@ -975,13 +1007,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         // Advance waypoint if not yet at buy port
         if (plan.legs.length > 0 && ship.port_id !== plan.buyPortId) {
-          try {
-            await fleetApi.transit(ship.id, { route_id: plan.legs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } } };
-            s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: waypoint failed — ${(e as Error).message}`);
-          }
+          const ssBeforeWaypoint = ss;
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } } };
+          s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
+          pendingTransits.push({
+            shipId: ship.id, routeId: plan.legs[0].routeId,
+            onError: (msg) => {
+              s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeWaypoint } };
+              s = appendLog(s, `${ship.name}: waypoint failed — ${msg}`);
+            },
+          });
           continue;
         }
 
@@ -1034,14 +1069,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         // Dispatch to sell port (use pre-computed sellLegs, or find path if needed)
         const sellLegs = plan.sellLegs ?? [];
         if (sellLegs.length > 0) {
-          try {
-            await fleetApi.transit(ship.id, { route_id: sellLegs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: sellLegs.slice(1) }, cyclesIdle: 0 } } };
-            s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: sell dispatch failed — ${(e as Error).message}`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-          }
+          const ssBeforeSellLegs = ss;
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: sellLegs.slice(1) }, cyclesIdle: 0 } } };
+          s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
+          pendingTransits.push({
+            shipId: ship.id, routeId: sellLegs[0].routeId,
+            onError: (msg) => {
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ssBeforeSellLegs, phase: "idle" } } };
+              s = appendLog(s, `${ship.name}: sell dispatch failed — ${msg}`);
+            },
+          });
         } else {
           // Rare: sellLegs was empty (same port buy/sell?), re-find path
           const sellPaths = findPaths(ship.port_id, allRoutes, 99);
@@ -1051,14 +1088,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
             continue;
           }
-          try {
-            await fleetApi.transit(ship.id, { route_id: toSell.legs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: toSell.legs.slice(1) }, cyclesIdle: 0 } } };
-            s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: sell dispatch failed — ${(e as Error).message}`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-          }
+          const ssBeforeAltSell = ss;
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: toSell.legs.slice(1) }, cyclesIdle: 0 } } };
+          s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
+          pendingTransits.push({
+            shipId: ship.id, routeId: toSell.legs[0].routeId,
+            onError: (msg) => {
+              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ssBeforeAltSell, phase: "idle" } } };
+              s = appendLog(s, `${ship.name}: sell dispatch failed — ${msg}`);
+            },
+          });
         }
 
       // ══════════════════════════════════════════════════════════════════════════
@@ -1069,13 +1108,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
         // Advance waypoint
         if (plan.legs.length > 0 && ship.port_id !== plan.sellPortId) {
-          try {
-            await fleetApi.transit(ship.id, { route_id: plan.legs[0].routeId });
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } } };
-            s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: waypoint failed — ${(e as Error).message}`);
-          }
+          const ssBeforeWaypoint = ss;
+          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } } };
+          s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
+          pendingTransits.push({
+            shipId: ship.id, routeId: plan.legs[0].routeId,
+            onError: (msg) => {
+              s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeWaypoint } };
+              s = appendLog(s, `${ship.name}: waypoint failed — ${msg}`);
+            },
+          });
           continue;
         }
 
@@ -1133,6 +1175,22 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
 
     s = appendLog(s, `🚢 ship loop done — ${shipsActioned} docked processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+
+    // ── Batch transit flush ────────────────────────────────────────────────────
+    if (pendingTransits.length > 0) {
+      for (let i = 0; i < pendingTransits.length; i += TRANSIT_BATCH_SIZE) {
+        const batch = pendingTransits.slice(i, i + TRANSIT_BATCH_SIZE);
+        const results = await Promise.allSettled(
+          batch.map(({ shipId, routeId }) => api.post<Ship>(`/ships/${shipId}/transit`, { route_id: routeId })),
+        );
+        for (let j = 0; j < batch.length; j++) {
+          if (results[j].status === "rejected") {
+            batch[j].onError((results[j] as PromiseRejectedResult).reason?.message ?? "transit failed");
+          }
+        }
+      }
+      s = appendLog(s, `⚡ ${pendingTransits.length} transit(s) dispatched in ${Math.ceil(pendingTransits.length / TRANSIT_BATCH_SIZE)} batch(es)`);
+    }
 
     // ── Fleet management ───────────────────────────────────────────────────────
     s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds, allPassengers);
