@@ -246,6 +246,35 @@ async function runFleetManagement(
   const overTarget = ships.length > fleetTarget;
   console.log(`[fleetMgmt] ships=${ships.length} target=${fleetTarget === Infinity ? "∞" : fleetTarget} overTarget=${overTarget} enabled=${fleetMgmt.enabled}`);
 
+  // ── DISCOVER shipyard ports ────────────────────────────────────────────────
+  // When over target and we have few/no known shipyard ports, probe a batch of
+  // docked ship ports in parallel to populate knownShipyardPortIds.
+  if (overTarget) {
+    const dockedPortIds = [...new Set(
+      ships.filter((sh) => sh.status !== "traveling" && sh.port_id).map((sh) => sh.port_id!)
+    )].filter((pid) => !fleetMgmt.knownShipyardPortIds.includes(pid));
+
+    if (dockedPortIds.length > 0) {
+      const PROBE_BATCH = 20;
+      const probe = dockedPortIds.slice(0, PROBE_BATCH);
+      console.log(`[fleetMgmt:discover] probing ${probe.length} ports for shipyards`);
+      const results = await Promise.allSettled(probe.map(async (pid) => ({ pid, sy: await shipyardsApi.getPortShipyard(pid) })));
+      const newYards: string[] = [];
+      for (const r of results) {
+        if (r.status === "fulfilled") newYards.push(r.value.pid);
+      }
+      if (newYards.length > 0) {
+        const merged = [...new Set([...fleetMgmt.knownShipyardPortIds, ...newYards])];
+        s = { ...s, fleetMgmt: { ...s.fleetMgmt!, knownShipyardPortIds: merged } };
+        // Sync local ref so the sell loop below uses the updated list
+        fleetMgmt.knownShipyardPortIds = merged;
+        console.log(`[fleetMgmt:discover] found ${newYards.length} shipyard ports: ${newYards.join(", ")}`);
+      } else {
+        console.log(`[fleetMgmt:discover] no shipyards found in batch`);
+      }
+    }
+  }
+
   // ── SELL: idle ships at shipyard ports ────────────────────────────────────
   // When over fleet target: sell any idle ship immediately (no idle-cycle requirement).
   // When at/under target: only sell ships that have been idle for SELL_IDLE_CYCLES.
