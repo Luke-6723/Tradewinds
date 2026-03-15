@@ -47,10 +47,11 @@ const SHIP_WINDOW_SIZE = 20;
 const SELL_IDLE_CYCLES = 9;        // 3 min at 20s cycle
 /** Minimum fleet size — never sell below this. */
 const MIN_FLEET_SIZE = 2;
-/** Available-funds multiplier required before buying a ship. */
-const BUY_RESERVE_MULTIPLIER = 3;
-/** Cooldown between automated buys. */
-const BUY_COOLDOWN_MS  = 5 * 60_000;
+/** Available-funds multiplier required before buying a ship.
+ *  High value keeps treasury intact for cargo/pax trading capital. */
+const BUY_RESERVE_MULTIPLIER = 20;
+/** Cooldown between automated buys — infrequent to deprioritise expansion. */
+const BUY_COOLDOWN_MS  = 60 * 60_000; // 1 hour
 /** Cooldown between automated sells. */
 const SELL_COOLDOWN_MS = 2 * 60_000;
 
@@ -288,7 +289,7 @@ async function runFleetManagement(
     const lastProfit = prevPH.length > 0 ? prevPH[prevPH.length - 1].cycleProfit : 0;
     const perCycleUpkeep = economy.total_upkeep * (CYCLE_MS / 3_600_000);
 
-    if (lastProfit > 2 * perCycleUpkeep) {
+    if (lastProfit > 10 * perCycleUpkeep) {
       for (const ship of ships.filter((sh: Ship) => sh.status !== "traveling" && sh.port_id)) {
         const portId = ship.port_id!;
         try {
