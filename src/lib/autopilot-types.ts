@@ -45,6 +45,8 @@ export interface AutopilotShipState {
   paxTrips: number;
   /** Total cycles this ship has been tracked. */
   cyclesActive: number;
+  /** Role derived each cycle from ship type name. */
+  role?: "ferry" | "multi";
 }
 
 export interface LogEntry {
