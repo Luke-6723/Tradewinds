@@ -48,7 +48,9 @@ export default function DashboardPage() {
   const [ports, setPorts] = useState<Port[]>([]);
   const [goods, setGoods] = useState<Good[]>([]);
   const [warehouseStocks, setWarehouseStocks] = useState<StoredWarehouseStock[]>([]);
+  const [shipPage, setShipPage] = useState(0);
   const [loading, setLoading] = useState(true);
+  const SHIPS_PER_PAGE = 50;
   const { state: ap, toggle: toggleAp, toggleFleetMgmt } = useAutopilot();
 
   useEffect(() => {
@@ -501,7 +503,7 @@ export default function DashboardPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {ships.map((ship) => {
+                  {ships.slice(shipPage * SHIPS_PER_PAGE, (shipPage + 1) * SHIPS_PER_PAGE).map((ship) => {
                     const ss = ap.ships[ship.id];
                     const phase = ss?.phase ?? "idle";
                     const plan = ss?.plan;
@@ -570,6 +572,21 @@ export default function DashboardPage() {
                   })}
                 </tbody>
               </table>
+              {ships.length > SHIPS_PER_PAGE && (
+                <div className="flex items-center justify-between px-3 py-2 border-t bg-muted/30 text-sm">
+                  <span className="text-muted-foreground text-xs">
+                    {shipPage * SHIPS_PER_PAGE + 1}–{Math.min((shipPage + 1) * SHIPS_PER_PAGE, ships.length)} of {ships.length} ships
+                  </span>
+                  <div className="flex gap-2">
+                    <Button variant="outline" size="sm" disabled={shipPage === 0} onClick={() => setShipPage(p => p - 1)}>
+                      ← Prev
+                    </Button>
+                    <Button variant="outline" size="sm" disabled={(shipPage + 1) * SHIPS_PER_PAGE >= ships.length} onClick={() => setShipPage(p => p + 1)}>
+                      Next →
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
