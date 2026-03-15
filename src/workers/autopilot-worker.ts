@@ -15,9 +15,11 @@ import { handlePassengerEvent, handleShipSoldEvent, runCycle } from "@/lib/autop
 import { appendLog, blank, CYCLE_MS, type AutopilotState } from "@/lib/autopilot-types";
 import { loadAutopilotState, saveAutopilotState } from "@/lib/db/collections";
 import { UPSTREAM } from "@/lib/auth-cookies";
+import { refreshToken as doRefreshToken } from "@/lib/server/token-refresh";
 
 const companyId = process.env.TRADEWINDS_COMPANY_ID ?? "unknown";
-const token = process.env.TRADEWINDS_TOKEN ?? "";
+/** Mutable — updated by the token refresh loop. */
+let token = process.env.TRADEWINDS_TOKEN ?? "";
 
 let state: AutopilotState = blank();
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -28,6 +30,27 @@ let cycleRunning = false;
 function sendState(): void {
   process.send?.({ type: "state", data: state });
 }
+
+const TOKEN_REFRESH_INTERVAL_MS = 16 * 60 * 60 * 1000; // 16 hours
+
+async function rotateToken(): Promise<void> {
+  try {
+    const newToken = await doRefreshToken();
+    token = newToken;
+    process.env.TRADEWINDS_TOKEN = newToken; // picked up by api/client.ts buildHeaders
+    // Restart SSE stream with the new token
+    startEventStream();
+    state = appendLog(state, "🔑 Token refreshed");
+    sendState();
+    void saveAutopilotState(companyId, state);
+  } catch (e: unknown) {
+    state = appendLog(state, `⚠️ Token refresh failed: ${(e as Error).message}`);
+    sendState();
+  }
+}
+
+// Schedule automatic token rotation every 16 hours
+setInterval(() => void rotateToken(), TOKEN_REFRESH_INTERVAL_MS);
 
 async function tick(): Promise<void> {
   if (!state.enabled || cycleRunning) return;
