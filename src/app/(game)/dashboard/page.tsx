@@ -49,9 +49,17 @@ export default function DashboardPage() {
   const [goods, setGoods] = useState<Good[]>([]);
   const [warehouseStocks, setWarehouseStocks] = useState<StoredWarehouseStock[]>([]);
   const [shipPage, setShipPage] = useState(0);
+  const [credentialsStored, setCredentialsStored] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const SHIPS_PER_PAGE = 50;
   const { state: ap, toggle: toggleAp, toggleFleetMgmt } = useAutopilot();
+
+  useEffect(() => {
+    fetch("/api/auth/credentials-status")
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => setCredentialsStored(d?.stored ?? false))
+      .catch(() => setCredentialsStored(false));
+  }, []);
 
   useEffect(() => {
     Promise.all([
@@ -418,6 +426,12 @@ export default function DashboardPage() {
               </Button>
             </div>
           </div>
+
+          {credentialsStored === false && (
+            <div className="mt-2 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+              ⚠️ No stored credentials — log in once so the autopilot can refresh its token automatically.
+            </div>
+          )}
 
           {/* Profit + fleet mgmt strip */}
           <div className="flex flex-wrap items-center gap-x-6 gap-y-2 pt-2 text-sm">

@@ -156,6 +156,65 @@ export async function removeWarehouseStock(
     .deleteOne({ companyId, warehouseId, goodId });
 }
 
+// ── Autopilot credentials (stored on login for token refresh) ─────────────────
+// ⚠ Stored in plaintext — private app only.
+
+export interface StoredCredentials {
+  key: "singleton";
+  email: string;
+  password: string;
+  updatedAt: Date;
+}
+
+export async function saveAutopilotCredentials(email: string, password: string): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<StoredCredentials>("autopilot_credentials").updateOne(
+    { key: "singleton" },
+    { $set: { key: "singleton", email, password, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
+export async function getAutopilotCredentials(): Promise<{ email: string; password: string } | null> {
+  const db = await getDb();
+  if (!db) return null;
+  const doc = await db.collection<StoredCredentials>("autopilot_credentials").findOne({ key: "singleton" });
+  if (!doc) return null;
+  return { email: doc.email, password: doc.password };
+}
+
+// ── Autopilot commands ────────────────────────────────────────────────────────
+// Written by the dashboard; polled by the standalone autopilot process.
+
+export interface AutopilotCommand {
+  companyId: string;
+  enabled: boolean;
+  fleetMgmt: { enabled: boolean };
+  updatedAt: Date;
+}
+
+export async function saveAutopilotCommand(
+  companyId: string,
+  command: Pick<AutopilotCommand, "enabled" | "fleetMgmt">,
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<AutopilotCommand>("autopilot_commands").updateOne(
+    { companyId },
+    { $set: { companyId, ...command, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
+export async function getAutopilotCommand(
+  companyId: string,
+): Promise<AutopilotCommand | null> {
+  const db = await getDb();
+  if (!db) return null;
+  return db.collection<AutopilotCommand>("autopilot_commands").findOne({ companyId });
+}
+
 // ── Ledger entries ─────────────────────────────────────────────────────────────
 
 export interface StoredLedgerEntry {

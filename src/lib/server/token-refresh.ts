@@ -10,14 +10,21 @@
  */
 
 import { UPSTREAM } from "@/lib/auth-cookies";
+import { getAutopilotCredentials } from "@/lib/db/collections";
 
 /** Login and return a fresh bearer token. Throws on failure. */
 export async function refreshToken(): Promise<string> {
-  const email    = process.env.TRADEWINDS_EMAIL    ?? "";
-  const password = process.env.TRADEWINDS_PASSWORD ?? "";
+  let email    = process.env.TRADEWINDS_EMAIL    ?? "";
+  let password = process.env.TRADEWINDS_PASSWORD ?? "";
+
+  // Fall back to MongoDB-stored credentials (set on dashboard login)
+  if (!email || !password) {
+    const stored = await getAutopilotCredentials();
+    if (stored) { email = stored.email; password = stored.password; }
+  }
 
   if (!email || !password) {
-    throw new Error("TRADEWINDS_EMAIL / TRADEWINDS_PASSWORD not set — cannot refresh token");
+    throw new Error("No credentials available — log in via the dashboard first");
   }
 
   const res = await fetch(`${UPSTREAM}/api/v1/auth/login`, {

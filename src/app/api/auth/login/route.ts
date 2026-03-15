@@ -18,6 +18,11 @@ export async function POST(req: NextRequest) {
 
   const token: string = data.data.token;
 
+  // Persist credentials so the standalone autopilot process can refresh tokens.
+  // ⚠ Plaintext — this is a private app.
+  const { saveAutopilotCredentials } = await import("@/lib/db/collections");
+  void saveAutopilotCredentials(body.email as string, body.password as string).catch(() => {});
+
   const res = NextResponse.json({ ok: true });
   res.cookies.set(COOKIE_TOKEN, token, {
     httpOnly: true,
