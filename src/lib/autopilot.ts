@@ -354,6 +354,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   s = { ...s, lastCycleAt: new Date().toISOString() };
   let treasuryBalance: number | null = null;
   const pendingTransits: PendingTransit[] = [];
+  const cycleT0 = Date.now();
 
   const timed = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
     const t0 = Date.now();
@@ -383,6 +384,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     s = appendLog(s, `📦 all data fetched in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
     const dockedShips = ships.filter((sh: Ship) => sh.status !== "traveling");
     console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, companyId=${companyId}`);
+    console.log(`[runCycle:fetch] data ready in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
 
     const bankingCap = economy.total_upkeep + 2_000;
     let availableFunds = Math.max(0, company.treasury - bankingCap);
@@ -611,6 +613,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         }),
       );
       for (const [id, inv] of invResults) shipInventoryCache.set(id, inv);
+      const invElapsed = ((Date.now() - fetchStart) / 1000).toFixed(1);
+      console.log(`[runCycle:inv] ${toFetch.length} inventories pre-fetched in ${invElapsed}s`);
       s = appendLog(s, `🗃️ inventories pre-fetched for ${toFetch.length} docked ships`);
     }
 
@@ -627,8 +631,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
     // ⑤ Pre-compute trade candidates per unique docked port (avoids recomputing per-ship)
     //    Key: portId → RawCandidate[]  (full unfiltered list; per-ship pax filter applied below)
+    const candidatesT0 = Date.now();
     const candidatesByPort = new Map<string, RawCandidate[]>();
-    for (const portId of new Set(ships.filter((sh: Ship) => sh.status !== "traveling" && sh.port_id).map((sh: Ship) => sh.port_id!))) {
+    const uniqueDockedPorts = new Set(ships.filter((sh: Ship) => sh.status !== "traveling" && sh.port_id).map((sh: Ship) => sh.port_id!));
+    for (const portId of uniqueDockedPorts) {
       const paths = getPathsFrom(portId);
       const allCandidates: RawCandidate[] = [];
       for (const buyPortId of npcGoods.keys()) {
@@ -657,13 +663,19 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
       candidatesByPort.set(portId, allCandidates);
     }
+    console.log(`[runCycle:cands] ${uniqueDockedPorts.size} ports pre-computed in ${((Date.now() - candidatesT0) / 1000).toFixed(1)}s`);
 
     // Inline inventory fetch helper — now just reads from the pre-populated cache
     const fetchShipInv = (shipId: string): Cargo[] => shipInventoryCache.get(shipId) ?? [];
 
     const shipLoopStart = Date.now();
     let shipsActioned = 0;
+    let loopIdx = 0;
     for (const ship of ships) {
+      loopIdx++;
+      if (loopIdx % 50 === 0) {
+        console.log(`[runCycle:loop] ${loopIdx}/${ships.length} ships, ${shipsActioned} actioned, ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+      }
       if (ship.status === "traveling") {
         // Ship is en route — keep metrics ticking but don't idle-count it.
         // Also set role here so it's visible even when the ship never docks.
@@ -1205,9 +1217,13 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
 
     s = appendLog(s, `🚢 ship loop done — ${shipsActioned} docked processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+    console.log(`[runCycle:loop] done — ${shipsActioned}/${ships.length} processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
 
     // ── Batch transit flush ────────────────────────────────────────────────────
     if (pendingTransits.length > 0) {
+      const flushT0 = Date.now();
+      let flushOk = 0, flushFail = 0;
+      console.log(`[runCycle:flush] dispatching ${pendingTransits.length} transits in batches of ${TRANSIT_BATCH_SIZE}…`);
       for (let i = 0; i < pendingTransits.length; i += TRANSIT_BATCH_SIZE) {
         const batch = pendingTransits.slice(i, i + TRANSIT_BATCH_SIZE);
         const results = await Promise.allSettled(
@@ -1215,10 +1231,15 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         );
         for (let j = 0; j < batch.length; j++) {
           if (results[j].status === "rejected") {
+            flushFail++;
             batch[j].onError((results[j] as PromiseRejectedResult).reason?.message ?? "transit failed");
+          } else {
+            flushOk++;
           }
         }
       }
+      const flushElapsed = ((Date.now() - flushT0) / 1000).toFixed(1);
+      console.log(`[runCycle:flush] done — ok=${flushOk} fail=${flushFail} in ${flushElapsed}s`);
       s = appendLog(s, `⚡ ${pendingTransits.length} transit(s) dispatched in ${Math.ceil(pendingTransits.length / TRANSIT_BATCH_SIZE)} batch(es)`);
     }
 
@@ -1227,6 +1248,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
   } catch (e: unknown) {
     s = appendLog(s, `Cycle error: ${(e as Error).message}`);
+    console.error(`[runCycle:error] ${(e as Error).message}`, (e as Error).stack);
   }
 
   // ── Profit & treasury history snapshots ───────────────────────────────────
@@ -1243,5 +1265,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
   s = { ...s, profitHistory, treasuryHistory, cyclesRun: s.cyclesRun + 1 };
 
+  console.log(`[runCycle:done] cycle complete in ${((Date.now() - cycleT0) / 1000).toFixed(1)}s`);
   return s;
 }

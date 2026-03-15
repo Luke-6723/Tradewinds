@@ -66,13 +66,16 @@ setInterval(() => void rotateToken(), TOKEN_REFRESH_INTERVAL_MS);
 
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
-const CYCLE_TIMEOUT_MS = 60_000;
+const CYCLE_TIMEOUT_MS = 300_000; // 5 min — cycles with 800 ships can take 2–3 min
 
 async function tick(): Promise<void> {
   console.log(`[tick] enabled=${state.enabled} cycleRunning=${cycleRunning} token=${token ? "set" : "EMPTY"} companyId=${companyId}`);
   if (!state.enabled || cycleRunning) return;
   cycleRunning = true;
-  const guard = setTimeout(() => { cycleRunning = false; }, CYCLE_TIMEOUT_MS);
+  const guard = setTimeout(() => {
+    console.warn(`[tick] CYCLE_TIMEOUT guard fired after ${CYCLE_TIMEOUT_MS / 1000}s — resetting cycleRunning`);
+    cycleRunning = false;
+  }, CYCLE_TIMEOUT_MS);
   try {
     state = await runCycle(state, companyId);
   } catch (e: unknown) {
