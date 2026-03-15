@@ -40,9 +40,9 @@ function buildHeaders(init?: HeadersInit): HeadersInit {
 }
 
 
-// API limit: ~900 req/60s = 15 req/s. We target 10 req/s for headroom.
-const RATE_LIMIT_RPS = 10;
-const REFILL_INTERVAL_MS = 1000 / RATE_LIMIT_RPS; // 125ms per token
+// API limit: ~900 req/60s = 15 req/s. We target 7 req/s for headroom.
+const RATE_LIMIT_RPS = 7;
+const REFILL_INTERVAL_MS = 1000 / RATE_LIMIT_RPS; // ~143ms per token
 
 let tokens = RATE_LIMIT_RPS * 3; // start with a small burst allowance
 let lastRefill = Date.now();
@@ -105,7 +105,7 @@ function formatErrors(errors: Record<string, string | string[]> | undefined): st
 }
 
 const REQUEST_TIMEOUT_MS = 60_000;
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 3;
 
 async function requestCore(
   path: string,
@@ -129,6 +129,15 @@ async function requestCore(
       return requestCore(path, options, attempt + 1);
     }
     throw e;
+  }
+
+  // Retry on 429 (rate limited) — honour Retry-After header if present
+  if (res.status === 429 && attempt < MAX_RETRIES) {
+    const retryAfter = res.headers.get("Retry-After");
+    const waitMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 5_000 * (attempt + 1);
+    console.warn(`[client] 429 rate limited on ${path} — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+    await sleep(waitMs);
+    return requestCore(path, options, attempt + 1);
   }
 
   // Retry on 5xx for idempotent methods

@@ -344,7 +344,8 @@ async function runFleetManagement(
 // cache indefinitely until process restart to avoid burning rate-limit budget.
 // Trader positions (NPC prices) change slowly — refresh every TRADER_POS_TTL_MS.
 
-const TRADER_POS_TTL_MS = 5 * 60 * 1_000; // 5 min = 30 cycles
+const TRADER_POS_TTL_MS = 5 * 60 * 1_000; // 5 min = 15 cycles at 20s
+const SHIPS_TTL_MS = 25_000; // 25s — refreshes each cycle but avoids double-hit on back-to-back starts
 
 let _cachedRoutes: Route[] | null = null;
 let _cachedShipTypes: ShipType[] | null = null;
@@ -352,6 +353,8 @@ let _cachedPorts: Port[] | null = null;
 let _cachedGoods: Good[] | null = null;
 let _cachedTraderPositions: TraderPosition[] | null = null;
 let _traderPositionsFetchedAt = 0;
+let _cachedShips: Ship[] | null = null;
+let _shipsFetchedAt = 0;
 
 async function cachedRoutes(): Promise<Route[]> {
   if (!_cachedRoutes) {
@@ -395,6 +398,16 @@ async function cachedTraderPositions(): Promise<TraderPosition[]> {
   return _cachedTraderPositions;
 }
 
+async function cachedShips(): Promise<Ship[]> {
+  const now = Date.now();
+  if (!_cachedShips || now - _shipsFetchedAt > SHIPS_TTL_MS) {
+    _cachedShips = await fleetApi.getShips();
+    _shipsFetchedAt = now;
+    console.log(`[cache] ships refreshed (${_cachedShips.length})`);
+  }
+  return _cachedShips;
+}
+
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
 export async function runCycle(s: AutopilotState, companyId: string): Promise<AutopilotState> {
@@ -424,10 +437,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   try {
     s = appendLog(s, `── cycle start ──`);
     const fetchStart = Date.now();
-    // Fresh each cycle: ships, company, economy, warehouses, passengers
-    // Cached: routes (forever), shipTypes (forever), ports (forever), goods (forever), traderPositions (5 min)
+    // Fresh each cycle: company, economy, warehouses, passengers
+    // Cached: ships (25s), routes (forever), shipTypes (forever), ports (forever), goods (forever), traderPositions (5 min)
     const [ships, allRoutes, shipTypes, allPorts, allGoods, company, economy, allWarehouses, allPassengers, allTraderPositions] = await Promise.all([
-      timed("ships", () => fleetApi.getShips()).catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
+      cachedShips().catch((e: Error) => { throw new Error(`getShips: ${e.message}`); }),
       cachedRoutes().catch((e: Error) => { throw new Error(`getRoutes: ${e.message}`); }),
       cachedShipTypes().catch((e: Error) => { throw new Error(`getShipTypes: ${e.message}`); }),
       cachedPorts().catch((e: Error) => { throw new Error(`getPorts: ${e.message}`); }),
