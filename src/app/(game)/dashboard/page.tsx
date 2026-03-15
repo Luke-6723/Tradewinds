@@ -108,7 +108,7 @@ export default function DashboardPage() {
       .then(([c, e, l, p, g, stocks]) => {
         setCompany(c);
         setEconomy(e);
-        setLedger(l);
+        setLedger((l as LedgerEntry[]).filter((e, i, arr) => arr.findIndex((x) => x.id === e.id) === i));
         setPorts(p as Port[]);
         setGoods(g as Good[]);
         setWarehouseStocks(stocks as StoredWarehouseStock[]);
