@@ -69,6 +69,7 @@ setInterval(() => void rotateToken(), TOKEN_REFRESH_INTERVAL_MS);
 const CYCLE_TIMEOUT_MS = 60_000;
 
 async function tick(): Promise<void> {
+  console.log(`[tick] enabled=${state.enabled} cycleRunning=${cycleRunning} token=${token ? "set" : "EMPTY"} companyId=${companyId}`);
   if (!state.enabled || cycleRunning) return;
   cycleRunning = true;
   const guard = setTimeout(() => { cycleRunning = false; }, CYCLE_TIMEOUT_MS);
@@ -76,12 +77,12 @@ async function tick(): Promise<void> {
     state = await runCycle(state, companyId);
   } catch (e: unknown) {
     state = appendLog(state, `Fatal cycle error: ${(e as Error).message}`);
+    console.error(`[tick] fatal cycle error: ${(e as Error).message}`);
   } finally {
     clearTimeout(guard);
     cycleRunning = false;
   }
   sendState();
-  void saveAutopilotState(companyId, state);
 }
 
 // ── SSE stream ─────────────────────────────────────────────────────────────────
@@ -215,8 +216,6 @@ async function checkCommands(): Promise<void> {
   } catch { /* DB unavailable — keep running with current state */ }
 }
 
-setInterval(() => void checkCommands(), 2_000);
-
 // ── Init ───────────────────────────────────────────────────────────────────────
 
 async function init(): Promise<void> {
@@ -263,4 +262,9 @@ async function init(): Promise<void> {
   await checkCommands();
 }
 
-void init();
+// Wait for init to complete before polling — prevents checkCommands from enabling
+// the worker before setWorkerContext has been called (race condition).
+void (async () => {
+  await init();
+  setInterval(() => void checkCommands(), 2_000);
+})();

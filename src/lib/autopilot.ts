@@ -381,6 +381,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       timed("traderPositions", () => tradeApi.getTraderPositions()).catch(() => []),
     ]);
     s = appendLog(s, `📦 all data fetched in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
+    const dockedShips = ships.filter((sh: Ship) => sh.status !== "traveling");
+    console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, companyId=${companyId}`);
 
     const bankingCap = economy.total_upkeep + 2_000;
     let availableFunds = Math.max(0, company.treasury - bankingCap);

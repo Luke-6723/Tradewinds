@@ -19,6 +19,7 @@ let _workerCompanyId = "";
 export function setWorkerContext(token: string, companyId: string): void {
   _workerToken     = token;
   _workerCompanyId = companyId;
+  console.log(`[setWorkerContext] token=${token ? `set(${token.slice(0, 8)}…)` : "EMPTY"} companyId=${companyId || "EMPTY"}`);
 }
 
 function buildHeaders(init?: HeadersInit): HeadersInit {
@@ -31,6 +32,9 @@ function buildHeaders(init?: HeadersInit): HeadersInit {
     const companyId = _workerCompanyId || process.env.TRADEWINDS_COMPANY_ID || "";
     if (token)     headers["Authorization"]         = `Bearer ${token}`;
     if (companyId) headers["tradewinds-company-id"] = companyId;
+    if (!token || !companyId) {
+      console.warn(`[buildHeaders] WARNING: IS_SERVER=true but token=${token ? "set" : "EMPTY"} companyId=${companyId || "EMPTY"}`);
+    }
   }
   return headers;
 }
