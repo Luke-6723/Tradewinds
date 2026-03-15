@@ -33,52 +33,108 @@ export const PORT_COORDS: Record<string, [number, number]> = {
   Alexandria: [31.20, 29.92],
 };
 
+// ── Sea-lane corridor anchors ──────────────────────────────────────────────
+// Reusable sea-lane turning points, labelled by location.
+const C = {
+  northChannel:   [55.2,  -5.6] as [number, number], // North Channel (between Ireland & Scotland)
+  capeMalinHead:  [55.4,  -7.4] as [number, number], // NW tip of Ireland
+  offSEIreland:   [51.9,  -6.2] as [number, number], // off Wexford, SE Ireland
+  celticSea:      [50.8,  -7.5] as [number, number], // Celtic Sea, SW of Ireland
+  lizardPoint:    [49.9,  -5.2] as [number, number], // SW tip of England
+  westChannel:    [50.0,  -3.5] as [number, number], // Western English Channel
+  doverStrait:    [51.0,   1.5] as [number, number], // Strait of Dover
+  bristolChannel: [51.2,  -5.5] as [number, number], // Bristol Channel approach
+  capeWrath:      [58.6,  -5.0] as [number, number], // Cape Wrath, NW Scotland
+  northScotSea:   [58.2,  -2.5] as [number, number], // NE of Scotland, open North Sea
+  humberMouth:    [53.6,   0.1] as [number, number], // off Humber mouth, North Sea
+  // Iberian / Med
+  caboCape:       [37.0,  -9.5] as [number, number], // Cape St Vincent, SW Iberia
+  gibraltarStr:   [35.9,  -5.4] as [number, number], // Strait of Gibraltar
+  gulfOfLion:     [42.5,   3.5] as [number, number], // Gulf of Lion
+  sardiniaCh:     [39.2,   7.8] as [number, number], // Sardinia Channel
+  messina:        [38.2,  15.6] as [number, number], // off toe of Italy / Messina
+  adriaticS:      [40.0,  17.5] as [number, number], // southern Adriatic
+  aegeanS:        [36.5,  23.5] as [number, number], // southern Aegean
+};
+
 /**
  * Sea-lane waypoints for routes that would draw straight lines over land.
- * Keys are "{PortA}:{PortB}" with ports in alphabetical order.
- * Values are intermediate [lat, lng] points the route should pass through.
+ * Keys are "{PortA}:{PortB}" — order does not matter, seaLaneWaypoints() handles both.
  */
 export const SEA_LANE_WAYPOINTS: Record<string, Array<[number, number]>> = {
-  // Dublin routes — Irish Sea, St George's Channel, Celtic Sea
-  "Bristol:Dublin":      [[51.6, -5.5]],                       // Bristol Channel → Celtic Sea
-  "Dublin:Edinburgh":    [[55.2, -5.6]],                       // North Channel
-  "Dublin:Glasgow":      [[55.2, -5.6]],                       // North Channel
-  "Dublin:Hull":         [[54.0, -5.2], [54.0, -3.0]],         // Irish Sea → NE England coast
-  "Dublin:Hamburg":      [[55.2, -5.6], [57.0, -2.0]],         // North Channel → North Sea
-  "Dublin:London":       [[51.6, -5.5], [50.5, -3.0]],         // Celtic Sea → English Channel
-  "Dublin:Plymouth":     [[51.6, -5.8]],                       // Celtic Sea
-  "Dublin:Portsmouth":   [[51.6, -5.5], [50.6, -2.5]],         // Celtic Sea → English Channel
-  "Dublin:Rotterdam":    [[53.5, -5.0], [53.0, -2.0]],         // Irish Sea south → North Sea
-  "Dublin:Antwerp":      [[52.0, -5.2], [51.5, -2.0]],         // St George's → Channel
-  "Dublin:Bremen":       [[55.2, -5.6], [57.0, -1.0]],         // North Channel → North Sea
-  "Dublin:Dunkirk":      [[51.6, -5.5], [50.5, -1.5]],         // Celtic Sea → Channel
-  "Dublin:Calais":       [[51.6, -5.5], [50.5, -1.5]],         // Celtic Sea → Channel
-  "Dublin:Amsterdam":    [[53.5, -5.0], [53.0, -2.0]],         // Irish Sea → North Sea
-  // Glasgow routes that cross Scotland/England
-  "Calais:Glasgow":      [[55.2, -5.6]],                       // round North Channel
-  "Glasgow:Hamburg":     [[57.5, -2.0]],                       // tip of Scotland → North Sea
-  "Amsterdam:Glasgow":   [[57.5, -2.0]],                       // North Sea → tip of Scotland
-  "Glasgow:Rotterdam":   [[57.5, -2.0]],                       // North Sea → tip of Scotland
-  "Antwerp:Glasgow":     [[55.2, -5.6]],                       // round North Channel
-  "Dunkirk:Glasgow":     [[55.2, -5.6]],                       // round North Channel
-  // Mediterranean routes that might cross land (future-proofing)
-  "Genoa:Naples":        [[39.5, 9.5]],                        // west of Sardinia
-  "Barcelona:Genoa":     [[41.5, 5.5]],                        // Gulf of Lion
-  "Cartagena:Genoa":     [[39.5, 7.0]],                        // via Sardinia west
-  "Lisbon:Marseille":    [[36.0, -5.5], [36.5, 0.0]],          // Gibraltar → Gulf of Lion
-  "Lisbon:Barcelona":    [[36.0, -5.5]],                       // Gibraltar Strait
-  "Lisbon:Cartagena":    [[36.0, -5.5]],                       // Gibraltar Strait
-  "Lisbon:Genoa":        [[36.0, -5.5], [39.0, 4.5]],          // Gibraltar → Med
-  "Lisbon:Naples":       [[36.0, -5.5], [38.5, 10.0]],         // Gibraltar → Tyrrhenian
-  "Lisbon:Venice":       [[36.0, -5.5], [37.5, 12.0]],         // Gibraltar → Adriatic
-  "Lisbon:Piraeus":      [[36.0, -5.5], [35.5, 15.0]],         // Gibraltar → Ionian
-  "Lisbon:Istanbul":     [[36.0, -5.5], [35.5, 18.0]],         // Gibraltar → Aegean
-  "Lisbon:Alexandria":   [[36.0, -5.5], [32.0, 20.0]],         // Gibraltar → E. Med
-  "Naples:Venice":       [[39.5, 16.5]],                       // heel of Italy → Adriatic
-  "Piraeus:Venice":      [[39.5, 16.5]],                       // Adriatic entry
-  "Istanbul:Naples":     [[37.0, 22.0], [38.5, 16.5]],         // Aegean → S. Italy
-  "Alexandria:Naples":   [[33.0, 22.0], [38.5, 14.0]],         // E. Med → Tyrrhenian
-  "Alexandria:Piraeus":  [[33.5, 25.5]],                       // E. Med north
+  // ── Dublin ─────────────────────────────────────────────────────────────────
+  // South / English Channel ports — exit via SE Ireland → Celtic Sea → Channel
+  "Bristol:Dublin":      [C.bristolChannel, C.offSEIreland],
+  "Dublin:Plymouth":     [C.offSEIreland, C.celticSea],
+  "Dublin:Portsmouth":   [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel],
+  "Dublin:London":       [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Calais":       [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Dunkirk":      [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Antwerp":      [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Rotterdam":    [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Amsterdam":    [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Bremen":       [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Dublin:Hamburg":      [C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  // North / Scottish ports — exit via North Channel
+  "Dublin:Glasgow":      [C.northChannel],
+  "Dublin:Edinburgh":    [C.northChannel, C.northScotSea],
+  "Dublin:Hull":         [C.northChannel, C.northScotSea, C.humberMouth],
+  // ── Glasgow ────────────────────────────────────────────────────────────────
+  // East coast / North Sea — round Cape Wrath
+  "Glasgow:Hamburg":     [C.capeWrath, C.northScotSea],
+  "Glasgow:Rotterdam":   [C.capeWrath, C.northScotSea],
+  "Glasgow:Amsterdam":   [C.capeWrath, C.northScotSea],
+  "Glasgow:Antwerp":     [C.capeWrath, C.northScotSea, C.doverStrait],
+  "Calais:Glasgow":      [C.doverStrait, C.northScotSea, C.capeWrath],
+  "Dunkirk:Glasgow":     [C.doverStrait, C.northScotSea, C.capeWrath],
+  "Glasgow:Hull":        [C.capeWrath, C.northScotSea, C.humberMouth],
+  "Glasgow:Edinburgh":   [C.capeWrath, C.northScotSea],
+  // South coast / Channel ports — round Mull of Kintyre → Irish Sea → Channel
+  "Glasgow:Plymouth":    [C.northChannel, C.offSEIreland, C.celticSea],
+  "Glasgow:Portsmouth":  [C.northChannel, C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel],
+  "Glasgow:London":      [C.northChannel, C.offSEIreland, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Glasgow:Bristol":     [C.northChannel, C.bristolChannel],
+  // ── Edinburgh to western/southern ports ────────────────────────────────────
+  "Bristol:Edinburgh":   [C.bristolChannel, C.celticSea, C.lizardPoint, C.westChannel, C.humberMouth, C.northScotSea],
+  "Edinburgh:Plymouth":  [C.northScotSea, C.humberMouth, C.westChannel, C.lizardPoint],
+  // ── Bristol to North Sea ports (via Channel) ────────────────────────────────
+  "Bristol:Hamburg":     [C.bristolChannel, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Bristol:Bremen":      [C.bristolChannel, C.celticSea, C.lizardPoint, C.westChannel, C.doverStrait],
+  "Bristol:Dunkirk":     [C.bristolChannel, C.celticSea, C.lizardPoint, C.westChannel],
+  "Bristol:Antwerp":     [C.bristolChannel, C.celticSea, C.lizardPoint, C.westChannel],
+  // ── Plymouth / Portsmouth to North Sea ─────────────────────────────────────
+  "Plymouth:Bremen":     [C.lizardPoint, C.westChannel, C.doverStrait],
+  "Plymouth:Rotterdam":  [C.lizardPoint, C.westChannel, C.doverStrait],
+  "Plymouth:Antwerp":    [C.westChannel, C.doverStrait],
+  "Plymouth:Edinburgh":  [C.lizardPoint, C.celticSea, C.offSEIreland, C.northChannel, C.northScotSea],
+  "Portsmouth:Bremen":   [C.doverStrait],
+  "Portsmouth:Dublin":   [C.westChannel, C.lizardPoint, C.celticSea, C.offSEIreland],
+  // ── Mediterranean routes (future-proofing) ──────────────────────────────────
+  // Northern Europe to Med — via Gibraltar
+  "Lisbon:Marseille":    [C.caboCape, C.gibraltarStr, C.gulfOfLion],
+  "Lisbon:Barcelona":    [C.caboCape, C.gibraltarStr],
+  "Lisbon:Cartagena":    [C.caboCape, C.gibraltarStr],
+  "Lisbon:Genoa":        [C.caboCape, C.gibraltarStr, C.sardiniaCh],
+  "Lisbon:Naples":       [C.caboCape, C.gibraltarStr, C.sardiniaCh],
+  "Lisbon:Venice":       [C.caboCape, C.gibraltarStr, C.sardiniaCh, C.adriaticS],
+  "Lisbon:Piraeus":      [C.caboCape, C.gibraltarStr, C.sardiniaCh, C.aegeanS],
+  "Lisbon:Istanbul":     [C.caboCape, C.gibraltarStr, C.sardiniaCh, C.aegeanS],
+  "Lisbon:Alexandria":   [C.caboCape, C.gibraltarStr, C.sardiniaCh, C.aegeanS],
+  // Med internal
+  "Barcelona:Genoa":     [C.gulfOfLion],
+  "Barcelona:Marseille": [C.gulfOfLion],
+  "Cartagena:Genoa":     [C.sardiniaCh],
+  "Cartagena:Naples":    [C.sardiniaCh],
+  "Genoa:Naples":        [[39.0, 9.5]],                          // west of Sardinia
+  "Naples:Venice":       [C.adriaticS],                          // around heel of Italy
+  "Naples:Piraeus":      [C.messina, C.aegeanS],
+  "Naples:Istanbul":     [C.messina, C.aegeanS],
+  "Naples:Alexandria":   [C.messina, [34.0, 20.0]],
+  "Piraeus:Venice":      [C.aegeanS, C.adriaticS],
+  "Istanbul:Piraeus":    [[39.0, 25.0]],                         // through Aegean
+  "Alexandria:Piraeus":  [[34.0, 25.0]],                         // E. Med
+  "Alexandria:Naples":   [[34.0, 20.0], C.messina],
+  "Alexandria:Istanbul": [[34.0, 26.0], [39.0, 27.0]],
 };
 
 /** Return waypoints for a route between two named ports, regardless of order. */
@@ -88,7 +144,10 @@ export function seaLaneWaypoints(
 ): Array<[number, number]> {
   const key1 = `${fromName}:${toName}`;
   const key2 = `${toName}:${fromName}`;
-  return SEA_LANE_WAYPOINTS[key1] ?? SEA_LANE_WAYPOINTS[key2] ?? [];
+  const pts = SEA_LANE_WAYPOINTS[key1] ?? SEA_LANE_WAYPOINTS[key2];
+  if (!pts) return [];
+  // If direction is reversed, reverse the waypoints too
+  return SEA_LANE_WAYPOINTS[key2] && !SEA_LANE_WAYPOINTS[key1] ? [...pts].reverse() : pts;
 }
 
 export function buildMST(routes: Route[]): Set<string> {

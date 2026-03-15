@@ -100,11 +100,13 @@ export default function LeafletMap({
         url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
       />
 
-      {/* Route lines — full network always visible; active routes highlighted */}
+      {/* Route lines — active ships only, plus port-hover highlights */}
       {routes.map((r) => {
         const isActive      = activeRouteIds.has(r.id);
         const isPortHovered = hoveredPort !== null &&
           (r.from_id === hoveredPort || r.to_id === hoveredPort);
+
+        if (!isActive && !isPortHovered) return null;
 
         const fromPort = portById.get(r.from_id);
         const toPort   = portById.get(r.to_id);
@@ -123,9 +125,7 @@ export default function LeafletMap({
             pathOptions={
               isActive
                 ? { color: "#7dd3fc", weight: 2.5, dashArray: "8 6", opacity: 0.85 }
-                : isPortHovered
-                ? { color: "#a78bfa", weight: 2, dashArray: "6 5", opacity: 0.75 }
-                : { color: "#334155", weight: 1, dashArray: undefined, opacity: 0.6 }
+                : { color: "#a78bfa", weight: 2, dashArray: "6 5", opacity: 0.75 }
             }
           />
         );
