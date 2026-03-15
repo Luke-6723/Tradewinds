@@ -11,16 +11,26 @@ const BASE_URL = IS_SERVER
   ? `${process.env.TRADEWINDS_API_URL ?? "https://tradewinds.fly.dev"}/api/v1`
   : "/api";
 
+// Runtime overrides set by the standalone worker after resolving credentials.
+let _workerToken     = "";
+let _workerCompanyId = "";
+
+/** Set auth context for worker process API calls (avoids mutating process.env). */
+export function setWorkerContext(token: string, companyId: string): void {
+  _workerToken     = token;
+  _workerCompanyId = companyId;
+}
+
 function buildHeaders(init?: HeadersInit): HeadersInit {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(init as Record<string, string> | undefined),
   };
   if (IS_SERVER) {
-    if (process.env.TRADEWINDS_TOKEN)
-      headers["Authorization"] = `Bearer ${process.env.TRADEWINDS_TOKEN}`;
-    if (process.env.TRADEWINDS_COMPANY_ID)
-      headers["tradewinds-company-id"] = process.env.TRADEWINDS_COMPANY_ID;
+    const token     = _workerToken     || process.env.TRADEWINDS_TOKEN     || "";
+    const companyId = _workerCompanyId || process.env.TRADEWINDS_COMPANY_ID || "";
+    if (token)     headers["Authorization"]         = `Bearer ${token}`;
+    if (companyId) headers["tradewinds-company-id"] = companyId;
   }
   return headers;
 }

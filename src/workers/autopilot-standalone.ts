@@ -22,6 +22,7 @@ import {
 } from "@/lib/db/collections";
 import { UPSTREAM } from "@/lib/auth-cookies";
 import { refreshToken as doRefreshToken } from "@/lib/server/token-refresh";
+import { setWorkerContext } from "@/lib/api/client";
 
 // Company ID: prefer env (allows overriding), fall back to MongoDB-stored value
 async function resolveCompanyId(): Promise<string> {
@@ -51,7 +52,7 @@ async function rotateToken(): Promise<void> {
   try {
     const newToken = await doRefreshToken();
     token = newToken;
-    process.env.TRADEWINDS_TOKEN = newToken;
+    setWorkerContext(token, companyId);
     startEventStream();
     state = appendLog(state, "🔑 Token refreshed");
     sendState();
@@ -157,6 +158,7 @@ async function checkCommands(): Promise<void> {
     if (companyId === "unknown") {
       try {
         companyId = await resolveCompanyId();
+        setWorkerContext(token, companyId);
         console.log(`[autopilot:${companyId.slice(0, 8)}] company ID resolved`);
       } catch {
         return; // still no credentials — try again next poll
@@ -184,7 +186,7 @@ async function checkCommands(): Promise<void> {
       if (!token) {
         try {
           token = await doRefreshToken();
-          process.env.TRADEWINDS_TOKEN = token;
+          setWorkerContext(token, companyId);
           console.log(`[autopilot:${companyId.slice(0, 8)}] token acquired on enable`);
         } catch (e: unknown) {
           const msg = `⚠️ Cannot enable — token refresh failed: ${(e as Error).message}`;
@@ -242,7 +244,7 @@ async function init(): Promise<void> {
   // Acquire initial token from MongoDB credentials
   try {
     token = await doRefreshToken();
-    process.env.TRADEWINDS_TOKEN = token;
+    setWorkerContext(token, companyId);
     console.log(`[autopilot:${companyId.slice(0, 8)}] token acquired`);
   } catch (e: unknown) {
     console.error(`[autopilot:${companyId.slice(0, 8)}] initial token refresh failed:`, (e as Error).message);
