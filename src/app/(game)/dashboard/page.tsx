@@ -473,6 +473,29 @@ export default function DashboardPage() {
         </CardHeader>
 
         <CardContent className="space-y-3 pt-0">
+          {/* Activity log — pinned to top */}
+          {ap.log.length > 0 && (
+            <div className="rounded-lg border bg-muted/20">
+              <p className="text-xs text-muted-foreground px-3 pt-2 pb-1 font-medium border-b">Activity log</p>
+              <div className="divide-y max-h-52 overflow-y-auto">
+                {ap.log.slice(0, 30).map((entry, i) => (
+                  <div key={i} className="flex gap-2.5 px-3 py-1.5 text-xs">
+                    <span className="tabular-nums text-muted-foreground shrink-0 pt-px">
+                      {new Date(entry.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                    </span>
+                    <span className="leading-relaxed">{entry.message}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {ap.enabled && ap.log.length === 0 && (
+            <p className="text-muted-foreground text-sm">
+              Scanning for opportunities… (first cycle runs immediately on enable)
+            </p>
+          )}
+
           {/* Ship table */}
           {ships.length > 0 && (
             <div className="rounded-lg border overflow-hidden">
@@ -585,28 +608,6 @@ export default function DashboardPage() {
             );
           })()}
 
-          {/* Activity log */}
-          {ap.log.length > 0 && (
-            <div className="rounded-lg border bg-muted/20">
-              <p className="text-xs text-muted-foreground px-3 pt-2 pb-1 font-medium border-b">Activity log</p>
-              <div className="divide-y max-h-52 overflow-y-auto">
-                {ap.log.slice(0, 30).map((entry, i) => (
-                  <div key={i} className="flex gap-2.5 px-3 py-1.5 text-xs">
-                    <span className="tabular-nums text-muted-foreground shrink-0 pt-px">
-                      {new Date(entry.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-                    </span>
-                    <span className="leading-relaxed">{entry.message}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {ap.enabled && ap.log.length === 0 && (
-            <p className="text-muted-foreground text-sm">
-              Scanning for opportunities… (first cycle runs immediately on enable)
-            </p>
-          )}
         </CardContent>
       </Card>
 
