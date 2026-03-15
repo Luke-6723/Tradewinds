@@ -11,7 +11,7 @@
  * IPC out: { type: "state", data: AutopilotState }
  */
 
-import { handlePassengerEvent, runCycle } from "@/lib/autopilot";
+import { handlePassengerEvent, handleShipSoldEvent, runCycle } from "@/lib/autopilot";
 import { appendLog, blank, CYCLE_MS, type AutopilotState } from "@/lib/autopilot-types";
 import { loadAutopilotState, saveAutopilotState } from "@/lib/db/collections";
 import { UPSTREAM } from "@/lib/auth-cookies";
@@ -53,6 +53,14 @@ interface PassengerEventData {
   expires_at: string;
 }
 
+interface ShipSoldEventData {
+  ship_id: string;
+  company_id: string;
+  ship_type_id: string;
+  company_name: string;
+  name: string;
+}
+
 function startEventStream(): void {
   if (esAbort) { esAbort.abort(); esAbort = null; }
   if (!token) return;
@@ -88,6 +96,15 @@ function startEventStream(): void {
               cycleRunning = true;
               try {
                 state = await handlePassengerEvent(state, companyId, event.data as PassengerEventData);
+              } finally {
+                cycleRunning = false;
+              }
+              sendState();
+              void saveAutopilotState(companyId, state);
+            } else if (event.type === "ship_sold" && state.enabled && !cycleRunning) {
+              cycleRunning = true;
+              try {
+                state = await handleShipSoldEvent(state, companyId, event.data as ShipSoldEventData);
               } finally {
                 cycleRunning = false;
               }

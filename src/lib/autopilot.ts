@@ -400,6 +400,73 @@ export async function handlePassengerEvent(
 
 // ── Fleet management ──────────────────────────────────────────────────────────
 
+/**
+ * Called immediately when a `ship_sold` SSE event fires for another company's ship.
+ * Buys the ship if treasury will remain ≥ 4× total_upkeep after purchase.
+ */
+export async function handleShipSoldEvent(
+  s: AutopilotState,
+  companyId: string,
+  eventData: {
+    ship_id: string;
+    company_id: string;
+    ship_type_id: string;
+    company_name: string;
+    name: string;
+  },
+): Promise<AutopilotState> {
+  // Ignore our own ship sales
+  if (eventData.company_id === companyId) return s;
+  if (!(s.fleetMgmt?.enabled ?? true)) return s;
+
+  try {
+    const [company, economy, allShips] = await Promise.all([
+      companyApi.getCompany().catch(() => null),
+      companyApi.getEconomy().catch(() => null),
+      fleetApi.getShips().catch(() => [] as Ship[]),
+    ]);
+
+    const treasury = company?.treasury ?? 0;
+    const totalUpkeep = economy?.total_upkeep ?? 0;
+
+    const shipTypes = await worldApi.getShipTypes().catch(() => [] as ShipType[]);
+    const shipType = shipTypes.find((t: ShipType) => t.id === eventData.ship_type_id);
+    const estimatedCost = shipType?.base_price ?? 0;
+
+    // Must keep 4× hourly upkeep as reserve after purchase
+    const reserveRequired = 4 * totalUpkeep;
+    if (estimatedCost > 0 && treasury - estimatedCost < reserveRequired) {
+      s = appendLog(s, `⛔ Skip secondary buy "${eventData.name}" — treasury £${treasury.toLocaleString()} too low (need £${(estimatedCost + reserveRequired).toLocaleString()})`);
+      return s;
+    }
+
+    const newShip = await fleetApi.buySecondaryShip(eventData.ship_id);
+
+    const usedNames = allShips.map((sh) => sh.name);
+    const chosenName = pickShipName(usedNames);
+    try {
+      await fleetApi.renameShip(newShip.id, { name: chosenName });
+    } catch { /* non-fatal */ }
+
+    s = {
+      ...s,
+      fleetMgmt: {
+        ...s.fleetMgmt,
+        secondaryBuys: (s.fleetMgmt?.secondaryBuys ?? 0) + 1,
+        lastBuyAt: new Date().toISOString(),
+      },
+    };
+    s = appendLog(s, `🏴‍☠️ Sniped "${chosenName}" (${shipType?.name ?? "ship"}) from ${eventData.company_name} @ £${estimatedCost.toLocaleString()}`);
+  } catch (e: unknown) {
+    const msg = (e as Error).message ?? "";
+    // 404 = already bought by someone else — skip silently
+    if (!msg.includes("404") && !msg.includes("Not Found")) {
+      s = appendLog(s, `⚡ secondary buy failed — ${msg}`);
+    }
+  }
+  return s;
+}
+
 async function runFleetManagement(
   s: AutopilotState,
   ships: Ship[],
@@ -408,7 +475,7 @@ async function runFleetManagement(
   availableFunds: number,
   allPassengers: Passenger[],
 ): Promise<AutopilotState> {
-  const fleetMgmt = s.fleetMgmt ?? { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] };
+  const fleetMgmt = s.fleetMgmt ?? { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [], secondaryBuys: 0 };
   if (!fleetMgmt.enabled) return s;
 
   const now = Date.now();
@@ -1302,15 +1369,20 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     // ── Fleet management ───────────────────────────────────────────────────────
     s = await runFleetManagement(s, ships, shipTypes, economy, availableFunds, allPassengers);
 
-    // ── Rename default-named ships (one per cycle to limit API calls) ──────────
-    const allNames = ships.map((sh) => sh.name);
-    const needsRename = ships.find((sh) => sh.status !== "traveling" && isDefaultName(sh.name));
-    if (needsRename) {
-      const newName = pickShipName(allNames);
-      try {
-        await fleetApi.renameShip(needsRename.id, { name: newName });
-        s = appendLog(s, `✏️ Renamed "${needsRename.name}" → "${newName}"`);
-      } catch { /* non-fatal */ }
+    // ── Rename ALL default-named ships in one pass ────────────────────────────
+    const defaultNamed = ships.filter((sh) => isDefaultName(sh.name));
+    if (defaultNamed.length > 0) {
+      const usedNames = ships.map((sh) => sh.name);
+      let renamedCount = 0;
+      for (const sh of defaultNamed) {
+        const newName = pickShipName(usedNames);
+        try {
+          await fleetApi.renameShip(sh.id, { name: newName });
+          usedNames.push(newName);
+          renamedCount++;
+        } catch { /* non-fatal */ }
+      }
+      if (renamedCount > 0) s = appendLog(s, `✏️ Renamed ${renamedCount} default-named ship${renamedCount > 1 ? "s" : ""}`);
     }
 
   } catch (e: unknown) {
