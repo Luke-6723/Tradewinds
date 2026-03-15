@@ -41,6 +41,8 @@ const DOCK_DELAY_MS = 0;
 const MIN_SELL_PRICE_LEVEL = 4;
 /** Number of transit API calls to fire concurrently per batch. */
 const TRANSIT_BATCH_SIZE = 20;
+/** Number of docked ships to process per cycle (rolling window). */
+const SHIP_WINDOW_SIZE = 50;
 
 // ── Fleet management constants ─────────────────────────────────────────────
 /** Cycles a ship must be consecutively idle before it's a sell candidate. */
@@ -382,8 +384,15 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       timed("traderPositions", () => tradeApi.getTraderPositions()).catch(() => []),
     ]);
     s = appendLog(s, `📦 all data fetched in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
-    const dockedShips = ships.filter((sh: Ship) => sh.status !== "traveling");
-    console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, companyId=${companyId}`);
+    // Sort docked ships by ID for a stable window across cycles
+    const dockedShips = ships.filter((sh: Ship) => sh.status !== "traveling").sort((a, b) => a.id.localeCompare(b.id));
+    // Rolling window — clamp offset in case fleet size shrank since last cycle
+    const windowOffset = dockedShips.length > 0 ? (s.shipWindowOffset ?? 0) % dockedShips.length : 0;
+    const windowEnd = Math.min(windowOffset + SHIP_WINDOW_SIZE, dockedShips.length);
+    const windowShips = dockedShips.slice(windowOffset, windowEnd);
+    const windowShipIds = new Set(windowShips.map((sh) => sh.id));
+    const nextWindowOffset = windowEnd >= dockedShips.length ? 0 : windowEnd;
+    console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, window=${windowOffset}–${windowEnd - 1}, companyId=${companyId}`);
     console.log(`[runCycle:fetch] data ready in ${((Date.now() - fetchStart) / 1000).toFixed(1)}s`);
 
     const bankingCap = economy.total_upkeep + 2_000;
@@ -601,11 +610,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       return _pathCache.get(key)!;
     };
 
-    // ③ Pre-fetch all docked ship inventories in parallel before the loop
-    //    (avoids 800 sequential awaits — the single biggest latency bottleneck)
+    // ③ Pre-fetch inventories for the current window only (was all 490 — now just 50)
     const shipInventoryCache = new Map<string, Cargo[]>();
     {
-      const toFetch = ships.filter((sh: Ship) => sh.status !== "traveling");
+      const toFetch = windowShips;
       const invResults = await Promise.all(
         toFetch.map(async (sh: Ship) => {
           try { return [sh.id, await fleetApi.getInventory(sh.id)] as const; }
@@ -615,7 +623,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       for (const [id, inv] of invResults) shipInventoryCache.set(id, inv);
       const invElapsed = ((Date.now() - fetchStart) / 1000).toFixed(1);
       console.log(`[runCycle:inv] ${toFetch.length} inventories pre-fetched in ${invElapsed}s`);
-      s = appendLog(s, `🗃️ inventories pre-fetched for ${toFetch.length} docked ships`);
+      s = appendLog(s, `🗃️ inventories pre-fetched for ${toFetch.length} window ships`);
     }
 
     // ④ Pre-compute coveredPorts once (was O(n²) — rebuilt per ship inside the loop)
@@ -629,11 +637,11 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
     }
 
-    // ⑤ Pre-compute trade candidates per unique docked port (avoids recomputing per-ship)
+    // ⑤ Pre-compute trade candidates per unique port in the current window only
     //    Key: portId → RawCandidate[]  (full unfiltered list; per-ship pax filter applied below)
     const candidatesT0 = Date.now();
     const candidatesByPort = new Map<string, RawCandidate[]>();
-    const uniqueDockedPorts = new Set(ships.filter((sh: Ship) => sh.status !== "traveling" && sh.port_id).map((sh: Ship) => sh.port_id!));
+    const uniqueDockedPorts = new Set(windowShips.filter((sh: Ship) => sh.port_id).map((sh: Ship) => sh.port_id!));
     for (const portId of uniqueDockedPorts) {
       const paths = getPathsFrom(portId);
       const allCandidates: RawCandidate[] = [];
@@ -686,6 +694,9 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         continue;
       }
       if (!ship.port_id) continue;
+
+      // Skip docked ships outside the current window — they'll be handled in a future cycle
+      if (!windowShipIds.has(ship.id)) continue;
 
       const ss = s.ships[ship.id] ?? defaultShipState();
       const shipType = stMap.get(ship.ship_type_id);
@@ -1216,8 +1227,9 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
     }
 
-    s = appendLog(s, `🚢 ship loop done — ${shipsActioned} docked processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
-    console.log(`[runCycle:loop] done — ${shipsActioned}/${ships.length} processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+    s = appendLog(s, `🚢 window ${windowOffset}–${windowEnd - 1}/${dockedShips.length} — ${shipsActioned} ships in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+    console.log(`[runCycle:loop] done — ${shipsActioned}/${windowShips.length} window ships processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+    s = { ...s, shipWindowOffset: nextWindowOffset };
 
     // ── Batch transit flush ────────────────────────────────────────────────────
     if (pendingTransits.length > 0) {

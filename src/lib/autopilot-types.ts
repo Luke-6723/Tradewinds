@@ -87,6 +87,13 @@ export interface AutopilotState {
   treasuryHistory: TreasurySnapshot[];
   fleetMgmt: FleetMgmtState;
   cyclesRun: number;
+  /**
+   * Rolling window offset into the sorted docked ships array.
+   * Each cycle processes SHIP_WINDOW_SIZE ships starting at this index.
+   * Advances by SHIP_WINDOW_SIZE each cycle and wraps at dockedShips.length.
+   * Optional for backwards compatibility with existing DB records.
+   */
+  shipWindowOffset?: number;
 }
 
 export function blank(): AutopilotState {
@@ -100,6 +107,7 @@ export function blank(): AutopilotState {
     treasuryHistory: [],
     fleetMgmt: { enabled: true, lastBuyAt: null, lastSellAt: null, knownShipyardPortIds: [] },
     cyclesRun: 0,
+    shipWindowOffset: 0,
   };
 }
 
