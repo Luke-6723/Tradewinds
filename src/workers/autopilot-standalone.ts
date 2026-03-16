@@ -173,7 +173,14 @@ async function checkCommands(): Promise<void> {
     console.log(`[debug:poll] companyId=${companyId}, cmd=${cmd ? `enabled=${cmd.enabled}, updatedAt=${cmd.updatedAt.toISOString()}` : "null"}`);
     if (!cmd) return;
 
-    // Skip if nothing changed
+    // Always sync fleetTarget — repull every poll so frontend changes are picked up immediately
+    const wantsFleetTarget: number | undefined = cmd.fleetTarget ?? undefined;
+    if (wantsFleetTarget !== state.fleetMgmt?.fleetTarget) {
+      state = { ...state, fleetMgmt: { ...state.fleetMgmt, fleetTarget: wantsFleetTarget } };
+      sendState();
+    }
+
+    // Skip remaining command processing if nothing else changed
     if (lastCommandUpdatedAt && cmd.updatedAt <= lastCommandUpdatedAt) return;
     lastCommandUpdatedAt = cmd.updatedAt;
 
@@ -182,13 +189,6 @@ async function checkCommands(): Promise<void> {
 
     if (wantsFleetMgmt !== (state.fleetMgmt?.enabled ?? false)) {
       state = { ...state, fleetMgmt: { ...state.fleetMgmt, enabled: wantsFleetMgmt } };
-      sendState();
-    }
-
-    // Apply fleet target from command doc (dashboard writes here; worker owns state)
-    const wantsFleetTarget: number | undefined = cmd.fleetTarget ?? undefined;
-    if (wantsFleetTarget !== state.fleetMgmt?.fleetTarget) {
-      state = { ...state, fleetMgmt: { ...state.fleetMgmt, fleetTarget: wantsFleetTarget } };
       sendState();
     }
 

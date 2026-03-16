@@ -296,6 +296,7 @@ async function runFleetManagement(
       if (!ship.port_id) continue;
       const ss = s.ships[ship.id];
       if (!ss || ss.role === "ferry") continue; // ferries are never auto-sold
+      if (ss.phase !== "idle") continue; // never sell a ship that still has cargo or an active plan
       if (!overTarget && ss.cyclesIdle < SELL_IDLE_CYCLES) continue;
 
       console.log(`[fleetMgmt:sell] trying ${ship.name} @ port=${ship.port_id} cyclesIdle=${ss.cyclesIdle}`);
