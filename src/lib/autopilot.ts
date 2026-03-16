@@ -653,21 +653,36 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             requests: buyCandidates.map((c) => ({ port_id: c.portId, good_id: c.goodId, quantity: c.toBuy, action: "buy" as const })),
           });
         } catch { /* proceed with empty */ }
+
+        // Reserve funds for each affordable candidate (sequential — shared state),
+        // then execute all reserved buys in parallel.
+        type Reserved = { c: (typeof buyCandidates)[0]; token: string; unitPrice: number };
+        const reserved: Reserved[] = [];
         for (let i = 0; i < buyCandidates.length; i++) {
           const c = buyCandidates[i];
           const bq = buyQuotes[i];
           if (!bq || bq.status !== "success" || !bq.quote) continue;
-          if (bq.quote.unit_price * c.toBuy > availableFunds) continue;
-          try {
-            await tradeApi.executeQuote({ token: bq.token, destinations: [{ type: "warehouse", id: c.warehouseId, quantity: c.toBuy }] });
-            const totalCost = bq.quote.unit_price * c.toBuy;
-            availableFunds -= totalCost;
-            s = appendLog(s, `🏭 Stocked ${c.toBuy}× ${c.goodName} @ £${bq.quote.unit_price} (level ${c.npcPriceOrd})`);
-            await upsertWarehouseStock(companyId, { warehouseId: c.warehouseId, portId: c.portId, goodId: c.goodId, goodName: c.goodName, avgBuyPrice: bq.quote.unit_price }).catch(() => {});
-          } catch (e: unknown) {
-            s = appendLog(s, `🏭 Warehouse stock failed (${c.goodName}) — ${(e as Error).message}`);
-          }
+          const cost = bq.quote.unit_price * c.toBuy;
+          if (cost > availableFunds) continue;
+          availableFunds -= cost; // reserve
+          reserved.push({ c, token: bq.token, unitPrice: bq.quote.unit_price });
         }
+
+        const buyResults = await Promise.allSettled(
+          reserved.map(({ c, token }) =>
+            tradeApi.executeQuote({ token, destinations: [{ type: "warehouse", id: c.warehouseId, quantity: c.toBuy }] }),
+          ),
+        );
+
+        await Promise.all(reserved.map(async ({ c, unitPrice }, i) => {
+          if (buyResults[i].status === "fulfilled") {
+            s = appendLog(s, `🏭 Stocked ${c.toBuy}× ${c.goodName} @ £${unitPrice} (level ${c.npcPriceOrd})`);
+            await upsertWarehouseStock(companyId, { warehouseId: c.warehouseId, portId: c.portId, goodId: c.goodId, goodName: c.goodName, avgBuyPrice: unitPrice }).catch(() => {});
+          } else {
+            availableFunds += unitPrice * c.toBuy; // refund reserved funds
+            s = appendLog(s, `🏭 Warehouse stock failed (${c.goodName}) — ${(buyResults[i] as PromiseRejectedResult).reason?.message ?? "unknown"}`);
+          }
+        }));
       }
     }
 
