@@ -488,6 +488,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   s = { ...s, lastCycleAt: new Date().toISOString() };
   let treasuryBalance: number | null = null;
   const cycleT0 = Date.now();
+  const shipBatches = Math.max(1, parseInt(process.env.AUTOPILOT_SHIP_BATCHES ?? "1", 10) || 1);
 
   // Fire a transit immediately and roll back optimistic state on failure
   const dispatchTransit = async (shipId: string, routeId: string, onError: (msg: string) => void): Promise<void> => {
@@ -530,7 +531,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     const dockedShips = ships.filter((sh: Ship) => sh.status !== "traveling").sort((a, b) => a.id.localeCompare(b.id));
     // Rolling window — clamp offset in case fleet size shrank since last cycle
     const windowOffset = dockedShips.length > 0 ? (s.shipWindowOffset ?? 0) % dockedShips.length : 0;
-    const windowEnd = Math.min(windowOffset + SHIP_WINDOW_SIZE, dockedShips.length);
+    const windowEnd = Math.min(windowOffset + SHIP_WINDOW_SIZE * shipBatches, dockedShips.length);
     const windowShips = dockedShips.slice(windowOffset, windowEnd);
     const nextWindowOffset = windowEnd >= dockedShips.length ? 0 : windowEnd;
     console.log(`[runCycle] ${ships.length} ships total, ${dockedShips.length} docked, window=${windowOffset}–${windowEnd - 1}, companyId=${companyId}`);
@@ -786,7 +787,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     const fetchShipInv = (shipId: string): Cargo[] => shipInventoryCache.get(shipId) ?? [];
 
     const shipLoopStart = Date.now();
-    let shipsActioned = 0;
 
     // Pass 1: traveling ships — cheap metric tick over all ships (no API calls)
     for (const ship of ships) {
@@ -797,534 +797,567 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       s = { ...s, ships: { ...s.ships, [ship.id]: { ...tss, role: travelingRole, cyclesActive: tss.cyclesActive + 1, cyclesIdle: 0 } } };
     }
 
-    // Pass 2: docked ships in the current window — full routing logic
-    let windowIdx = 0;
-    for (const ship of windowShips) {
-      windowIdx++;
-      if (windowIdx % 10 === 0) {
-        console.log(`[runCycle:loop] ${windowIdx}/${windowShips.length} window ships, ${shipsActioned} actioned, ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
-      }
-      if (!ship.port_id) continue;
+    // Pass 2: docked ships in the current window — full routing logic (parallel batches)
+    const chunkArray = <T>(arr: T[], size: number): T[][] => {
+      const chunks: T[][] = [];
+      for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+      return chunks;
+    };
 
-      const ss = s.ships[ship.id] ?? defaultShipState();
-      const shipType = stMap.get(ship.ship_type_id);
-      const isFerry = FERRY_TYPE_PATTERN.test(shipType?.name ?? "");
-      const role: "ferry" | "multi" = isFerry ? "ferry" : "multi";
+    const fundsRef = { value: availableFunds };
 
-      // Persist the role so the dashboard can display it
-      if (ss.role !== role) {
-        s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, role } } };
-      }
+    const subBatches = chunkArray(windowShips, SHIP_WINDOW_SIZE);
+    let shipsActioned = 0;
 
-      const capacity = Math.min(shipType?.capacity ?? 20, MAX_UNITS);
+    for (const batch of subBatches) {
+      type ShipResult = { shipId: string; finalState: AutopilotShipState | null; logs: string[]; profitDelta: number; actioned: boolean };
 
-      // Actual remaining cargo space — prevents "Capacity exceeded" on buy
-      const shipInv = fetchShipInv(ship.id);
-      const usedCapacity = shipInv.reduce((sum, c) => sum + c.quantity, 0);
-      const freeCapacity = Math.max(0, capacity - usedCapacity);
+      const batchResults = await Promise.allSettled(
+        batch.map(async (ship): Promise<ShipResult> => {
+          const logs: string[] = [];
+          let profitDelta = 0;
+          let actioned = false;
 
-      // ── RELOCATION: route ship toward a shipyard port for sale ───────────
-      if (ss.phase === "idle" && ss.relocatingToPortId) {
-        const targetPortId = ss.relocatingToPortId;
-        const relocPaths = getPathsFrom(ship.port_id);
-        const relocPath = relocPaths.find((p) => p.destPortId === targetPortId);
-        if (relocPath && relocPath.legs.length > 0) {
-          const ssBeforeReloc = ss;
-          const relocPlan: ShipPlan = { sellPortId: targetPortId, legs: relocPath.legs.slice(1) };
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: relocPlan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-          s = appendLog(s, `🏴 ${ship.name}: relocating → ${portName(targetPortId)} for sale`);
-          await dispatchTransit(ship.id, relocPath.legs[0].routeId, (msg) => {
-            s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeReloc } };
-            s = appendLog(s, `${ship.name}: relocation dispatch failed — ${msg}`);
-          });
-          shipsActioned++;
-          continue;
-        } else if (ship.port_id === targetPortId) {
-          // Arrived — clear the tag, let fleet management sell it next cycle
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, relocatingToPortId: undefined } } };
-        }
-      }
+          if (!ship.port_id) return { shipId: ship.id, finalState: null, logs, profitDelta, actioned };
 
-      // ══════════════════════════════════════════════════════════════════════════
-      // IDLE — board passengers + scan for cargo, then dispatch
-      // ══════════════════════════════════════════════════════════════════════════
-      if (ss.phase === "idle") {
-        await sleep(DOCK_DELAY_MS);
-        shipsActioned++;
+          let shipState = s.ships[ship.id] ?? defaultShipState();
+          const shipType = stMap.get(ship.ship_type_id);
+          const isFerry = FERRY_TYPE_PATTERN.test(shipType?.name ?? "");
+          const role: "ferry" | "multi" = isFerry ? "ferry" : "multi";
 
-        // ── 0. Clear leftover cargo before buying/boarding ─────────────────────
-        // A ship can end up idle-with-cargo after a failed sell or state reset.
-        // Try to sell at current port; if that fails, dispatch to the best sell port.
-        if (usedCapacity > 0) {
-          let dispatched = false;
-          for (const item of shipInv.filter((c) => c.quantity > 0)) {
-            try {
-              const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
-              await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: item.quantity }] });
-              s.profitAccrued += sq.unit_price * item.quantity;
-              s = appendLog(s, `${ship.name}: 🧹 cleared ${item.quantity}× ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
-              shipInventoryCache.delete(ship.id); // invalidate so freeCapacity is recalculated if needed
-            } catch {
-              // Can't sell here — find best sell port and dispatch
-              const sellPaths = getPathsFrom(ship.port_id);
-              const bestSellPath = sellPaths
-                .filter((sp) => (npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0) >= MIN_SELL_PRICE_LEVEL)
-                .sort((a, b) => (npcMaxOrd.get(`${b.destPortId}:${item.good_id}`) ?? 0) - (npcMaxOrd.get(`${a.destPortId}:${item.good_id}`) ?? 0))[0];
-              if (bestSellPath && bestSellPath.legs.length > 0) {
-                const plan: ShipPlan = {
-                  goodId: item.good_id, goodName: goodNameFn(item.good_id),
-                  quantity: item.quantity, actualBuyPrice: 0,
-                  sellPortId: bestSellPath.destPortId, legs: bestSellPath.legs.slice(1),
-                };
-                const ssBeforeDispatch = ss;
-                s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-                s = appendLog(s, `${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${item.quantity}× ${goodNameFn(item.good_id)}`);
-                await dispatchTransit(ship.id, bestSellPath.legs[0].routeId, (msg) => {
-                  s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeDispatch } };
-                  s = appendLog(s, `${ship.name}: leftover dispatch failed — ${msg}`);
-                });
-                dispatched = true;
-              } else {
-                s = appendLog(s, `${ship.name}: ⚠️ stuck with ${item.quantity}× ${goodNameFn(item.good_id)} — no sell route`);
-              }
-              if (dispatched) break;
-            }
+          // Persist the role so the dashboard can display it
+          if (shipState.role !== role) {
+            shipState = { ...shipState, role };
           }
-          if (dispatched) continue;
-        }
 
-        const paths = getPathsFrom(ship.port_id);
+          const capacity = Math.min(shipType?.capacity ?? 20, MAX_UNITS);
 
-        // ── 1. Board best passenger at current port (always — pure profit) ─────
-        const cycleNow = new Date();
-        const paxHere = allPassengers.filter((p) =>
-          p.origin_port_id === ship.port_id && new Date(p.expires_at) > cycleNow,
-        );
+          // Actual remaining cargo space — prevents "Capacity exceeded" on buy
+          const shipInv = fetchShipInv(ship.id);
+          const usedCapacity = shipInv.reduce((sum, c) => sum + c.quantity, 0);
+          const freeCapacity = Math.max(0, capacity - usedCapacity);
 
-        let boardedPaxDestination: string | null = null;
-        let boardedPaxBid = 0;
-
-        if (paxHere.length > 0 && (shipType?.passengers ?? 0) > 0) {
-          // Score passengers by bid per unit of distance (best value first)
-          const scored = paxHere
-            .map((p) => {
-              const path = paths.find((pa) => pa.destPortId === p.destination_port_id);
-              return { ...p, dist: path?.totalDistance ?? Infinity };
-            })
-            .filter((p) => p.dist < Infinity)
-            .sort((a, b) => b.bid / a.dist - a.bid / b.dist);
-
-          for (const p of scored) {
-            try {
-              await passengersApi.boardPassenger(p.id, { ship_id: ship.id });
-              boardedPaxDestination = p.destination_port_id;
-              boardedPaxBid = p.bid;
-              s.profitAccrued += p.bid; // accrue at boarding — delivery is automatic
-              s = appendLog(s, `${ship.name}: 🧳 boarded ${p.count} pax → ${portName(p.destination_port_id)} (£${p.bid})`);
-              break;
-            } catch (e: unknown) {
-              s = appendLog(s, `${ship.name}: pax board failed — ${(e as Error).message}`);
-            }
-          }
-        }
-
-        // ── 2. Scan for best cargo (multi-purpose ships only) ─────────────────
-        let bestCargo: (ScoredCandidate & { buyPrice: number }) | null = null;
-
-        if (!isFerry) {
-          // Use pre-computed candidates for this port; apply per-ship pax filter below
-          const allCandidates = candidatesByPort.get(ship.port_id) ?? [];
-
-          // If pax were boarded: filter to cargo co-routable to the same destination
-          // (buy at current port, sell at pax destination = no extra detour)
-          const candidates = boardedPaxDestination
-            ? allCandidates.filter(
-                (c) => c.sellPortId === boardedPaxDestination && c.buyPortId === ship.port_id,
-              )
-            : allCandidates;
-
-          const sellBatch = dedupBestPerGood(candidates, SCAN_BATCH);
-
-          if (sellBatch.length > 0) {
-            let batchItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
-            try {
-              batchItems = await tradeApi.batchCreateQuotes({
-                requests: sellBatch.map((c) => ({
-                  port_id: c.sellPortId, good_id: c.goodId, quantity: capacity, action: "sell" as const,
-                })),
+          // ── RELOCATION: route ship toward a shipyard port for sale ───────────
+          if (shipState.phase === "idle" && shipState.relocatingToPortId) {
+            const targetPortId = shipState.relocatingToPortId;
+            const relocPaths = getPathsFrom(ship.port_id);
+            const relocPath = relocPaths.find((p) => p.destPortId === targetPortId);
+            if (relocPath && relocPath.legs.length > 0) {
+              const ssBeforeReloc = shipState;
+              const relocPlan: ShipPlan = { sellPortId: targetPortId, legs: relocPath.legs.slice(1) };
+              shipState = { ...shipState, phase: "transiting_to_sell", plan: relocPlan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
+              logs.push(`🏴 ${ship.name}: relocating → ${portName(targetPortId)} for sale`);
+              await dispatchTransit(ship.id, relocPath.legs[0].routeId, (msg) => {
+                shipState = ssBeforeReloc;
+                logs.push(`${ship.name}: relocation dispatch failed — ${msg}`);
               });
-            } catch { /* proceed with empty */ }
-
-            const scored: ScoredCandidate[] = sellBatch
-              .map((c, i) => {
-                const item = batchItems[i];
-                if (!item || item.status !== "success" || !item.quote) return null;
-                return { ...c, npcSellPrice: item.quote.unit_price };
-              })
-              .filter(Boolean) as ScoredCandidate[];
-
-            for (const c of scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice)) {
-              try {
-                const bq = await tradeApi.createQuote({ port_id: c.buyPortId, good_id: c.goodId, quantity: capacity, action: "buy" });
-                const margin = (c.npcSellPrice - bq.unit_price) / bq.unit_price;
-                if (margin >= MIN_MARGIN) { bestCargo = { ...c, buyPrice: bq.unit_price }; break; }
-              } catch { /* try next */ }
+              actioned = true;
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            } else if (ship.port_id === targetPortId) {
+              // Arrived — clear the tag, let fleet management sell it next cycle
+              shipState = { ...shipState, relocatingToPortId: undefined };
             }
           }
-        }
 
-        // ── 3. Decide and dispatch ─────────────────────────────────────────────
+          // ══════════════════════════════════════════════════════════════════════════
+          // IDLE — board passengers + scan for cargo, then dispatch
+          // ══════════════════════════════════════════════════════════════════════════
+          if (shipState.phase === "idle") {
+            await sleep(DOCK_DELAY_MS);
+            actioned = true;
 
-        if (boardedPaxDestination) {
-          // Passengers boarded — MUST go to their destination
-          const destPath = paths.find((p) => p.destPortId === boardedPaxDestination);
-          if (!destPath || destPath.legs.length === 0) {
-            s = appendLog(s, `${ship.name}: ⚠️ no route to pax destination ${portName(boardedPaxDestination)} — resetting`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-            continue;
-          }
-
-          // Buy cargo to the same destination if available and affordable
-          let cargoGoodId: string | undefined;
-          let cargoGoodName: string | undefined;
-          let cargoQty = 0;
-          let cargoBuyPrice = 0;
-          let cargoSellPrice: number | undefined;
-
-          if (bestCargo && availableFunds > 0 && freeCapacity > 0) {
-            try {
-              const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
-              const affordable = Math.floor(availableFunds / bq.unit_price);
-              const buyQty = Math.min(freeCapacity, affordable);
-              if (buyQty > 0) {
-                const eq = buyQty < freeCapacity
-                  ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
-                  : bq;
-                await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
-                availableFunds -= buyQty * eq.unit_price;
-                cargoGoodId    = bestCargo.goodId;
-                cargoGoodName  = goodNameFn(bestCargo.goodId);
-                cargoQty       = buyQty;
-                cargoBuyPrice  = eq.unit_price;
-                cargoSellPrice = bestCargo.npcSellPrice;
-                s = appendLog(s, `${ship.name}: 📦 bought ${buyQty}× ${cargoGoodName} @ £${eq.unit_price} (co-routing with pax)`);
+            // ── 0. Clear leftover cargo before buying/boarding ─────────────────────
+            // A ship can end up idle-with-cargo after a failed sell or state reset.
+            // Try to sell at current port; if that fails, dispatch to the best sell port.
+            if (usedCapacity > 0) {
+              let dispatched = false;
+              for (const item of shipInv.filter((c) => c.quantity > 0)) {
+                try {
+                  const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
+                  await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: item.quantity }] });
+                  profitDelta += sq.unit_price * item.quantity;
+                  logs.push(`${ship.name}: 🧹 cleared ${item.quantity}× ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
+                  shipInventoryCache.delete(ship.id); // invalidate so freeCapacity is recalculated if needed
+                } catch {
+                  // Can't sell here — find best sell port and dispatch
+                  const sellPaths = getPathsFrom(ship.port_id);
+                  const bestSellPath = sellPaths
+                    .filter((sp) => (npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0) >= MIN_SELL_PRICE_LEVEL)
+                    .sort((a, b) => (npcMaxOrd.get(`${b.destPortId}:${item.good_id}`) ?? 0) - (npcMaxOrd.get(`${a.destPortId}:${item.good_id}`) ?? 0))[0];
+                  if (bestSellPath && bestSellPath.legs.length > 0) {
+                    const plan: ShipPlan = {
+                      goodId: item.good_id, goodName: goodNameFn(item.good_id),
+                      quantity: item.quantity, actualBuyPrice: 0,
+                      sellPortId: bestSellPath.destPortId, legs: bestSellPath.legs.slice(1),
+                    };
+                    const ssBeforeDispatch = shipState;
+                    shipState = { ...shipState, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
+                    logs.push(`${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${item.quantity}× ${goodNameFn(item.good_id)}`);
+                    await dispatchTransit(ship.id, bestSellPath.legs[0].routeId, (msg) => {
+                      shipState = ssBeforeDispatch;
+                      logs.push(`${ship.name}: leftover dispatch failed — ${msg}`);
+                    });
+                    dispatched = true;
+                  } else {
+                    logs.push(`${ship.name}: ⚠️ stuck with ${item.quantity}× ${goodNameFn(item.good_id)} — no sell route`);
+                  }
+                  if (dispatched) break;
+                }
               }
-            } catch (e: unknown) {
-              s = appendLog(s, `${ship.name}: co-route cargo buy failed — ${(e as Error).message}`);
+              if (dispatched) return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
             }
-          }
 
-          const plan: ShipPlan = {
-            sellPortId: boardedPaxDestination,
-            legs: destPath.legs.slice(1),
-            passengerBid: boardedPaxBid,
-            ...(cargoQty > 0 ? { goodId: cargoGoodId, goodName: cargoGoodName, quantity: cargoQty, actualBuyPrice: cargoBuyPrice, sellPrice: cargoSellPrice } : {}),
-          };
+            const paths = getPathsFrom(ship.port_id);
 
-          const ssBeforePaxDispatch = ss;
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-          s = appendLog(s, `${ship.name}: → ${portName(boardedPaxDestination)} (pax £${boardedPaxBid}${cargoQty > 0 ? ` + ${cargoQty}× ${cargoGoodName}` : ""})`);
-          await dispatchTransit(ship.id, destPath.legs[0].routeId, (msg) => {
-            s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforePaxDispatch } };
-            s = appendLog(s, `${ship.name}: pax dispatch failed — ${msg}`);
-          });
+            // ── 1. Board best passenger at current port (always — pure profit) ─────
+            const cycleNow = new Date();
+            const paxHere = allPassengers.filter((p) =>
+              p.origin_port_id === ship.port_id && new Date(p.expires_at) > cycleNow,
+            );
 
-        } else if (bestCargo) {
-          // No passengers — execute best cargo trade
+            let boardedPaxDestination: string | null = null;
+            let boardedPaxBid = 0;
 
-          if (bestCargo.buyPortId === ship.port_id) {
-            // ── Local buy: purchase here, head to sell port ──────────────────
-            const destPath = paths.find((p) => p.destPortId === bestCargo.sellPortId);
-            if (!destPath || destPath.legs.length === 0) {
-              s = appendLog(s, `${ship.name}: no route to sell port ${portName(bestCargo.sellPortId)}`);
-              continue;
-            }
-            try {
-              const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
-              const affordable = Math.floor(availableFunds / bq.unit_price);
-              const buyQty = Math.min(freeCapacity, affordable);
-              if (buyQty <= 0) {
-                s = appendLog(s, `${ship.name}: insufficient funds for ${goodNameFn(bestCargo.goodId)}`);
-                continue;
+            if (paxHere.length > 0 && (shipType?.passengers ?? 0) > 0) {
+              // Score passengers by bid per unit of distance (best value first)
+              const scored = paxHere
+                .map((p) => {
+                  const path = paths.find((pa) => pa.destPortId === p.destination_port_id);
+                  return { ...p, dist: path?.totalDistance ?? Infinity };
+                })
+                .filter((p) => p.dist < Infinity)
+                .sort((a, b) => b.bid / a.dist - a.bid / b.dist);
+
+              for (const p of scored) {
+                try {
+                  await passengersApi.boardPassenger(p.id, { ship_id: ship.id });
+                  boardedPaxDestination = p.destination_port_id;
+                  boardedPaxBid = p.bid;
+                  profitDelta += p.bid; // accrue at boarding — delivery is automatic
+                  logs.push(`${ship.name}: 🧳 boarded ${p.count} pax → ${portName(p.destination_port_id)} (£${p.bid})`);
+                  break;
+                } catch (e: unknown) {
+                  logs.push(`${ship.name}: pax board failed — ${(e as Error).message}`);
+                }
               }
-              const eq = buyQty < freeCapacity
-                ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
-                : bq;
-              await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
-              availableFunds -= buyQty * eq.unit_price;
+            }
+
+            // ── 2. Scan for best cargo (multi-purpose ships only) ─────────────────
+            let bestCargo: (ScoredCandidate & { buyPrice: number }) | null = null;
+
+            if (!isFerry) {
+              // Use pre-computed candidates for this port; apply per-ship pax filter below
+              const allCandidates = candidatesByPort.get(ship.port_id) ?? [];
+
+              // If pax were boarded: filter to cargo co-routable to the same destination
+              // (buy at current port, sell at pax destination = no extra detour)
+              const candidates = boardedPaxDestination
+                ? allCandidates.filter(
+                    (c) => c.sellPortId === boardedPaxDestination && c.buyPortId === ship.port_id,
+                  )
+                : allCandidates;
+
+              const sellBatch = dedupBestPerGood(candidates, SCAN_BATCH);
+
+              if (sellBatch.length > 0) {
+                let batchItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+                try {
+                  batchItems = await tradeApi.batchCreateQuotes({
+                    requests: sellBatch.map((c) => ({
+                      port_id: c.sellPortId, good_id: c.goodId, quantity: capacity, action: "sell" as const,
+                    })),
+                  });
+                } catch { /* proceed with empty */ }
+
+                const scored: ScoredCandidate[] = sellBatch
+                  .map((c, i) => {
+                    const item = batchItems[i];
+                    if (!item || item.status !== "success" || !item.quote) return null;
+                    return { ...c, npcSellPrice: item.quote.unit_price };
+                  })
+                  .filter(Boolean) as ScoredCandidate[];
+
+                for (const c of scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice)) {
+                  try {
+                    const bq = await tradeApi.createQuote({ port_id: c.buyPortId, good_id: c.goodId, quantity: capacity, action: "buy" });
+                    const margin = (c.npcSellPrice - bq.unit_price) / bq.unit_price;
+                    if (margin >= MIN_MARGIN) { bestCargo = { ...c, buyPrice: bq.unit_price }; break; }
+                  } catch { /* try next */ }
+                }
+              }
+            }
+
+            // ── 3. Decide and dispatch ─────────────────────────────────────────────
+
+            if (boardedPaxDestination) {
+              // Passengers boarded — MUST go to their destination
+              const destPath = paths.find((p) => p.destPortId === boardedPaxDestination);
+              if (!destPath || destPath.legs.length === 0) {
+                logs.push(`${ship.name}: ⚠️ no route to pax destination ${portName(boardedPaxDestination)} — resetting`);
+                shipState = { ...shipState, phase: "idle" };
+                return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+              }
+
+              // Buy cargo to the same destination if available and affordable
+              let cargoGoodId: string | undefined;
+              let cargoGoodName: string | undefined;
+              let cargoQty = 0;
+              let cargoBuyPrice = 0;
+              let cargoSellPrice: number | undefined;
+
+              if (bestCargo && fundsRef.value > 0 && freeCapacity > 0) {
+                try {
+                  const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
+                  const affordable = Math.floor(fundsRef.value / bq.unit_price);
+                  const buyQty = Math.min(freeCapacity, affordable);
+                  if (buyQty > 0) {
+                    const eq = buyQty < freeCapacity
+                      ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
+                      : bq;
+                    await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
+                    fundsRef.value -= buyQty * eq.unit_price;
+                    cargoGoodId    = bestCargo.goodId;
+                    cargoGoodName  = goodNameFn(bestCargo.goodId);
+                    cargoQty       = buyQty;
+                    cargoBuyPrice  = eq.unit_price;
+                    cargoSellPrice = bestCargo.npcSellPrice;
+                    logs.push(`${ship.name}: 📦 bought ${buyQty}× ${cargoGoodName} @ £${eq.unit_price} (co-routing with pax)`);
+                  }
+                } catch (e: unknown) {
+                  logs.push(`${ship.name}: co-route cargo buy failed — ${(e as Error).message}`);
+                }
+              }
 
               const plan: ShipPlan = {
-                goodId: bestCargo.goodId, goodName: goodNameFn(bestCargo.goodId),
-                quantity: buyQty, actualBuyPrice: eq.unit_price, sellPrice: bestCargo.npcSellPrice,
-                sellPortId: bestCargo.sellPortId, legs: destPath.legs.slice(1),
+                sellPortId: boardedPaxDestination,
+                legs: destPath.legs.slice(1),
+                passengerBid: boardedPaxBid,
+                ...(cargoQty > 0 ? { goodId: cargoGoodId, goodName: cargoGoodName, quantity: cargoQty, actualBuyPrice: cargoBuyPrice, sellPrice: cargoSellPrice } : {}),
               };
-              const ssBeforeLocalDispatch = ss;
-              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-              s = appendLog(s, `${ship.name}: 📦 ${buyQty}× ${plan.goodName} → ${portName(bestCargo.sellPortId)} (£${eq.unit_price}→£${bestCargo.npcSellPrice}, ${((bestCargo.npcSellPrice - eq.unit_price) / eq.unit_price * 100).toFixed(1)}%)`);
+
+              const ssBeforePaxDispatch = shipState;
+              shipState = { ...shipState, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
+              logs.push(`${ship.name}: → ${portName(boardedPaxDestination)} (pax £${boardedPaxBid}${cargoQty > 0 ? ` + ${cargoQty}× ${cargoGoodName}` : ""})`);
               await dispatchTransit(ship.id, destPath.legs[0].routeId, (msg) => {
-                s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeLocalDispatch } };
-                s = appendLog(s, `${ship.name}: local buy failed — ${msg}`);
+                shipState = ssBeforePaxDispatch;
+                logs.push(`${ship.name}: pax dispatch failed — ${msg}`);
               });
-            } catch (e: unknown) {
-              s = appendLog(s, `${ship.name}: local buy failed — ${(e as Error).message}`);
-            }
 
-          } else {
-            // ── Remote buy: head to buy port first ───────────────────────────
-            const toBuyPath = paths.find((p) => p.destPortId === bestCargo.buyPortId);
-            if (!toBuyPath || toBuyPath.legs.length === 0) {
-              s = appendLog(s, `${ship.name}: no route to buy port ${portName(bestCargo.buyPortId)}`);
-              continue;
-            }
-            const plan: ShipPlan = {
-              goodId: bestCargo.goodId, goodName: goodNameFn(bestCargo.goodId),
-              quantity: 0, actualBuyPrice: 0,
-              buyPortId: bestCargo.buyPortId,
-              sellPortId: bestCargo.sellPortId, sellPrice: bestCargo.npcSellPrice,
-              sellLegs: bestCargo.sellLegs,
-              legs: toBuyPath.legs.slice(1),
-            };
-            const ssBeforeRemoteDispatch = ss;
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-            s = appendLog(s, `${ship.name}: → ${portName(bestCargo.buyPortId)} to buy ${goodNameFn(bestCargo.goodId)}`);
-            await dispatchTransit(ship.id, toBuyPath.legs[0].routeId, (msg) => {
-              s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeRemoteDispatch } };
-              s = appendLog(s, `${ship.name}: remote dispatch failed — ${msg}`);
-            });
-          }
+            } else if (bestCargo) {
+              // No passengers — execute best cargo trade
 
-        } else {
-          // ── No cargo opportunity — route ship to best uncovered passenger port ──
-          let chasedPax = false;
-          if ((shipType?.passengers ?? 0) > 0) {
-            const now = Date.now();
-            const speed = shipType?.speed ?? 4;
-            const paxPaths = getPathsFrom(ship.port_id, MAX_PAX_CHASE_HOPS);
+              if (bestCargo.buyPortId === ship.port_id) {
+                // ── Local buy: purchase here, head to sell port ──────────────────
+                const destPath = paths.find((p) => p.destPortId === bestCargo.sellPortId);
+                if (!destPath || destPath.legs.length === 0) {
+                  logs.push(`${ship.name}: no route to sell port ${portName(bestCargo.sellPortId)}`);
+                  return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+                }
+                try {
+                  const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
+                  const affordable = Math.floor(fundsRef.value / bq.unit_price);
+                  const buyQty = Math.min(freeCapacity, affordable);
+                  if (buyQty <= 0) {
+                    logs.push(`${ship.name}: insufficient funds for ${goodNameFn(bestCargo.goodId)}`);
+                    return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+                  }
+                  const eq = buyQty < freeCapacity
+                    ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
+                    : bq;
+                  await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
+                  fundsRef.value -= buyQty * eq.unit_price;
 
-            // coveredPorts is pre-computed before the loop and updated incrementally
+                  const plan: ShipPlan = {
+                    goodId: bestCargo.goodId, goodName: goodNameFn(bestCargo.goodId),
+                    quantity: buyQty, actualBuyPrice: eq.unit_price, sellPrice: bestCargo.npcSellPrice,
+                    sellPortId: bestCargo.sellPortId, legs: destPath.legs.slice(1),
+                  };
+                  const ssBeforeLocalDispatch = shipState;
+                  shipState = { ...shipState, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
+                  logs.push(`${ship.name}: 📦 ${buyQty}× ${plan.goodName} → ${portName(bestCargo.sellPortId)} (£${eq.unit_price}→£${bestCargo.npcSellPrice}, ${((bestCargo.npcSellPrice - eq.unit_price) / eq.unit_price * 100).toFixed(1)}%)`);
+                  await dispatchTransit(ship.id, destPath.legs[0].routeId, (msg) => {
+                    shipState = ssBeforeLocalDispatch;
+                    logs.push(`${ship.name}: local buy failed — ${msg}`);
+                  });
+                } catch (e: unknown) {
+                  logs.push(`${ship.name}: local buy failed — ${(e as Error).message}`);
+                }
 
-            // Group valid passengers by origin port, compute total bid per port.
-            // Filter out passengers this ship cannot reach before they expire.
-            const portBids = new Map<string, { total: number; best: Passenger }>();
-            for (const p of allPassengers) {
-              const path = paxPaths.find((pa) => pa.destPortId === p.origin_port_id);
-              if (!path) continue;
-              const eta = travelTimeMs(path.totalDistance, speed) + TRAVEL_BUFFER_MS;
-              const timeLeft = new Date(p.expires_at).getTime() - now;
-              if (timeLeft < eta + MIN_PAX_EXPIRY_BUFFER_MS) continue;
-              const existing = portBids.get(p.origin_port_id);
-              if (!existing || p.bid > existing.best.bid) {
-                portBids.set(p.origin_port_id, {
-                  total: (existing?.total ?? 0) + p.bid,
-                  best: existing && existing.best.bid >= p.bid ? existing.best : p,
-                });
               } else {
-                existing.total += p.bid;
+                // ── Remote buy: head to buy port first ───────────────────────────
+                const toBuyPath = paths.find((p) => p.destPortId === bestCargo.buyPortId);
+                if (!toBuyPath || toBuyPath.legs.length === 0) {
+                  logs.push(`${ship.name}: no route to buy port ${portName(bestCargo.buyPortId)}`);
+                  return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+                }
+                const plan: ShipPlan = {
+                  goodId: bestCargo.goodId, goodName: goodNameFn(bestCargo.goodId),
+                  quantity: 0, actualBuyPrice: 0,
+                  buyPortId: bestCargo.buyPortId,
+                  sellPortId: bestCargo.sellPortId, sellPrice: bestCargo.npcSellPrice,
+                  sellLegs: bestCargo.sellLegs,
+                  legs: toBuyPath.legs.slice(1),
+                };
+                const ssBeforeRemoteDispatch = shipState;
+                shipState = { ...shipState, phase: "transiting_to_buy", plan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
+                logs.push(`${ship.name}: → ${portName(bestCargo.buyPortId)} to buy ${goodNameFn(bestCargo.goodId)}`);
+                await dispatchTransit(ship.id, toBuyPath.legs[0].routeId, (msg) => {
+                  shipState = ssBeforeRemoteDispatch;
+                  logs.push(`${ship.name}: remote dispatch failed — ${msg}`);
+                });
+              }
+
+            } else {
+              // ── No cargo opportunity — route ship to best uncovered passenger port ──
+              let chasedPax = false;
+              if ((shipType?.passengers ?? 0) > 0) {
+                const now = Date.now();
+                const speed = shipType?.speed ?? 4;
+                const paxPaths = getPathsFrom(ship.port_id, MAX_PAX_CHASE_HOPS);
+
+                // coveredPorts is pre-computed before the loop and updated incrementally
+
+                // Group valid passengers by origin port, compute total bid per port.
+                // Filter out passengers this ship cannot reach before they expire.
+                const portBids = new Map<string, { total: number; best: Passenger }>();
+                for (const p of allPassengers) {
+                  const path = paxPaths.find((pa) => pa.destPortId === p.origin_port_id);
+                  if (!path) continue;
+                  const eta = travelTimeMs(path.totalDistance, speed) + TRAVEL_BUFFER_MS;
+                  const timeLeft = new Date(p.expires_at).getTime() - now;
+                  if (timeLeft < eta + MIN_PAX_EXPIRY_BUFFER_MS) continue;
+                  const existing = portBids.get(p.origin_port_id);
+                  if (!existing || p.bid > existing.best.bid) {
+                    portBids.set(p.origin_port_id, {
+                      total: (existing?.total ?? 0) + p.bid,
+                      best: existing && existing.best.bid >= p.bid ? existing.best : p,
+                    });
+                  } else {
+                    existing.total += p.bid;
+                  }
+                }
+
+                // Score each reachable port: uncovered ports get a 2× multiplier
+                const portCandidates = Array.from(portBids.entries())
+                  .filter(([portId]) => portId !== ship.port_id)
+                  .map(([portId, { total, best }]) => {
+                    const path = paxPaths.find((pa) => pa.destPortId === portId)!;
+                    const coverageBonus = coveredPorts.has(portId) ? 1 : 2;
+                    return { portId, path, best, totalBid: total, score: (total / path.totalDistance) * coverageBonus };
+                  })
+                  .sort((a, b) => b.score - a.score);
+
+                const bestPort = portCandidates[0];
+                if (bestPort) {
+                  const ssBeforePaxChase = shipState;
+                  shipState = { ...shipState, phase: "transiting_to_buy", plan: {
+                    goodId: "", goodName: "",
+                    quantity: 0, actualBuyPrice: 0,
+                    buyPortId: bestPort.portId,
+                    sellPortId: bestPort.best.destination_port_id, sellPrice: 0,
+                    sellLegs: [], legs: bestPort.path.legs.slice(1),
+                    passengerBid: bestPort.totalBid,
+                  }, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
+                  const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
+                  const etaSec = Math.round(travelTimeMs(bestPort.path.totalDistance, speed) / 1000);
+                  logs.push(`${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ETA ~${etaSec}s)`);
+                  coveredPorts.add(bestPort.portId); // incremental update — prevents next ship choosing same port
+                  await dispatchTransit(ship.id, bestPort.path.legs[0].routeId, (msg) => {
+                    shipState = ssBeforePaxChase;
+                    logs.push(`${ship.name}: pax-chase dispatch failed — ${msg}`);
+                  });
+                  chasedPax = true;
+                }
+              }
+
+              if (!chasedPax) {
+                if (isFerry) {
+                  logs.push(`${ship.name}: ⚓ covering ${portName(ship.port_id)}`);
+                  shipState = { ...shipState, cyclesActive: shipState.cyclesActive + 1 };
+                } else {
+                  logs.push(`${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
+                  shipState = { ...shipState, cyclesIdle: shipState.cyclesIdle + 1, cyclesActive: shipState.cyclesActive + 1 };
+                }
               }
             }
 
-            // Score each reachable port: uncovered ports get a 2× multiplier
-            const portCandidates = Array.from(portBids.entries())
-              .filter(([portId]) => portId !== ship.port_id)
-              .map(([portId, { total, best }]) => {
-                const path = paxPaths.find((pa) => pa.destPortId === portId)!;
-                const coverageBonus = coveredPorts.has(portId) ? 1 : 2;
-                return { portId, path, best, totalBid: total, score: (total / path.totalDistance) * coverageBonus };
-              })
-              .sort((a, b) => b.score - a.score);
+          // ══════════════════════════════════════════════════════════════════════════
+          // TRANSITING_TO_BUY — advance waypoints; buy and dispatch on arrival
+          // ══════════════════════════════════════════════════════════════════════════
+          } else if (shipState.phase === "transiting_to_buy") {
+            const plan = shipState.plan!;
 
-            const bestPort = portCandidates[0];
-            if (bestPort) {
-              const ssBeforePaxChase = ss;
-              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_buy", plan: {
-                goodId: "", goodName: "",
-                quantity: 0, actualBuyPrice: 0,
-                buyPortId: bestPort.portId,
-                sellPortId: bestPort.best.destination_port_id, sellPrice: 0,
-                sellLegs: [], legs: bestPort.path.legs.slice(1),
-                passengerBid: bestPort.totalBid,
-              }, cyclesIdle: 0, cyclesActive: ss.cyclesActive + 1 } } };
-              const covTag = coveredPorts.has(bestPort.portId) ? "" : " (uncovered)";
-              const etaSec = Math.round(travelTimeMs(bestPort.path.totalDistance, speed) / 1000);
-              s = appendLog(s, `${ship.name}: 🧳 → ${portName(bestPort.portId)}${covTag} (£${bestPort.totalBid} pax, ETA ~${etaSec}s)`);
-              coveredPorts.add(bestPort.portId); // incremental update — prevents next ship choosing same port
-              await dispatchTransit(ship.id, bestPort.path.legs[0].routeId, (msg) => {
-                s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforePaxChase } };
-                s = appendLog(s, `${ship.name}: pax-chase dispatch failed — ${msg}`);
+            // Advance waypoint if not yet at buy port
+            if (plan.legs.length > 0 && ship.port_id !== plan.buyPortId) {
+              const ssBeforeWaypoint = shipState;
+              shipState = { ...shipState, plan: { ...plan, legs: plan.legs.slice(1) } };
+              logs.push(`${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
+              await dispatchTransit(ship.id, plan.legs[0].routeId, (msg) => {
+                shipState = ssBeforeWaypoint;
+                logs.push(`${ship.name}: waypoint failed — ${msg}`);
               });
-              chasedPax = true;
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
             }
-          }
 
-          if (!chasedPax) {
-            if (isFerry) {
-              s = appendLog(s, `${ship.name}: ⚓ covering ${portName(ship.port_id)}`);
-              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesActive: ss.cyclesActive + 1 } } };
+            if (ship.port_id !== plan.buyPortId) {
+              logs.push(`${ship.name}: ⚠️ lost in transit (expected ${portName(plan.buyPortId)}) — resetting`);
+              shipState = { ...shipState, phase: "idle" };
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            }
+
+            // Arrived at buy port
+            await sleep(DOCK_DELAY_MS);
+
+            // Passenger-chase: arrived at origin port — reset to idle so the passenger
+            // boarding logic in the idle branch picks them up this cycle.
+            if (!plan.goodId) {
+              logs.push(`${ship.name}: arrived at ${portName(ship.port_id)} to board pax`);
+              shipState = { ...shipState, phase: "idle" };
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            }
+
+            let boughtQty = 0;
+            let actualBuyPrice = 0;
+
+            if (fundsRef.value > 0 && freeCapacity > 0) {
+              try {
+                const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: freeCapacity, action: "buy" });
+                const affordable = Math.floor(fundsRef.value / bq.unit_price);
+                const buyQty = Math.min(freeCapacity, affordable);
+                if (buyQty > 0) {
+                  const eq = buyQty < freeCapacity
+                    ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: buyQty, action: "buy" })
+                    : bq;
+                  await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
+                  fundsRef.value -= buyQty * eq.unit_price;
+                  boughtQty = buyQty;
+                  actualBuyPrice = eq.unit_price;
+                  logs.push(`${ship.name}: bought ${buyQty}× ${plan.goodName} @ £${eq.unit_price} at ${portName(ship.port_id)}`);
+                }
+              } catch (e: unknown) {
+                logs.push(`${ship.name}: buy failed at ${portName(ship.port_id)} — ${(e as Error).message}`);
+              }
+            }
+
+            if (boughtQty === 0) {
+              logs.push(`${ship.name}: nothing bought at ${portName(ship.port_id)} — resetting`);
+              shipState = { ...shipState, phase: "idle" };
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            }
+
+            // Dispatch to sell port (use pre-computed sellLegs, or find path if needed)
+            const sellLegs = plan.sellLegs ?? [];
+            if (sellLegs.length > 0) {
+              const ssBeforeSellLegs = shipState;
+              shipState = { ...shipState, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: sellLegs.slice(1) }, cyclesIdle: 0 };
+              logs.push(`${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
+              await dispatchTransit(ship.id, sellLegs[0].routeId, (msg) => {
+                shipState = { ...ssBeforeSellLegs, phase: "idle" };
+                logs.push(`${ship.name}: sell dispatch failed — ${msg}`);
+              });
             } else {
-              s = appendLog(s, `${ship.name}: idle at ${portName(ship.port_id)} — no opportunity`);
-              s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, cyclesIdle: ss.cyclesIdle + 1, cyclesActive: ss.cyclesActive + 1 } } };
-            }
-          }
-        }
-
-      // ══════════════════════════════════════════════════════════════════════════
-      // TRANSITING_TO_BUY — advance waypoints; buy and dispatch on arrival
-      // ══════════════════════════════════════════════════════════════════════════
-      } else if (ss.phase === "transiting_to_buy") {
-        const plan = ss.plan!;
-
-        // Advance waypoint if not yet at buy port
-        if (plan.legs.length > 0 && ship.port_id !== plan.buyPortId) {
-          const ssBeforeWaypoint = ss;
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } } };
-          s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
-          await dispatchTransit(ship.id, plan.legs[0].routeId, (msg) => {
-            s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeWaypoint } };
-            s = appendLog(s, `${ship.name}: waypoint failed — ${msg}`);
-          });
-          continue;
-        }
-
-        if (ship.port_id !== plan.buyPortId) {
-          s = appendLog(s, `${ship.name}: ⚠️ lost in transit (expected ${portName(plan.buyPortId)}) — resetting`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-          continue;
-        }
-
-        // Arrived at buy port
-        await sleep(DOCK_DELAY_MS);
-
-        // Passenger-chase: arrived at origin port — reset to idle so the passenger
-        // boarding logic in the idle branch picks them up this cycle.
-        if (!plan.goodId) {
-          s = appendLog(s, `${ship.name}: arrived at ${portName(ship.port_id)} to board pax`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-          continue;
-        }
-
-        let boughtQty = 0;
-        let actualBuyPrice = 0;
-
-        if (availableFunds > 0 && freeCapacity > 0) {
-          try {
-            const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: freeCapacity, action: "buy" });
-            const affordable = Math.floor(availableFunds / bq.unit_price);
-            const buyQty = Math.min(freeCapacity, affordable);
-            if (buyQty > 0) {
-              const eq = buyQty < freeCapacity
-                ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: buyQty, action: "buy" })
-                : bq;
-              await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
-              availableFunds -= buyQty * eq.unit_price;
-              boughtQty = buyQty;
-              actualBuyPrice = eq.unit_price;
-              s = appendLog(s, `${ship.name}: bought ${buyQty}× ${plan.goodName} @ £${eq.unit_price} at ${portName(ship.port_id)}`);
-            }
-          } catch (e: unknown) {
-            s = appendLog(s, `${ship.name}: buy failed at ${portName(ship.port_id)} — ${(e as Error).message}`);
-          }
-        }
-
-        if (boughtQty === 0) {
-          s = appendLog(s, `${ship.name}: nothing bought at ${portName(ship.port_id)} — resetting`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-          continue;
-        }
-
-        // Dispatch to sell port (use pre-computed sellLegs, or find path if needed)
-        const sellLegs = plan.sellLegs ?? [];
-        if (sellLegs.length > 0) {
-          const ssBeforeSellLegs = ss;
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: sellLegs.slice(1) }, cyclesIdle: 0 } } };
-          s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
-          await dispatchTransit(ship.id, sellLegs[0].routeId, (msg) => {
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ssBeforeSellLegs, phase: "idle" } } };
-            s = appendLog(s, `${ship.name}: sell dispatch failed — ${msg}`);
-          });
-        } else {
-          // Rare: sellLegs was empty (same port buy/sell?), re-find path
-          const sellPaths = getPathsFrom(ship.port_id);
-          const toSell = sellPaths.find((p) => p.destPortId === plan.sellPortId);
-          if (!toSell || toSell.legs.length === 0) {
-            s = appendLog(s, `${ship.name}: ⚠️ no sell route from ${portName(ship.port_id)} — resetting`);
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-            continue;
-          }
-          const ssBeforeAltSell = ss;
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: toSell.legs.slice(1) }, cyclesIdle: 0 } } };
-          s = appendLog(s, `${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
-          await dispatchTransit(ship.id, toSell.legs[0].routeId, (msg) => {
-            s = { ...s, ships: { ...s.ships, [ship.id]: { ...ssBeforeAltSell, phase: "idle" } } };
-            s = appendLog(s, `${ship.name}: sell dispatch failed — ${msg}`);
-          });
-        }
-
-      // ══════════════════════════════════════════════════════════════════════════
-      // TRANSITING_TO_SELL — advance waypoints; sell cargo on arrival, then idle
-      // ══════════════════════════════════════════════════════════════════════════
-      } else if (ss.phase === "transiting_to_sell") {
-        const plan = ss.plan!;
-
-        // Advance waypoint
-        if (plan.legs.length > 0 && ship.port_id !== plan.sellPortId) {
-          const ssBeforeWaypoint = ss;
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, plan: { ...plan, legs: plan.legs.slice(1) } } } };
-          s = appendLog(s, `${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
-          await dispatchTransit(ship.id, plan.legs[0].routeId, (msg) => {
-            s = { ...s, ships: { ...s.ships, [ship.id]: ssBeforeWaypoint } };
-            s = appendLog(s, `${ship.name}: waypoint failed — ${msg}`);
-          });
-          continue;
-        }
-
-        if (ship.port_id !== plan.sellPortId) {
-          s = appendLog(s, `${ship.name}: ⚠️ at ${portName(ship.port_id)}, expected ${portName(plan.sellPortId)} — resetting`);
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...ss, phase: "idle" } } };
-          continue;
-        }
-
-        // Arrived at destination
-        await sleep(DOCK_DELAY_MS);
-
-        // Sell cargo if any — use ACTUAL inventory to avoid "Cargo not found"
-        if (plan.goodId) {
-          const actualItem = shipInv.find((c) => c.good_id === plan.goodId);
-          const sellQty = actualItem?.quantity ?? 0;
-          if (sellQty > 0) {
-            let sold = false;
-            try {
-              const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: sellQty, action: "sell" });
-              await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: sellQty }] });
-              const profit = (sq.unit_price - (plan.actualBuyPrice ?? 0)) * sellQty;
-              s.profitAccrued += profit;
-              const updSs = s.ships[ship.id] ?? defaultShipState();
-              s = { ...s, ships: { ...s.ships, [ship.id]: { ...updSs, cargoTrips: updSs.cargoTrips + 1, lifetimeProfit: updSs.lifetimeProfit + profit } } };
-              s = appendLog(s, `${ship.name}: sold ${sellQty}× ${plan.goodName} @ £${sq.unit_price} (+£${Math.round(profit).toLocaleString()})`);
-              sold = true;
-            } catch (e: unknown) {
-              s = appendLog(s, `${ship.name}: NPC sell failed — ${(e as Error).message}`);
+              // Rare: sellLegs was empty (same port buy/sell?), re-find path
+              const sellPaths = getPathsFrom(ship.port_id);
+              const toSell = sellPaths.find((p) => p.destPortId === plan.sellPortId);
+              if (!toSell || toSell.legs.length === 0) {
+                logs.push(`${ship.name}: ⚠️ no sell route from ${portName(ship.port_id)} — resetting`);
+                shipState = { ...shipState, phase: "idle" };
+                return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+              }
+              const ssBeforeAltSell = shipState;
+              shipState = { ...shipState, phase: "transiting_to_sell", plan: { ...plan, quantity: boughtQty, actualBuyPrice, legs: toSell.legs.slice(1) }, cyclesIdle: 0 };
+              logs.push(`${ship.name}: → ${portName(plan.sellPortId)} to sell ${boughtQty}× ${plan.goodName}`);
+              await dispatchTransit(ship.id, toSell.legs[0].routeId, (msg) => {
+                shipState = { ...ssBeforeAltSell, phase: "idle" };
+                logs.push(`${ship.name}: sell dispatch failed — ${msg}`);
+              });
             }
 
-            if (!sold) {
-              s = appendLog(s, `${ship.name}: ⚠️ NPC sell failed for ${sellQty}× ${plan.goodName} — cargo remains on ship`);
+          // ══════════════════════════════════════════════════════════════════════════
+          // TRANSITING_TO_SELL — advance waypoints; sell cargo on arrival, then idle
+          // ══════════════════════════════════════════════════════════════════════════
+          } else if (shipState.phase === "transiting_to_sell") {
+            const plan = shipState.plan!;
+
+            // Advance waypoint
+            if (plan.legs.length > 0 && ship.port_id !== plan.sellPortId) {
+              const ssBeforeWaypoint = shipState;
+              shipState = { ...shipState, plan: { ...plan, legs: plan.legs.slice(1) } };
+              logs.push(`${ship.name}: waypoint → ${portName(plan.legs[0].toPortId)}`);
+              await dispatchTransit(ship.id, plan.legs[0].routeId, (msg) => {
+                shipState = ssBeforeWaypoint;
+                logs.push(`${ship.name}: waypoint failed — ${msg}`);
+              });
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
             }
-          } else if ((plan.quantity ?? 0) > 0) {
-            s = appendLog(s, `${ship.name}: ⚠️ cargo gone (${plan.goodName}) — skipping sell`);
+
+            if (ship.port_id !== plan.sellPortId) {
+              logs.push(`${ship.name}: ⚠️ at ${portName(ship.port_id)}, expected ${portName(plan.sellPortId)} — resetting`);
+              shipState = { ...shipState, phase: "idle" };
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            }
+
+            // Arrived at destination
+            await sleep(DOCK_DELAY_MS);
+
+            // Sell cargo if any — use ACTUAL inventory to avoid "Cargo not found"
+            if (plan.goodId) {
+              const actualItem = shipInv.find((c) => c.good_id === plan.goodId);
+              const sellQty = actualItem?.quantity ?? 0;
+              if (sellQty > 0) {
+                let sold = false;
+                try {
+                  const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId, quantity: sellQty, action: "sell" });
+                  await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: sellQty }] });
+                  const profit = (sq.unit_price - (plan.actualBuyPrice ?? 0)) * sellQty;
+                  profitDelta += profit;
+                  shipState = { ...shipState, cargoTrips: shipState.cargoTrips + 1, lifetimeProfit: shipState.lifetimeProfit + profit };
+                  logs.push(`${ship.name}: sold ${sellQty}× ${plan.goodName} @ £${sq.unit_price} (+£${Math.round(profit).toLocaleString()})`);
+                  sold = true;
+                } catch (e: unknown) {
+                  logs.push(`${ship.name}: NPC sell failed — ${(e as Error).message}`);
+                }
+
+                if (!sold) {
+                  logs.push(`${ship.name}: ⚠️ NPC sell failed for ${sellQty}× ${plan.goodName} — cargo remains on ship`);
+                }
+              } else if ((plan.quantity ?? 0) > 0) {
+                logs.push(`${ship.name}: ⚠️ cargo gone (${plan.goodName}) — skipping sell`);
+              }
+            }
+
+            if (plan.passengerBid) {
+              shipState = { ...shipState, paxTrips: shipState.paxTrips + 1, lifetimeProfit: shipState.lifetimeProfit + plan.passengerBid };
+              logs.push(`${ship.name}: 🧳 pax delivered to ${portName(ship.port_id)} (+£${plan.passengerBid} at boarding)`);
+            }
+
+            // Back to idle — will re-scan next cycle
+            shipState = { ...shipState, phase: "idle", cyclesIdle: 0 };
           }
-        }
 
-        if (plan.passengerBid) {
-          const paxSs = s.ships[ship.id] ?? defaultShipState();
-          s = { ...s, ships: { ...s.ships, [ship.id]: { ...paxSs, paxTrips: paxSs.paxTrips + 1, lifetimeProfit: paxSs.lifetimeProfit + plan.passengerBid } } };
-          s = appendLog(s, `${ship.name}: 🧳 pax delivered to ${portName(ship.port_id)} (+£${plan.passengerBid} at boarding)`);
-        }
+          return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+        })
+      );
 
-        // Back to idle — will re-scan next cycle
-        s = { ...s, ships: { ...s.ships, [ship.id]: { ...(s.ships[ship.id] ?? defaultShipState()), phase: "idle", cyclesIdle: 0 } } };
+      // Apply all results to s
+      for (const result of batchResults) {
+        if (result.status === "rejected") {
+          s = appendLog(s, `Ship processing error: ${(result.reason as Error).message}`);
+          continue;
+        }
+        const r = result.value;
+        for (const msg of r.logs) s = appendLog(s, msg);
+        s.profitAccrued += r.profitDelta;
+        if (r.finalState !== null) {
+          s = { ...s, ships: { ...s.ships, [r.shipId]: r.finalState } };
+        }
+        if (r.actioned) shipsActioned++;
       }
     }
 
-    s = appendLog(s, `🚢 window ${windowOffset}–${windowEnd - 1}/${dockedShips.length} — ${shipsActioned} ships in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
+    availableFunds = fundsRef.value;
+
+    s = appendLog(s, `🚢 window ${windowOffset}–${windowEnd - 1}/${dockedShips.length} (${shipBatches} batch${shipBatches > 1 ? "es" : ""}) — ${shipsActioned} ships in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
     console.log(`[runCycle:loop] done — ${shipsActioned}/${windowShips.length} window ships processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
     s = { ...s, shipWindowOffset: nextWindowOffset };
 
