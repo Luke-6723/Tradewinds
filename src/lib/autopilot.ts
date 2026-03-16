@@ -813,28 +813,43 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
       if (requests.length > 0) {
         const quoteFetchT0 = Date.now();
-        // Split into chunks and run all chunks in parallel
+        const QUOTE_MAX_RETRIES = 3;
+        // Split into chunks; retry failed chunks up to QUOTE_MAX_RETRIES times
         const chunks: Array<{ reqs: typeof requests; startIdx: number }> = [];
         for (let i = 0; i < requests.length; i += QUOTE_BATCH_CHUNK) {
           chunks.push({ reqs: requests.slice(i, i + QUOTE_BATCH_CHUNK), startIdx: i });
         }
-        const chunkResults = await Promise.allSettled(
-          chunks.map(({ reqs }) => tradeApi.batchCreateQuotes({ requests: reqs })),
-        );
-        let totalHits = 0;
-        let failedChunks = 0;
-        for (let ci = 0; ci < chunks.length; ci++) {
-          const result = chunkResults[ci];
-          if (result.status !== "fulfilled") { failedChunks++; continue; }
-          const { startIdx } = chunks[ci];
-          let chunkHits = 0;
-          for (let j = 0; j < result.value.length; j++) {
-            const item = result.value[j];
-            if (item?.status === "success" && item.quote) { quoteCache.set(keys[startIdx + j], item.quote.unit_price); chunkHits++; }
+
+        // Track which chunks still need to run (initially all)
+        let pending = chunks.map((_, ci) => ci);
+        const settled = new Map<number, Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>>>();
+
+        for (let attempt = 0; attempt < QUOTE_MAX_RETRIES && pending.length > 0; attempt++) {
+          const results = await Promise.allSettled(
+            pending.map((ci) => tradeApi.batchCreateQuotes({ requests: chunks[ci].reqs })),
+          );
+          const stillFailing: number[] = [];
+          for (let i = 0; i < pending.length; i++) {
+            const ci = pending[i];
+            const result = results[i];
+            if (result.status === "fulfilled") {
+              settled.set(ci, result.value);
+            } else {
+              stillFailing.push(ci);
+            }
           }
-          totalHits += chunkHits;
+          pending = stillFailing;
         }
-        const failNote = failedChunks > 0 ? ` (${failedChunks} chunks failed)` : "";
+
+        let totalHits = 0;
+        for (const [ci, value] of settled) {
+          const { startIdx } = chunks[ci];
+          for (let j = 0; j < value.length; j++) {
+            const item = value[j];
+            if (item?.status === "success" && item.quote) { quoteCache.set(keys[startIdx + j], item.quote.unit_price); totalHits++; }
+          }
+        }
+        const failNote = pending.length > 0 ? ` (${pending.length} chunks failed after ${QUOTE_MAX_RETRIES} retries)` : "";
         console.log(`[runCycle:quotes] ${requests.length} quotes (${chunks.length} chunks) pre-fetched in ${((Date.now() - quoteFetchT0) / 1000).toFixed(1)}s (${totalHits} hits${failNote})`);
       }
     }
