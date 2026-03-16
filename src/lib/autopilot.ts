@@ -40,11 +40,11 @@ const DOCK_DELAY_MS = 0;
 /** Price level at or above which we sell from warehouse (Expensive = 4). */
 const MIN_SELL_PRICE_LEVEL = 4;
 /** Number of docked ships to process per cycle (rolling window). */
-const SHIP_WINDOW_SIZE = 20;
+const SHIP_WINDOW_SIZE = 50;
 
 // ── Fleet management constants ─────────────────────────────────────────────
 /** Cycles a ship must be consecutively idle before it's a sell candidate. */
-const SELL_IDLE_CYCLES = 9;        // 3 min at 20s cycle
+const SELL_IDLE_CYCLES = 18;       // 3 min at 10s cycle
 /** Minimum fleet size — never sell below this. */
 const MIN_FLEET_SIZE = 2;
 /** Available-funds multiplier required before buying a ship.
