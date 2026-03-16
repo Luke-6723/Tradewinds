@@ -132,12 +132,15 @@ async function requestCore(
   }
 
   // Retry on 429 (rate limited) — honour Retry-After header if present
-  if (res.status === 429 && attempt < MAX_RETRIES) {
-    const retryAfter = res.headers.get("Retry-After");
-    const waitMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 5_000 * (attempt + 1);
-    console.warn(`[client] 429 rate limited on ${path} — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
-    await sleep(waitMs);
-    return requestCore(path, options, attempt + 1);
+  if (res.status === 429) {
+    if (attempt < MAX_RETRIES) {
+      const retryAfter = res.headers.get("Retry-After");
+      const waitMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 5_000 * (attempt + 1);
+      console.error(`[client:429] rate limited on ${path} — waiting ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(waitMs);
+      return requestCore(path, options, attempt + 1);
+    }
+    console.error(`[client:429] rate limited on ${path} — all ${MAX_RETRIES} retries exhausted`);
   }
 
   // Retry on 5xx for idempotent methods
