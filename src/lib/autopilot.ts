@@ -30,10 +30,8 @@ export * from "@/lib/autopilot-types";
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
-const MIN_MARGIN   = 0.01;  // 1% minimum margin to accept a cargo trade
+const MIN_MARGIN   = 0;     // any positive margin is enough — idle ships lose money
 const MAX_UNITS    = 50;
-/** Sell-quote batch size per ship scan. */
-const SCAN_BATCH   = 16;
 /** Delay (ms) after docking before buying/selling (lets server process the dock). */
 const DOCK_DELAY_MS = 0;
 /** Price level at or above which we sell from warehouse (Expensive = 4). */
@@ -142,20 +140,6 @@ interface RawCandidate {
 
 interface ScoredCandidate extends RawCandidate {
   npcSellPrice: number;
-}
-
-/** Keep the best candidate per (buyPort, good) pair — highest prescore/distance ratio wins. */
-function dedupBestPerGood(candidates: RawCandidate[], limit: number): RawCandidate[] {
-  const seen = new Map<string, RawCandidate>();
-  for (const c of candidates) {
-    const k = `${c.buyPortId}:${c.goodId}`;
-    const score = c.prescore / (c.totalDist || 1);
-    const existing = seen.get(k);
-    if (!existing || score > existing.prescore / (existing.totalDist || 1)) seen.set(k, c);
-  }
-  return [...seen.values()]
-    .sort((a, b) => (b.prescore / (b.totalDist || 1)) - (a.prescore / (a.totalDist || 1)))
-    .slice(0, limit);
 }
 
 /** Default per-ship state for newly tracked ships. */
@@ -751,6 +735,43 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
     console.log(`[runCycle:cands] ${uniqueDockedPorts.size} ports pre-computed in ${((Date.now() - candidatesT0) / 1000).toFixed(1)}s`);
 
+    // ⑥ Pre-fetch ALL sell + buy quotes for window candidates in one batch.
+    //    Quotes are valid for 120 s — safe to reuse for all per-ship routing decisions
+    //    this cycle, eliminating every per-ship quote API call.
+    const quoteCache = new Map<string, number>(); // "portId:goodId:action" → unit_price
+    {
+      const seen = new Set<string>();
+      const requests: Array<{ port_id: string; good_id: string; quantity: number; action: "buy" | "sell" }> = [];
+      const keys: string[] = [];
+      for (const candidates of candidatesByPort.values()) {
+        for (const c of candidates) {
+          const sellKey = `${c.sellPortId}:${c.goodId}:sell`;
+          if (!seen.has(sellKey)) {
+            seen.add(sellKey);
+            requests.push({ port_id: c.sellPortId, good_id: c.goodId, quantity: MAX_UNITS, action: "sell" });
+            keys.push(sellKey);
+          }
+          const buyKey = `${c.buyPortId}:${c.goodId}:buy`;
+          if (!seen.has(buyKey)) {
+            seen.add(buyKey);
+            requests.push({ port_id: c.buyPortId, good_id: c.goodId, quantity: MAX_UNITS, action: "buy" });
+            keys.push(buyKey);
+          }
+        }
+      }
+      if (requests.length > 0) {
+        const quoteFetchT0 = Date.now();
+        try {
+          const results = await tradeApi.batchCreateQuotes({ requests });
+          for (let i = 0; i < keys.length; i++) {
+            const item = results[i];
+            if (item?.status === "success" && item.quote) quoteCache.set(keys[i], item.quote.unit_price);
+          }
+        } catch { /* ships skip cargo this cycle if batch fails */ }
+        console.log(`[runCycle:quotes] ${requests.length} quotes pre-fetched in ${((Date.now() - quoteFetchT0) / 1000).toFixed(1)}s (${quoteCache.size} hits)`);
+      }
+    }
+
     // ── Tag ships for relocation when over fleet target ────────────────────
     // Must run after getPathsFrom is available. Cogs first; ferries excluded.
     {
@@ -946,43 +967,25 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             let bestCargo: (ScoredCandidate & { buyPrice: number }) | null = null;
 
             if (!isFerry) {
-              // Use pre-computed candidates for this port; apply per-ship pax filter below
               const allCandidates = candidatesByPort.get(ship.port_id) ?? [];
 
-              // If pax were boarded: filter to cargo co-routable to the same destination
-              // (buy at current port, sell at pax destination = no extra detour)
+              // If pax were boarded: only consider co-routable cargo (same dest, buy here)
               const candidates = boardedPaxDestination
                 ? allCandidates.filter(
                     (c) => c.sellPortId === boardedPaxDestination && c.buyPortId === ship.port_id,
                   )
                 : allCandidates;
 
-              const sellBatch = dedupBestPerGood(candidates, SCAN_BATCH);
-
-              if (sellBatch.length > 0) {
-                let batchItems: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
-                try {
-                  batchItems = await tradeApi.batchCreateQuotes({
-                    requests: sellBatch.map((c) => ({
-                      port_id: c.sellPortId, good_id: c.goodId, quantity: capacity, action: "sell" as const,
-                    })),
-                  });
-                } catch { /* proceed with empty */ }
-
-                const scored: ScoredCandidate[] = sellBatch
-                  .map((c, i) => {
-                    const item = batchItems[i];
-                    if (!item || item.status !== "success" || !item.quote) return null;
-                    return { ...c, npcSellPrice: item.quote.unit_price };
-                  })
-                  .filter(Boolean) as ScoredCandidate[];
-
-                for (const c of scored.sort((a, b) => b.npcSellPrice - a.npcSellPrice)) {
-                  try {
-                    const bq = await tradeApi.createQuote({ port_id: c.buyPortId, good_id: c.goodId, quantity: capacity, action: "buy" });
-                    const margin = (c.npcSellPrice - bq.unit_price) / bq.unit_price;
-                    if (margin >= MIN_MARGIN) { bestCargo = { ...c, buyPrice: bq.unit_price }; break; }
-                  } catch { /* try next */ }
+              // All quotes pre-fetched this cycle — pure synchronous lookup, zero API calls
+              let bestMargin = -Infinity;
+              for (const c of candidates) {
+                const sellPrice = quoteCache.get(`${c.sellPortId}:${c.goodId}:sell`);
+                const buyPrice  = quoteCache.get(`${c.buyPortId}:${c.goodId}:buy`);
+                if (sellPrice === undefined || buyPrice === undefined) continue;
+                const margin = (sellPrice - buyPrice) / buyPrice;
+                if (margin >= MIN_MARGIN && margin > bestMargin) {
+                  bestMargin = margin;
+                  bestCargo = { ...c, npcSellPrice: sellPrice, buyPrice };
                 }
               }
             }
