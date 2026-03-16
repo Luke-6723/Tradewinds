@@ -549,7 +549,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
 
     // ── Warehouse maps ─────────────────────────────────────────────────────────
-    const warehouseByPort = new Map<string, Warehouse>(allWarehouses.map((w: Warehouse) => [w.port_id, w]));
     const warehouseInventory = new Map<string, WarehouseInventory[]>();
     const wInvStart = Date.now();
     if (allWarehouses.length > 0) s = appendLog(s, `⏳ fetching warehouse inventories (${allWarehouses.length})…`);
@@ -577,80 +576,97 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     s = appendLog(s, `⟳ ${ships.length} ship(s) / ${dockedCount} docked / £${Math.round(availableFunds).toLocaleString()} avail | ${allPassengers.length} pax available`);
 
     // ── Warehouse sell scan (independent — runs every cycle) ───────────────────
-    // Tries order book buy orders first (better prices), then falls back to NPC sell.
-    for (const [warehouseId, inventory] of warehouseInventory) {
-      const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
-      if (!warehouse) continue;
-      for (const item of inventory) {
-        if (item.quantity <= 0) continue;
-        const priceLevel = npcMaxOrd.get(`${warehouse.port_id}:${item.good_id}`) ?? 0;
-        if (priceLevel < MIN_SELL_PRICE_LEVEL) continue;
-
-        const avgBuy = stockPrices.get(`${warehouseId}:${item.good_id}`) ?? 0;
-        let totalRevenue = 0;
-
-        // Sell to NPC
-        try {
-          const sq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
-          await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: item.quantity }] });
-          totalRevenue = sq.unit_price * item.quantity;
-          s = appendLog(s, `🏭 NPC sold ${item.quantity}× ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
-        } catch (e: unknown) {
-          s = appendLog(s, `🏭 Warehouse sell failed (${goodNameFn(item.good_id)}) — ${(e as Error).message}`);
+    // Collect all items eligible for selling, batch-quote them, then execute in parallel.
+    {
+      type WSSellItem = { warehouseId: string; portId: string; good_id: string; quantity: number; avgBuy: number };
+      const sellItems: WSSellItem[] = [];
+      for (const [warehouseId, inventory] of warehouseInventory) {
+        const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
+        if (!warehouse) continue;
+        for (const item of inventory) {
+          if (item.quantity <= 0) continue;
+          const priceLevel = npcMaxOrd.get(`${warehouse.port_id}:${item.good_id}`) ?? 0;
+          if (priceLevel < MIN_SELL_PRICE_LEVEL) continue;
+          sellItems.push({ warehouseId, portId: warehouse.port_id, good_id: item.good_id, quantity: item.quantity, avgBuy: stockPrices.get(`${warehouseId}:${item.good_id}`) ?? 0 });
         }
-
-        if (totalRevenue > 0) {
-          const profit = totalRevenue - avgBuy * item.quantity;
-          s.profitAccrued += profit;
-          await removeWarehouseStock(companyId, warehouseId, item.good_id).catch(() => {});
-          s = appendLog(s, `🏭 ${goodNameFn(item.good_id)}: total £${Math.round(totalRevenue).toLocaleString()} (+£${Math.round(profit).toLocaleString()} profit)`);
+      }
+      if (sellItems.length > 0) {
+        let sellQuotes: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+        try {
+          sellQuotes = await tradeApi.batchCreateQuotes({
+            requests: sellItems.map((it) => ({ port_id: it.portId, good_id: it.good_id, quantity: it.quantity, action: "sell" as const })),
+          });
+        } catch { /* proceed with empty */ }
+        const sellResults = await Promise.allSettled(
+          sellItems.map(async (it, i) => {
+            const sq = sellQuotes[i];
+            if (!sq || sq.status !== "success" || !sq.quote) throw new Error("no quote");
+            await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "warehouse", id: it.warehouseId, quantity: it.quantity }] });
+            return { ...it, unitPrice: sq.quote.unit_price };
+          }),
+        );
+        for (let i = 0; i < sellItems.length; i++) {
+          const result = sellResults[i];
+          const it = sellItems[i];
+          if (result.status === "fulfilled") {
+            const { unitPrice, quantity, good_id, avgBuy, warehouseId } = result.value;
+            const totalRevenue = unitPrice * quantity;
+            const profit = totalRevenue - avgBuy * quantity;
+            s.profitAccrued += profit;
+            s = appendLog(s, `🏭 NPC sold ${quantity}× ${goodNameFn(good_id)} @ £${unitPrice} (+£${Math.round(profit).toLocaleString()} profit)`);
+            await removeWarehouseStock(companyId, warehouseId, good_id).catch(() => {});
+          } else {
+            s = appendLog(s, `🏭 Warehouse sell failed (${goodNameFn(it.good_id)}) — ${(result.reason as Error).message ?? "unknown"}`);
+          }
         }
       }
     }
 
     // ── Warehouse buy scan (opportunistic stockpiling) ────────────────────────
-    for (const [warehouseId, inventory] of warehouseInventory) {
-      const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
-      if (!warehouse) continue;
-
-      const stockedGoods = inventory.filter((i) => i.quantity > 0).map((i) => i.good_id);
-      if (stockedGoods.length >= MAX_WAREHOUSE_GOODS) continue;
-
-      const candidateGoods = new Set(npcGoods.get(warehouse.port_id) ?? []);
-
-      for (const goodId of candidateGoods) {
-        if (stockedGoods.includes(goodId)) continue;
-
-        const npcPriceOrd = npcMinOrd.get(`${warehouse.port_id}:${goodId}`) ?? 0;
-        if (npcPriceOrd <= 0 || npcPriceOrd > MAX_BUY_PRICE_LEVEL) continue;
-
-        const existingQty = inventory.find((i) => i.good_id === goodId)?.quantity ?? 0;
-        const toBuy = MAX_WAREHOUSE_STOCK - existingQty;
-        if (toBuy <= 0) continue;
-
-        let boughtQty = 0;
-        let totalCost = 0;
-
-        try {
-          const bq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: goodId, quantity: toBuy, action: "buy" });
-          if (bq.unit_price * toBuy > availableFunds) continue;
-          await tradeApi.executeQuote({ token: bq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: toBuy }] });
-          totalCost = bq.unit_price * toBuy;
-          availableFunds -= totalCost;
-          boughtQty = toBuy;
-          s = appendLog(s, `🏭 Stocked ${toBuy}× ${goodNameFn(goodId)} @ £${bq.unit_price} (level ${npcPriceOrd})`);
-        } catch (e: unknown) {
-          s = appendLog(s, `🏭 Warehouse stock failed (${goodNameFn(goodId)}) — ${(e as Error).message}`);
+    // Batch-quote all candidates upfront; execute sequentially to respect budget + slot limits.
+    {
+      type WSBuyCandidate = { warehouseId: string; portId: string; goodId: string; goodName: string; toBuy: number; npcPriceOrd: number; stockedGoods: string[] };
+      const buyCandidates: WSBuyCandidate[] = [];
+      for (const [warehouseId, inventory] of warehouseInventory) {
+        const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
+        if (!warehouse) continue;
+        const stockedGoods = inventory.filter((i) => i.quantity > 0).map((i) => i.good_id);
+        if (stockedGoods.length >= MAX_WAREHOUSE_GOODS) continue;
+        const candidateGoods = new Set(npcGoods.get(warehouse.port_id) ?? []);
+        let pendingSlots = 0;
+        for (const goodId of candidateGoods) {
+          if (stockedGoods.length + pendingSlots >= MAX_WAREHOUSE_GOODS) break;
+          if (stockedGoods.includes(goodId)) continue;
+          const npcPriceOrd = npcMinOrd.get(`${warehouse.port_id}:${goodId}`) ?? 0;
+          if (npcPriceOrd <= 0 || npcPriceOrd > MAX_BUY_PRICE_LEVEL) continue;
+          const existingQty = inventory.find((i) => i.good_id === goodId)?.quantity ?? 0;
+          const toBuy = MAX_WAREHOUSE_STOCK - existingQty;
+          if (toBuy <= 0) continue;
+          buyCandidates.push({ warehouseId, portId: warehouse.port_id, goodId, goodName: goodNameFn(goodId), toBuy, npcPriceOrd, stockedGoods });
+          pendingSlots++;
         }
-
-        if (boughtQty > 0) {
-          const avgPrice = totalCost / boughtQty;
-          await upsertWarehouseStock(companyId, {
-            warehouseId, portId: warehouse.port_id,
-            goodId, goodName: goodNameFn(goodId), avgBuyPrice: avgPrice,
-          }).catch(() => {});
-          stockedGoods.push(goodId);
-          if (stockedGoods.length >= MAX_WAREHOUSE_GOODS) break;
+      }
+      if (buyCandidates.length > 0) {
+        let buyQuotes: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+        try {
+          buyQuotes = await tradeApi.batchCreateQuotes({
+            requests: buyCandidates.map((c) => ({ port_id: c.portId, good_id: c.goodId, quantity: c.toBuy, action: "buy" as const })),
+          });
+        } catch { /* proceed with empty */ }
+        for (let i = 0; i < buyCandidates.length; i++) {
+          const c = buyCandidates[i];
+          const bq = buyQuotes[i];
+          if (!bq || bq.status !== "success" || !bq.quote) continue;
+          if (bq.quote.unit_price * c.toBuy > availableFunds) continue;
+          try {
+            await tradeApi.executeQuote({ token: bq.token, destinations: [{ type: "warehouse", id: c.warehouseId, quantity: c.toBuy }] });
+            const totalCost = bq.quote.unit_price * c.toBuy;
+            availableFunds -= totalCost;
+            s = appendLog(s, `🏭 Stocked ${c.toBuy}× ${c.goodName} @ £${bq.quote.unit_price} (level ${c.npcPriceOrd})`);
+            await upsertWarehouseStock(companyId, { warehouseId: c.warehouseId, portId: c.portId, goodId: c.goodId, goodName: c.goodName, avgBuyPrice: bq.quote.unit_price }).catch(() => {});
+          } catch (e: unknown) {
+            s = appendLog(s, `🏭 Warehouse stock failed (${c.goodName}) — ${(e as Error).message}`);
+          }
         }
       }
     }
@@ -793,8 +809,9 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           if (!ss || ss.role === "ferry") continue;
           if (knownYards.includes(sh.port_id)) continue;
           if (ss.relocatingToPortId) continue;
+          const shPaths = getPathsFrom(sh.port_id!);
           const nearest = knownYards
-            .map((pid) => ({ portId: pid, path: getPathsFrom(sh.port_id!).find((p) => p.destPortId === pid) }))
+            .map((pid) => ({ portId: pid, path: shPaths.find((p) => p.destPortId === pid) }))
             .filter((x): x is { portId: string; path: NonNullable<typeof x.path> } => x.path != null)
             .sort((a, b) => a.path.totalDistance - b.path.totalDistance)[0];
           if (!nearest) continue;
@@ -889,40 +906,54 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
             // ── 0. Clear leftover cargo before buying/boarding ─────────────────────
             // A ship can end up idle-with-cargo after a failed sell or state reset.
-            // Try to sell at current port; if that fails, dispatch to the best sell port.
+            // Try to sell all items at current port in parallel; any that fail get dispatched.
             if (usedCapacity > 0) {
               let dispatched = false;
-              for (const item of shipInv.filter((c) => c.quantity > 0)) {
-                try {
-                  const sq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
-                  await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: item.quantity }] });
-                  profitDelta += sq.unit_price * item.quantity;
-                  logs.push(`${ship.name}: 🧹 cleared ${item.quantity}× ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
-                  shipInventoryCache.delete(ship.id); // invalidate so freeCapacity is recalculated if needed
-                } catch {
-                  // Can't sell here — find best sell port and dispatch
+              const leftoverItems = shipInv.filter((c) => c.quantity > 0);
+              let leftoverQuotes: Awaited<ReturnType<typeof tradeApi.batchCreateQuotes>> = [];
+              try {
+                leftoverQuotes = await tradeApi.batchCreateQuotes({
+                  requests: leftoverItems.map((it) => ({ port_id: ship.port_id!, good_id: it.good_id, quantity: it.quantity, action: "sell" as const })),
+                });
+              } catch { /* try fallback dispatch below */ }
+              const leftoverSells = await Promise.allSettled(
+                leftoverItems.map(async (it, i) => {
+                  const sq = leftoverQuotes[i];
+                  if (!sq || sq.status !== "success" || !sq.quote) throw new Error("no quote");
+                  await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "ship", id: ship.id, quantity: it.quantity }] });
+                  return { good_id: it.good_id, quantity: it.quantity, unitPrice: sq.quote.unit_price };
+                }),
+              );
+              for (let i = 0; i < leftoverItems.length; i++) {
+                const result = leftoverSells[i];
+                const it = leftoverItems[i];
+                if (result.status === "fulfilled") {
+                  profitDelta += result.value.unitPrice * it.quantity;
+                  logs.push(`${ship.name}: 🧹 cleared ${it.quantity}× ${goodNameFn(it.good_id)} @ £${result.value.unitPrice}`);
+                  shipInventoryCache.delete(ship.id);
+                } else if (!dispatched) {
+                  // Can't sell here — dispatch to best sell port for first unsold item
                   const sellPaths = getPathsFrom(ship.port_id);
                   const bestSellPath = sellPaths
-                    .filter((sp) => (npcMaxOrd.get(`${sp.destPortId}:${item.good_id}`) ?? 0) >= MIN_SELL_PRICE_LEVEL)
-                    .sort((a, b) => (npcMaxOrd.get(`${b.destPortId}:${item.good_id}`) ?? 0) - (npcMaxOrd.get(`${a.destPortId}:${item.good_id}`) ?? 0))[0];
+                    .filter((sp) => (npcMaxOrd.get(`${sp.destPortId}:${it.good_id}`) ?? 0) >= MIN_SELL_PRICE_LEVEL)
+                    .sort((a, b) => (npcMaxOrd.get(`${b.destPortId}:${it.good_id}`) ?? 0) - (npcMaxOrd.get(`${a.destPortId}:${it.good_id}`) ?? 0))[0];
                   if (bestSellPath && bestSellPath.legs.length > 0) {
                     const plan: ShipPlan = {
-                      goodId: item.good_id, goodName: goodNameFn(item.good_id),
-                      quantity: item.quantity, actualBuyPrice: 0,
+                      goodId: it.good_id, goodName: goodNameFn(it.good_id),
+                      quantity: it.quantity, actualBuyPrice: 0,
                       sellPortId: bestSellPath.destPortId, legs: bestSellPath.legs.slice(1),
                     };
                     const ssBeforeDispatch = shipState;
                     shipState = { ...shipState, phase: "transiting_to_sell", plan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
-                    logs.push(`${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${item.quantity}× ${goodNameFn(item.good_id)}`);
+                    logs.push(`${ship.name}: → ${portName(bestSellPath.destPortId)} to sell leftover ${it.quantity}× ${goodNameFn(it.good_id)}`);
                     await dispatchTransit(ship.id, bestSellPath.legs[0].routeId, (msg) => {
                       shipState = ssBeforeDispatch;
                       logs.push(`${ship.name}: leftover dispatch failed — ${msg}`);
                     });
                     dispatched = true;
                   } else {
-                    logs.push(`${ship.name}: ⚠️ stuck with ${item.quantity}× ${goodNameFn(item.good_id)} — no sell route`);
+                    logs.push(`${ship.name}: ⚠️ stuck with ${it.quantity}× ${goodNameFn(it.good_id)} — no sell route`);
                   }
-                  if (dispatched) break;
                 }
               }
               if (dispatched) return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
@@ -1010,13 +1041,11 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
               if (bestCargo && fundsRef.value > 0 && freeCapacity > 0) {
                 try {
-                  const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
-                  const affordable = Math.floor(fundsRef.value / bq.unit_price);
+                  // Use pre-fetched price to calculate exact qty, then ONE fresh quote for execution
+                  const affordable = Math.floor(fundsRef.value / bestCargo.buyPrice);
                   const buyQty = Math.min(freeCapacity, affordable);
                   if (buyQty > 0) {
-                    const eq = buyQty < freeCapacity
-                      ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
-                      : bq;
+                    const eq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" });
                     await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
                     fundsRef.value -= buyQty * eq.unit_price;
                     cargoGoodId    = bestCargo.goodId;
@@ -1057,16 +1086,14 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                   return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
                 }
                 try {
-                  const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: freeCapacity, action: "buy" });
-                  const affordable = Math.floor(fundsRef.value / bq.unit_price);
+                  // Use pre-fetched price to calculate exact qty, then ONE fresh quote for execution
+                  const affordable = Math.floor(fundsRef.value / bestCargo.buyPrice);
                   const buyQty = Math.min(freeCapacity, affordable);
                   if (buyQty <= 0) {
                     logs.push(`${ship.name}: insufficient funds for ${goodNameFn(bestCargo.goodId)}`);
                     return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
                   }
-                  const eq = buyQty < freeCapacity
-                    ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" })
-                    : bq;
+                  const eq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: bestCargo.goodId, quantity: buyQty, action: "buy" });
                   await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
                   fundsRef.value -= buyQty * eq.unit_price;
 
@@ -1120,11 +1147,14 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
                 // coveredPorts is pre-computed before the loop and updated incrementally
 
+                // Build a path lookup map for O(1) access instead of repeated .find() calls
+                const paxPathMap = new Map<string, Path>(paxPaths.map((p) => [p.destPortId, p]));
+
                 // Group valid passengers by origin port, compute total bid per port.
                 // Filter out passengers this ship cannot reach before they expire.
                 const portBids = new Map<string, { total: number; best: Passenger }>();
                 for (const p of allPassengers) {
-                  const path = paxPaths.find((pa) => pa.destPortId === p.origin_port_id);
+                  const path = paxPathMap.get(p.origin_port_id);
                   if (!path) continue;
                   const eta = travelTimeMs(path.totalDistance, speed) + TRAVEL_BUFFER_MS;
                   const timeLeft = new Date(p.expires_at).getTime() - now;
@@ -1144,7 +1174,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                 const portCandidates = Array.from(portBids.entries())
                   .filter(([portId]) => portId !== ship.port_id)
                   .map(([portId, { total, best }]) => {
-                    const path = paxPaths.find((pa) => pa.destPortId === portId)!;
+                    const path = paxPathMap.get(portId)!;
                     const coverageBonus = coveredPorts.has(portId) ? 1 : 2;
                     return { portId, path, best, totalBid: total, score: (total / path.totalDistance) * coverageBonus };
                   })
@@ -1224,18 +1254,19 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
             if (fundsRef.value > 0 && freeCapacity > 0) {
               try {
-                const bq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: freeCapacity, action: "buy" });
-                const affordable = Math.floor(fundsRef.value / bq.unit_price);
-                const buyQty = Math.min(freeCapacity, affordable);
-                if (buyQty > 0) {
-                  const eq = buyQty < freeCapacity
-                    ? await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: buyQty, action: "buy" })
-                    : bq;
-                  await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: buyQty }] });
-                  fundsRef.value -= buyQty * eq.unit_price;
-                  boughtQty = buyQty;
+                // Use cached price to estimate qty — avoids a round-trip for affordability check
+                const priceEstimate = quoteCache.get(`${ship.port_id}:${plan.goodId!}:buy`) ?? 0;
+                const affordable = priceEstimate > 0 ? Math.floor(fundsRef.value / priceEstimate) : freeCapacity;
+                const buyQty = Math.min(freeCapacity, Math.max(1, affordable));
+                const eq = await tradeApi.createQuote({ port_id: ship.port_id, good_id: plan.goodId!, quantity: buyQty, action: "buy" });
+                // Re-check affordability at actual price in case market moved
+                const actualBuyQty = Math.min(buyQty, Math.floor(fundsRef.value / eq.unit_price));
+                if (actualBuyQty > 0) {
+                  await tradeApi.executeQuote({ token: eq.token, destinations: [{ type: "ship", id: ship.id, quantity: actualBuyQty }] });
+                  fundsRef.value -= actualBuyQty * eq.unit_price;
+                  boughtQty = actualBuyQty;
                   actualBuyPrice = eq.unit_price;
-                  logs.push(`${ship.name}: bought ${buyQty}× ${plan.goodName} @ £${eq.unit_price} at ${portName(ship.port_id)}`);
+                  logs.push(`${ship.name}: bought ${actualBuyQty}× ${plan.goodName} @ £${eq.unit_price} at ${portName(ship.port_id)}`);
                 }
               } catch (e: unknown) {
                 logs.push(`${ship.name}: buy failed at ${portName(ship.port_id)} — ${(e as Error).message}`);
