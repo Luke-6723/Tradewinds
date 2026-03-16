@@ -14,11 +14,10 @@
  * Passenger delivery is automatic server-side on arrival at destination_port_id.
  */
 
-import type { Cargo, Good, MarketOrder, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, TraderPosition, Warehouse, WarehouseInventory } from "@/lib/types";
+import type { Cargo, Good, Passenger, Port, Route, Ship, ShipType, ShipyardInventoryItem, TraderPosition, Warehouse, WarehouseInventory } from "@/lib/types";
 import { api } from "@/lib/api/client";
 import { companyApi } from "@/lib/api/company";
 import { fleetApi } from "@/lib/api/fleet";
-import { marketApi } from "@/lib/api/market";
 import { passengersApi } from "@/lib/api/passengers";
 import { shipyardsApi } from "@/lib/api/shipyards";
 import { tradeApi } from "@/lib/api/trade";
@@ -603,40 +602,16 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         if (priceLevel < MIN_SELL_PRICE_LEVEL) continue;
 
         const avgBuy = stockPrices.get(`${warehouseId}:${item.good_id}`) ?? 0;
-        let remainingQty = item.quantity;
         let totalRevenue = 0;
 
-        // ── 1. Fill order book buy orders first (may offer better prices) ─────
+        // Sell to NPC
         try {
-          const buyOrders = await marketApi.getOrders([warehouse.port_id], [item.good_id], "buy").catch(() => [] as MarketOrder[]);
-          const openBuyOrders = buyOrders
-            .filter((o) => o.status === "open" && o.remaining > 0)
-            .sort((a, b) => b.price - a.price);
-          for (const order of openBuyOrders) {
-            if (remainingQty <= 0) break;
-            const fillQty = Math.min(remainingQty, order.remaining);
-            try {
-              await marketApi.fillOrder(order.id, { quantity: fillQty });
-              totalRevenue += fillQty * order.price;
-              remainingQty -= fillQty;
-              s = appendLog(s, `📒 Filled buy order ${fillQty}× ${goodNameFn(item.good_id)} @ £${order.price} (+£${Math.round(fillQty * order.price).toLocaleString()})`);
-            } catch { /* order may have been filled/cancelled */ }
-          }
-        } catch { /* non-fatal */ }
-
-        // ── 2. Sell remaining to NPC ───────────────────────────────────────────
-        if (remainingQty > 0) {
-          try {
-            const sq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: item.good_id, quantity: remainingQty, action: "sell" });
-            await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: remainingQty }] });
-            totalRevenue += sq.unit_price * remainingQty;
-            remainingQty = 0;
-            s = appendLog(s, `🏭 NPC sold ${Math.round(sq.unit_price * (item.quantity - remainingQty))} worth of ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
-          } catch (e: unknown) {
-            if (totalRevenue === 0) {
-              s = appendLog(s, `🏭 Warehouse sell failed (${goodNameFn(item.good_id)}) — ${(e as Error).message}`);
-            }
-          }
+          const sq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: item.good_id, quantity: item.quantity, action: "sell" });
+          await tradeApi.executeQuote({ token: sq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: item.quantity }] });
+          totalRevenue = sq.unit_price * item.quantity;
+          s = appendLog(s, `🏭 NPC sold ${item.quantity}× ${goodNameFn(item.good_id)} @ £${sq.unit_price}`);
+        } catch (e: unknown) {
+          s = appendLog(s, `🏭 Warehouse sell failed (${goodNameFn(item.good_id)}) — ${(e as Error).message}`);
         }
 
         if (totalRevenue > 0) {
@@ -649,7 +624,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
 
     // ── Warehouse buy scan (opportunistic stockpiling) ────────────────────────
-    // Tries order book sell orders first (may be cheaper), then falls back to NPC buy.
     for (const [warehouseId, inventory] of warehouseInventory) {
       const warehouse = allWarehouses.find((w: Warehouse) => w.id === warehouseId);
       if (!warehouse) continue;
@@ -657,70 +631,31 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       const stockedGoods = inventory.filter((i) => i.quantity > 0).map((i) => i.good_id);
       if (stockedGoods.length >= MAX_WAREHOUSE_GOODS) continue;
 
-      // Collect candidate goods: NPC goods + any open sell orders at this port
       const candidateGoods = new Set(npcGoods.get(warehouse.port_id) ?? []);
-      let orderBookSellOrders: MarketOrder[] = [];
-      try {
-        orderBookSellOrders = await marketApi.getOrders([warehouse.port_id], undefined, "sell").catch(() => [] as MarketOrder[]);
-        for (const o of orderBookSellOrders) {
-          if (o.status === "open" && o.remaining > 0) candidateGoods.add(o.good_id);
-        }
-      } catch { /* non-fatal */ }
 
       for (const goodId of candidateGoods) {
         if (stockedGoods.includes(goodId)) continue;
 
         const npcPriceOrd = npcMinOrd.get(`${warehouse.port_id}:${goodId}`) ?? 0;
-        // Order book sell orders for this good (sorted cheapest first)
-        const goodSellOrders = orderBookSellOrders
-          .filter((o) => o.good_id === goodId && o.status === "open" && o.remaining > 0)
-          .sort((a, b) => a.price - b.price);
+        if (npcPriceOrd <= 0 || npcPriceOrd > MAX_BUY_PRICE_LEVEL) continue;
 
         const existingQty = inventory.find((i) => i.good_id === goodId)?.quantity ?? 0;
         const toBuy = MAX_WAREHOUSE_STOCK - existingQty;
         if (toBuy <= 0) continue;
 
-        // Decide: use order book if cheapest order price is below NPC buy level threshold
-        const cheapestOrderPrice = goodSellOrders[0]?.price ?? Infinity;
-        const useOrderBook = goodSellOrders.length > 0 && cheapestOrderPrice * toBuy <= availableFunds;
-        const useNpc = npcPriceOrd > 0 && npcPriceOrd <= MAX_BUY_PRICE_LEVEL;
-
-        if (!useOrderBook && !useNpc) continue;
-
         let boughtQty = 0;
         let totalCost = 0;
 
-        if (useOrderBook) {
-          // Fill sell orders (goods go to warehouse)
-          let remaining = toBuy;
-          for (const order of goodSellOrders) {
-            if (remaining <= 0) break;
-            if (order.price * remaining > availableFunds) break;
-            const fillQty = Math.min(remaining, order.remaining);
-            try {
-              await marketApi.fillOrder(order.id, { quantity: fillQty });
-              totalCost += fillQty * order.price;
-              availableFunds -= fillQty * order.price;
-              boughtQty += fillQty;
-              remaining -= fillQty;
-              s = appendLog(s, `📒 Filled sell order ${fillQty}× ${goodNameFn(goodId)} @ £${order.price}`);
-            } catch { /* non-fatal */ }
-          }
-        }
-
-        if (boughtQty === 0 && useNpc) {
-          // Fallback: NPC buy
-          try {
-            const bq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: goodId, quantity: toBuy, action: "buy" });
-            if (bq.unit_price * toBuy > availableFunds) continue;
-            await tradeApi.executeQuote({ token: bq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: toBuy }] });
-            totalCost = bq.unit_price * toBuy;
-            availableFunds -= totalCost;
-            boughtQty = toBuy;
-            s = appendLog(s, `🏭 Stocked ${toBuy}× ${goodNameFn(goodId)} @ £${bq.unit_price} (level ${npcPriceOrd})`);
-          } catch (e: unknown) {
-            s = appendLog(s, `🏭 Warehouse stock failed (${goodNameFn(goodId)}) — ${(e as Error).message}`);
-          }
+        try {
+          const bq = await tradeApi.createQuote({ port_id: warehouse.port_id, good_id: goodId, quantity: toBuy, action: "buy" });
+          if (bq.unit_price * toBuy > availableFunds) continue;
+          await tradeApi.executeQuote({ token: bq.token, destinations: [{ type: "warehouse", id: warehouseId, quantity: toBuy }] });
+          totalCost = bq.unit_price * toBuy;
+          availableFunds -= totalCost;
+          boughtQty = toBuy;
+          s = appendLog(s, `🏭 Stocked ${toBuy}× ${goodNameFn(goodId)} @ £${bq.unit_price} (level ${npcPriceOrd})`);
+        } catch (e: unknown) {
+          s = appendLog(s, `🏭 Warehouse stock failed (${goodNameFn(goodId)}) — ${(e as Error).message}`);
         }
 
         if (boughtQty > 0) {
@@ -1371,13 +1306,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             }
 
             if (!sold) {
-              try {
-                const askPrice = Math.round((plan.actualBuyPrice ?? 0) * 1.15);
-                await marketApi.createOrder({ port_id: ship.port_id, good_id: plan.goodId, total: sellQty, price: askPrice, side: "sell" });
-                s = appendLog(s, `${ship.name}: posted sell order ${sellQty}× @ £${askPrice}`);
-              } catch (e2: unknown) {
-                s = appendLog(s, `${ship.name}: market order also failed — ${(e2 as Error).message}`);
-              }
+              s = appendLog(s, `${ship.name}: ⚠️ NPC sell failed for ${sellQty}× ${plan.goodName} — cargo remains on ship`);
             }
           } else if ((plan.quantity ?? 0) > 0) {
             s = appendLog(s, `${ship.name}: ⚠️ cargo gone (${plan.goodName}) — skipping sell`);
