@@ -4,7 +4,7 @@ import type {
   FillOrderRequest,
   MarketOrder,
 } from "@/lib/types";
-import { api } from "./client";
+import { api, fetchAllPages } from "./client";
 
 export const marketApi = {
   getOrders: (portIds?: string[], goodIds?: string[], side?: "buy" | "sell") => {
@@ -13,7 +13,7 @@ export const marketApi = {
     for (const id of goodIds ?? []) params.append("good_ids[]", id);
     if (side) params.set("side", side);
     const qs = params.toString();
-    return api.get<MarketOrder[]>(`/market/orders${qs ? `?${qs}` : ""}`);
+    return fetchAllPages<MarketOrder>(`/market/orders${qs ? `?${qs}` : ""}`);
   },
   createOrder: (data: CreateOrderRequest) =>
     api.post<MarketOrder>("/market/orders", data),
