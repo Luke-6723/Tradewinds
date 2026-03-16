@@ -5,7 +5,7 @@ import type {
   QuoteRequest,
   TraderPosition,
 } from "@/lib/types";
-import { api } from "./client";
+import { api, fetchAllPages } from "./client";
 
 type RawQuoteData = {
   token: string;
@@ -58,9 +58,9 @@ export type BatchExecuteItem =
 
 export const tradeApi = {
   getTraders: () =>
-    api.get<{ id: string; name: string; inserted_at: string; updated_at: string }[]>("/trade/traders"),
+    fetchAllPages<{ id: string; name: string; inserted_at: string; updated_at: string }>("/trade/traders"),
   getTraderPositions: (traderId?: string) =>
-    api.get<TraderPosition[]>(
+    fetchAllPages<TraderPosition>(
       traderId ? `/trade/trader-positions?trader_id=${traderId}` : "/trade/trader-positions",
     ),
   createQuote: (data: QuoteRequest): Promise<Quote> =>
