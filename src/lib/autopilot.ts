@@ -703,17 +703,24 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       return _pathCache.get(key)!;
     };
 
-    // ③ Pre-fetch inventories for the current window only (was all 490 — now just 50)
+    // ③ Pre-fetch inventories for the current window with a concurrency cap.
+    //    Unbounded Promise.all floods the server; 20 concurrent is plenty.
+    const INV_CONCURRENCY = 20;
     const shipInventoryCache = new Map<string, Cargo[]>();
     {
       const toFetch = windowShips;
-      const invResults = await Promise.all(
-        toFetch.map(async (sh: Ship) => {
-          try { return [sh.id, await fleetApi.getInventory(sh.id)] as const; }
-          catch { return [sh.id, [] as Cargo[]] as const; }
-        }),
-      );
-      for (const [id, inv] of invResults) shipInventoryCache.set(id, inv);
+      const results: Array<readonly [string, Cargo[]]> = [];
+      for (let i = 0; i < toFetch.length; i += INV_CONCURRENCY) {
+        const slice = toFetch.slice(i, i + INV_CONCURRENCY);
+        const sliceResults = await Promise.all(
+          slice.map(async (sh: Ship) => {
+            try { return [sh.id, await fleetApi.getInventory(sh.id)] as const; }
+            catch { return [sh.id, [] as Cargo[]] as const; }
+          }),
+        );
+        results.push(...sliceResults);
+      }
+      for (const [id, inv] of results) shipInventoryCache.set(id, inv);
       const invElapsed = ((Date.now() - fetchStart) / 1000).toFixed(1);
       console.log(`[runCycle:inv] ${toFetch.length} inventories pre-fetched in ${invElapsed}s`);
       s = appendLog(s, `🗃️ inventories pre-fetched for ${toFetch.length} window ships`);
@@ -766,9 +773,11 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
     console.log(`[runCycle:cands] ${uniqueDockedPorts.size} ports pre-computed in ${((Date.now() - candidatesT0) / 1000).toFixed(1)}s`);
 
-    // ⑥ Pre-fetch ALL sell + buy quotes for window candidates in one batch.
+    // ⑥ Pre-fetch ALL sell + buy quotes for window candidates in chunked parallel batches.
     //    Quotes are valid for 120 s — safe to reuse for all per-ship routing decisions
     //    this cycle, eliminating every per-ship quote API call.
+    //    Chunked to respect server batch-size limits; chunks run in parallel.
+    const QUOTE_BATCH_CHUNK = 100; // max items per batchCreateQuotes call
     const quoteCache = new Map<string, number>(); // "portId:goodId:action" → unit_price
     {
       const seen = new Set<string>();
@@ -792,14 +801,24 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       }
       if (requests.length > 0) {
         const quoteFetchT0 = Date.now();
-        try {
-          const results = await tradeApi.batchCreateQuotes({ requests });
-          for (let i = 0; i < keys.length; i++) {
-            const item = results[i];
-            if (item?.status === "success" && item.quote) quoteCache.set(keys[i], item.quote.unit_price);
+        // Split into chunks and run all chunks in parallel
+        const chunks: Array<{ reqs: typeof requests; startIdx: number }> = [];
+        for (let i = 0; i < requests.length; i += QUOTE_BATCH_CHUNK) {
+          chunks.push({ reqs: requests.slice(i, i + QUOTE_BATCH_CHUNK), startIdx: i });
+        }
+        const chunkResults = await Promise.allSettled(
+          chunks.map(({ reqs }) => tradeApi.batchCreateQuotes({ requests: reqs })),
+        );
+        for (let ci = 0; ci < chunks.length; ci++) {
+          const result = chunkResults[ci];
+          if (result.status !== "fulfilled") continue;
+          const { startIdx } = chunks[ci];
+          for (let j = 0; j < result.value.length; j++) {
+            const item = result.value[j];
+            if (item?.status === "success" && item.quote) quoteCache.set(keys[startIdx + j], item.quote.unit_price);
           }
-        } catch { /* ships skip cargo this cycle if batch fails */ }
-        console.log(`[runCycle:quotes] ${requests.length} quotes pre-fetched in ${((Date.now() - quoteFetchT0) / 1000).toFixed(1)}s (${quoteCache.size} hits)`);
+        }
+        console.log(`[runCycle:quotes] ${requests.length} quotes (${chunks.length} chunks) pre-fetched in ${((Date.now() - quoteFetchT0) / 1000).toFixed(1)}s (${quoteCache.size} hits)`);
       }
     }
 
