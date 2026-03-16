@@ -493,6 +493,8 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     return result;
   };
 
+  let shipsActionedTotal = 0;
+
   try {
     s = appendLog(s, `── cycle start ──`);
     const fetchStart = Date.now();
@@ -578,6 +580,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     // ── Warehouse sell scan (independent — runs every cycle) ───────────────────
     // Collect all items eligible for selling, batch-quote them, then execute in parallel.
     {
+      const wsT0 = Date.now();
       type WSSellItem = { warehouseId: string; portId: string; good_id: string; quantity: number; avgBuy: number };
       const sellItems: WSSellItem[] = [];
       for (const [warehouseId, inventory] of warehouseInventory) {
@@ -619,12 +622,17 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             s = appendLog(s, `🏭 Warehouse sell failed (${goodNameFn(it.good_id)}) — ${(result.reason as Error).message ?? "unknown"}`);
           }
         }
+        const sold = sellResults.filter((r) => r.status === "fulfilled").length;
+        console.log(`[runCycle:wh:sell] ${sold}/${sellItems.length} sold in ${((Date.now() - wsT0) / 1000).toFixed(1)}s`);
+      } else {
+        console.log(`[runCycle:wh:sell] nothing eligible to sell`);
       }
     }
 
     // ── Warehouse buy scan (opportunistic stockpiling) ────────────────────────
     // Batch-quote all candidates upfront; execute sequentially to respect budget + slot limits.
     {
+      const wbT0 = Date.now();
       type WSBuyCandidate = { warehouseId: string; portId: string; goodId: string; goodName: string; toBuy: number; npcPriceOrd: number; stockedGoods: string[] };
       const buyCandidates: WSBuyCandidate[] = [];
       for (const [warehouseId, inventory] of warehouseInventory) {
@@ -683,6 +691,10 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             s = appendLog(s, `🏭 Warehouse stock failed (${c.goodName}) — ${(buyResults[i] as PromiseRejectedResult).reason?.message ?? "unknown"}`);
           }
         }));
+        const bought = buyResults.filter((r) => r.status === "fulfilled").length;
+        console.log(`[runCycle:wh:buy] ${bought}/${reserved.length} stocked (${buyCandidates.length} candidates) in ${((Date.now() - wbT0) / 1000).toFixed(1)}s`);
+      } else {
+        console.log(`[runCycle:wh:buy] no buy candidates`);
       }
     }
 
@@ -809,16 +821,21 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
         const chunkResults = await Promise.allSettled(
           chunks.map(({ reqs }) => tradeApi.batchCreateQuotes({ requests: reqs })),
         );
+        let totalHits = 0;
+        let failedChunks = 0;
         for (let ci = 0; ci < chunks.length; ci++) {
           const result = chunkResults[ci];
-          if (result.status !== "fulfilled") continue;
+          if (result.status !== "fulfilled") { failedChunks++; continue; }
           const { startIdx } = chunks[ci];
+          let chunkHits = 0;
           for (let j = 0; j < result.value.length; j++) {
             const item = result.value[j];
-            if (item?.status === "success" && item.quote) quoteCache.set(keys[startIdx + j], item.quote.unit_price);
+            if (item?.status === "success" && item.quote) { quoteCache.set(keys[startIdx + j], item.quote.unit_price); chunkHits++; }
           }
+          totalHits += chunkHits;
         }
-        console.log(`[runCycle:quotes] ${requests.length} quotes (${chunks.length} chunks) pre-fetched in ${((Date.now() - quoteFetchT0) / 1000).toFixed(1)}s (${quoteCache.size} hits)`);
+        const failNote = failedChunks > 0 ? ` (${failedChunks} chunks failed)` : "";
+        console.log(`[runCycle:quotes] ${requests.length} quotes (${chunks.length} chunks) pre-fetched in ${((Date.now() - quoteFetchT0) / 1000).toFixed(1)}s (${totalHits} hits${failNote})`);
       }
     }
 
@@ -1424,6 +1441,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     }
 
     availableFunds = fundsRef.value;
+    shipsActionedTotal = shipsActioned;
 
     s = appendLog(s, `🚢 window ${windowOffset}–${windowEnd - 1}/${dockedShips.length} (${shipBatches} batch${shipBatches > 1 ? "es" : ""}) — ${shipsActioned} ships in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
     console.log(`[runCycle:loop] done — ${shipsActioned}/${windowShips.length} window ships processed in ${((Date.now() - shipLoopStart) / 1000).toFixed(1)}s`);
@@ -1451,6 +1469,6 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
 
   s = { ...s, profitHistory, treasuryHistory, cyclesRun: s.cyclesRun + 1 };
 
-  console.log(`[runCycle:done] cycle complete in ${((Date.now() - cycleT0) / 1000).toFixed(1)}s`);
+  console.log(`[runCycle:done] cycle #${s.cyclesRun + 1} in ${((Date.now() - cycleT0) / 1000).toFixed(1)}s | dispatched=${shipsActionedTotal} | profit=£${Math.round(cycleProfit).toLocaleString()} | cumulative=£${Math.round(s.profitAccrued).toLocaleString()}`);
   return s;
 }

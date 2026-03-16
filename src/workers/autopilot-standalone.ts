@@ -69,8 +69,8 @@ setInterval(() => void rotateToken(), TOKEN_REFRESH_INTERVAL_MS);
 const CYCLE_TIMEOUT_MS = 300_000; // 5 min — cycles with 800 ships can take 2–3 min
 
 async function tick(): Promise<void> {
-  console.log(`[tick] enabled=${state.enabled} cycleRunning=${cycleRunning} token=${token ? "set" : "EMPTY"} companyId=${companyId}`);
   if (!state.enabled || cycleRunning) return;
+  console.log(`[tick] starting cycle — token=${token ? "set" : "EMPTY"} companyId=${companyId}`);
   cycleRunning = true;
   const guard = setTimeout(() => {
     console.warn(`[tick] CYCLE_TIMEOUT guard fired after ${CYCLE_TIMEOUT_MS / 1000}s — resetting cycleRunning`);
@@ -170,7 +170,6 @@ async function checkCommands(): Promise<void> {
     }
 
     const cmd = await getAutopilotCommand(companyId);
-    console.log(`[debug:poll] companyId=${companyId}, cmd=${cmd ? `enabled=${cmd.enabled}, updatedAt=${cmd.updatedAt.toISOString()}` : "null"}`);
     if (!cmd) return;
 
     // Always sync fleetTarget — repull every poll so frontend changes are picked up immediately
@@ -229,18 +228,6 @@ async function checkCommands(): Promise<void> {
 // ── Init ───────────────────────────────────────────────────────────────────────
 
 async function init(): Promise<void> {
-  // [DEBUG] Log MongoDB URI presence without revealing value
-  console.log(`[debug] MONGODB_URI set: ${!!process.env.MONGODB_URI} (length: ${(process.env.MONGODB_URI ?? "").length})`);
-
-  // [DEBUG] Test raw DB connection
-  const { getDb: getDbDebug } = await import("@/lib/db/mongodb");
-  const dbDebug = await getDbDebug();
-  console.log(`[debug] getDb() returned: ${dbDebug ? "connected (db=" + dbDebug.databaseName + ")" : "null"}`);
-
-  // [DEBUG] Test credential lookup directly
-  const rawCreds = await getAutopilotCredentials();
-  console.log(`[debug] getAutopilotCredentials() returned: ${rawCreds ? `email=${rawCreds.email}, companyId=${rawCreds.companyId ?? "(none)"}` : "null"}`);
-
   // Resolve company ID from env or MongoDB
   try {
     companyId = await resolveCompanyId();
