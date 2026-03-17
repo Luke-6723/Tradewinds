@@ -67,7 +67,7 @@ setInterval(() => void rotateToken(), TOKEN_REFRESH_INTERVAL_MS);
 
 // ── Cycle ──────────────────────────────────────────────────────────────────────
 
-const CYCLE_TIMEOUT_MS = 300_000; // 5 min — cycles with 800 ships can take 2–3 min
+const CYCLE_TIMEOUT_MS = 900_000; // 15 min — large fleets can run much longer
 
 async function tick(): Promise<void> {
   if (!state.enabled || cycleRunning) return;
