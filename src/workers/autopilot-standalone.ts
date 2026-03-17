@@ -39,6 +39,7 @@ let state: AutopilotState = blank();
 let timer: ReturnType<typeof setInterval> | null = null;
 let esAbort: AbortController | null = null;
 let cycleRunning = false;
+let activeRunId = 0;
 
 function sendState(): void {
   void saveAutopilotState(companyId, state);
@@ -72,7 +73,9 @@ async function tick(): Promise<void> {
   if (!state.enabled || cycleRunning) return;
   console.log(`[tick] starting cycle — token=${token ? "set" : "EMPTY"} companyId=${companyId}`);
   cycleRunning = true;
+  const runId = ++activeRunId;
   const guard = setTimeout(() => {
+    if (runId !== activeRunId) return;
     console.warn(`[tick] CYCLE_TIMEOUT guard fired after ${CYCLE_TIMEOUT_MS / 1000}s — resetting cycleRunning`);
     cycleRunning = false;
   }, CYCLE_TIMEOUT_MS);
@@ -83,7 +86,7 @@ async function tick(): Promise<void> {
     console.error(`[tick] fatal cycle error: ${(e as Error).message}`);
   } finally {
     clearTimeout(guard);
-    cycleRunning = false;
+    if (runId === activeRunId) cycleRunning = false;
   }
   sendState();
 }
@@ -132,12 +135,16 @@ function startEventStream(): void {
             const event = JSON.parse(raw) as { type: string; data: unknown };
             if (event.type === "passenger_request_created" && state.enabled && !cycleRunning) {
               cycleRunning = true;
-              const guard = setTimeout(() => { cycleRunning = false; }, CYCLE_TIMEOUT_MS);
+              const runId = ++activeRunId;
+              const guard = setTimeout(() => {
+                if (runId !== activeRunId) return;
+                cycleRunning = false;
+              }, CYCLE_TIMEOUT_MS);
               try {
                 state = await handlePassengerEvent(state, companyId, event.data as PassengerEventData);
               } finally {
                 clearTimeout(guard);
-                cycleRunning = false;
+                if (runId === activeRunId) cycleRunning = false;
               }
               sendState();
               void saveAutopilotState(companyId, state);
