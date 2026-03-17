@@ -43,6 +43,17 @@ export function useAutopilot() {
     } catch { /* ignore */ }
   }, [state.fleetMgmt?.enabled]);
 
+  const toggleDispatch = useCallback(async () => {
+    try {
+      const res = await fetch("/api/autopilot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dispatchEnabled: !(state.dispatchEnabled ?? true) }),
+      });
+      if (res.ok) setState(await res.json() as AutopilotState);
+    } catch { /* ignore */ }
+  }, [state.dispatchEnabled]);
+
   const setFleetTarget = useCallback(async (target: number | null) => {
     try {
       const res = await fetch("/api/autopilot", {
@@ -54,6 +65,6 @@ export function useAutopilot() {
     } catch { /* ignore */ }
   }, []);
 
-  return { state, toggle, toggleFleetMgmt, setFleetTarget };
+  return { state, toggle, toggleDispatch, toggleFleetMgmt, setFleetTarget };
 }
 

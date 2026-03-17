@@ -201,6 +201,7 @@ export async function getAutopilotCredentials(): Promise<{ email: string; passwo
 export interface AutopilotCommand {
   companyId: string;
   enabled: boolean;
+  dispatchEnabled?: boolean;
   fleetMgmt: { enabled: boolean };
   fleetTarget?: number | null;
   updatedAt: Date;
@@ -245,9 +246,22 @@ export async function saveAutopilotCommandFleetTarget(
   );
 }
 
+export async function saveAutopilotCommandDispatchEnabled(
+  companyId: string,
+  dispatchEnabled: boolean,
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.collection<AutopilotCommand>("autopilot_commands").updateOne(
+    { companyId },
+    { $set: { companyId, dispatchEnabled, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
 export async function saveAutopilotCommand(
   companyId: string,
-  command: Pick<AutopilotCommand, "enabled" | "fleetMgmt">,
+  command: Pick<AutopilotCommand, "enabled" | "fleetMgmt"> & Partial<Pick<AutopilotCommand, "dispatchEnabled">>,
 ): Promise<void> {
   const db = await getDb();
   if (!db) return;

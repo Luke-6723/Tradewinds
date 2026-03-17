@@ -498,6 +498,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
   let shipsActionedTotal = 0;
 
   try {
+    if (s.dispatchEnabled === undefined) s = { ...s, dispatchEnabled: true };
     s = appendLog(s, `── cycle start ──`);
     const fetchStart = Date.now();
     // Fresh each cycle: company, economy, warehouses, passengers
@@ -528,6 +529,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
     const bankingCap = Math.max(MIN_TREASURY_FLOOR, economy.total_upkeep * 2 + 2_000);
     let availableFunds = Math.max(0, company.treasury - bankingCap);
     treasuryBalance = company.treasury;
+    const dispatchEnabled = s.dispatchEnabled ?? true;
 
     const portName = (id: string | null | undefined) =>
       allPorts.find((p: Port) => p.id === id)?.name ?? (id ?? "?").slice(0, 8);
@@ -862,7 +864,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
       const fm = s.fleetMgmt;
       const fleetTarget = fm?.fleetTarget ?? Infinity;
       console.log(`[runCycle:reloc] ships=${ships.length} target=${fleetTarget === Infinity ? "∞" : fleetTarget} knownYards=${fm?.knownShipyardPortIds.length ?? 0}`);
-      if (ships.length > fleetTarget && (fm?.knownShipyardPortIds.length ?? 0) > 0) {
+      if (dispatchEnabled && ships.length > fleetTarget && (fm?.knownShipyardPortIds.length ?? 0) > 0) {
         const knownYards = fm!.knownShipyardPortIds;
         const relocCandidates = ships
           .filter((sh) => sh.status !== "traveling" && sh.port_id)
@@ -948,7 +950,7 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
             const targetPortId = shipState.relocatingToPortId;
             const relocPaths = getPathsFrom(ship.port_id);
             const relocPath = relocPaths.find((p) => p.destPortId === targetPortId);
-            if (relocPath && relocPath.legs.length > 0) {
+            if (dispatchEnabled && relocPath && relocPath.legs.length > 0) {
               const ssBeforeReloc = shipState;
               const relocPlan: ShipPlan = { sellPortId: targetPortId, legs: relocPath.legs.slice(1) };
               shipState = { ...shipState, phase: "transiting_to_sell", plan: relocPlan, cyclesIdle: 0, cyclesActive: shipState.cyclesActive + 1 };
@@ -1025,6 +1027,12 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
                 }
               }
               if (dispatched) return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            }
+
+            if (!dispatchEnabled) {
+              logs.push(`${ship.name}: ⏸ dispatch paused at ${portName(ship.port_id)}`);
+              shipState = { ...shipState, cyclesIdle: shipState.cyclesIdle + 1, cyclesActive: shipState.cyclesActive + 1 };
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
             }
 
             const paths = getPathsFrom(ship.port_id);
@@ -1287,6 +1295,12 @@ export async function runCycle(s: AutopilotState, companyId: string): Promise<Au
           // ══════════════════════════════════════════════════════════════════════════
           } else if (shipState.phase === "transiting_to_buy") {
             const plan = shipState.plan!;
+
+            if (!dispatchEnabled) {
+              logs.push(`${ship.name}: ⏸ dispatch paused at ${portName(ship.port_id)} — holding`);
+              shipState = { ...shipState, phase: "idle", plan: undefined, cyclesIdle: shipState.cyclesIdle + 1, cyclesActive: shipState.cyclesActive + 1 };
+              return { shipId: ship.id, finalState: shipState, logs, profitDelta, actioned };
+            }
 
             // Advance waypoint if not yet at buy port
             if (plan.legs.length > 0 && ship.port_id !== plan.buyPortId) {

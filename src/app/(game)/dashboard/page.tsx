@@ -72,7 +72,7 @@ export default function DashboardPage() {
   const [kpis, setKpis] = useState<DashboardKpis | null>(null);
   const [credentialsStored, setCredentialsStored] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
-  const { state: ap, toggle: toggleAp, toggleFleetMgmt, setFleetTarget } = useAutopilot();
+  const { state: ap, toggle: toggleAp, toggleDispatch, toggleFleetMgmt, setFleetTarget } = useAutopilot();
 
   const fetchShipsPage = useCallback((page: number) => {
     setShipsLoading(true);
@@ -473,6 +473,16 @@ export default function DashboardPage() {
                 {(ap.fleetMgmt?.enabled ?? true) ? "On" : "Off"}
               </Badge>
               <Button size="sm" variant="outline" className="text-xs h-6 px-2" onClick={toggleFleetMgmt}>
+                Toggle
+              </Button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="text-muted-foreground">Dispatch:</span>
+              <Badge variant={(ap.dispatchEnabled ?? true) ? "success" : "secondary"} className="text-xs">
+                {(ap.dispatchEnabled ?? true) ? "On" : "Paused"}
+              </Badge>
+              <Button size="sm" variant="outline" className="text-xs h-6 px-2" onClick={toggleDispatch}>
                 Toggle
               </Button>
             </div>

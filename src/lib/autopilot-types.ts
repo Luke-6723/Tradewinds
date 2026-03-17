@@ -80,6 +80,8 @@ export interface FleetMgmtState {
 
 export interface AutopilotState {
   enabled: boolean;
+  /** When false, no new ship departures are issued; arrival-side selling can still complete. */
+  dispatchEnabled: boolean;
   ships: Record<string, AutopilotShipState>;
   profitAccrued: number;
   log: LogEntry[];
@@ -102,6 +104,7 @@ export interface AutopilotState {
 export function blank(): AutopilotState {
   return {
     enabled: false,
+    dispatchEnabled: true,
     ships: {},
     profitAccrued: 0,
     log: [],

@@ -179,7 +179,13 @@ async function checkCommands(): Promise<void> {
     const cmd = await getAutopilotCommand(companyId);
     if (!cmd) return;
 
-    // Always sync fleetTarget — repull every poll so frontend changes are picked up immediately
+    // Always sync command knobs — repull every poll so frontend changes are picked up immediately
+    const wantsDispatchEnabled = cmd.dispatchEnabled ?? true;
+    if (wantsDispatchEnabled !== (state.dispatchEnabled ?? true)) {
+      state = { ...state, dispatchEnabled: wantsDispatchEnabled };
+      sendState();
+    }
+
     const wantsFleetTarget: number | undefined = cmd.fleetTarget ?? undefined;
     if (wantsFleetTarget !== state.fleetMgmt?.fleetTarget) {
       state = { ...state, fleetMgmt: { ...state.fleetMgmt, fleetTarget: wantsFleetTarget } };

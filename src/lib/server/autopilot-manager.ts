@@ -11,6 +11,7 @@ import {
   loadAutopilotState,
   saveAutopilotState,
   saveAutopilotCommandEnabled,
+  saveAutopilotCommandDispatchEnabled,
   saveAutopilotCommandFleetMgmt,
   saveAutopilotCommandFleetTarget,
   getAutopilotCommand,
@@ -30,6 +31,16 @@ export const autopilotManager = {
     const next: AutopilotState = { ...current, enabled };
     await Promise.all([
       saveAutopilotCommandEnabled(companyId, enabled),
+      saveAutopilotState(companyId, next),
+    ]);
+    return next;
+  },
+
+  async setDispatchEnabled(companyId: string, enabled: boolean): Promise<AutopilotState> {
+    const current = await loadAutopilotState(companyId) ?? blank();
+    const next: AutopilotState = { ...current, dispatchEnabled: enabled };
+    await Promise.all([
+      saveAutopilotCommandDispatchEnabled(companyId, enabled),
       saveAutopilotState(companyId, next),
     ]);
     return next;
