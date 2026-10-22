@@ -1,197 +1,212 @@
 ﻿"use client";
 
-import { useEffect, useState } from "react";
-import { use } from "react";
-import { worldApi } from "@/lib/api/world";
-import { tradeApi } from "@/lib/api/trade";
-import { marketApi } from "@/lib/api/market";
-import { shipyardsApi } from "@/lib/api/shipyards";
-import type { Good, MarketOrder, Port, Shipyard, ShipyardInventoryItem, ShipType, TraderPosition } from "@/lib/types";
+import { useState } from "react";
+import Link from "next/link";
+import { useParams } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Empty, ErrorNote, KV, Loading, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { useCatalog } from "@/hooks/use-catalog";
+import { usePoll } from "@/hooks/use-poll";
+import { kibbGet } from "@/lib/kibb/browser";
+import { fmtAgeSeconds, fmtAgo, fmtBps, fmtCr, fmtTons } from "@/lib/kibb/format";
+import type { ContractListing, PortDetail, PortOrderBook, ShipResult } from "@/lib/kibb/types";
 
-export default function PortDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
-  const [port, setPort] = useState<Port | null>(null);
-  const [traders, setTraders] = useState<TraderPosition[]>([]);
-  const [goods, setGoods] = useState<Good[]>([]);
-  const [orders, setOrders] = useState<MarketOrder[]>([]);
-  const [shipyard, setShipyard] = useState<Shipyard | null>(null);
-  const [inventory, setInventory] = useState<ShipyardInventoryItem[]>([]);
-  const [shipTypes, setShipTypes] = useState<Map<string, ShipType>>(new Map());
-  const [loading, setLoading] = useState(true);
+function GoodsList({ title, ids }: { title: string; ids: string[] | null | undefined }) {
+  const { goodName } = useCatalog();
+  return (
+    <div>
+      <div className="mb-1 text-muted-foreground text-xs">{title}</div>
+      <div className="flex flex-wrap gap-1">
+        {ids?.length ? ids.map((g) => <Badge key={g} variant="outline" size="sm">{goodName(g)}</Badge>) : <span className="text-sm">—</span>}
+      </div>
+    </div>
+  );
+}
 
-  const [purchasingItemId, setPurchasingItemId] = useState<string | null>(null);
-  const [purchasing, setPurchasing] = useState(false);
-  const [purchaseError, setPurchaseError] = useState<string | null>(null);
-  const [purchasedShipName, setPurchasedShipName] = useState<string | null>(null);
+export default function PortPage() {
+  const { id } = useParams<{ id: string }>();
+  const { catalog, portName, goodName, shipClassName } = useCatalog();
+  const { data: port, error } = usePoll(() => kibbGet<PortDetail>("/v1/world/port", { port_id: id }), 30_000, [id]);
+  const visible = !!port && port.visibility !== "none";
+  const { data: book } = usePoll(visible ? () => kibbGet<PortOrderBook>("/v1/market/book", { port_id: id }) : null, 30_000, [id, visible]);
+  const { data: contracts } = usePoll(() => kibbGet<ContractListing[]>("/v1/contract/list", { port_id: id, status: "open", limit: 200 }), 60_000, [id]);
+  const { data: ships } = usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { port_id: id, limit: 200 }), 30_000, [id]);
+  const [gossipPort, setGossipPort] = useState<string | null>(null);
 
-  useEffect(() => {
-    worldApi.getPort(id)
-      .then((p) => {
-        setPort(p);
-        Promise.all([
-          tradeApi.getTraderPositions().catch(() => [] as TraderPosition[]),
-          worldApi.getGoods().catch(() => [] as Good[]),
-          marketApi.getOrders([id]).catch(() => [] as MarketOrder[]),
-          worldApi.getShipTypes().catch(() => [] as ShipType[]),
-        ]).then(([allPositions, g, o, st]) => {
-          setTraders((allPositions as TraderPosition[]).filter((tp) => tp.port_id === id));
-          setGoods(g as Good[]);
-          setOrders(o as MarketOrder[]);
-          setShipTypes(new Map((st as ShipType[]).map((s) => [s.id, s])));
-          return shipyardsApi.getPortShipyard(id).catch(() => null);
-        }).then((sy) => {
-          if (sy) {
-            setShipyard(sy);
-            return shipyardsApi.getInventory(sy.id).catch(() => []);
-          }
-          return [];
-        }).then(setInventory)
-          .catch(console.error);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, [id]);
+  const cat = catalog?.ports.find((p) => p.id === id);
+  if (!port) return error ? <ErrorNote error={error} /> : <Loading />;
 
-  async function confirmPurchase(item: ShipyardInventoryItem) {
-    if (!shipyard) return;
-    setPurchasing(true);
-    setPurchaseError(null);
-    try {
-      const ship = await shipyardsApi.purchaseShip(shipyard.id, { ship_type_id: item.ship_type_id });
-      setInventory((prev) => prev.filter((i) => i.id !== item.id));
-      setPurchasingItemId(null);
-      setPurchasedShipName(ship.name);
-    } catch (err: unknown) {
-      setPurchaseError(err instanceof Error ? err.message : "Purchase failed.");
-    } finally {
-      setPurchasing(false);
-    }
-  }
-
-  if (loading) return <div className="flex h-full items-center justify-center"><Spinner className="size-8" /></div>;
-  if (!port) return <p className="text-muted-foreground">Port not found.</p>;
+  const gossip = (port.coffee_house_gossip ?? []).slice().sort((a, b) => a.age_seconds - b.age_seconds);
+  const gossipShown = gossip.find((g) => g.subject_port_id === gossipPort) ?? null;
+  const here = (contracts ?? []).filter((c) => c.origin_port_id === id);
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">{port.name}</h1>
-        <div className="flex items-center gap-2 mt-1">
-          <Badge variant="secondary">{port.shortcode}</Badge>
-          {port.is_hub && <Badge variant="outline">Hub</Badge>}
+    <div className="space-y-6 pb-8">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <Link href="/ports" className="text-muted-foreground text-xs hover:text-foreground">← Ports</Link>
+          <div className="mt-1 flex items-center gap-2">
+            <h1 className="font-bold text-2xl tracking-tight">{port.name}</h1>
+            {port.is_hub && <Badge variant="info">hub</Badge>}
+            {port.has_shipyard && <Badge variant="outline">shipyard</Badge>}
+            <Badge variant={visible ? "success" : "secondary"}>{port.visibility}</Badge>
+          </div>
+          <p className="mt-0.5 text-muted-foreground text-sm capitalize">
+            {port.banking_region.replace(/_/g, " ")} · {portName(port.sea_zone_id)} · phase {port.phase}
+          </p>
         </div>
+        {visible && (
+          <Button variant="outline" render={<Link href={`/market?port=${id}`} />}>
+            Trade here →
+          </Button>
+        )}
       </div>
 
-      <Tabs defaultValue="traders">
-        <TabsList>
-          <TabsTrigger value="traders">Traders ({traders.length})</TabsTrigger>
-          <TabsTrigger value="market">Orders ({orders.length})</TabsTrigger>
-          {shipyard && <TabsTrigger value="shipyard">Shipyard</TabsTrigger>}
-        </TabsList>
-
-        <TabsContent value="traders" className="mt-4">
-          <div className="divide-y rounded-lg border">
-            {traders.length === 0 ? (
-              <p className="p-4 text-muted-foreground text-sm">No traders at this port.</p>
-            ) : traders.map((t) => {
-              const good = goods.find((g) => g.id === t.good_id);
-              return (
-                <div key={t.id} className="flex items-center justify-between px-4 py-3 text-sm">
-                  <span className="font-medium">{good?.name ?? t.good_id.slice(0, 8)}</span>
-                  <div className="flex items-center gap-3">
-                    <span className="text-xs text-muted-foreground">{t.stock_bounds}</span>
-                    <Badge variant="outline" className="text-xs">{t.price_bounds}</Badge>
-                  </div>
-                </div>
-              );
-            })}
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Panel title="Port">
+          <KV
+            rows={[
+              ["Customs (base)", `${fmtBps(port.customs_bps)} (${fmtBps(port.base_customs_bps)})`],
+              ["Berths", `${port.occupied_berths} / ${port.effective_berths} used`],
+              ["Queued for a berth", port.queued_ships],
+              ["Berth dues", `${fmtCr(port.berth_dues_per_day_pence)} / game day`],
+              ["Warehouses leased", `${fmtTons(port.total_leased_warehouse)} / ${fmtTons(port.total_warehouse_cap)}`],
+              ["Health", fmtBps(port.health_score_bps)],
+              ["Player volume (rolling)", `${fmtTons(port.rolling_player_volume_tons)} · ${fmtCr(port.rolling_player_turnover_pence)}`],
+            ]}
+          />
+        </Panel>
+        <Panel title="Trades" className="lg:col-span-2">
+          <div className="space-y-3">
+            <GoodsList title="Produces" ids={cat?.produces} />
+            <GoodsList title="Manufactures" ids={cat?.manufactures} />
+            <GoodsList title="Imports (pays more)" ids={cat?.imports} />
           </div>
-        </TabsContent>
+        </Panel>
+      </div>
 
-        <TabsContent value="market" className="mt-4">
-          <div className="divide-y rounded-lg border">
-            {orders.length === 0 ? (
-              <p className="p-4 text-muted-foreground text-sm">No orders at this port.</p>
-            ) : orders.map((o) => (
-              <div key={o.id} className="flex items-center justify-between px-4 py-3 text-sm">
-                <span className="font-medium">{goods.find((g) => g.id === o.good_id)?.name ?? o.good_id.slice(0, 8)}</span>
-                <div className="flex items-center gap-3">
-                  <Badge variant={o.side === "sell" ? "info" : "success"}>{o.side === "sell" ? "Sell" : "Buy"}</Badge>
-                  <span className="font-mono">£{o.price.toLocaleString()}</span>
-                  <span className="text-muted-foreground">{o.remaining}/{o.total}</span>
-                </div>
-              </div>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Panel title="Your ships here">
+          {!ships ? (
+            <Loading />
+          ) : ships.length === 0 ? (
+            <Empty>None. A berthed or anchored ship gives quay visibility.</Empty>
+          ) : (
+            <Table head={["Ship", "Class", "Status", "Cargo"]}>
+              {ships.map((r) => (
+                <tr key={r.ship.id}>
+                  <td><Link href={`/fleet/${r.ship.id}`} className="font-medium hover:underline">{r.ship.name}</Link></td>
+                  <td className="text-muted-foreground">{shipClassName(r.ship.ship_class)}</td>
+                  <td><ShipStatusBadge status={r.ship.status} /></td>
+                  <td className="tabular-nums">{fmtTons(r.cargo_used_tons)}</td>
+                </tr>
+              ))}
+            </Table>
+          )}
+        </Panel>
+        <Panel title="Open contracts here">
+          {!contracts ? (
+            <Loading />
+          ) : here.length === 0 ? (
+            <Empty>{visible ? "None open." : "Local charters and freight are only listed with presence here."}</Empty>
+          ) : (
+            <Table head={["Type", "Good", "Remaining", "Pay", "To"]}>
+              {here.map((c) => (
+                <tr key={c.id}>
+                  <td className="capitalize">
+                    {c.contract_type}
+                    {c.stale && <Badge variant="outline" size="sm" className="ml-1.5">gossip</Badge>}
+                  </td>
+                  <td>{goodName(c.commodity_id)}</td>
+                  <td className="tabular-nums">{fmtTons(c.remaining_quantity)}</td>
+                  <td className="tabular-nums">
+                    {c.contract_type === "charter"
+                      ? `${fmtCr(c.reward_per_ton_pence ?? Math.floor(c.reward_pence / Math.max(1, c.quantity_required)), 2)}/t`
+                      : `${fmtCr(c.reward_pence)} (collateral ${fmtCr(c.collateral_pence)})`}
+                  </td>
+                  <td>{c.contract_type === "freight" ? portName(c.dest_port_id) : "—"}</td>
+                </tr>
+              ))}
+            </Table>
+          )}
+        </Panel>
+      </div>
+
+      {visible && book && (
+        <Panel title={`Order book · ${book.visibility}${book.as_of ? ` · ${fmtAgo(book.as_of)}` : ""}`}>
+          <Table head={["Good", "Best bid", "Best ask", "NPC stock"]}>
+            {book.books.map((b) => (
+              <tr key={b.commodity_id}>
+                <td>{goodName(b.commodity_id)}</td>
+                <td className="tabular-nums">{b.best_bid ? `${fmtCr(b.best_bid.price_pence, 2)} × ${b.best_bid.quantity}` : "—"}</td>
+                <td className="tabular-nums">{b.best_ask ? `${fmtCr(b.best_ask.price_pence, 2)} × ${b.best_ask.quantity}` : "—"}</td>
+                <td className="text-muted-foreground tabular-nums">{b.depth ? fmtTons(b.depth.npc_current_stock) : "—"}</td>
+              </tr>
             ))}
-          </div>
-        </TabsContent>
+          </Table>
+        </Panel>
+      )}
 
-        {shipyard && (
-          <TabsContent value="shipyard" className="mt-4">
-            <div className="space-y-2">
-              {purchasedShipName && (
-                <p className="text-sm text-green-600 font-medium px-1">
-                  ✓ <span className="font-semibold">{purchasedShipName}</span> purchased and added to your fleet.
-                </p>
-              )}
-              {inventory.length === 0 ? (
-                <div className="rounded-lg border">
-                  <p className="p-4 text-muted-foreground text-sm">No ships available for purchase.</p>
+      {port.visibility === "quay" && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <Panel title="Coffee house gossip">
+            {gossip.length === 0 ? (
+              <Empty>No news from other ports yet.</Empty>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex flex-wrap gap-1">
+                  {gossip.map((g) => (
+                    <button
+                      key={g.subject_port_id}
+                      type="button"
+                      onClick={() => setGossipPort(g.subject_port_id)}
+                      className={`rounded-md border px-2 py-1 text-xs ${gossipPort === g.subject_port_id ? "border-primary bg-accent" : "hover:bg-accent/50"}`}
+                    >
+                      {portName(g.subject_port_id)} <span className="text-muted-foreground">{fmtAgeSeconds(g.age_seconds)}</span>
+                    </button>
+                  ))}
                 </div>
-              ) : (
-                <div className="divide-y rounded-lg border">
-                  {inventory.map((item) => {
-                    const shipType = shipTypes.get(item.ship_type_id);
-                    const isExpanded = purchasingItemId === item.id;
-                    return (
-                      <div key={item.id} className="px-4 py-3 text-sm">
-                        <div className="flex items-center justify-between">
-                          <div className="space-y-0.5">
-                            <p className="font-semibold">{shipType?.name ?? item.ship_type_id.slice(0, 8)}</p>
-                            {shipType && (
-                              <p className="text-xs text-muted-foreground">
-                                Capacity {shipType.capacity}
-                                {shipType.passengers > 0 && ` · ${shipType.passengers} passengers`}
-                                {" · "}Speed {shipType.speed} · Upkeep £{shipType.upkeep.toLocaleString()}/wk
-                              </p>
-                            )}
-                          </div>
-                          <div className="flex items-center gap-3">
-                            <span className="font-mono font-semibold">£{item.cost.toLocaleString()}</span>
-                            {!isExpanded && (
-                              <Button size="sm" onClick={() => { setPurchasingItemId(item.id); setPurchaseError(null); setPurchasedShipName(null); }}>
-                                Purchase
-                              </Button>
-                            )}
-                          </div>
-                        </div>
-                        {isExpanded && (
-                          <div className="mt-3 space-y-3 rounded-md border bg-muted/40 p-3">
-                            <p className="text-xs text-muted-foreground">
-                              Confirm purchase of <span className="font-medium">{shipType?.name ?? "this ship"}</span> for £{item.cost.toLocaleString()}. The ship will be named by the shipyard.
-                            </p>
-                            {purchaseError && <p className="text-xs text-destructive">{purchaseError}</p>}
-                            <div className="flex gap-2">
-                              <Button size="sm" onClick={() => confirmPurchase(item)} disabled={purchasing}>
-                                {purchasing ? <Spinner className="size-3" /> : "Confirm Purchase"}
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => setPurchasingItemId(null)} disabled={purchasing}>
-                                Cancel
-                              </Button>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </TabsContent>
-        )}
-      </Tabs>
+                {gossipShown ? (
+                  <Table head={["Good", "Stock", "Bid", "Ask"]}>
+                    {gossipShown.commodities.map((c) => (
+                      <tr key={c.commodity_id}>
+                        <td>{goodName(c.commodity_id)}</td>
+                        <td className="tabular-nums">{fmtTons(c.current_stock)}</td>
+                        <td className="tabular-nums">{fmtCr(c.best_bid_pence, 2)}</td>
+                        <td className="tabular-nums">{fmtCr(c.best_ask_pence, 2)}</td>
+                      </tr>
+                    ))}
+                  </Table>
+                ) : (
+                  <Empty>Pick a port to see what crews reported there.</Empty>
+                )}
+              </div>
+            )}
+          </Panel>
+          <Panel title="Recent sailings (24 game hours)">
+            {(port.recent_sailings ?? []).length === 0 ? (
+              <Empty>No traffic.</Empty>
+            ) : (
+              <Table head={["Ship", "Owner", "", "Load", "Seen"]}>
+                {(port.recent_sailings ?? []).map((n, i) => (
+                  <tr key={`${n.ship_name}-${n.seen_at}-${i}`}>
+                    <td>
+                      {n.ship_name} <span className="text-muted-foreground text-xs">{shipClassName(n.ship_class)}</span>
+                    </td>
+                    <td className="text-muted-foreground">{n.company_name}</td>
+                    <td className="text-xs">
+                      {n.direction === "sailed" ? `→ ${portName(n.other_port_id)}` : `← ${portName(n.other_port_id)}`}
+                    </td>
+                    <td className="text-xs">{n.load_state.replace("_", " ")}</td>
+                    <td className="text-muted-foreground text-xs">{fmtAgo(n.seen_at)}</td>
+                  </tr>
+                ))}
+              </Table>
+            )}
+          </Panel>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,9 +1,11 @@
-// pm2 ecosystem — run both apps with: pm2 start ecosystem.config.cjs
-// Restart individually:  pm2 restart tw-dashboard | pm2 restart tw-autopilot
+// pm2 ecosystem — run with: pm2 start ecosystem.config.cjs
+// Restart: pm2 restart tw-dashboard
 //
-// Only MONGODB_URI is required in .env.local (or passed via env below).
-// Everything else (credentials, company ID, API URL) is stored in MongoDB
-// after the first dashboard login + company selection.
+// The dashboard runs the charter runner in-process, so it is the only app.
+// Sign in, pick a company and press Start once; the runner resumes on every restart after that.
+// Company API keys and runner settings live in .kibb/store.json (gitignored). No database needed.
+//
+// Build first: pnpm build
 
 module.exports = {
   apps: [
@@ -18,18 +20,6 @@ module.exports = {
       watch: false,
       autorestart: true,
       restart_delay: 3000,
-    },
-    {
-      name: "tw-autopilot",
-      script: "node",
-      args: "--env-file=.env.local --import tsx src/workers/autopilot-standalone.ts",
-      env: {
-        NODE_ENV: "production",
-      },
-      watch: false,
-      autorestart: true,
-      restart_delay: 5000,
-      // Logs go to ~/.pm2/logs/tw-autopilot-out.log
     },
   ],
 };

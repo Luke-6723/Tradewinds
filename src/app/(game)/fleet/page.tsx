@@ -1,144 +1,63 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
-import { fleetApi } from "@/lib/api/fleet";
-import { shipyardsApi } from "@/lib/api/shipyards";
-import { worldApi } from "@/lib/api/world";
-import type { Port, Ship } from "@/lib/types";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
-import { ShipIcon } from "lucide-react";
-
-type SellState =
-  | { phase: "idle" }
-  | { phase: "confirming" }
-  | { phase: "loading" }
-  | { phase: "error"; message: string }
-  | { phase: "sold"; price: number };
+import { Empty, ErrorNote, Loading, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { useCatalog } from "@/hooks/use-catalog";
+import { usePoll } from "@/hooks/use-poll";
+import { kibbGet } from "@/lib/kibb/browser";
+import { fmtIn, fmtTons } from "@/lib/kibb/format";
+import type { ShipResult } from "@/lib/kibb/types";
 
 export default function FleetPage() {
-  const [ships, setShips] = useState<Ship[]>([]);
-  const [ports, setPorts] = useState<Port[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [sellState, setSellState] = useState<Record<string, SellState>>({});
-
-  useEffect(() => {
-    Promise.all([fleetApi.getShips(), worldApi.getPorts().catch(() => [])])
-      .then(([s, p]) => { setShips(s); setPorts(p as Port[]); })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, []);
-
-  const portName = (id: string | null) =>
-    id ? (ports.find((p) => p.id === id)?.name ?? id) : "At sea";
-
-  const initiateSell = (ship: Ship) => {
-    setSellState((s) => ({ ...s, [ship.id]: { phase: "confirming" } }));
-  };
-
-  const confirmSell = async (ship: Ship) => {
-    if (!ship.port_id) return;
-    setSellState((s) => ({ ...s, [ship.id]: { phase: "loading" } }));
-    try {
-      const shipyard = await shipyardsApi.getPortShipyard(ship.port_id);
-      const result = await shipyardsApi.sellShip(shipyard.id, ship.id);
-      setSellState((s) => ({ ...s, [ship.id]: { phase: "sold", price: result.price } }));
-      setShips((prev) => prev.filter((s) => s.id !== ship.id));
-    } catch (e: unknown) {
-      const msg = (e as Error).message ?? "Sale failed";
-      const friendly = msg.toLowerCase().includes("shipyard not found")
-        ? "No shipyard at this port."
-        : msg;
-      setSellState((s) => ({ ...s, [ship.id]: { phase: "error", message: friendly } }));
-    }
-  };
-
-  if (loading) return <div className="flex justify-center items-center h-full"><Spinner className="size-8" /></div>;
+  const { portName, goodName, shipClassName } = useCatalog();
+  const { data: ships, error } = usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { limit: 200 }), 10_000);
 
   return (
-    <div className="space-y-6">
-      <h1 className="font-bold text-2xl">Fleet</h1>
-      {ships.length === 0 ? (
-        <p className="text-muted-foreground">No ships. Buy one from a port shipyard.</p>
-      ) : (
-        <div className="gap-4 grid sm:grid-cols-2 lg:grid-cols-3">
-          {ships.map((ship) => {
-            const ss = sellState[ship.id] ?? { phase: "idle" };
-            const isDocked = ship.status === "docked" && !!ship.port_id;
-            return (
-              <Card key={ship.id} className="flex flex-col">
-                <Link href={`/fleet/${ship.id}`} className="flex-1 hover:bg-accent/40 transition-colors rounded-t-lg">
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <ShipIcon className="size-4 text-muted-foreground" />
-                      {ship.name}
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-1 text-sm">
-                    <div className="flex items-center gap-2">
-                      <Badge variant={ship.status === "docked" ? "success" : "info"}>
-                        {ship.status}
-                      </Badge>
-                    </div>
-                    <p className="text-muted-foreground">
-                      {portName(ship.port_id)}
-                      {ship.status === "traveling" && ship.arriving_at && (
-                        <> · arriving {new Date(ship.arriving_at).toLocaleTimeString()}</>
-                      )}
-                    </p>
-                  </CardContent>
-                </Link>
-
-                {ship.status === "docked" && (
-                  <div className="px-6 pb-4 pt-0">
-                    {ss.phase === "idle" && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="w-full text-muted-foreground"
-                        onClick={() => initiateSell(ship)}
-                      >
-                        Sell Ship
-                      </Button>
+    <div className="space-y-6 pb-8">
+      <div>
+        <h1 className="font-bold text-2xl tracking-tight">Fleet</h1>
+        <p className="mt-0.5 text-muted-foreground text-sm">Ships, where they are and what they carry.</p>
+      </div>
+      <ErrorNote error={error} />
+      <Panel title={ships ? `${ships.length} ship${ships.length === 1 ? "" : "s"}` : "Ships"}>
+        {!ships ? (
+          <Loading />
+        ) : ships.length === 0 ? (
+          <Empty>No ships.</Empty>
+        ) : (
+          <Table head={["Ship", "Class", "Status", "Where", "Hold", "Cargo", "Stores", "Guns"]}>
+            {ships.map((r) => {
+              const s = r.ship;
+              const dest = r.route_legs.at(-1)?.to_node;
+              const cargo = Object.entries(r.cargo_manifest);
+              return (
+                <tr key={s.id}>
+                  <td>
+                    <Link href={`/fleet/${s.id}`} className="font-medium hover:underline">{s.name}</Link>
+                  </td>
+                  <td className="text-muted-foreground">{shipClassName(s.ship_class)}</td>
+                  <td><ShipStatusBadge status={s.status} /></td>
+                  <td>
+                    {s.status === "sailing" ? (
+                      <>
+                        → {portName(dest)} <span className="text-muted-foreground text-xs">{fmtIn(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at)}</span>
+                      </>
+                    ) : (
+                      portName(s.current_port_id)
                     )}
-                    {ss.phase === "loading" && (
-                      <Button size="sm" variant="outline" className="w-full" disabled>
-                        <Spinner className="size-3 mr-1" /> Loading…
-                      </Button>
-                    )}
-                    {ss.phase === "confirming" && (
-                      <div className="space-y-2">
-                        <p className="text-xs text-muted-foreground text-center">
-                          Sell <span className="font-semibold text-foreground">{ship.name}</span>? This cannot be undone.
-                        </p>
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="destructive" className="flex-1" onClick={() => confirmSell(ship)}>
-                            Confirm
-                          </Button>
-                          <Button size="sm" variant="outline" className="flex-1" onClick={() => setSellState((s) => ({ ...s, [ship.id]: { phase: "idle" } }))}>
-                            Cancel
-                          </Button>
-                        </div>
-                      </div>
-                    )}
-                    {ss.phase === "error" && (
-                      <div className="space-y-2">
-                        <p className="text-xs text-destructive text-center">{ss.message}</p>
-                        <Button size="sm" variant="outline" className="w-full" onClick={() => setSellState((s) => ({ ...s, [ship.id]: { phase: "idle" } }))}>
-                          Dismiss
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </Card>
-            );
-          })}
-        </div>
-      )}
+                  </td>
+                  <td className="tabular-nums">{fmtTons(r.cargo_used_tons)} / {fmtTons(r.effective_hold_capacity_tons)}</td>
+                  <td className="text-muted-foreground text-xs">
+                    {cargo.length ? cargo.map(([g, t]) => `${t} t ${goodName(g)}`).join(", ") : "empty"}
+                  </td>
+                  <td className="tabular-nums">{fmtTons(r.stores.provisions_tons, 2)}</td>
+                  <td className="tabular-nums">{s.cannons_count}</td>
+                </tr>
+              );
+            })}
+          </Table>
+        )}
+      </Panel>
     </div>
   );
 }

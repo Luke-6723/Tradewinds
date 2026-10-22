@@ -6,53 +6,40 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { ErrorNote } from "@/components/kibb/bits";
+import { dash } from "@/lib/kibb/browser";
+
+const HANDLE_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 
 export default function RegisterPage() {
   const router = useRouter();
-  const [name,     setName]     = useState("");
-  const [email,    setEmail]    = useState("");
-  const [password, setPassword] = useState("");
-  const [confirm,  setConfirm]  = useState("");
-  const [error,    setError]    = useState<string | null>(null);
-  const [loading,  setLoading]  = useState(false);
+  const [handle,     setHandle]     = useState("");
+  const [passphrase, setPassphrase] = useState("");
+  const [confirm,    setConfirm]    = useState("");
+  const [error,      setError]      = useState<string | null>(null);
+  const [loading,    setLoading]    = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-
-    if (password !== confirm) {
-      setError("Passwords do not match.");
+    if (!HANDLE_RE.test(handle)) {
+      setError("Handle must be 3–32 characters: letters, numbers, _ . -");
       return;
     }
-    if (password.length < 8) {
-      setError("Password must be at least 8 characters.");
+    if (passphrase.length < 8) {
+      setError("Passphrase must be at least 8 characters.");
       return;
     }
-
+    if (passphrase !== confirm) {
+      setError("Passphrases don't match.");
+      return;
+    }
     setLoading(true);
     try {
-      const res = await fetch("/api/auth/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, email, password }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        const errs = data?.errors ?? {};
-        const msg =
-          errs.email?.[0] ??
-          errs.name?.[0] ??
-          errs.password?.[0] ??
-          errs.detail ??
-          "Registration failed.";
-        setError(msg);
-        return;
-      }
-
-      // Registered + auto-logged-in — go create a company
+      await dash.post("/api/kibb/auth/register", { handle, passphrase });
       router.push("/companies/new");
+    } catch (err) {
+      setError((err as Error).message || "Registration failed.");
     } finally {
       setLoading(false);
     }
@@ -60,68 +47,51 @@ export default function RegisterPage() {
 
   return (
     <div className="rounded-xl border bg-card p-6 shadow-lg">
-      <h2 className="mb-5 text-lg font-semibold">Create account</h2>
+      <h2 className="mb-5 font-semibold text-lg">Create account</h2>
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="space-y-1.5">
-          <Label htmlFor="name">Display name</Label>
+          <Label htmlFor="handle">Handle</Label>
           <Input
-            id="name"
-            autoComplete="name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Captain Kidd"
+            id="handle"
+            autoComplete="username"
+            value={handle}
+            onChange={(e) => setHandle(e.target.value)}
+            placeholder="hawkins"
             required
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="email">Email</Label>
+          <Label htmlFor="passphrase">Passphrase</Label>
           <Input
-            id="email"
-            type="email"
-            autoComplete="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="you@example.com"
-            required
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="password">Password</Label>
-          <Input
-            id="password"
+            id="passphrase"
             type="password"
             autoComplete="new-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="••••••••"
+            value={passphrase}
+            onChange={(e) => setPassphrase(e.target.value)}
+            placeholder="8+ characters"
             required
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="confirm">Confirm password</Label>
+          <Label htmlFor="confirm">Confirm passphrase</Label>
           <Input
             id="confirm"
             type="password"
             autoComplete="new-password"
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
-            placeholder="••••••••"
             required
           />
         </div>
 
-        {error && (
-          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            {error}
-          </p>
-        )}
+        <ErrorNote error={error} />
 
         <Button type="submit" className="w-full" disabled={loading}>
           {loading ? "Creating account…" : "Create account"}
         </Button>
       </form>
 
-      <p className="mt-4 text-center text-sm text-muted-foreground">
+      <p className="mt-4 text-center text-muted-foreground text-sm">
         Already have an account?{" "}
         <Link href="/login" className="text-primary underline-offset-4 hover:underline">
           Sign in

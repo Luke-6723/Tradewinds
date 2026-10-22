@@ -42,3 +42,6 @@ next-env.d.ts
 # scripts — local automation, not for repo
 scripts/amsterdam-setup.mjs
 scripts/fill-grain-order.mjs
+
+# dashboard key store (company API keys, runner settings)
+.kibb/

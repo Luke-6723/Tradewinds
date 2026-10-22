@@ -1,259 +1,253 @@
 ﻿"use client";
 
-import { use, useEffect, useState } from "react";
-import { fleetApi } from "@/lib/api/fleet";
-import { worldApi } from "@/lib/api/world";
-import { warehousesApi } from "@/lib/api/warehouses";
-import { shipyardsApi } from "@/lib/api/shipyards";
-import type { Cargo, Good, Port, Route, Ship, Shipyard, Warehouse } from "@/lib/types";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { useState } from "react";
+import Link from "next/link";
+import { useParams } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Empty, ErrorNote, KV, Loading, NativeSelect, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { useCatalog } from "@/hooks/use-catalog";
+import { usePoll } from "@/hooks/use-poll";
+import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
+import { fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
+import type { RunnerView } from "@/lib/kibb/runner-registry";
+import type { DepartResult, DockActionResult, RoutePlan, ShipResult, WorldClock, ZoneClass } from "@/lib/kibb/types";
 
-export default function ShipDetailPage({ params }: { params: Promise<{ shipId: string }> }) {
-  const { shipId } = use(params);
-  const [ship, setShip] = useState<Ship | null>(null);
-  const [ports, setPorts] = useState<Port[]>([]);
-  const [routes, setRoutes] = useState<Route[]>([]);
-  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
-  const [cargo, setCargo] = useState<Cargo[]>([]);
-  const [goods, setGoods] = useState<Good[]>([]);
-  const [shipyard, setShipyard] = useState<Shipyard | null>(null);
-  const [loading, setLoading] = useState(true);
+const HULL_RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
 
-  const [newName, setNewName] = useState("");
-  const [selectedRoute, setSelectedRoute] = useState("");
-  const [message, setMessage] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+function DepartForm({ r, onDone }: { r: ShipResult; onDone: () => void }) {
+  const { catalog, portName } = useCatalog();
+  const { data: clock } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"));
+  const [dest, setDest] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<DepartResult | null>(null);
+  const from = r.ship.current_port_id ?? "";
+  const { data: plan, error: planError } = usePoll(
+    dest ? () => kibbGet<RoutePlan>("/v1/world/route", { from, to: dest, ship_class: r.ship.ship_class }) : null,
+    0,
+    [dest, from],
+  );
 
-  // Sell state
-  const [sellPrice, setSellPrice] = useState<number | null>(null);
-  const [selling, setSelling] = useState(false);
-  const [sellConfirm, setSellConfirm] = useState(false);
+  const hull = catalog?.ship_classes.find((c) => c.id === r.ship.ship_class)?.hull_category ?? "coastal";
+  const ports = (catalog?.ports ?? [])
+    .filter((p) => p.id !== from && p.phase <= (clock?.unlocked_phase ?? 1))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const unrated = plan?.legs.filter((l) => HULL_RANK[l.edge_class] > HULL_RANK[hull]) ?? [];
+  const short = plan ? r.stores.provisions_tons < plan.safe_provisions_tons : false;
 
-  const portName = (id: string | null) =>
-    id ? (ports.find((p) => p.id === id)?.name ?? id) : "At sea";
-
-  const reload = () => {
-    fleetApi.getShip(shipId)
-      .then((s) => {
-        setShip(s);
-        setNewName(s.name);
-        if (s.port_id) {
-          worldApi.getRoutes(s.port_id).then(setRoutes).catch(() => setRoutes([]));
-        }
-      })
-      .catch(console.error);
-  };
-
-  useEffect(() => {
-    Promise.all([
-      fleetApi.getShip(shipId),
-      worldApi.getPorts().catch(() => []),
-      warehousesApi.getWarehouses().catch(() => []),
-      worldApi.getGoods().catch(() => []),
-    ])
-      .then(([s, p, w, g]) => {
-        setShip(s);
-        setNewName(s.name);
-        setPorts(p as Port[]);
-        setWarehouses(w as Warehouse[]);
-        setGoods(g as Good[]);
-        return Promise.all([
-          fleetApi.getInventoryCached(s).catch(() => []),
-          s.port_id ? worldApi.getRoutes(s.port_id).catch(() => []) : Promise.resolve([]),
-          s.port_id && s.status === "docked"
-            ? shipyardsApi.getPortShipyard(s.port_id).catch(() => null)
-            : Promise.resolve(null),
-        ]);
-      })
-      .then(([c, r, sy]) => {
-        setCargo(c as Cargo[]);
-        setRoutes(r as Route[]);
-        setShipyard(sy as Shipyard | null);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, [shipId]);
-
-  const handle = async (fn: () => Promise<unknown>, msg: string) => {
-    setSubmitting(true); setMessage("");
-    try { await fn(); reload(); setMessage(msg); }
-    catch (e: unknown) { setMessage(`Error: ${(e as Error).message}`); }
-    finally { setSubmitting(false); }
-  };
-
-  const handleSell = async () => {
-    if (!ship?.port_id) return;
-    setSelling(true);
-    setMessage("");
+  async function depart() {
+    setBusy(true);
+    setError(null);
     try {
-      const shipyard = await shipyardsApi.getPortShipyard(ship.port_id);
-      const result = await shipyardsApi.sellShip(shipyard.id, ship.id);
-      setSellPrice(result.price);
-      setSellConfirm(false);
-    } catch (e: unknown) {
-      setMessage(`Error: ${(e as Error).message}`);
+      setResult(await kibbPost<DepartResult>("/v1/fleet/depart", { ship_id: r.ship.id, dest_port_id: dest }));
+      onDone();
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
-      setSelling(false);
+      setBusy(false);
     }
-  };
-
-  if (loading) return <div className="flex h-full items-center justify-center"><Spinner className="size-8" /></div>;
-  if (!ship) return <p className="text-muted-foreground">Ship not found.</p>;
-
-  const isSold = sellPrice !== null;
+  }
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">{ship.name}</h1>
-        <div className="mt-1 flex items-center gap-2">
-          <Badge variant="secondary">{ship.ship_type_id.slice(0, 8)}…</Badge>
-          <Badge variant={ship.status === "docked" ? "success" : "info"}>{ship.status}</Badge>
+    <div className="space-y-3">
+      <div className="space-y-1">
+        <Label>Sail to</Label>
+        <NativeSelect value={dest} onChange={(e) => { setDest(e.target.value); setResult(null); }}>
+          <option value="">Choose a port…</option>
+          {ports.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </NativeSelect>
+      </div>
+      <ErrorNote error={planError} />
+      {plan && (
+        <div className="space-y-2 rounded-lg border p-3 text-sm">
+          <KV
+            rows={[
+              ["Distance", `${plan.total_distance_nm} nm`],
+              ["Stores needed (safe)", `${fmtTons(plan.expected_provisions_tons, 2)} (${fmtTons(plan.safe_provisions_tons, 2)})`],
+              ["Stores aboard", fmtTons(r.stores.provisions_tons, 2)],
+            ]}
+          />
+          <div className="flex flex-wrap gap-1">
+            {plan.legs.map((l, i) => (
+              <Badge key={i} variant={HULL_RANK[l.edge_class] > HULL_RANK[hull] ? "error" : "outline"} size="sm">
+                {portName(l.to_node)} · {l.edge_class}
+              </Badge>
+            ))}
+          </div>
+          {unrated.length > 0 && (
+            <ErrorNote error={`A ${hull} hull isn't rated for ${unrated.map((l) => l.edge_class).join(", ")} water on this route: real risk of sinking.`} />
+          )}
+          {short && <ErrorNote error="Stores are below the safe figure for this route. Buy provisions into stores first (Market page)." />}
         </div>
+      )}
+      <ErrorNote error={error} />
+      {result && (
+        <p className="text-sm">
+          Sailing to {portName(result.dest_port_id)}, arrives {fmtIn(result.estimated_arrival_at)}
+          {result.berth_dues_pence > 0 && `; berth dues ${fmtCr(result.berth_dues_pence)}`}.
+          {result.warnings.map((w) => ` ⚠ ${w.detail}`)}
+        </p>
+      )}
+      <Button disabled={!dest || busy || unrated.length > 0} onClick={depart}>
+        {busy ? "Departing…" : "Depart"}
+      </Button>
+    </div>
+  );
+}
+
+export default function ShipPage() {
+  const { shipId } = useParams<{ shipId: string }>();
+  const { catalog, portName, goodName, shipClassName } = useCatalog();
+  const { data: r, error, reload } = usePoll(() => kibbGet<ShipResult>("/v1/fleet/ship", { ship_id: shipId }), 5_000, [shipId]);
+  const { data: runner } = usePoll(() => dash.get<RunnerView>("/api/kibb/runner"), 10_000);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  if (!r) {
+    return error ? <ErrorNote error={error} /> : <Loading />;
+  }
+  const s = r.ship;
+  const cls = catalog?.ship_classes.find((c) => c.id === s.ship_class);
+  const runnerShip = runner?.settings.shipId || runner?.state?.shipId;
+  const runnerOwnsShip = !!runner?.enabled && runnerShip === s.id;
+  const locked = s.status === "berthed" && !!s.turnaround_unlocks_at && Date.parse(s.turnaround_unlocks_at) > Date.now();
+
+  async function dockAction(kind: "dock" | "offshore") {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await kibbPost<DockActionResult>(`/v1/fleet/${kind}`, { ship_id: s.id });
+      await reload();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6 pb-8">
+      <div>
+        <Link href="/fleet" className="text-muted-foreground text-xs hover:text-foreground">← Fleet</Link>
+        <div className="mt-1 flex items-center gap-3">
+          <h1 className="font-bold text-2xl tracking-tight">{s.name}</h1>
+          <ShipStatusBadge status={s.status} />
+        </div>
+        <p className="mt-0.5 text-muted-foreground text-sm">
+          {shipClassName(s.ship_class)} · {cls?.hull_category ?? "?"} hull · {s.cannons_count}/{cls?.max_cannons ?? "?"} guns · crew {cls?.crew_required ?? "?"}
+        </p>
       </div>
 
-      {isSold ? (
-        <div className="rounded-lg border border-green-500/40 bg-green-500/8 p-4 text-sm text-green-700 dark:text-green-400">
-          ✓ Ship sold for <span className="font-mono font-semibold">£{sellPrice!.toLocaleString()}</span>. It has been removed from your fleet.
-        </div>
-      ) : (
-        <>
-          <div className="grid gap-3 sm:grid-cols-3 text-sm">
-            <div className="rounded-lg border p-3">
-              <p className="text-muted-foreground">Location</p>
-              <p className="font-medium">{portName(ship.port_id)}</p>
-            </div>
-            {ship.status === "traveling" && ship.arriving_at && (
-              <div className="rounded-lg border p-3">
-                <p className="text-muted-foreground">Arriving</p>
-                <p className="font-medium">{new Date(ship.arriving_at).toLocaleTimeString()}</p>
-              </div>
+      {runnerOwnsShip && (
+        <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+          The charter runner is sailing this ship. Stop it on the dashboard before giving manual orders.
+        </p>
+      )}
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Panel title="Position">
+          <KV
+            rows={[
+              ["Status", s.status.replace("_", " ")],
+              s.status === "sailing"
+                ? ["Bound for", portName(r.route_legs.at(-1)?.to_node)]
+                : ["Port", portName(s.current_port_id)],
+              ...(s.status === "sailing"
+                ? ([["Arrives", fmtIn(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at)], ["Speed", `${((r.voyage?.speed_centiknots ?? 0) / 100).toFixed(1)} kn`]] as Array<[string, string]>)
+                : []),
+              ...(s.status === "berthed"
+                ? ([["Berthed", fmtTime(s.berthed_at)], ["Turnaround", locked ? fmtIn(s.turnaround_unlocks_at) : "free to sail"]] as Array<[string, string]>)
+                : []),
+              ...(s.dock_queued_at ? ([["Queued for berth", fmtTime(s.dock_queued_at)]] as Array<[string, string]>) : []),
+            ]}
+          />
+        </Panel>
+
+        <Panel title="Hold">
+          <KV
+            rows={[
+              ["Capacity", fmtTons(r.hold_capacity_tons)],
+              ["After guns and stores", fmtTons(r.effective_hold_capacity_tons)],
+              ["Cargo aboard", fmtTons(r.cargo_used_tons)],
+            ]}
+          />
+          <div className="mt-3">
+            {Object.keys(r.cargo_manifest).length === 0 ? (
+              <Empty>Hold empty.</Empty>
+            ) : (
+              <Table head={["Good", "Tons"]}>
+                {Object.entries(r.cargo_manifest).map(([g, t]) => (
+                  <tr key={g}>
+                    <td>{goodName(g)}</td>
+                    <td className="tabular-nums">{t}</td>
+                  </tr>
+                ))}
+              </Table>
             )}
           </div>
+        </Panel>
 
-          {message && <div className="rounded-lg border p-3 text-sm text-muted-foreground">{message}</div>}
+        <Panel title="Stores">
+          <KV
+            rows={[
+              ["Provisions", fmtTons(r.stores.provisions_tons, 2)],
+              ["Feeds the crew at sea for", `${r.stores.sea_days_remaining.toFixed(1)} game days`],
+            ]}
+          />
+          <p className="mt-3 text-muted-foreground text-xs">
+            Crews eat in port too, at half the sea rate. Buy stores with an IOC provisions bid “into stores” on the Market page.
+          </p>
+        </Panel>
+      </div>
 
-          <Tabs defaultValue="cargo">
-            <TabsList>
-              <TabsTrigger value="cargo">Cargo</TabsTrigger>
-              <TabsTrigger value="transit">Transit</TabsTrigger>
-              <TabsTrigger value="rename">Rename</TabsTrigger>
-              {ship.status === "docked" && (
-                <TabsTrigger value="sell">Sell Ship</TabsTrigger>
-              )}
-            </TabsList>
+      {s.status === "sailing" && r.voyage && (
+        <Panel title="Voyage">
+          <Table head={["Leg", "To", "Distance", "Arrives"]}>
+            {r.voyage.legs.map((l) => (
+              <tr key={l.leg_idx} className={l.leg_idx < r.voyage!.current_leg_idx ? "text-muted-foreground" : undefined}>
+                <td>{l.leg_idx + 1}</td>
+                <td>
+                  {portName(l.to_node)}
+                  {l.starving && <Badge variant="error" size="sm" className="ml-1.5">starving</Badge>}
+                </td>
+                <td className="tabular-nums">{l.distance_nm} nm</td>
+                <td>{fmtIn(l.estimated_arrival_at)}</td>
+              </tr>
+            ))}
+          </Table>
+        </Panel>
+      )}
 
-            <TabsContent value="cargo" className="mt-4">
-              <Card className="max-w-sm">
-                <CardHeader><CardTitle>Cargo Hold</CardTitle></CardHeader>
-                <CardContent>
-                  {cargo.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">Empty hold.</p>
-                  ) : (
-                    <div className="divide-y">
-                      {cargo.map((c) => {
-                        const good = goods.find((g) => g.id === c.good_id);
-                        return (
-                          <div key={c.good_id} className="flex items-center justify-between py-2 text-sm">
-                            <span>{good?.name ?? c.good_id.slice(0, 8)}</span>
-                            <span className="font-mono text-muted-foreground">{c.quantity.toLocaleString()} units</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="transit" className="mt-4">
-              <Card className="max-w-sm">
-                <CardHeader><CardTitle>Set Route</CardTitle></CardHeader>
-                <CardContent className="space-y-4">
-                  {ship.status !== "docked" ? (
-                    <p className="text-sm text-muted-foreground">
-                      Ship is traveling · arriving {ship.arriving_at ? new Date(ship.arriving_at).toLocaleString() : "soon"}.
-                    </p>
-                  ) : routes.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">No routes available from this port.</p>
-                  ) : (
-                    <>
-                      <div className="space-y-2">
-                        <Label>Destination</Label>
-                        <Select value={selectedRoute} onValueChange={setSelectedRoute}>
-                          <SelectTrigger><SelectValue placeholder="Select route…" /></SelectTrigger>
-                          <SelectContent>
-                            {routes.map((r) => (
-                              <SelectItem key={r.id} value={r.id}>
-                                {portName(r.to_id)} · {r.distance} km
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <Button
-                        onClick={() => handle(() => fleetApi.transit(shipId, { route_id: selectedRoute }), "Transit started!")}
-                        disabled={submitting || !selectedRoute}
-                      >
-                        {submitting ? <Spinner className="size-4" /> : "Begin Transit"}
-                      </Button>
-                    </>
-                  )}
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="rename" className="mt-4">
-              <Card className="max-w-sm">
-                <CardHeader><CardTitle>Rename Ship</CardTitle></CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="space-y-2"><Label>New Name</Label><Input value={newName} onChange={(e) => setNewName(e.target.value)} /></div>
-                  <Button onClick={() => handle(() => fleetApi.renameShip(shipId, { name: newName }), "Ship renamed!")} disabled={submitting || !newName}>
-                    {submitting ? <Spinner className="size-4" /> : "Rename"}
+      {(s.status === "berthed" || s.status === "anchored_roadstead") && (
+        <div className="grid gap-4 lg:grid-cols-3">
+          <Panel title="Berth">
+            <div className="space-y-3 text-sm">
+              {s.status === "anchored_roadstead" ? (
+                <>
+                  <p className="text-muted-foreground">
+                    In the roadstead: free, but you can only deliver charters and freight from here. Dock to trade.
+                  </p>
+                  <Button size="sm" disabled={busy || !!s.dock_queued_at} onClick={() => dockAction("dock")}>
+                    {s.dock_queued_at ? "Queued for a berth" : "Dock"}
                   </Button>
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            {ship.status === "docked" && (
-              <TabsContent value="sell" className="mt-4">
-                <Card className="max-w-sm">
-                  <CardHeader><CardTitle>Sell Ship</CardTitle></CardHeader>
-                  <CardContent className="space-y-4">
-                    {!shipyard ? (
-                      <p className="text-sm text-muted-foreground">
-                        No shipyard at this port. Sail to a port with a shipyard to sell this ship.
-                      </p>
-                    ) : !sellConfirm ? (
-                      <Button variant="destructive" onClick={() => setSellConfirm(true)}>
-                        Sell Ship
-                      </Button>
-                    ) : (
-                      <div className="space-y-3">
-                        <p className="text-sm font-medium text-destructive">Are you sure? This will permanently remove the ship.</p>
-                        <div className="flex gap-2">
-                          <Button variant="destructive" onClick={handleSell} disabled={selling}>
-                            {selling ? <Spinner className="size-4" /> : "Confirm Sale"}
-                          </Button>
-                          <Button variant="outline" onClick={() => setSellConfirm(false)} disabled={selling}>
-                            Cancel
-                          </Button>
-                        </div>
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
-              </TabsContent>
-            )}
-          </Tabs>
-        </>
+                </>
+              ) : (
+                <>
+                  <p className="text-muted-foreground">Berthed: berth dues accrue daily. Move to the roadstead to wait for free.</p>
+                  <Button size="sm" variant="outline" disabled={busy || locked} onClick={() => dockAction("offshore")}>
+                    {locked ? `Locked ${fmtIn(s.turnaround_unlocks_at)}` : "Move to roadstead"}
+                  </Button>
+                </>
+              )}
+              <ErrorNote error={actionError} />
+            </div>
+          </Panel>
+          <Panel title="Depart" className="lg:col-span-2">
+            <DepartForm r={r} onDone={() => void reload()} />
+          </Panel>
+        </div>
       )}
     </div>
   );

@@ -1,74 +1,62 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { companyApi } from "@/lib/api/company";
-import type { Company } from "@/lib/types";
+import { BotIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
-
-const POLL_MS = 8_000;
+import { Spinner } from "@/components/ui/spinner";
+import { usePoll } from "@/hooks/use-poll";
+import { useCatalog } from "@/hooks/use-catalog";
+import { dash, kibbGet } from "@/lib/kibb/browser";
+import { fmtCr } from "@/lib/kibb/format";
+import type { RunnerView } from "@/lib/kibb/runner-registry";
+import type { CompanyProfile } from "@/lib/kibb/types";
 
 export function Header() {
   const router   = useRouter();
   const pathname = usePathname();
-  const [company, setCompany] = useState<Company | null>(null);
-  const [loading, setLoading] = useState(true);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const { portName } = useCatalog();
+  const { data: profile, loading } = usePoll(() => kibbGet<CompanyProfile>("/v1/company/profile"), 15_000, [pathname]);
+  const { data: runner } = usePoll(() => dash.get<RunnerView>("/api/kibb/runner"), 10_000, [pathname]);
 
-  const fetchCompany = () => {
-    companyApi
-      .getCompany()
-      .then(setCompany)
-      .catch(() => setCompany(null))
-      .finally(() => setLoading(false));
-  };
-
-  // Refetch immediately on every route change (catches company switches)
-  useEffect(() => {
-    fetchCompany();
-  }, [pathname]);
-
-  // Also poll on a timer to keep balance live
-  useEffect(() => {
-    timerRef.current = setInterval(fetchCompany, POLL_MS);
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, []);
+  const cash = profile?.vaults.filter((v) => v.account_type === "vault").reduce((n, v) => n + v.balance_pence, 0);
+  const status = runner?.state?.status;
 
   async function handleSignOut() {
-    await fetch("/api/auth/logout", { method: "POST" });
+    await dash.post("/api/kibb/auth/logout").catch(() => undefined);
     router.push("/login");
   }
 
   return (
-    <header className="flex justify-between items-center bg-card px-6 border-b h-14 shrink-0">
+    <header className="flex h-14 shrink-0 items-center justify-between border-b bg-card px-6">
       <div className="flex items-center gap-3">
-        {loading ? (
+        {loading && !profile ? (
           <Spinner className="size-4 text-muted-foreground" />
-        ) : company ? (
+        ) : profile ? (
           <>
-            <span className="font-semibold">{company.name}</span>
-            <Badge variant="secondary" size="sm" className="font-mono">{company.ticker}</Badge>
-            {company.status === "bankrupt" && (
-              <Badge variant="destructive" size="sm">Bankrupt</Badge>
-            )}
+            <span className="font-semibold">{profile.company.name}</span>
+            <Badge variant="secondary" size="sm">{portName(profile.company.home_port_id)}</Badge>
+            <span className="text-muted-foreground text-xs">{profile.handle}</span>
           </>
         ) : (
           <span className="text-muted-foreground text-sm">No company selected</span>
         )}
       </div>
       <div className="flex items-center gap-3">
-        {company && (
-          <span className="font-mono text-muted-foreground text-sm transition-all">
-            £{company.treasury?.toLocaleString()}
-          </span>
+        {runner && (
+          <Badge
+            variant={status === "running" || status === "starting" ? "success" : status === "failed" ? "error" : "secondary"}
+            className="gap-1.5"
+          >
+            <BotIcon className="size-3" />
+            Charter runner {status === "running" || status === "starting" ? "on" : status === "failed" ? "failed" : "off"}
+          </Badge>
         )}
+        {cash !== undefined && <span className="font-mono text-muted-foreground text-sm">{fmtCr(cash)}</span>}
         <button
+          type="button"
           onClick={() => router.push("/companies")}
-          className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+          className="text-muted-foreground text-xs transition-colors hover:text-foreground"
           title="Switch company"
         >
           Switch
