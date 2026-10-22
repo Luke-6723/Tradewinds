@@ -366,6 +366,7 @@ export interface DepartResult {
   speed_centiknots: number;
   berth_dues_pence: number;
   berth_dues_debt_pence: number;
+  route_legs: RouteLeg[];
   warnings: DepartWarning[];
 }
 
@@ -462,6 +463,9 @@ export interface ContractListing {
   reward_per_ton_pence?: number | null;
   collateral_pence: number;
   expires_at?: string | null;
+  /** Freight only: who is carrying it once accepted. */
+  carrier_company_id?: string | null;
+  carrier_ship_id?: string | null;
   title?: string | null;
   funded_by?: "crown" | "mint" | null;
   /** True when this is second-hand news; `remaining_quantity` may be out of date. */
@@ -496,7 +500,71 @@ export interface DeliverCharterResult {
   unlocked_phase: number;
 }
 
+export interface AcceptFreightResult {
+  contract_id: string;
+  carrier_ship_id: string;
+  origin_port_id: string;
+  dest_port_id: string;
+  commodity_id: string;
+  quantity: number;
+  reward_pence: number;
+  collateral_pence: number;
+  delivery_deadline: string;
+  status: ContractStatus;
+}
+
+export interface DeliverFreightResult {
+  contract_id: string;
+  dest_port_id: string;
+  commodity_id: string;
+  delivered_quantity: number;
+  reward_paid_pence: number;
+  collateral_returned_pence: number;
+}
+
+// ── Shipyard ──────────────────────────────────────────────────────────────────
+
+export type BuildMode = "byom" | "turnkey_cash";
+
+export interface BuildQuote {
+  port_id: string;
+  ship_class: string;
+  build_mode: BuildMode;
+  available: boolean;
+  labour_pence: number;
+  materials_pence: number;
+  yard_markup_pence: number;
+  /** Null when a turnkey material cannot be supplied. */
+  total_cost_pence?: number | null;
+  materials: { commodity_id: string; quantity: number; in_stock: boolean; cost_pence?: number | null }[];
+}
+
+export interface BuildShipResult {
+  ship_id: string;
+  name: string;
+  port_id: string;
+  ship_class: string;
+  build_mode: BuildMode;
+  status: ShipStatus;
+  total_cost_pence: number;
+}
+
 // ── Treasury ──────────────────────────────────────────────────────────────────
+
+export interface AchRate {
+  from_region: BankingRegion;
+  to_region: BankingRegion;
+  fee_bps: number;
+}
+
+export interface RemitResult {
+  from_region: BankingRegion;
+  to_region: BankingRegion;
+  gross_amount_pence: number;
+  fee_bps: number;
+  fee_pence: number;
+  net_credited_pence: number;
+}
 
 export interface VaultBalance {
   account_id: string;

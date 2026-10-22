@@ -1,30 +1,23 @@
 "use client";
 
-import { useState } from "react";
 import Link from "next/link";
-import { AnchorIcon, CrownIcon, FlagIcon, PlayIcon, ShipIcon, SquareIcon, WalletIcon } from "lucide-react";
+import { AnchorIcon, CrownIcon, FlagIcon, ShipIcon, WalletIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Empty,
   ErrorNote,
-  KV,
   Loading,
-  NativeSelect,
   Panel,
   Progress,
   ShipStatusBadge,
   StatTile,
   Table,
 } from "@/components/kibb/bits";
+import { FleetPanel } from "@/components/kibb/fleet-panel";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
-import { dash, kibbGet } from "@/lib/kibb/browser";
-import { fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
-import type { CharterSettings } from "@/lib/kibb/charter-runner";
-import type { RunnerView } from "@/lib/kibb/runner-registry";
+import { kibbGet } from "@/lib/kibb/browser";
+import { fmtCr, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type {
   CompanyProfile,
   ContractListing,
@@ -32,178 +25,6 @@ import type {
   LeaderboardResult,
   ShipResult,
 } from "@/lib/kibb/types";
-
-// ── Charter runner ────────────────────────────────────────────────────────────
-
-function RunnerPanel({ ships }: { ships: ShipResult[] }) {
-  const { catalog, portName, goodName } = useCatalog();
-  const { data: view, error, reload } = usePoll(() => dash.get<RunnerView>("/api/kibb/runner"), 4_000);
-  const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState<CharterSettings | null>(null);
-
-  if (!view) return <Panel title="Charter runner">{error ? <ErrorNote error={error} /> : <Loading />}</Panel>;
-
-  const st = view.state;
-  const on = view.enabled;
-  const s = view.settings;
-  const shipName =
-    ships.find((x) => x.ship.id === (s.shipId || st?.shipId))?.ship.name ?? st?.shipName ?? ships[0]?.ship.name ?? "First ship";
-
-  async function send(body: { enabled?: boolean; settings?: Partial<CharterSettings> }) {
-    setBusy(true);
-    setActionError(null);
-    try {
-      await dash.post<RunnerView>("/api/kibb/runner", body);
-      await reload();
-      return true;
-    } catch (e) {
-      setActionError((e as Error).message);
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const statusBadge =
-    st?.status === "running" ? <Badge variant="success">Running</Badge>
-    : st?.status === "starting" ? <Badge variant="info">Starting</Badge>
-    : st?.status === "failed" ? <Badge variant="error">Failed</Badge>
-    : <Badge variant="secondary">Stopped</Badge>;
-
-  const ports = catalog?.ports.filter((p) => p.phase === 1).sort((a, b) => a.name.localeCompare(b.name)) ?? [];
-  const goods = catalog?.commodities.slice().sort((a, b) => a.name.localeCompare(b.name)) ?? [];
-  const d = draft ?? s;
-
-  return (
-    <Panel
-      title="Charter runner"
-      action={
-        <Button
-          size="sm"
-          variant={on ? "outline" : "default"}
-          disabled={busy}
-          onClick={() => void send({ enabled: !on })}
-        >
-          {on ? <SquareIcon /> : <PlayIcon />}
-          {on ? "Stop" : "Start"}
-        </Button>
-      }
-    >
-      <div className="space-y-4">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-          {statusBadge}
-          <span>
-            {shipName}: buy {goodName(s.commodity)} at {portName(s.sourcePort)} → deliver at {portName(s.charterPort)}
-          </span>
-          {st?.nextTickAt && (st.status === "running" || st.status === "starting") && (
-            <span className="text-muted-foreground text-xs">next check {fmtIn(st.nextTickAt)}</span>
-          )}
-          <button
-            type="button"
-            className="ml-auto text-muted-foreground text-xs hover:text-foreground"
-            onClick={() => {
-              setDraft(s);
-              setEditing(!editing);
-            }}
-          >
-            {editing ? "Close settings" : "Settings"}
-          </button>
-        </div>
-
-        <ErrorNote error={actionError ?? st?.error ?? null} />
-
-        {editing && (
-          <form
-            className="grid grid-cols-2 gap-3 rounded-lg border p-3 lg:grid-cols-3"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              if (await send({ settings: d })) setEditing(false);
-            }}
-          >
-            <div className="space-y-1">
-              <Label>Ship</Label>
-              <NativeSelect value={d.shipId} onChange={(e) => setDraft({ ...d, shipId: e.target.value })}>
-                <option value="">First ship</option>
-                {ships.map((x) => (
-                  <option key={x.ship.id} value={x.ship.id}>{x.ship.name}</option>
-                ))}
-              </NativeSelect>
-            </div>
-            <div className="space-y-1">
-              <Label>Buy at</Label>
-              <NativeSelect value={d.sourcePort} onChange={(e) => setDraft({ ...d, sourcePort: e.target.value })}>
-                {ports.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </NativeSelect>
-            </div>
-            <div className="space-y-1">
-              <Label>Deliver at</Label>
-              <NativeSelect value={d.charterPort} onChange={(e) => setDraft({ ...d, charterPort: e.target.value })}>
-                {ports.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </NativeSelect>
-            </div>
-            <div className="space-y-1">
-              <Label>Good</Label>
-              <NativeSelect value={d.commodity} onChange={(e) => setDraft({ ...d, commodity: e.target.value })}>
-                {goods.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
-              </NativeSelect>
-            </div>
-            <div className="space-y-1">
-              <Label>Min margin (Cr/t)</Label>
-              <Input
-                type="number"
-                min={0}
-                value={d.minMarginPence / 100}
-                onChange={(e) => setDraft({ ...d, minMarginPence: Math.round(Number(e.target.value) * 100) })}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label>Cash reserve (Cr)</Label>
-              <Input
-                type="number"
-                min={0}
-                value={d.reservePence / 100}
-                onChange={(e) => setDraft({ ...d, reservePence: Math.round(Number(e.target.value) * 100) })}
-              />
-            </div>
-            <div className="col-span-full flex justify-end gap-2">
-              <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
-              <Button size="sm" type="submit" disabled={busy}>Save{on ? " and restart" : ""}</Button>
-            </div>
-          </form>
-        )}
-
-        {st && (
-          <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-5">
-            <KV rows={[["Trips", st.stats.trips]]} />
-            <KV rows={[["Delivered", fmtTons(st.stats.deliveredTons)]]} />
-            <KV rows={[["Reward", fmtCr(st.stats.rewardPence)]]} />
-            <KV rows={[["Spent", fmtCr(st.stats.spentPence)]]} />
-            <KV rows={[["Net", fmtCr(st.stats.rewardPence - st.stats.spentPence)]]} />
-            <p className="col-span-full text-muted-foreground text-xs">
-              Since the server started. Spent includes cargo still on its way to the charter.
-            </p>
-          </div>
-        )}
-
-        <div className="h-64 overflow-y-auto rounded-lg bg-muted/40 p-3 font-mono text-xs leading-relaxed">
-          {st && st.log.length > 0 ? (
-            [...st.log].reverse().map((l, i) => (
-              <div key={`${l.at}-${i}`} className={l.msg.startsWith("FATAL") ? "text-destructive" : undefined}>
-                <span className="text-muted-foreground">{fmtTime(l.at)}</span> {l.msg}
-              </div>
-            ))
-          ) : (
-            <span className="text-muted-foreground">
-              {on ? "Waiting for the first log line…" : "Not running since the server started. Press Start to run the loop."}
-            </span>
-          )}
-        </div>
-      </div>
-    </Panel>
-  );
-}
 
 // ── Ships ─────────────────────────────────────────────────────────────────────
 
@@ -403,7 +224,7 @@ export default function DashboardPage() {
 
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="xl:col-span-2">
-          <RunnerPanel ships={ships ?? []} />
+          <FleetPanel />
         </div>
         <VaultsPanel profile={profile} />
       </div>

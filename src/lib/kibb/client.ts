@@ -10,8 +10,16 @@
 
 import { randomUUID } from "node:crypto";
 import type {
+  AcceptFreightResult,
+  AchRate,
+  BankingRegion,
+  BuildMode,
+  BuildQuote,
+  BuildShipResult,
   Catalog,
   CompanyProfile,
+  DeliverFreightResult,
+  RemitResult,
   ContractListFilter,
   ContractListing,
   CreateCompanyRequest,
@@ -231,7 +239,29 @@ export class KibbClient {
   deliverCharter = (req: DeliverCharterRequest) =>
     this.post<DeliverCharterResult>("/v1/contract/deliver-charter", req);
 
+  acceptFreight = (contractId: string, shipId: string) =>
+    this.post<AcceptFreightResult>("/v1/contract/accept-freight", { contract_id: contractId, ship_id: shipId });
+
+  deliverFreight = (contractId: string, shipId: string) =>
+    this.post<DeliverFreightResult>("/v1/contract/deliver-freight", { contract_id: contractId, ship_id: shipId });
+
+  // ── Shipyard ────────────────────────────────────────────────────────────────
+
+  shipyardQuote = (portId: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
+    this.get<BuildQuote>("/v1/shipyard/quote", { port_id: portId, ship_class: shipClass, build_mode: buildMode });
+
+  buildShip = (portId: string, name: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
+    this.post<BuildShipResult>("/v1/shipyard/build-ship", { port_id: portId, name, ship_class: shipClass, build_mode: buildMode });
+
+  /** Sets the cannon count; adding guns needs a shipyard port (150 Cr each). */
+  modifyShip = (shipId: string, cannons: number) =>
+    this.post<ShipResult>("/v1/shipyard/modify-ship", { ship_id: shipId, target_cannons_count: cannons });
+
   // ── Treasury ────────────────────────────────────────────────────────────────
 
   vaults = () => this.get<TreasuryVaults>("/v1/treasury/vaults");
+  rates = () => this.get<AchRate[]>("/v1/treasury/rates");
+
+  remit = (from: BankingRegion, to: BankingRegion, grossPence: number) =>
+    this.post<RemitResult>("/v1/treasury/remit", { from_region: from, to_region: to, gross_amount_pence: grossPence });
 }

@@ -1,7 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { COOKIE_COMPANY_ID, COOKIE_PLAYER_KEY } from "@/lib/kibb/cookies";
-import { cookieOptions, ensureCompanyKey, errorResponse, kibb, PLAYER_KEY_TTL_S } from "@/lib/kibb/server";
+import { cookieOptions, ensureCompanyKey, errorResponse, forgetOwner, kibb, PLAYER_KEY_TTL_S } from "@/lib/kibb/server";
 import { getCompanyKey } from "@/lib/kibb/store";
+import { KibbApiError } from "@/lib/kibb/client";
 import type { CreateCompanyRequest } from "@/lib/kibb/types";
 
 export const runtime = "nodejs";
@@ -26,6 +27,11 @@ export async function GET(req: NextRequest) {
       active_company_id: req.cookies.get(COOKIE_COMPANY_ID)?.value ?? null,
     });
   } catch (e) {
+    if (e instanceof KibbApiError && e.status === 401) {
+      const res = noSession();
+      res.cookies.delete(COOKIE_PLAYER_KEY);
+      return res;
+    }
     return errorResponse(e);
   }
 }
@@ -42,6 +48,7 @@ export async function POST(req: NextRequest) {
       starter_ship_name: body.starter_ship_name || undefined,
     });
     await ensureCompanyKey(playerKey, created.company);
+    forgetOwner(playerKey);
     const res = NextResponse.json(created, { status: 201 });
     res.cookies.set(COOKIE_COMPANY_ID, created.company.id, cookieOptions(PLAYER_KEY_TTL_S));
     return res;

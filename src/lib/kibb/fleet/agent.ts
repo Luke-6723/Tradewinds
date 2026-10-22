@@ -1,0 +1,1118 @@
+/**
+ * One ship's autopilot. Asks the fleet manager for a lane (planner.ts), then runs it:
+ *
+ *   at the source  → dock, trim/top up stores, buy up to the charter's break-even price, depart
+ *   at the charter → deliver (from the roadstead when the per-ton berth lock would cost more than
+ *                    waiting out the base lock), deliver any freight, re-plan, sail on
+ *   anywhere else  → pick up freight bound the same way if it pays for its berth time, sail on
+ *
+ * Sealed freight pins the ship: it sails to the freight's destination before taking a new lane,
+ * and stands by there if the issuer refuses the tender (the carrier is paid if it expires).
+ * A lane is kept until its cargo is delivered, so a charter only visible from its own port is not
+ * forgotten on the way to the source.
+ *
+ * Each port call is a "stay" with its own record of what was traded, bought and refused there.
+ * All times are compared on the server's clock (World.now()).
+ */
+
+import { isApiError, KibbApiError, type KibbClient } from "../client";
+import type { BankingRegion, ContractListing, OrderBookLevel, RoutePlan, ShipResult } from "../types";
+import type { FleetSettings } from "./manager";
+import type { Lane } from "./planner";
+import type { World } from "./world";
+
+const POLL_MS              = 15_000;
+const MAX_SAIL_SLEEP_MS    = 60_000;
+const IDLE_WAIT_MS         = 3 * 60_000;
+const NO_CASH_WAIT_MS      = 2 * 60_000;
+const STAND_BY_MS          = 5 * 60_000;
+const ERROR_BACKOFF_MS     = 30_000;
+/** A lane that just failed at its source is skipped for one NPC re-quote (6 game hours at 60×). */
+const LANE_COOLDOWN_MS     = 6 * 60_000;
+/** Stores kept beyond the next legs' safe figures, in game days of eating in port. */
+const STORES_BUFFER_DAYS   = 2;
+const STORES_GOOD          = "provisions";
+const GUN_PRICE_PENCE      = 15_000;
+/** Value of a ship-hour when nothing better is known, for weighing detours (pence). */
+const DEFAULT_RATE_PER_HOUR = 300_000;
+/** Holds at an unfair market before carrying leftovers to the best market elsewhere. */
+const MAX_HOLDS            = 2;
+const FATAL_CODES          = ["account_suspended", "company_frozen"];
+/** Delivery refusals that mean the contract itself is gone, not that our cargo was refused. */
+const CLOSED_RE            = /complet|closed|filled|expired|cancel|not open|no longer|no remaining|defaulted|breach/i;
+
+export interface FleetHost {
+  readonly world: World;
+  readonly client: KibbClient;
+  readonly settings: FleetSettings;
+  log(source: string, msg: string): void;
+  fatal(msg: string): void;
+  /** Picks, reserves and returns the best lane for this ship from `from` (null: nothing pays). */
+  assignLane(agent: ShipAgent, from: string, r: ShipResult): Promise<Lane | null>;
+  releaseLane(agent: ShipAgent): void;
+  /** Cash spendable in a region after its floor, topping it up from other regions if short. */
+  ensureCash(region: BankingRegion, amount: number): Promise<number>;
+  /** Runs `fn` holding the company's cash lock, so raising cash and spending it can't interleave. */
+  withCash<T>(fn: () => Promise<T>): Promise<T>;
+  /** Called while this ship gives us presence at a shipyard: the buyer's chance to build there. */
+  visitShipyard(port: string): Promise<void>;
+  /** Guns a ship should carry (set for ships the buyer built), or undefined. */
+  armTarget(shipId: string): number | undefined;
+  noteArmed(shipId: string, guns: number, costPence: number): void;
+}
+
+export interface AgentStats {
+  trips: number;
+  deliveredTons: number;
+  rewardPence: number;
+  spentPence: number;
+  freightPence: number;
+}
+
+export interface CarriedFreight {
+  dest: string;
+  good: string;
+  tons: number;
+  reward: number;
+  deadline: string | null;
+  /** Server time the issuer last refused the tender at `dest`. */
+  refusedAt?: number;
+  /** Delivery was rejected outright: keep counting the sealed tons, stop sailing for it. */
+  undeliverable?: boolean;
+}
+
+export interface AgentState {
+  shipId: string;
+  name: string;
+  shipClass: string;
+  status: string;
+  port: string | null;
+  dest: string | null;
+  eta: string | null;
+  activity: string;
+  lane: Lane | null;
+  cargoTons: number;
+  hold: number;
+  stores: number;
+  freight: CarriedFreight[];
+  stats: AgentStats;
+  nextTickAt: string | null;
+}
+
+/** One port call: what was done there, so nothing is repeated or mis-delivered. */
+interface Stay {
+  port: string;
+  key: string;
+  scouted: boolean;
+  /** Kinds of berth trades done: "cargo", "stores", "freight", "arm", "yard". */
+  traded: Set<string>;
+  /** Tons of each good bought or unloaded from stores here: never deliverable to a charter here. */
+  boughtHere: Map<string, number>;
+  /** Charters that refused our cargo during this stay. */
+  refused: Set<string>;
+}
+
+const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
+const cr = (pence: number) => `${(pence / 100).toLocaleString("en-GB", { maximumFractionDigits: 2 })} Cr`;
+
+export class ShipAgent {
+  lane: Lane | null = null;
+  activity = "starting";
+  stats: AgentStats = { trips: 0, deliveredTons: 0, rewardPence: 0, spentPence: 0, freightPence: 0 };
+  last: ShipResult | null = null;
+  /** Set when the ship is no longer ours (sunk, seized, gone). */
+  gone = false;
+
+  private readonly freight = new Map<string, CarriedFreight>();
+  /** Freight ids the server has listed as ours: only those can be dropped for going unlisted. */
+  private readonly listedFreight = new Set<string>();
+  private freightSynced = false;
+  private stay: Stay | null = null;
+  /** Lane keys to skip until the given server time (sold out / too dear at the source). */
+  private readonly avoid = new Map<string, number>();
+  /** Last lane's profit rate, to value this ship's time (pence/hour). */
+  private ratePerHour = DEFAULT_RATE_PER_HOUR;
+  /** Consecutive holds with leftovers at a market that won't pay fairly. */
+  private holds = 0;
+  private stopRequested = false;
+  private wake: (() => void) | null = null;
+  private loop: Promise<void> | null = null;
+  private nextTickAt: number | null = null;
+
+  constructor(
+    private readonly host: FleetHost,
+    readonly shipId: string,
+    public name: string,
+    readonly shipClass: string,
+  ) {}
+
+  // ── Lifecycle ───────────────────────────────────────────────────────────────
+
+  get running(): boolean {
+    return this.loop !== null;
+  }
+
+  get state(): AgentState {
+    const r = this.last;
+    const s = r?.ship;
+    return {
+      shipId: this.shipId,
+      name: this.name,
+      shipClass: this.shipClass,
+      status: this.gone ? "gone" : (s?.status ?? "unknown"),
+      port: s?.current_port_id ?? null,
+      dest: s?.status === "sailing" ? (r?.route_legs.at(-1)?.to_node ?? null) : null,
+      eta: s?.status === "sailing" ? (r?.voyage?.estimated_arrival_at ?? s.leg_arrives_at ?? null) : null,
+      activity: this.activity,
+      lane: this.lane,
+      cargoTons: r?.cargo_used_tons ?? 0,
+      hold: r?.effective_hold_capacity_tons ?? 0,
+      stores: r?.stores.provisions_tons ?? 0,
+      freight: [...this.freight.values()],
+      stats: { ...this.stats },
+      nextTickAt: this.nextTickAt ? new Date(this.nextTickAt).toISOString() : null,
+    };
+  }
+
+  /** Tons of this good aboard that belong to us (not sealed freight). */
+  ownTons(r: ShipResult, good: string): number {
+    let sealed = 0;
+    for (const f of this.freight.values()) if (f.good === good) sealed += f.tons;
+    return Math.max(0, (r.cargo_manifest[good] ?? 0) - sealed);
+  }
+
+  /** Tons of sealed freight aboard. */
+  sealedTons(): number {
+    let t = 0;
+    for (const f of this.freight.values()) t += f.tons;
+    return t;
+  }
+
+  /** True while the lane's cargo still has to be bought (it counts against the source's depth). */
+  get boundToBuy(): boolean {
+    return !!this.lane && !!this.last && this.ownTons(this.last, this.lane.good) === 0;
+  }
+
+  /** True while waiting for cash to buy a load. */
+  get waitingForCash(): boolean {
+    return this.activity.startsWith("waiting for cash");
+  }
+
+  isAvoided(laneKey: string): boolean {
+    const until = this.avoid.get(laneKey);
+    return until !== undefined && until > this.host.world.now();
+  }
+
+  noteLane(lane: Lane): void {
+    if (lane.profitPerHour > 0) this.ratePerHour = lane.profitPerHour;
+  }
+
+  start(): void {
+    if (this.loop) return;
+    this.stopRequested = false;
+    this.loop = this.run().finally(() => {
+      this.loop = null;
+      this.nextTickAt = null;
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.stopRequested = true;
+    this.wake?.();
+    await this.loop;
+  }
+
+  private log(msg: string): void {
+    this.host.log(this.name, msg);
+  }
+
+  private async run(): Promise<void> {
+    while (!this.stopRequested) {
+      let wait: number;
+      try {
+        wait = await this.tick();
+      } catch (e) {
+        if (isApiError(e) && (e.status === 401 || FATAL_CODES.includes(e.code ?? ""))) {
+          this.host.fatal(e.message);
+          return;
+        }
+        this.log(`tick failed: ${(e as Error).message}`);
+        wait = ERROR_BACKOFF_MS;
+      }
+      await this.sleep(wait);
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    if (this.stopRequested) return Promise.resolve();
+    this.nextTickAt = Date.now() + ms;
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, ms);
+      const self = this;
+      function done() {
+        clearTimeout(timer);
+        self.wake = null;
+        resolve();
+      }
+      this.wake = done;
+    });
+  }
+
+  // ── Freight bookkeeping ─────────────────────────────────────────────────────
+
+  /**
+   * Reconciles carried freight with the server: adds lots listed as ours, drops lots the server
+   * listed before and no longer does (settled), and drops lots a game day past their deadline.
+   */
+  private async syncFreight(): Promise<void> {
+    try {
+      const active = await this.host.client.listContracts({ contract_type: "freight", status: "active", limit: 200 });
+      const mine = active.filter((x) => x.carrier_ship_id === this.shipId);
+      const ids = new Set(mine.map((c) => c.id));
+      for (const c of mine) this.trackFreight(c);
+      for (const id of [...this.freight.keys()]) {
+        if (this.listedFreight.has(id) && !ids.has(id)) {
+          const f = this.freight.get(id)!;
+          this.log(`freight to ${f.dest} is no longer active; treating the ${f.tons} t ${f.good} as settled`);
+          this.freight.delete(id);
+        }
+      }
+      this.listedFreight.clear();
+      for (const id of ids) this.listedFreight.add(id);
+      this.freightSynced = true;
+    } catch (e) {
+      this.log(`could not list carried freight yet: ${(e as Error).message}`);
+    }
+    const now = this.host.world.now();
+    for (const [id, f] of this.freight) {
+      if (f.deadline && Date.parse(f.deadline) + 24 * 60 * this.host.world.gameMinuteMs < now) {
+        this.log(`freight to ${f.dest} is past its deadline; treating the ${f.tons} t ${f.good} as settled`);
+        this.freight.delete(id);
+      }
+    }
+  }
+
+  private trackFreight(c: ContractListing): void {
+    if (!c.dest_port_id || !c.commodity_id || this.freight.has(c.id)) return;
+    this.freight.set(c.id, {
+      dest: c.dest_port_id,
+      good: c.commodity_id,
+      tons: c.quantity_required,
+      reward: c.reward_pence,
+      deadline: c.expires_at ?? null,
+    });
+  }
+
+  /** The freight destination to make for next: earliest deadline first. */
+  private freightDestination(here: string): string | null {
+    const lots = [...this.freight.values()].filter((f) => f.dest !== here && !f.undeliverable);
+    if (lots.length === 0) return null;
+    lots.sort((a, b) => (a.deadline ? Date.parse(a.deadline) : Infinity) - (b.deadline ? Date.parse(b.deadline) : Infinity));
+    return lots[0].dest;
+  }
+
+  // ── Tick ────────────────────────────────────────────────────────────────────
+
+  private async tick(): Promise<number> {
+    const { client, world } = this.host;
+    let r: ShipResult;
+    try {
+      r = await client.ship(this.shipId);
+    } catch (e) {
+      if (isApiError(e) && (e.status === 404 || e.code === "ship_not_found")) return this.leaveFleet("is no longer in the fleet");
+      throw e;
+    }
+    this.last = r;
+    const s = r.ship;
+
+    if (s.status === "sunk") return this.leaveFleet("has sunk");
+    if (!this.freightSynced) await this.syncFreight();
+
+    if (s.status === "sailing") {
+      this.stay = null;
+      if (!this.lane && this.freightSynced) this.adoptCargoLane(r);
+      const eta = Date.parse(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at ?? "") || 0;
+      const ms = eta ? eta - world.now() : POLL_MS;
+      this.activity = `sailing to ${r.route_legs.at(-1)?.to_node ?? "?"}, arrives in ${secs(ms)}`;
+      return Math.min(Math.max(ms + 1_500, 2_000), MAX_SAIL_SLEEP_MS);
+    }
+
+    const port = s.current_port_id;
+    if (!port) return POLL_MS;
+    if (!this.stay || this.stay.port !== port) {
+      this.stay = { port, key: `${port}@${Date.now()}`, scouted: false, traded: new Set(), boughtHere: new Map(), refused: new Set() };
+      await this.syncFreight();
+      await this.refreshPortCharters(port);
+    }
+    if (!this.freightSynced) {
+      this.activity = "waiting to confirm which cargo is sealed freight";
+      return POLL_MS;
+    }
+    return this.atPort(r, this.stay);
+  }
+
+  private leaveFleet(why: string): number {
+    this.log(`${why}; stopping its autopilot`);
+    this.activity = why;
+    this.gone = true;
+    this.host.releaseLane(this);
+    this.stopRequested = true;
+    return 0;
+  }
+
+  /** After a restart mid-voyage: rebuild the lane so its charter room stays reserved. */
+  private adoptCargoLane(r: ShipResult): void {
+    const dest = r.route_legs.at(-1)?.to_node;
+    if (!dest) return;
+    for (const good of Object.keys(r.cargo_manifest)) {
+      const tons = this.ownTons(r, good);
+      const c = this.host.world.charters.filter((x) => x.port === dest && x.good === good).sort((a, b) => b.payPerTon - a.payPerTon)[0];
+      if (tons <= 0 || !c) continue;
+      this.lane = this.cargoLane(good, r.route_legs[0]?.from_node ?? dest, dest, c.id, Math.min(tons, c.remaining), c.payPerTon);
+      return;
+    }
+  }
+
+  private cargoLane(good: string, source: string, dest: string, charterId: string, tons: number, pay: number): Lane {
+    return {
+      key: `${good}:${source}>${dest}`,
+      good,
+      source,
+      dest,
+      fills: [[charterId, tons]],
+      pay,
+      minPay: pay,
+      estAsk: 0,
+      askKnown: false,
+      costPerTon: 0,
+      margin: 0,
+      tons,
+      loopMs: 0,
+      profitPerHour: 0,
+    };
+  }
+
+  private async refreshPortCharters(port: string): Promise<void> {
+    try {
+      const list = await this.host.client.listContracts({ contract_type: "charter", port_id: port, status: "open", limit: 200 });
+      this.host.world.mergePortCharters(port, list);
+    } catch {
+      // Keep the manager's last listing.
+    }
+  }
+
+  private async atPort(r: ShipResult, stay: Stay): Promise<number> {
+    const { world, client } = this.host;
+    const port = stay.port;
+    const atYard = !!world.port(port)?.has_shipyard;
+
+    if (!stay.scouted) {
+      stay.scouted = true;
+      await this.scout(port);
+    }
+
+    // 1. Freight that ends here (works from the roadstead).
+    let refusedHere = false;
+    let freightChanged = false;
+    for (const [id, f] of [...this.freight].filter(([, x]) => x.dest === port && !x.undeliverable)) {
+      const out = await this.deliverFreight(id, f);
+      if (out === "retry") {
+        this.activity = "freight delivery hit a temporary error; retrying";
+        return 15_000;
+      }
+      if (out === "refused") refusedHere = true;
+      else if (out !== "error") freightChanged = true;
+    }
+    if (freightChanged) r = await this.reread();
+
+    // 2. Our own cargo that a charter here takes. Goods loaded at this port never count.
+    const deliverable = (good: string) => this.ownTons(r, good) - (stay.boughtHere.get(good) ?? 0);
+    const due = world.charters.filter((c) => c.port === port && c.remaining > 0 && !stay.refused.has(c.id) && deliverable(c.good) > 0);
+    if (due.length > 0) {
+      const s = r.ship;
+      const tons = due.reduce((n, c) => Math.max(n, deliverable(c.good)), 0);
+      if (s.status === "berthed") {
+        const lockLeft = s.turnaround_unlocks_at ? Date.parse(s.turnaround_unlocks_at) - world.now() : 0;
+        // At the berth each ton delivered extends the lock; from the roadstead it doesn't.
+        if (tons * world.handlingMsPerTon(port) > Math.max(lockLeft, 0) + 5_000) {
+          if (lockLeft > 0) {
+            this.activity = `waiting ${secs(lockLeft)} for the berth lock, then delivering from the roadstead`;
+            return lockLeft + 1_000;
+          }
+          try {
+            await client.offshore(this.shipId);
+            this.log(`moved to the roadstead at ${port} to deliver without the per-ton berth lock`);
+          } catch (e) {
+            if (!isApiError(e) || e.status >= 500) throw e;
+            // Lock not quite clear on the server's clock: deliver at the berth instead.
+          }
+        }
+      }
+      const res = await this.deliverCharters(r, port, stay, deliverable);
+      if (res.delivered > 0) {
+        this.stats.trips++;
+        this.host.releaseLane(this);
+      }
+      r = await this.reread();
+      if (res.retry) {
+        this.activity = "delivery hit a temporary error; retrying";
+        return 15_000;
+      }
+    }
+
+    if (refusedHere) {
+      // Standing by: hold nothing else back, and keep checking whether the contract has settled.
+      this.host.releaseLane(this);
+      await this.syncFreight();
+      if (r.ship.status === "berthed" && !this.locked(r)) await client.offshore(this.shipId).catch(() => undefined);
+      this.activity = `standing by at ${port}: the freight issuer has no warehouse space (we are paid if it expires)`;
+      return STAND_BY_MS;
+    }
+
+    if (atYard && (await this.armIfNeeded(r, stay))) r = await this.reread();
+    // Building needs presence, which we have only while here: give the buyer a look before leaving,
+    // after this ship's own next lane is reserved so its load money is counted.
+    const yardVisit = async () => {
+      if (atYard && !stay.traded.has("yard")) {
+        stay.traded.add("yard");
+        await this.host.visitShipyard(port);
+      }
+    };
+
+    // 3. Where next. Sealed freight decides first.
+    const pinned = this.freightDestination(port);
+    if (pinned) {
+      if (this.lane && this.lane.source !== pinned) this.host.releaseLane(this);
+      await yardVisit();
+      return this.sailTo(r, pinned, stay);
+    }
+    // At the source of the lane we hold: load (keeping the lane, whose charter may only be visible
+    // from its own port), topping up whatever of the good is already aboard.
+    if (this.lane && this.lane.source === port && !stay.traded.has("cargo") && !this.isAvoided(this.lane.key)) {
+      // The lane was planned a while ago: load only what its charters still have room for.
+      const now = world.now();
+      const live = this.lane.fills.reduce((n, [id, t]) => {
+        const c = world.charters.find((x) => x.id === id && x.remaining > 0 && (x.expiresAt === null || x.expiresAt > now));
+        return n + (c ? Math.min(t, c.remaining) : 0);
+      }, 0);
+      if (live >= Math.min(10, this.lane.tons / 2)) {
+        if (live < this.lane.tons) this.lane = { ...this.lane, tons: live };
+        await yardVisit();
+        return this.loadAt(await this.reread(), this.lane, stay);
+      }
+      this.host.releaseLane(this);
+    }
+    if (this.lane && this.ownTons(r, this.lane.good) > 0 && this.lane.dest !== port) {
+      await yardVisit();
+      return this.sailTo(r, this.lane.dest, stay);
+    }
+    for (const good of Object.keys(r.cargo_manifest)) {
+      if (this.ownTons(r, good) <= 0) continue;
+      const wait = await this.handleLeftover(r, good, stay);
+      if (wait !== null) return wait;
+    }
+    this.holds = 0;
+
+    const lane = await this.host.assignLane(this, port, r);
+    await yardVisit();
+    if (!lane) {
+      this.activity = "no lane pays right now; waiting";
+      if (r.ship.status === "berthed" && !this.locked(r)) await client.offshore(this.shipId).catch(() => undefined);
+      return IDLE_WAIT_MS;
+    }
+    if (lane.source === port) return this.loadAt(await this.reread(), lane, stay);
+    await this.takeFreight(r, lane.source, stay);
+    return this.sailTo(await this.reread(), lane.source, stay);
+  }
+
+  private async reread(): Promise<ShipResult> {
+    this.last = await this.host.client.ship(this.shipId);
+    return this.last;
+  }
+
+  private locked(r: ShipResult): boolean {
+    const u = r.ship.turnaround_unlocks_at;
+    return r.ship.status === "berthed" && !!u && Date.parse(u) > this.host.world.now();
+  }
+
+  /** Hold tons that topping stores up to `target` will take (stores come in whole tons). */
+  private storesHoldNeed(have: number, target: number): number {
+    if (have >= target) return 0;
+    const tons = Math.max(1, Math.ceil(target - have));
+    return Math.ceil(have + tons) - Math.ceil(have);
+  }
+
+  /** Reads the book and the coffee-house gossip once per stay, feeding the planner's prices. */
+  private async scout(port: string): Promise<void> {
+    const { client, world } = this.host;
+    const [book, detail] = await Promise.allSettled([client.book(port), client.port(port)]);
+    if (book.status === "fulfilled") world.observeBook(book.value);
+    if (detail.status === "fulfilled") world.observeGossip(detail.value);
+  }
+
+  /**
+   * Mounts the guns the buyer decided on while berthed at a yard, if the hold has room for them
+   * (2 t each) plus a ton to spare for stores. Returns whether guns were mounted.
+   */
+  private async armIfNeeded(r: ShipResult, stay: Stay): Promise<boolean> {
+    const target = this.host.armTarget(this.shipId);
+    if (target === undefined || r.ship.cannons_count >= target || stay.traded.has("arm") || r.ship.status !== "berthed") return false;
+    const adding = target - r.ship.cannons_count;
+    if (r.effective_hold_capacity_tons - r.cargo_used_tons < 2 * adding + 1) return false;
+    stay.traded.add("arm");
+    const cost = adding * GUN_PRICE_PENCE;
+    const region = this.host.world.region(stay.port);
+    return this.host.withCash(async () => {
+      const cash = await this.host.ensureCash(region, cost);
+      if (cash < cost) {
+        this.log(`can't afford ${adding} guns yet`);
+        return false;
+      }
+      try {
+        await this.host.client.modifyShip(this.shipId, target);
+        this.host.world.vaults.set(region, this.host.world.vault(region) - cost);
+        this.host.noteArmed(this.shipId, target, cost);
+        this.log(`mounted guns: now ${target}`);
+        return true;
+      } catch (e) {
+        if (!isApiError(e) || e.status >= 500) throw e;
+        this.log(`arming refused: ${e.message}`);
+        return false;
+      }
+    });
+  }
+
+  // ── Loading ─────────────────────────────────────────────────────────────────
+
+  private async loadAt(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
+    if (stay.traded.has("cargo")) return this.sailTo(r, lane.dest, stay);
+    if (r.ship.status !== "berthed") {
+      // Docking costs a berth stay: only when at least a ton can be paid for.
+      const ton = Math.max(lane.costPerTon, 1);
+      if ((await this.host.ensureCash(this.host.world.region(lane.source), ton)) < ton) {
+        this.host.releaseLane(this);
+        this.activity = "waiting for cash to buy a load";
+        return NO_CASH_WAIT_MS;
+      }
+      return this.dockOrWait(r);
+    }
+
+    const trimmed = lane.good === STORES_GOOD ? await this.trimStores(r, lane, stay) : 0;
+    await this.topUpStoresFor(await this.reread(), lane.source, lane.dest, stay, lane.source);
+    r = await this.reread();
+
+    const res = await this.buyCargo(r, lane, stay);
+    if (res.bought === 0) {
+      // Put surplus stores moved into cargo back: they were only worth carrying with a load.
+      if (trimmed > 0) {
+        await this.host.client.provision(this.shipId, trimmed, "cargo").catch(() => undefined);
+        stay.boughtHere.set(STORES_GOOD, Math.max(0, (stay.boughtHere.get(STORES_GOOD) ?? 0) - trimmed));
+      }
+      this.host.releaseLane(this);
+      if (res.reason === "cash") {
+        this.activity = "waiting for cash to buy a load";
+        if (!this.locked(r)) await this.host.client.offshore(this.shipId).catch(() => undefined);
+        return NO_CASH_WAIT_MS;
+      }
+      this.avoid.set(lane.key, this.host.world.now() + LANE_COOLDOWN_MS * (60 / this.host.world.timeScale));
+      this.activity = `re-planning: ${res.reason}`;
+      return 3_000;
+    }
+    stay.traded.add("cargo");
+    return this.sailTo(await this.reread(), lane.dest, stay);
+  }
+
+  private async buyCargo(r: ShipResult, lane: Lane, stay: Stay): Promise<{ bought: number; reason: string }> {
+    const { client, world, settings } = this.host;
+    const port = lane.source;
+    // Room for the cargo after the whole tons of stores the voyage still needs.
+    const storesTarget = await this.storesTarget(lane.source, lane.dest, lane.source);
+    const storesRoom = this.storesHoldNeed(r.stores.provisions_tons, storesTarget);
+    return this.host.withCash(async () => {
+      const book = await client.book(port, lane.good);
+      world.observeBook(book);
+      const b = book.books.find((x) => x.commodity_id === lane.good);
+      if (!b?.best_ask) {
+        world.observeNoAsk(port, lane.good);
+        return { bought: 0, reason: `no ${lane.good} on offer at ${port}` };
+      }
+
+      const customs = 1 + book.customs_bps / 10_000;
+      const fee = 1 + world.remitBps(world.region(lane.dest), world.region(port)) / 10_000;
+      // Every ton must clear the margin against the lowest-paying charter in the load.
+      const limit = Math.floor((lane.minPay - settings.minMarginPence) / (customs * fee));
+      if (b.best_ask.price_pence > limit) {
+        this.log(`${lane.good} at ${port} asks ${cr(b.best_ask.price_pence)}/t, above the ${cr(limit)}/t break-even for ${lane.dest}`);
+        return { bought: 0, reason: `${lane.good} too dear at ${port}` };
+      }
+      const room = Math.min(r.effective_hold_capacity_tons - r.cargo_used_tons - storesRoom, lane.tons - this.ownTons(r, lane.good));
+      if (room <= 0) return { bought: 0, reason: "no room" };
+
+      // Price `n` tons by walking the visible ask ladder up to the limit (beyond it: at the limit).
+      const asks: OrderBookLevel[] = (b.depth?.asks ?? []).filter((l) => l.price_pence <= limit).sort((x, y) => x.price_pence - y.price_pence);
+      const costFor = (n: number) => {
+        let left = n;
+        let cost = 0;
+        for (const l of asks) {
+          const take = Math.min(left, l.remaining_quantity);
+          cost += take * l.price_pence;
+          left -= take;
+          if (left <= 0) break;
+        }
+        return Math.ceil((cost + Math.max(0, left) * limit) * customs);
+      };
+      const cash = await this.host.ensureCash(world.region(port), costFor(room));
+      let qty = room;
+      while (qty > 0 && costFor(qty) > cash) qty--;
+      if (qty <= 0) {
+        this.log(`not enough cash in ${world.region(port)} for ${lane.good} at ${port}`);
+        return { bought: 0, reason: "cash" };
+      }
+
+      try {
+        this.log(`bid ${qty} t ${lane.good} at ${port} ≤ ${cr(limit)}/t (ask ${cr(b.best_ask.price_pence)}, pays ${cr(lane.pay)}/t at ${lane.dest})`);
+        const res = await client.placeOrder({
+          port_id: port,
+          commodity_id: lane.good,
+          side: "bid",
+          time_in_force: "ioc",
+          price_pence: limit,
+          quantity: qty,
+          ship_id: this.shipId,
+        });
+        const paid = res.total_gross_pence + res.customs_duty_pence;
+        this.stats.spentPence += paid;
+        world.vaults.set(world.region(port), world.vault(world.region(port)) - paid);
+        stay.boughtHere.set(lane.good, (stay.boughtHere.get(lane.good) ?? 0) + res.filled_quantity);
+        this.log(`bought ${res.filled_quantity}/${qty} t for ${cr(paid)} (${cr(res.filled_quantity ? paid / res.filled_quantity : 0)}/t landed)`);
+        return { bought: res.filled_quantity, reason: res.filled_quantity ? "ok" : "nothing filled" };
+      } catch (e) {
+        if (isApiError(e) && e.status === 400) {
+          this.log(`buy refused: ${e.message}`);
+          return { bought: 0, reason: "refused" };
+        }
+        throw e;
+      }
+    });
+  }
+
+  // ── Delivering ──────────────────────────────────────────────────────────────
+
+  private async deliverCharters(
+    r: ShipResult,
+    port: string,
+    stay: Stay,
+    deliverable: (good: string) => number,
+  ): Promise<{ delivered: number; retry: boolean }> {
+    const { client, world } = this.host;
+    let delivered = 0;
+    let retry = false;
+    const charters = world.charters.filter((c) => c.port === port && !stay.refused.has(c.id)).sort((a, b) => b.payPerTon - a.payPerTon);
+    for (const c of charters) {
+      const qty = Math.min(deliverable(c.good), c.remaining);
+      if (qty <= 0) continue;
+      try {
+        const res = await client.deliverCharter({ contract_id: c.id, quantity: qty, ship_id: this.shipId });
+        c.remaining -= res.delivered_quantity;
+        if (c.remaining <= 0 || res.contract_status !== "open") {
+          c.remaining = 0;
+          world.markClosed(c.id);
+        }
+        r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
+        delivered += res.delivered_quantity;
+        this.stats.deliveredTons += res.delivered_quantity;
+        this.stats.rewardPence += res.reward_paid_pence;
+        world.vaults.set(world.region(port), world.vault(world.region(port)) + res.reward_paid_pence);
+        this.log(`delivered ${res.delivered_quantity} t ${c.good} at ${port}: ${cr(res.reward_paid_pence)} (${c.title}; ${res.contract_status}, phase ${res.unlocked_phase})`);
+      } catch (e) {
+        if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
+        if (e.status === 401 || e.status === 403 || FATAL_CODES.includes(e.code ?? "")) throw e;
+        if (e.status === 429 || e.code === "idempotency_request_in_flight") {
+          retry = true;
+          break;
+        }
+        if (e.status === 404 || ((e.status === 400 || e.status === 409) && CLOSED_RE.test(e.detail))) {
+          c.remaining = 0;
+          world.markClosed(c.id);
+          this.log(`${c.title} is closed: ${e.detail}`);
+        } else {
+          stay.refused.add(c.id);
+          this.log(`${c.title} refused our ${c.good}: ${e.message}`);
+        }
+      }
+    }
+    return { delivered, retry };
+  }
+
+  private async deliverFreight(id: string, f: CarriedFreight): Promise<"delivered" | "refused" | "gone" | "retry" | "error"> {
+    try {
+      const res = await this.host.client.deliverFreight(id, this.shipId);
+      this.freight.delete(id);
+      this.stats.freightPence += res.reward_paid_pence;
+      this.log(`delivered freight: ${res.delivered_quantity} t ${f.good} at ${f.dest} for ${cr(res.reward_paid_pence)}`);
+      return "delivered";
+    } catch (e) {
+      if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
+      if (e.status === 401 || FATAL_CODES.includes(e.code ?? "")) throw e;
+      if (e.status === 429 || e.code === "idempotency_request_in_flight") return "retry";
+      const pastDeadline = !!f.deadline && Date.parse(f.deadline) < this.host.world.now();
+      if (e.status === 404 || CLOSED_RE.test(e.detail) || (e.status === 409 && pastDeadline)) {
+        this.log(`freight to ${f.dest} is settled: ${e.detail}`);
+        this.freight.delete(id);
+        return "gone";
+      }
+      if (e.status === 409) {
+        // Refused tender: the issuer has no space. The cargo stays sealed; stand by until it settles.
+        if (!f.refusedAt) this.log(`freight tender at ${f.dest} refused (${e.detail}); standing by`);
+        f.refusedAt = this.host.world.now();
+        return "refused";
+      }
+      // Rejected outright: stop sailing for it; the sealed tons stay counted until the server drops it.
+      f.undeliverable = true;
+      this.log(`freight delivery at ${f.dest} rejected (${e.message}); no longer sailing for it`);
+      return "error";
+    }
+  }
+
+  /**
+   * Takes open freight from here to `next` (the leg we are about to sail anyway) when its reward
+   * beats the value of the berth time its loading costs. Leaves room for the stores the voyage needs.
+   */
+  private async takeFreight(r: ShipResult, next: string, stay: Stay): Promise<void> {
+    const { client, world, settings } = this.host;
+    const port = stay.port;
+    if (!settings.useFreight || r.ship.status !== "berthed" || stay.traded.has("freight")) return;
+    stay.traded.add("freight");
+
+    let listings: ContractListing[];
+    try {
+      listings = await client.listContracts({ contract_type: "freight", port_id: port, status: "open", limit: 200 });
+    } catch {
+      return;
+    }
+    const profitPerMs = this.ratePerHour / 3_600_000;
+    const handling = world.handlingMsPerTon(port);
+    const candidates = listings
+      .filter((c) => c.origin_port_id === port && c.dest_port_id === next && !c.stale)
+      .map((c) => ({ c, value: c.reward_pence - c.quantity_required * handling * profitPerMs }))
+      .filter((x) => x.value > 0)
+      .sort((a, b) => b.value / b.c.quantity_required - a.value / a.c.quantity_required);
+    if (candidates.length === 0) return;
+
+    const need = await this.storesTarget(port, next, this.lane?.dest);
+    let room = r.effective_hold_capacity_tons - r.cargo_used_tons - this.storesHoldNeed(r.stores.provisions_tons, need);
+
+    for (const { c } of candidates) {
+      if (c.quantity_required > room) continue;
+      const taken = await this.host.withCash(async () => {
+        const cash = await this.host.ensureCash(world.region(port), c.collateral_pence);
+        if (cash < c.collateral_pence) return false;
+        try {
+          const res = await client.acceptFreight(c.id, this.shipId);
+          this.freight.set(c.id, {
+            dest: res.dest_port_id,
+            good: res.commodity_id,
+            tons: res.quantity,
+            reward: res.reward_pence,
+            deadline: res.delivery_deadline,
+          });
+          world.vaults.set(world.region(port), world.vault(world.region(port)) - res.collateral_pence);
+          this.log(`took freight: ${res.quantity} t ${res.commodity_id} ${port} → ${res.dest_port_id} for ${cr(res.reward_pence)} (collateral ${cr(res.collateral_pence)})`);
+          return true;
+        } catch (e) {
+          const unknown = !isApiError(e) || e.status >= 500 || e.code === "idempotency_request_in_flight" || e.status === 429;
+          if (!unknown && e.status !== 401) {
+            this.log(`freight ${c.id.slice(0, 8)} not taken: ${(e as Error).message}`);
+            return false;
+          }
+          // Unknown outcome: the server may have bound it to us. Re-sync before going on.
+          this.freightSynced = false;
+          throw e;
+        }
+      });
+      if (taken) room -= c.quantity_required;
+    }
+  }
+
+  /**
+   * Own cargo with no lane (charter filled, restart). In order: carry it to an open charter when
+   * that beats selling here by more than the voyage is worth; sell here at a fair bid; let a small
+   * residue ride along (returns null: carry on planning); else take it to the best market elsewhere.
+   */
+  private async handleLeftover(r: ShipResult, good: string, stay: Stay): Promise<number | null> {
+    const { world, client, settings } = this.host;
+    const port = stay.port;
+    const tons = this.ownTons(r, good);
+    const cls = world.shipClass(this.shipClass);
+    const hull = cls?.hull_category ?? "coastal";
+    const knots = (cls?.base_speed_centiknots ?? 800) / 100;
+    const now = world.now();
+    const base = world.basePrice(good);
+
+    // What it fetches here (fresh book when this port trades it).
+    let localBid = 0;
+    if (world.trades(port, good)) {
+      const book = await client.book(port, good).catch(() => null);
+      if (book) world.observeBook(book);
+      localBid = world.price(port, good)?.bid ?? 0;
+    }
+
+    // Stores this ship could carry for a leg: what it has, plus free hold, plus provisions cargo it could eat.
+    const stockable = r.stores.provisions_tons + Math.max(0, r.effective_hold_capacity_tons - r.cargo_used_tons) + this.ownTons(r, STORES_GOOD);
+    const reachable = (plan: RoutePlan) => world.routeRated(plan, hull) && plan.safe_provisions_tons <= stockable;
+
+    let best: { c: (typeof world.charters)[number]; take: number; value: number } | null = null;
+    for (const c of world.charters) {
+      if (c.good !== good || c.port === port || c.stale || c.remaining <= 0 || !world.isOpen(c.port)) continue;
+      const plan = await world.route(port, c.port, this.shipClass).catch(() => null);
+      if (!plan || !reachable(plan)) continue;
+      const sailMs = world.sailMs(plan.total_distance_nm, knots * 0.8);
+      if (c.expiresAt !== null && c.expiresAt < now + sailMs + 30 * world.gameMinuteMs + 10 * 60_000) continue;
+      const take = Math.min(tons, c.remaining);
+      const value = take * (c.payPerTon - localBid - settings.minMarginPence) - (sailMs / 3_600_000) * this.ratePerHour;
+      if (value > 0 && (!best || value > best.value)) best = { c, take, value };
+    }
+    if (best) {
+      this.lane = this.cargoLane(good, port, best.c.port, best.c.id, best.take, best.c.payPerTon);
+      this.log(`carrying ${tons} t ${good} already aboard to ${best.c.title}`);
+      return this.sailTo(r, best.c.port, stay);
+    }
+
+    // Sell here at a fair bid, unless a charter here refused it this stay (don't dump it at a loss).
+    const refusedHere = world.charters.some((c) => c.good === good && stay.refused.has(c.id));
+    if (localBid >= base * 0.5 && !refusedHere) {
+      if (r.ship.status !== "berthed") return this.dockOrWait(r);
+      try {
+        const res = await client.placeOrder({
+          port_id: port,
+          commodity_id: good,
+          side: "ask",
+          time_in_force: "ioc",
+          price_pence: localBid,
+          quantity: tons,
+          ship_id: this.shipId,
+        });
+        if (res.filled_quantity > 0) {
+          this.stats.rewardPence += res.total_gross_pence;
+          this.holds = 0;
+          this.log(`sold ${res.filled_quantity}/${tons} t leftover ${good} at ${port} for ${cr(res.total_gross_pence)}`);
+          return 2_000;
+        }
+      } catch (e) {
+        if (!isApiError(e) || e.status >= 500) throw e;
+        this.log(`selling ${good} at ${port} refused: ${e.message}`);
+      }
+    }
+
+    // A small residue (part of a load a charter couldn't take) rides along rather than idling the ship.
+    if (tons <= Math.max(2, 0.05 * Math.max(r.hold_capacity_tons, 1))) return null;
+
+    // The best market elsewhere: known bids net of the voyage, after holding here a while.
+    this.holds++;
+    let market: { port: string; value: number } | null = null;
+    for (const p of world.catalog.ports) {
+      if (p.id === port || !world.isOpen(p.id) || !world.trades(p.id, good)) continue;
+      const plan = await world.route(port, p.id, this.shipClass).catch(() => null);
+      if (!plan || !reachable(plan)) continue;
+      const bid = world.price(p.id, good)?.bid ?? ((p.imports ?? []).includes(good) ? base * 0.9 : 0);
+      const value = tons * bid - (world.sailMs(plan.total_distance_nm, knots * 0.8) / 3_600_000) * this.ratePerHour;
+      if (!market || value > market.value) market = { port: p.id, value };
+    }
+    if (market && (market.value > tons * localBid || this.holds > MAX_HOLDS)) {
+      this.log(`taking ${tons} t ${good} to ${market.port} to sell`);
+      this.holds = 0;
+      return this.sailTo(r, market.port, stay);
+    }
+    this.activity = `holding ${tons} t ${good}: no fair bid at ${port}`;
+    if (r.ship.status === "berthed" && !this.locked(r)) await client.offshore(this.shipId).catch(() => undefined);
+    return IDLE_WAIT_MS;
+  }
+
+  // ── Stores ──────────────────────────────────────────────────────────────────
+
+  private async storesTarget(from: string, to: string, then?: string): Promise<number> {
+    const { world } = this.host;
+    if (from === to) return 0;
+    const first = await world.route(from, to, this.shipClass);
+    const second = then && then !== to ? await world.route(to, then, this.shipClass) : null;
+    return first.safe_provisions_tons + (second?.safe_provisions_tons ?? 0) + STORES_BUFFER_DAYS * first.port_provisions_tons_per_day;
+  }
+
+  /** Whole tons of surplus stores into cargo, carried on to the provisions charter. Returns tons moved. */
+  private async trimStores(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
+    if (stay.port === lane.dest) return 0;
+    const target = await this.storesTarget(lane.source, lane.dest, lane.source);
+    const surplus = Math.floor(r.stores.provisions_tons - target);
+    if (surplus < 1) return 0;
+    await this.host.client.unprovision(this.shipId, surplus, "cargo");
+    stay.boughtHere.set(STORES_GOOD, (stay.boughtHere.get(STORES_GOOD) ?? 0) + surplus);
+    this.log(`moved ${surplus} t of surplus stores into cargo for the ${lane.dest} charter`);
+    return surplus;
+  }
+
+  /**
+   * Best effort: buys stores for the next leg (and the one after) while berthed, only what fits in
+   * the hold and only if the cash is there. Returns whether the stores now cover the target.
+   */
+  private async topUpStoresFor(r: ShipResult, from: string, to: string, stay: Stay, then?: string, extraTons = 0): Promise<boolean> {
+    const { client, world } = this.host;
+    const target = (await this.storesTarget(from, to, then ?? from)) + extraTons;
+    const have = r.stores.provisions_tons;
+    if (have >= target) return true;
+    if (r.ship.status !== "berthed") return false;
+
+    // Stores take whole tons of hold: buy no more than the free space allows.
+    const free = r.effective_hold_capacity_tons - r.cargo_used_tons;
+    let tons = Math.max(1, Math.ceil(target - have));
+    while (tons > 0 && Math.ceil(have + tons) - Math.ceil(have) > free) tons--;
+    if (tons <= 0) {
+      this.log(`no hold space for stores at ${stay.port}`);
+      return false;
+    }
+
+    const port = stay.port;
+    const book = await client.book(port, STORES_GOOD);
+    world.observeBook(book);
+    const ask = book.books.find((b) => b.commodity_id === STORES_GOOD)?.best_ask;
+    if (!ask) {
+      this.log(`no provisions on sale at ${port} for stores`);
+      return false;
+    }
+    const limit = Math.ceil(ask.price_pence * 1.1);
+    const cost = Math.ceil(limit * tons * (1 + book.customs_bps / 10_000));
+    return this.host.withCash(async () => {
+      const cash = await this.host.ensureCash(world.region(port), cost);
+      if (cash < cost) {
+        this.log(`no cash in ${world.region(port)} for stores at ${port}`);
+        return false;
+      }
+      try {
+        const res = await client.placeOrder({
+          port_id: port,
+          commodity_id: STORES_GOOD,
+          side: "bid",
+          time_in_force: "ioc",
+          price_pence: limit,
+          quantity: tons,
+          ship_id: this.shipId,
+          into_stores: true,
+        });
+        const paid = res.total_gross_pence + res.customs_duty_pence;
+        this.stats.spentPence += paid;
+        world.vaults.set(world.region(port), world.vault(world.region(port)) - paid);
+        stay.traded.add("stores");
+        this.log(`stores: bought ${res.filled_quantity}/${tons} t at ${port}`);
+        return have + res.filled_quantity >= target;
+      } catch (e) {
+        if (!isApiError(e) || e.status >= 500 || e.status === 401) throw e;
+        this.log(`stores purchase refused: ${e.message}`);
+        return false;
+      }
+    });
+  }
+
+  // ── Moving ──────────────────────────────────────────────────────────────────
+
+  private async dockOrWait(r: ShipResult): Promise<number> {
+    if (r.ship.dock_queued_at) {
+      this.activity = `queued for a berth at ${r.ship.current_port_id}`;
+      return POLL_MS;
+    }
+    const res = await this.host.client.dock(this.shipId);
+    this.activity = res.queue_position ? `queued #${res.queue_position} for a berth` : `docked at ${res.port_id}`;
+    return 2_000;
+  }
+
+  private async sailTo(r: ShipResult, dest: string, stay: Stay): Promise<number> {
+    const { client, world } = this.host;
+    const port = stay.port;
+    const hull = world.shipClass(this.shipClass)?.hull_category ?? "coastal";
+
+    let plan: RoutePlan;
+    try {
+      plan = await world.route(port, dest, this.shipClass);
+    } catch (e) {
+      this.log(`no route ${port} → ${dest}: ${(e as Error).message}`);
+      this.host.releaseLane(this);
+      return IDLE_WAIT_MS;
+    }
+    if (!world.routeRated(plan, hull)) {
+      this.log(`${port} → ${dest} crosses water a ${hull} hull isn't rated for; dropping the lane`);
+      this.host.releaseLane(this);
+      return 5_000;
+    }
+
+    // Stores: aim for this leg plus the laden leg after a deadhead; never sail below this leg's safe figure.
+    const then = this.lane && dest === this.lane.source ? this.lane.dest : undefined;
+    const need = await this.storesTarget(port, dest, then);
+    if (r.stores.provisions_tons < need) {
+      if (r.ship.status === "berthed") {
+        await this.topUpStoresFor(r, port, dest, stay, then);
+        r = await this.reread();
+      } else if (r.stores.provisions_tons < plan.safe_provisions_tons) {
+        return this.dockOrWait(r);
+      }
+    }
+    if (r.stores.provisions_tons < plan.safe_provisions_tons) {
+      // No hold room to buy stores: eat our own provisions cargo if we carry any.
+      const own = Math.min(this.ownTons(r, STORES_GOOD), Math.ceil(plan.safe_provisions_tons - r.stores.provisions_tons));
+      if (own > 0) {
+        try {
+          await client.provision(this.shipId, own, "cargo");
+          this.log(`moved ${own} t of provisions cargo into the stores for ${dest}`);
+          return 1_000;
+        } catch (e) {
+          if (!isApiError(e) || e.status >= 500) throw e;
+        }
+      }
+      this.activity = `stores ${r.stores.provisions_tons.toFixed(2)} t below the ${plan.safe_provisions_tons.toFixed(2)} t needed for ${dest}`;
+      const free = r.effective_hold_capacity_tons - r.cargo_used_tons;
+      if (r.ship.status === "berthed" && this.storesHoldNeed(r.stores.provisions_tons, plan.safe_provisions_tons) > free) {
+        // No room to stock this leg: give the destination up so the cargo is sold or sent somewhere reachable.
+        this.log(`can't stock stores for ${dest} with the hold this full; re-planning`);
+        this.host.releaseLane(this);
+        return 5_000;
+      }
+      return 60_000;
+    }
+
+    if (this.locked(r)) {
+      const wait = Date.parse(r.ship.turnaround_unlocks_at!) - world.now();
+      this.activity = `berth lock: leaving for ${dest} in ${secs(wait)}`;
+      return wait + 750;
+    }
+
+    try {
+      const res = await client.depart({ ship_id: this.shipId, dest_port_id: dest });
+      for (const w of res.warnings) this.log(`depart warning ${w.code}: ${w.detail}`);
+      const eta = Date.parse(res.estimated_arrival_at);
+      const own = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g), 0);
+      this.log(`sailing ${port} → ${dest} with ${own} t${this.freight.size ? ` + ${this.sealedTons()} t freight` : ""}, arrives in ${secs(eta - world.now())}`);
+      this.activity = `sailing to ${dest}`;
+      this.stay = null;
+      // Reflect the departure for the dashboard until the next read.
+      this.last = {
+        ...r,
+        ship: { ...r.ship, status: "sailing", current_port_id: null, leg_arrives_at: res.estimated_arrival_at },
+        route_legs: res.route_legs ?? r.route_legs,
+        voyage: null,
+      };
+      return Math.min(Math.max(eta - world.now() + 1_500, 2_000), MAX_SAIL_SLEEP_MS);
+    } catch (e) {
+      if (isApiError(e, "conflict")) {
+        // "...in physical turnaround lock for 12s more..." — wait exactly that long.
+        const m = /for (\d+)s more/.exec(e.detail);
+        this.activity = `depart refused: ${e.detail}`;
+        return m ? (Number(m[1]) + 1) * 1_000 : 5_000;
+      }
+      if (isApiError(e, "insufficient_provisions")) {
+        const short = (e.body as { provisions_shortfall?: { buy_provisions_tons?: number } }).provisions_shortfall;
+        this.log(`depart refused, stores short: ${e.detail}`);
+        if (r.ship.status !== "berthed") return this.dockOrWait(r);
+        await this.topUpStoresFor(r, port, dest, stay, then, Math.max(1, short?.buy_provisions_tons ?? 1));
+        return 30_000;
+      }
+      throw e;
+    }
+  }
+}

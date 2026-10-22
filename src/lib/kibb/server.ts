@@ -3,8 +3,10 @@
  * Server-only (pulls in the local store).
  */
 
-import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
+import { type NextRequest, NextResponse } from "next/server";
 import { KibbClient, KibbApiError, KIBB_DEFAULT_URL } from "./client";
+import { COOKIE_COMPANY_ID, COOKIE_PLAYER_KEY } from "./cookies";
 import { getCompanyKey, keyIsUsable, saveCompanyKey, type StoredCompanyKey } from "./store";
 import type { ApiKeyScope } from "./types";
 
@@ -47,7 +49,15 @@ export async function ensureCompanyKey(
   company: { id: string; name: string },
 ): Promise<StoredCompanyKey> {
   const stored = await getCompanyKey(company.id);
-  if (stored && keyIsUsable(stored, REUSE_MIN_LIFE_MS)) return stored;
+  if (stored && keyIsUsable(stored, REUSE_MIN_LIFE_MS)) {
+    // Reuse it only if the game still accepts it (it may have been revoked).
+    try {
+      await kibb(stored.apiKey).whoami();
+      return stored;
+    } catch (e) {
+      if (!(e instanceof KibbApiError) || e.status !== 401) return stored;
+    }
+  }
 
   // A sub-key can't outlive the key that mints it.
   const player = kibb(playerKey);
@@ -70,7 +80,71 @@ export async function ensureCompanyKey(
     savedAt: new Date().toISOString(),
   };
   await saveCompanyKey(key);
+  // A running autopilot still holds the old key: restart it on the new one.
+  void import("./fleet-registry").then((m) => m.refreshFleetKey(company.id)).catch(() => undefined);
   return key;
+}
+
+// Which companies each signed-in player owns, cached briefly (keyed by a hash of the player key).
+const g = globalThis as { __kibbOwners?: Map<string, { ids: Set<string>; at: number }> };
+const owners = (g.__kibbOwners ??= new Map());
+const OWNER_TTL_MS = 5 * 60_000;
+
+/** The game couldn't be asked who owns what (network, 5xx, rate limit): answer 503, don't sign out. */
+export class UpstreamUnavailable extends Error {}
+
+/** The game rejected the player key itself (expired or revoked): the user must sign in again. */
+export class PlayerKeyRejected extends Error {}
+
+/**
+ * The active company id, only if the request carries a player session that owns it. Guards the
+ * routes that act with the company's stored key: the company cookie alone proves nothing.
+ * Null means "not signed in or not the owner"; throws UpstreamUnavailable when it can't tell.
+ */
+export async function authorizedCompany(req: NextRequest): Promise<string | null> {
+  const playerKey = req.cookies.get(COOKIE_PLAYER_KEY)?.value;
+  const companyId = req.cookies.get(COOKIE_COMPANY_ID)?.value;
+  if (!playerKey || !companyId) return null;
+  const id = createHash("sha256").update(playerKey).digest("hex");
+  const hit = owners.get(id);
+  if (hit && Date.now() - hit.at < OWNER_TTL_MS) return hit.ids.has(companyId) ? companyId : null;
+  try {
+    const { companies } = await kibb(playerKey).playerProfile();
+    owners.set(id, { ids: new Set(companies.map((c) => c.id)), at: Date.now() });
+    return companies.some((c) => c.id === companyId) ? companyId : null;
+  } catch (e) {
+    if (e instanceof KibbApiError && e.status === 401) {
+      owners.delete(id);
+      throw new PlayerKeyRejected(e.detail);
+    }
+    // An upstream blip: the last known answer is better than signing the owner out.
+    if (hit) return hit.ids.has(companyId) ? companyId : null;
+    throw new UpstreamUnavailable((e as Error).message);
+  }
+}
+
+/** The 401/503 reply for a request authorizedCompany turned away. */
+export function unauthorizedResponse(req: NextRequest, e?: unknown): NextResponse {
+  if (e instanceof UpstreamUnavailable) {
+    return NextResponse.json({ status: 503, code: "upstream_unreachable", detail: `Couldn't reach the game: ${e.message}` }, { status: 503 });
+  }
+  if (e instanceof PlayerKeyRejected) {
+    const res = NextResponse.json({ status: 401, code: "not_signed_in", detail: "Your session has expired; sign in again" }, { status: 401 });
+    res.cookies.delete(COOKIE_PLAYER_KEY);
+    return res;
+  }
+  const signedIn = req.cookies.has(COOKIE_PLAYER_KEY);
+  return NextResponse.json(
+    signedIn
+      ? { status: 401, code: "no_company_key", detail: "Select a company you own" }
+      : { status: 401, code: "not_signed_in", detail: "Sign in first" },
+    { status: 401 },
+  );
+}
+
+/** Forgets the ownership cache for a player key (after founding or selecting a company). */
+export function forgetOwner(playerKey: string): void {
+  owners.delete(createHash("sha256").update(playerKey).digest("hex"));
 }
 
 /** Turns an upstream error into a problem+json reply with the same status. */

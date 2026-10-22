@@ -9,7 +9,7 @@ import { usePoll } from "@/hooks/use-poll";
 import { useCatalog } from "@/hooks/use-catalog";
 import { dash, kibbGet } from "@/lib/kibb/browser";
 import { fmtCr } from "@/lib/kibb/format";
-import type { RunnerView } from "@/lib/kibb/runner-registry";
+import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { CompanyProfile } from "@/lib/kibb/types";
 
 export function Header() {
@@ -17,7 +17,7 @@ export function Header() {
   const pathname = usePathname();
   const { portName } = useCatalog();
   const { data: profile, loading } = usePoll(() => kibbGet<CompanyProfile>("/v1/company/profile"), 15_000, [pathname]);
-  const { data: runner } = usePoll(() => dash.get<RunnerView>("/api/kibb/runner"), 10_000, [pathname]);
+  const { data: runner } = usePoll(() => dash.get<FleetView>("/api/kibb/fleet"), 10_000, [pathname]);
 
   const cash = profile?.vaults.filter((v) => v.account_type === "vault").reduce((n, v) => n + v.balance_pence, 0);
   const status = runner?.state?.status;
@@ -49,7 +49,7 @@ export function Header() {
             className="gap-1.5"
           >
             <BotIcon className="size-3" />
-            Charter runner {status === "running" || status === "starting" ? "on" : status === "failed" ? "failed" : "off"}
+            Autopilot {status === "running" || status === "starting" ? "on" : status === "failed" ? "failed" : "off"}
           </Badge>
         )}
         {cash !== undefined && <span className="font-mono text-muted-foreground text-sm">{fmtCr(cash)}</span>}

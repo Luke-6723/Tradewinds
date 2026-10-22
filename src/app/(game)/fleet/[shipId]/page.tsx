@@ -11,7 +11,7 @@ import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
 import { fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
-import type { RunnerView } from "@/lib/kibb/runner-registry";
+import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { DepartResult, DockActionResult, RoutePlan, ShipResult, WorldClock, ZoneClass } from "@/lib/kibb/types";
 
 const HULL_RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
@@ -34,7 +34,12 @@ function DepartForm({ r, onDone }: { r: ShipResult; onDone: () => void }) {
   const ports = (catalog?.ports ?? [])
     .filter((p) => p.id !== from && p.phase <= (clock?.unlocked_phase ?? 1))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const unrated = plan?.legs.filter((l) => HULL_RANK[l.edge_class] > HULL_RANK[hull]) ?? [];
+  // A leg is rated when the hull covers both the lane and the sea zone it ends in (hazards roll there).
+  const legClass = (l: RoutePlan["legs"][number]): ZoneClass => {
+    const zone = catalog?.sea_zones.find((z) => z.id === l.to_node)?.zone_class;
+    return zone && HULL_RANK[zone] > HULL_RANK[l.edge_class] ? zone : l.edge_class;
+  };
+  const unrated = plan?.legs.filter((l) => HULL_RANK[legClass(l)] > HULL_RANK[hull]) ?? [];
   const short = plan ? r.stores.provisions_tons < plan.safe_provisions_tons : false;
 
   async function depart() {
@@ -71,13 +76,13 @@ function DepartForm({ r, onDone }: { r: ShipResult; onDone: () => void }) {
           />
           <div className="flex flex-wrap gap-1">
             {plan.legs.map((l, i) => (
-              <Badge key={i} variant={HULL_RANK[l.edge_class] > HULL_RANK[hull] ? "error" : "outline"} size="sm">
-                {portName(l.to_node)} · {l.edge_class}
+              <Badge key={i} variant={HULL_RANK[legClass(l)] > HULL_RANK[hull] ? "error" : "outline"} size="sm">
+                {portName(l.to_node)} · {legClass(l)}
               </Badge>
             ))}
           </div>
           {unrated.length > 0 && (
-            <ErrorNote error={`A ${hull} hull isn't rated for ${unrated.map((l) => l.edge_class).join(", ")} water on this route: real risk of sinking.`} />
+            <ErrorNote error={`A ${hull} hull isn't rated for ${unrated.map(legClass).join(", ")} water on this route: real risk of sinking.`} />
           )}
           {short && <ErrorNote error="Stores are below the safe figure for this route. Buy provisions into stores first (Market page)." />}
         </div>
@@ -101,7 +106,7 @@ export default function ShipPage() {
   const { shipId } = useParams<{ shipId: string }>();
   const { catalog, portName, goodName, shipClassName } = useCatalog();
   const { data: r, error, reload } = usePoll(() => kibbGet<ShipResult>("/v1/fleet/ship", { ship_id: shipId }), 5_000, [shipId]);
-  const { data: runner } = usePoll(() => dash.get<RunnerView>("/api/kibb/runner"), 10_000);
+  const { data: fleet } = usePoll(() => dash.get<FleetView>("/api/kibb/fleet"), 10_000);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -110,8 +115,7 @@ export default function ShipPage() {
   }
   const s = r.ship;
   const cls = catalog?.ship_classes.find((c) => c.id === s.ship_class);
-  const runnerShip = runner?.settings.shipId || runner?.state?.shipId;
-  const runnerOwnsShip = !!runner?.enabled && runnerShip === s.id;
+  const runnerOwnsShip = !!fleet?.enabled && !!fleet.state?.agents.some((a) => a.shipId === s.id);
   const locked = s.status === "berthed" && !!s.turnaround_unlocks_at && Date.parse(s.turnaround_unlocks_at) > Date.now();
 
   async function dockAction(kind: "dock" | "offshore") {
@@ -142,7 +146,7 @@ export default function ShipPage() {
 
       {runnerOwnsShip && (
         <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
-          The charter runner is sailing this ship. Stop it on the dashboard before giving manual orders.
+          The fleet autopilot is sailing this ship. Stop it on the dashboard before giving manual orders.
         </p>
       )}
 

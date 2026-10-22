@@ -1,16 +1,16 @@
 /**
- * Local JSON store for the dashboard: company-bound API keys and charter-runner settings.
+ * Local JSON store for the dashboard: company-bound API keys and fleet-autopilot settings.
  *
  * Lives in `.kibb/store.json` under the project root (gitignored), or KIBB_STORE_DIR.
- * Passphrases are never stored; company keys are, so the runner can trade while no browser is open.
+ * Passphrases are never stored; company keys are, so the autopilot can trade while no browser is open.
  * Server-only (uses node:fs).
  */
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { CharterSettings } from "./charter-runner";
+import type { FleetSettings } from "./fleet/manager";
 
-const STORE_DIR  = process.env.KIBB_STORE_DIR ?? path.join(process.cwd(), ".kibb");
+export const STORE_DIR = process.env.KIBB_STORE_DIR ?? path.join(process.cwd(), ".kibb");
 const STORE_FILE = path.join(STORE_DIR, "store.json");
 
 export interface StoredCompanyKey {
@@ -22,15 +22,39 @@ export interface StoredCompanyKey {
   savedAt: string;
 }
 
-export interface StoredRunner {
+export interface StoredFleet {
   enabled: boolean;
-  settings: CharterSettings;
+  settings: Partial<FleetSettings>;
+  /** Guns still to mount on ships the buyer built. */
+  armTargets?: Record<string, number>;
   updatedAt: string;
 }
 
 interface StoreData {
   companies: Record<string, StoredCompanyKey>;
-  runners: Record<string, StoredRunner>;
+  fleets: Record<string, StoredFleet>;
+  /** Pre-fleet single charter runner; only its enabled flag is carried over. */
+  runners?: Record<string, { enabled: boolean }>;
+}
+
+/**
+ * Renames `from` over `to`, retrying briefly: on Windows a rename onto a file another handle has
+ * open fails with EPERM/EACCES/EBUSY until that handle closes.
+ */
+export async function renameOver(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.rename(from, to);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? "";
+      if (attempt >= 9 || !["EPERM", "EACCES", "EBUSY"].includes(code)) {
+        await fs.unlink(from).catch(() => undefined);
+        throw e;
+      }
+      await new Promise((r) => setTimeout(r, 20 + attempt * 10));
+    }
+  }
 }
 
 // One write queue per process, shared across Next.js module instances.
@@ -39,9 +63,9 @@ const g = globalThis as { __kibbStoreQueue?: Promise<unknown> };
 async function read(): Promise<StoreData> {
   try {
     const data = JSON.parse(await fs.readFile(STORE_FILE, "utf8")) as Partial<StoreData>;
-    return { companies: data.companies ?? {}, runners: data.runners ?? {} };
+    return { companies: data.companies ?? {}, fleets: data.fleets ?? {}, runners: data.runners };
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { companies: {}, runners: {} };
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { companies: {}, fleets: {} };
     throw e;
   }
 }
@@ -54,7 +78,7 @@ function update(fn: (data: StoreData) => void): Promise<StoreData> {
     await fs.mkdir(STORE_DIR, { recursive: true });
     const tmp = `${STORE_FILE}.${process.pid}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-    await fs.rename(tmp, STORE_FILE);
+    await renameOver(tmp, STORE_FILE);
     return data;
   });
   g.__kibbStoreQueue = next.catch(() => undefined);
@@ -84,18 +108,35 @@ export async function listCompanyKeys(): Promise<StoredCompanyKey[]> {
   return Object.values((await read()).companies);
 }
 
-// ── Runner settings ───────────────────────────────────────────────────────────
+// ── Fleet autopilot ───────────────────────────────────────────────────────────
 
-export async function getStoredRunner(companyId: string): Promise<StoredRunner | null> {
-  return (await read()).runners[companyId] ?? null;
+export async function getStoredFleet(companyId: string): Promise<StoredFleet | null> {
+  const d = await read();
+  const legacy = d.runners?.[companyId];
+  return d.fleets[companyId] ?? (legacy ? { enabled: legacy.enabled, settings: {}, updatedAt: "" } : null);
 }
 
-export async function saveStoredRunner(companyId: string, runner: Omit<StoredRunner, "updatedAt">): Promise<void> {
+export async function saveStoredFleet(companyId: string, fleet: Omit<StoredFleet, "updatedAt" | "armTargets">): Promise<void> {
   await update((d) => {
-    d.runners[companyId] = { ...runner, updatedAt: new Date().toISOString() };
+    d.fleets[companyId] = { ...d.fleets[companyId], ...fleet, updatedAt: new Date().toISOString() };
+    if (d.runners) delete d.runners[companyId];
   });
 }
 
-export async function listStoredRunners(): Promise<Array<StoredRunner & { companyId: string }>> {
-  return Object.entries((await read()).runners).map(([companyId, r]) => ({ companyId, ...r }));
+export async function saveArmTargets(companyId: string, armTargets: Record<string, number>): Promise<void> {
+  await update((d) => {
+    const cur = d.fleets[companyId] ?? { enabled: false, settings: {}, updatedAt: "" };
+    d.fleets[companyId] = { ...cur, armTargets, updatedAt: new Date().toISOString() };
+  });
+}
+
+export async function listStoredFleets(): Promise<Array<StoredFleet & { companyId: string }>> {
+  const d = await read();
+  const ids = new Set([...Object.keys(d.fleets), ...Object.keys(d.runners ?? {})]);
+  const out: Array<StoredFleet & { companyId: string }> = [];
+  for (const companyId of ids) {
+    const f = d.fleets[companyId] ?? { enabled: d.runners?.[companyId]?.enabled ?? false, settings: {}, updatedAt: "" };
+    out.push({ companyId, ...f });
+  }
+  return out;
 }

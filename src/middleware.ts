@@ -24,8 +24,9 @@ export function middleware(req: NextRequest) {
   // Picking or founding a company needs the player key
   if (pathname.startsWith("/companies")) return hasPlayer ? NextResponse.next() : redirect("/login");
 
-  // Game pages run on the company key stored server-side; the cookie says which company
-  if (!hasCompany) return redirect(hasPlayer ? "/companies" : "/login");
+  // Game pages need a signed-in player and a chosen company (the server checks ownership)
+  if (!hasPlayer) return redirect("/login");
+  if (!hasCompany) return redirect("/companies");
 
   return NextResponse.next();
 }

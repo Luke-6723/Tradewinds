@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { COOKIE_COMPANY_ID, COOKIE_PLAYER_KEY } from "@/lib/kibb/cookies";
-import { cookieOptions, ensureCompanyKey, errorResponse, kibb, PLAYER_KEY_TTL_S } from "@/lib/kibb/server";
+import { cookieOptions, ensureCompanyKey, errorResponse, forgetOwner, kibb, PLAYER_KEY_TTL_S } from "@/lib/kibb/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,6 +19,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ status: 404, code: "not_found", detail: "No such company on this account" }, { status: 404 });
     }
     await ensureCompanyKey(playerKey, company);
+    forgetOwner(playerKey);
     const res = NextResponse.json({ ok: true, company });
     res.cookies.set(COOKIE_COMPANY_ID, company.id, cookieOptions(PLAYER_KEY_TTL_S));
     return res;
