@@ -219,6 +219,19 @@ export interface PortDetail {
   recent_sailings?: SailingNotice[] | null;
 }
 
+/** `GET /v1/world/zones`: live piracy per sea zone. */
+export interface SeaZoneStatus {
+  sea_zone_id: string;
+  name: string;
+  phase: number;
+  base_piracy_bps: number;
+  marque_piracy_bps: number;
+  patrol_suppression_bps: number;
+  net_piracy_bps: number;
+  active_marques: number;
+  active_patrols: number;
+}
+
 export interface LeaderboardResult {
   season_number: number;
   ranked_players: number;

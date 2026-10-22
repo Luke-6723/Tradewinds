@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3Icon, LayoutDashboardIcon, MapIcon, ShipIcon, SailboatIcon } from "lucide-react";
+import { BarChart3Icon, Globe2Icon, LayoutDashboardIcon, MapIcon, ShipIcon, SailboatIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePoll } from "@/hooks/use-poll";
 import { kibbGet } from "@/lib/kibb/browser";
@@ -10,6 +10,7 @@ import type { WorldClock } from "@/lib/kibb/types";
 
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboardIcon },
+  { href: "/map",       label: "Map",       icon: Globe2Icon },
   { href: "/fleet",     label: "Fleet",     icon: ShipIcon },
   { href: "/market",    label: "Market",    icon: BarChart3Icon },
   { href: "/ports",     label: "Ports",     icon: MapIcon },

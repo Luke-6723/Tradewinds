@@ -156,3 +156,27 @@
 .leaflet-tooltip::before { display: none !important; }
 
 .leaflet-container { font-family: inherit; }
+
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: #0f172a !important;
+  color: #e2e8f0 !important;
+  border: 1px solid #1e293b;
+}
+.leaflet-popup-content { margin: 10px 12px !important; }
+.leaflet-popup-content a { color: #93c5fd; }
+.leaflet-container a.leaflet-popup-close-button { color: #94a3b8; }
+
+/* Ship markers: no default div-icon box; compact always-on name label */
+.kibb-ship-icon {
+  background: none;
+  border: none;
+}
+.leaflet-tooltip.kibb-ship-label {
+  padding: 0 5px !important;
+  border: none !important;
+  border-radius: 4px !important;
+  background: rgb(15 23 42 / 0.8) !important;
+  box-shadow: none !important;
+  font-size: 11px !important;
+}

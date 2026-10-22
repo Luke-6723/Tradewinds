@@ -52,6 +52,7 @@ with `KIBB_API_KEY` (a company-bound key) in `.env.local`. See the header of [sr
 | `/login`, `/register` | Player sign-in and registration |
 | `/companies` | Pick or found a company |
 | `/dashboard` | Cash, fleet, phase-2 progress, leaderboard; charter runner controls and log; ships, vaults, charters |
+| `/map` | Live map: ships placed along their routes, sea lanes, ports, piracy per sea zone |
 | `/fleet` | All ships: status, position, cargo, stores |
 | `/fleet/[shipId]` | Ship detail; dock, move to the roadstead, depart with a route and stores check |
 | `/market` | Order books for ports you have presence at; IOC buy/sell into a berthed ship |
