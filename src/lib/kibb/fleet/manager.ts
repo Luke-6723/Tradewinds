@@ -3,9 +3,14 @@
  * reservations (so ships spread across charters and sources instead of piling onto one), cash moved
  * between banking regions on demand, and automatic ship purchases.
  *
- * Buying: whenever one of our ships is at a shipyard (building needs presence there), quote every
+ * Buying: wherever we have presence at a shipyard (a ship there, or a Resident Factor), quote every
  * allowed hull class, score each by payback hours on its best lane net of the extra fleet upkeep,
- * and build the quickest payback within the limits.
+ * and build the quickest payback within the limits. With no presence at any yard, it prices a build
+ * at the yard nearest the fleet's work from the last quotes seen; if one would pay back (counting the
+ * fee), it hires a Resident Factor there for the build and dismisses it straight after, so building
+ * never waits for a ship to happen by and no factor salary runs on. As the expansion tier nears
+ * completion (and for a while after it turns over) part of the spare cash is kept back for the new
+ * tier's charters, which nobody can reach at first, so they stall and re-post richer.
  *
  * Guns: every gun takes 2 t of hold. With the "auto" policy a ship calling at a yard is refitted to
  * the count that earns most on its lane: hold space against the cargo pirates are expected to take
@@ -27,11 +32,11 @@ import type { LetterOfMarque } from "../schema";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
 import type { BankingRegion, ShipResult } from "../types";
-import { ShipAgent, type AgentState, type AgentStats, type FleetHost } from "./agent";
+import { ShipAgent, type AgentState, type AgentStats, type FleetHost, type HoldInfo } from "./agent";
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
 import { rankLanes, type Lane, type Reservations, type ShipSpec } from "./planner";
-import { World } from "./world";
+import { World, type ExpansionWatch } from "./world";
 
 // ── Settings & state ──────────────────────────────────────────────────────────
 
@@ -79,6 +84,18 @@ export interface FleetSettings {
   underwriteMinEdgeBps: number;
   /** Carry Merchant Adventurers freight on legs we sail anyway, when it pays for its berth time. */
   useFreight: boolean;
+  /**
+   * With no presence at any shipyard, hire a Resident Factor (750 Cr) at the yard nearest the fleet's
+   * work when a build there would pay back, build, and dismiss the factor straight after.
+   */
+  yardFactor: boolean;
+  /**
+   * Hold cargo for a stalled expansion charter (nothing delivered in its posting) that lapses within
+   * a few game hours of arrival, and deliver into its richer re-post. Off by default.
+   */
+  holdForRepost: boolean;
+  /** Share (0–90%) of spare cash the buyer leaves alone while the expansion tier is close to completing. */
+  phaseChestPct: number;
 }
 
 export type GunPolicy = "auto" | "full" | "off";
@@ -100,6 +117,9 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   underwriteMaxPerPolicyPence: 300_000,
   underwriteMinEdgeBps: 150,
   useFreight: true,
+  yardFactor: true,
+  holdForRepost: false,
+  phaseChestPct: 40,
 };
 
 export class FleetSettingsError extends Error {}
@@ -133,6 +153,10 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   num("underwriteBudgetPence", 0, true);
   num("underwriteMaxPerPolicyPence", 0, true);
   num("underwriteMinEdgeBps", 0, true);
+  bool("yardFactor");
+  bool("holdForRepost");
+  num("phaseChestPct", 0);
+  if (out.phaseChestPct !== undefined && out.phaseChestPct > 90) throw new FleetSettingsError("phaseChestPct must be 0 to 90");
   if (patch.guns !== undefined) {
     if (!GUN_POLICIES.includes(patch.guns)) throw new FleetSettingsError(`guns must be one of ${GUN_POLICIES.join(", ")}`);
     out.guns = patch.guns;
@@ -182,7 +206,23 @@ export interface FleetState {
   marques: MarqueReport | null;
   /** The last underwriting check (a dry run while it is off). */
   underwriting: UnderwriteReport | null;
+  /** The expansion tier as the autopilot sees it: pace, whether the buyer is keeping cash back, stalled charters. */
+  expansion: ExpansionReport | null;
+  /** Charge on cash a load ties up (per pence per real hour; 0 while cash isn't scarce). */
+  capitalRate: number;
   log: FleetLogLine[];
+}
+
+export interface ExpansionReport {
+  targetPhase: number | null;
+  progressBps: number;
+  /** Real ms until the tier completes at the recent pace, or null with no pace yet. */
+  etaMs: number | null;
+  /** The buyer is keeping `phaseChestPct` of spare cash back for the next tier. */
+  phaseSoon: boolean;
+  /** What a stalled posting's re-post is expected to do to pay and tons. */
+  escalation: { pay: number; tons: number };
+  charters: ExpansionWatch[];
 }
 
 export interface MarqueZoneReport {
@@ -263,6 +303,19 @@ const MARQUE_MIN_LADEN = 3;
 const MARQUE_MIN_PENCE = 10_000;
 /** How often the open insurance policies are judged. */
 const UNDERWRITE_CHECK_MS = 60_000;
+/** Resident Factor setup fee (its daily salary comes on top). */
+const FACTOR_FEE_PENCE = 75_000;
+/** Spare cash wanted for a hull when no quote has been seen yet, before hiring a factor to price one. */
+const FACTOR_HULL_GUESS_PENCE = 2_000_000;
+/** After a factor hire that led to no build (or failed), wait this long before hiring again. */
+const FACTOR_RETRY_MS = 30 * 60_000;
+/** The cash kept back near a phase stays back this long after the tier turns over. */
+const PHASE_CHEST_GRACE_MS = 60 * 60_000;
+/** The tier counts as close to completing at this progress, or this soon at its recent pace. */
+const PHASE_SOON_BPS = 9_000;
+const PHASE_SOON_MS = 2 * 60 * 60 * 1000;
+/** Share of the fleet's own return on cash charged on what a load ties up, while cash is scarce. */
+const CAPITAL_CHARGE_WEIGHT = 0.5;
 /** Trips a refit should pay for itself within. */
 const GUN_PAYBACK_TRIPS = 5;
 /** Whole tons of stores never counted as trimmable room (the voyage always needs some). */
@@ -290,6 +343,14 @@ export class FleetManager implements FleetHost {
   private startedAt: string | null = null;
   private stoppedAt: string | null = null;
   private homeRegion: BankingRegion | null = null;
+  private homePort: string | null = null;
+  /** The last hull quote per `yard|class` (pence): prices a build at a yard where we have no presence yet. */
+  private readonly hullQuotes = new Map<string, number>();
+  /** Factor passes in a row that built nothing: each one backs off longer. */
+  private factorFails = 0;
+  /** Factors the buyer hired for a build and hasn't dismissed yet (never the user's own). */
+  private readonly tempFactors = new Set<string>();
+  private factorBlockedUntil = 0;
   private canRemit = true;
   private logLines: FleetLogLine[] = [];
   private purchases: PurchaseRecord[] = [];
@@ -364,8 +425,32 @@ export class FleetManager implements FleetHost {
       buyer: this.buyer,
       marques: this.marqueReport,
       underwriting: this.underwriteReport,
+      expansion: this.expansionReport(),
+      capitalRate: this.capitalRate(),
       log: [...this.logLines],
     };
+  }
+
+  private expansionReport(): ExpansionReport | null {
+    const w = this.world;
+    if (w.tierTargetPhase === null) return null;
+    return {
+      targetPhase: w.tierTargetPhase,
+      progressBps: w.tierProgressBps,
+      etaMs: w.tierEtaMs,
+      phaseSoon: this.phaseSoon() && this.settings.autoBuy && this.settings.phaseChestPct > 0 && this.agents.size < this.settings.maxShips,
+      escalation: { ...w.escalation },
+      charters: [...w.expansionWatch.values()].sort((a, b) => Number(b.stalled) - Number(a.stalled) || b.rate - a.rate),
+    };
+  }
+
+  /** The expansion tier is close to completing: the next one's charters are worth cash in hand. */
+  private phaseSoon(): boolean {
+    const w = this.world;
+    // Still keep it for a while after the tier turns over: the new tier's charters need it then.
+    if (w.tierTurnedAt !== null && w.now() - w.tierTurnedAt < PHASE_CHEST_GRACE_MS) return true;
+    if (w.tierTargetPhase === null) return false;
+    return w.tierProgressBps >= PHASE_SOON_BPS || (w.tierEtaMs !== null && w.tierEtaMs < PHASE_SOON_MS);
   }
 
   start(): void {
@@ -389,6 +474,11 @@ export class FleetManager implements FleetHost {
     while (this.buying || [...this.agents.values()].some((a) => a.running)) {
       await Promise.all([...this.agents.values()].map((a) => a.stop()));
       if (this.buying) await new Promise((r) => setTimeout(r, 200));
+    }
+    // A factor the buyer hired must not keep drawing salary: try a few times before giving up.
+    for (let i = 0; i < 3 && this.tempFactors.size > 0; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 1_000));
+      await this.dismissTempFactors();
     }
     await this.lease?.release();
     this.lease = null;
@@ -493,6 +583,7 @@ export class FleetManager implements FleetHost {
     await this.world.init();
     const profile = await this.client.companyProfile();
     this.homeRegion = this.world.region(profile.company.home_port_id);
+    this.homePort = profile.company.home_port_id;
     this.world.companyId = profile.company.id;
     // Every company of this player: their ships aren't rivals and their policies aren't ours to write.
     this.ourCompanyIds.add(profile.company.id);
@@ -604,7 +695,7 @@ export class FleetManager implements FleetHost {
     const from = r?.ship.current_port_id ?? r?.route_legs.at(-1)?.to_node;
     if (!from || !r || !ref) return;
     try {
-      this.topLanes = await rankLanes(this.world, this.specFor(ref, r), from, this.reservations(ref), this.planOptions(this.loadCash(ref)));
+      this.topLanes = await rankLanes(this.world, this.specFor(ref, r), from, this.reservations(ref), this.planOptions(this.loadCash(ref), ref));
     } catch (e) {
       this.log("fleet", `lane overview failed: ${(e as Error).message}`);
     }
@@ -637,8 +728,31 @@ export class FleetManager implements FleetHost {
     };
   }
 
-  private planOptions(cash: number | null) {
-    return { minMargin: this.settings.minMarginPence, freight: this.settings.useFreight, bonusWeight: this.settings.bonusWeightPct / 100, cash };
+  /** `except`: the ship being planned for, whose own pending load isn't someone else's claim on cash. */
+  private planOptions(cash: number | null, except?: ShipAgent) {
+    return {
+      minMargin: this.settings.minMarginPence,
+      freight: this.settings.useFreight,
+      bonusWeight: this.settings.bonusWeightPct / 100,
+      cash,
+      capitalRate: this.capitalRate(except),
+      holdForRepost: this.settings.holdForRepost,
+    };
+  }
+
+  /**
+   * While cash is what limits the fleet (a ship waits for it, or what is spare wouldn't fill half a
+   * typical load), money a load ties up is charged at part of the fleet's own return on cash: profit
+   * per hour over the cash its current loads hold. 0 otherwise.
+   */
+  private capitalRate(except?: ShipAgent): number {
+    const others = [...this.agents.values()].filter((a) => a !== except);
+    const lanes = others.map((a) => a.lane).filter((l): l is Lane => !!l && (l.capital ?? 0) > 0 && l.profitPerHour > 0);
+    if (lanes.length === 0) return 0;
+    const capital = lanes.reduce((n, l) => n + l.capital, 0);
+    const scarce = others.some((a) => a.waitingForCash) || this.loadCash(except) < (capital / lanes.length) * 0.5;
+    if (!scarce) return 0;
+    return (CAPITAL_CHARGE_WEIGHT * lanes.reduce((n, l) => n + l.profitPerHour, 0)) / capital;
   }
 
   /** Cash a ship can spend on its next load: spare cash in every region, less loads other ships are bound to buy. */
@@ -795,7 +909,12 @@ export class FleetManager implements FleetHost {
         // listing; adjusting `remaining` here could count our own delivery twice.
         const id = str("contract_id", "charter_id");
         const remaining = e.event_type === "charter_expired" ? 0 : num("remaining_quantity");
-        if (id && remaining === 0) this.world.markClosed(id);
+        if (id && remaining === 0) this.world.markClosed(id, e.event_type === "charter_expired");
+        // A lapsed expansion posting is re-posted: fetch it soon.
+        if (id && e.event_type === "charter_expired" && this.world.renews({ id })) {
+          this.worldDirty = true;
+          this.wake?.();
+        }
         else if (!id || remaining === undefined) {
           this.worldDirty = true;
           this.wake?.();
@@ -844,16 +963,22 @@ export class FleetManager implements FleetHost {
     const sourceTons = new Map<string, number>();
     const sellTons = new Map<string, number>();
     const freightIds = new Set<string>();
+    const charterLandsAt = new Map<string, number>();
     const add = (m: Map<string, number>, k: string, t: number) => m.set(k, (m.get(k) ?? 0) + t);
     for (const a of this.agents.values()) {
       if (a === except || !a.lane) continue;
       const lane = a.lane;
-      for (const [id, t] of lane.fills) add(charterTons, id, t);
+      // Keyed by the posting that now stands for each charter (a lapsed one's re-post).
+      for (const [id, t] of lane.fills) {
+        const cur = this.world.currentId(id);
+        add(charterTons, cur, t);
+        if (!lane.holdMs && lane.deliverAt) charterLandsAt.set(cur, Math.min(charterLandsAt.get(cur) ?? Infinity, lane.deliverAt));
+      }
       for (const p of a.partsToBuy()) add(sourceTons, `${lane.source}|${p.good}`, p.tons);
       for (const p of lane.parts) if (p.kind === "market") add(sellTons, `${lane.dest}|${p.good}`, p.tons);
       for (const f of a.freightToTake()) freightIds.add(f.id);
     }
-    return { charterTons, sourceTons, sellTons, freightIds };
+    return { charterTons, sourceTons, sellTons, freightIds, charterLandsAt };
   }
 
   /** One planning pass at a time, so each ship sees the others' fresh reservations. */
@@ -866,7 +991,7 @@ export class FleetManager implements FleetHost {
   private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult): Promise<Lane | null> {
     const prev = agent.lane;
     const cash = this.loadCash(agent);
-    const lanes = await rankLanes(this.world, this.specFor(agent, r), from, this.reservations(agent), this.planOptions(cash));
+    const lanes = await rankLanes(this.world, this.specFor(agent, r), from, this.reservations(agent), this.planOptions(cash, agent));
     const best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
     agent.setLane(best);
     if (best) agent.noteLane(best);
@@ -879,6 +1004,7 @@ export class FleetManager implements FleetHost {
         agent.name,
         `lane: ${load} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t` +
           `${best.bonus > 0 ? ` incl. ~${cr(best.bonus)}/t phase bonus` : ""}${best.askKnown ? "" : " (ask estimated)"}, ~${cr(best.profitPerHour)}/h` +
+          `${best.holdMs > 0 ? `, holding ~${Math.round(best.holdMs / 1000)}s at ${best.dest} for a stalled charter's re-post` : ""}` +
           `${best.next ? `; then ${best.next}` : ""}`,
       );
     } else if (!best && prev) {
@@ -896,9 +1022,18 @@ export class FleetManager implements FleetHost {
     let held = 0;
     for (const a of this.agents.values()) {
       if (a === agent || !a.lane || !a.loaded) continue;
-      for (const [id, t] of a.lane.fills) if (id === charterId) held += t;
+      for (const [id, t] of a.lane.fills) if (this.world.currentId(id) === charterId) held += t;
     }
     return Math.max(0, remaining - held);
+  }
+
+  /** Another of our ships' hold at this port on this good for a re-post, if any. */
+  siblingHold(agent: ShipAgent, port: string, good: string): HoldInfo | undefined {
+    for (const a of this.agents.values()) {
+      const h = a !== agent ? a.holdAt(port, good) : undefined;
+      if (h) return h;
+    }
+    return undefined;
   }
 
   /** Whether another ship's lane means to take this freight lot. */
@@ -1215,6 +1350,76 @@ export class FleetManager implements FleetHost {
     if (p) p.costPence += costPence;
   }
 
+  /** The open shipyard nearest the fleet's work, for a factor to build at; null if none. */
+  private factorYard(): string | null {
+    const { world } = this;
+    const yards = world.catalog.ports.filter((p) => p.has_shipyard && world.isOpen(p.id));
+    if (yards.length === 0) return null;
+    // Where the fleet's lanes start (or end) earns a yard its weight; the home port and hubs break ties.
+    const score = new Map<string, number>(yards.map((p) => [p.id, (p.id === this.homePort ? 2 : 0) + (p.is_hub ? 1 : 0)]));
+    for (const a of this.agents.values()) {
+      const l = a.lane;
+      if (!l) continue;
+      const w = Math.max(1, l.profitPerHour / 100);
+      if (score.has(l.source)) score.set(l.source, score.get(l.source)! + 2 * w);
+      if (score.has(l.dest)) score.set(l.dest, score.get(l.dest)! + w);
+    }
+    for (const l of this.topLanes.slice(0, 3)) if (score.has(l.source)) score.set(l.source, score.get(l.source)! + 1);
+    return [...score].sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  /** Hires a factor at `yard` for a build (fee from that yard's region). False if it couldn't. */
+  private async hireTempFactor(yard: string): Promise<boolean> {
+    const { world } = this;
+    const region = world.region(yard);
+    const hired = await this.withCash(async () => {
+      if (this.stopRequested || !this.settings.yardFactor) return false;
+      const cash = await this.ensureCash(region, FACTOR_FEE_PENCE);
+      if (cash < FACTOR_FEE_PENCE) return false;
+      try {
+        await this.client.hireFactor(yard);
+        world.vaults.set(region, world.vault(region) - FACTOR_FEE_PENCE);
+        return true;
+      } catch (e) {
+        if (this.isFatal(e)) throw e;
+        this.log("fleet", `hiring a factor at ${yard} failed: ${(e as Error).message}`);
+        // Outcome unknown (network, 5xx): if the hire went through after all, it is ours to dismiss.
+        if (!isApiError(e) || e.status >= 500) {
+          const now = await this.client.factors().catch(() => [] as string[]);
+          if (now.includes(yard)) this.tempFactors.add(yard);
+        }
+        return false;
+      }
+    });
+    if (!hired) {
+      this.factorFailed();
+      return false;
+    }
+    this.tempFactors.add(yard);
+    this.log("fleet", `hired a Resident Factor at ${yard} (${cr(FACTOR_FEE_PENCE)}) to build there; dismissing it after`);
+    return true;
+  }
+
+  /** A factor pass built nothing: hold off hiring again, longer each time in a row. */
+  private factorFailed(): void {
+    this.factorBlockedUntil = Date.now() + FACTOR_RETRY_MS * 2 ** Math.min(this.factorFails, 4);
+    this.factorFails++;
+  }
+
+  /** Dismisses the factors the buyer hired for builds (kept to retry if a dismissal fails). */
+  private async dismissTempFactors(): Promise<void> {
+    for (const yard of [...this.tempFactors]) {
+      try {
+        await this.client.dismissFactor(yard);
+        this.tempFactors.delete(yard);
+        this.log("fleet", `dismissed the factor at ${yard}`);
+      } catch (e) {
+        if (isApiError(e) && (e.status === 404 || e.status === 409)) this.tempFactors.delete(yard);
+        else this.log("fleet", `dismissing the factor at ${yard} failed (${(e as Error).message}); retrying later`);
+      }
+    }
+  }
+
   async visitShipyard(port: string): Promise<void> {
     const last = this.lastYardCheck.get(port) ?? 0;
     if (Date.now() - last < YARD_RECHECK_MS) return;
@@ -1243,53 +1448,109 @@ export class FleetManager implements FleetHost {
   }
 
   private async considerPurchase(only: string[] | null): Promise<void> {
+    // A factor hired for a build never outlives the buyer pass that hired it (a failed dismissal is retried here).
+    await this.dismissTempFactors();
+    try {
+      await this.considerPurchaseNow(only);
+    } finally {
+      await this.dismissTempFactors();
+    }
+  }
+
+  private async considerPurchaseNow(only: string[] | null): Promise<void> {
     const { world, settings } = this;
     if (this.agents.size >= settings.maxShips) return this.setBuyer(`fleet at the ${settings.maxShips}-ship limit`);
+    const classes = world.catalog.ship_classes.filter((c) => settings.buyClasses.includes(c.id) && c.phase <= world.unlockedPhase);
+    if (classes.length === 0) return this.setBuyer("no allowed hull class can be built in this phase");
     if ([...this.agents.values()].some((a) => a.waitingForCash)) return this.setBuyer("a ship is waiting for cash to load: not buying");
 
     await world.refreshVaults();
     // Cash the existing fleet still needs for loads it is bound to buy comes first.
     let committed = 0;
     for (const a of this.agents.values()) committed += this.committedBy(a);
-    const spare = this.spareCash() - committed;
+    const loose = this.spareCash() - committed;
+    // Close to a new phase: part of it stays in hand for the new tier's charters.
+    const chest = this.phaseSoon() ? Math.max(0, Math.round((loose * settings.phaseChestPct) / 100)) : 0;
+    const spare = loose - chest;
+    const justTurned = world.tierTurnedAt !== null && world.now() - world.tierTurnedAt < PHASE_CHEST_GRACE_MS;
+    const chestNote = chest > 0 ? `, ${cr(chest)} kept back: ${justTurned ? "a new tier just opened" : `phase ${world.tierTargetPhase} is close`}` : "";
 
-    // Building needs presence: a ship of ours in a yard port (re-read when not called by that ship).
+    // Building needs presence: a ship of ours in a yard port (re-read when not called by that ship), or a factor.
+    // Presence that couldn't be read counts as unknown: no factor is hired on a failed read.
     const yards = new Set<string>(only ?? []);
+    let presenceKnown = true;
     if (!only) {
       for (const a of this.agents.values()) {
         const s = a.last?.ship;
         if (!s || s.status === "sailing" || !s.current_port_id || !world.port(s.current_port_id)?.has_shipyard) continue;
         const fresh = await this.client.ship(a.shipId).catch(() => null);
-        if (fresh && fresh.ship.status !== "sailing" && fresh.ship.current_port_id === s.current_port_id) yards.add(s.current_port_id);
+        if (!fresh) presenceKnown = false;
+        else if (fresh.ship.status !== "sailing" && fresh.ship.current_port_id === s.current_port_id) yards.add(s.current_port_id);
+      }
+      const factors = await this.client.factors().catch((e) => {
+        if (this.isFatal(e)) throw e;
+        presenceKnown = false;
+        return [] as string[];
+      });
+      for (const p of factors) if (world.port(p)?.has_shipyard && world.isOpen(p)) yards.add(p);
+    }
+    if (spare <= 0) return this.setBuyer(`no spare cash: ${cr(committed)} is committed to loads the fleet is about to buy${chestNote}`);
+
+    // No presence at any yard: price a build at the yard nearest the work from the last quotes seen
+    // (a factor would be hired for it). With no quotes yet, a factor is hired to get some.
+    let factorYard: string | null = null;
+    let factorPriced = false;
+    if (yards.size === 0 && !only && settings.yardFactor && presenceKnown && Date.now() >= this.factorBlockedUntil) {
+      const yard = this.factorYard();
+      const known = !!yard && classes.some((c) => this.hullQuotes.has(`${yard}|${c.id}`));
+      // Before hiring just to get a quote: the cheapest hull seen at any yard, or a guess.
+      const seen = classes.flatMap((c) => [...this.hullQuotes].filter(([k]) => k.endsWith(`|${c.id}`)).map(([, v]) => v));
+      const hullGuess = seen.length ? Math.min(...seen) : FACTOR_HULL_GUESS_PENCE;
+      if (yard && known) {
+        factorYard = yard;
+        factorPriced = true;
+      } else if (yard && spare >= FACTOR_FEE_PENCE + hullGuess && (await this.hireTempFactor(yard))) {
+        yards.add(yard);
+        factorYard = yard;
       }
     }
-    if (yards.size === 0) return this.setBuyer(`waiting for a ship to call at a shipyard (spare ${cr(spare)} after ${cr(committed)} for loads)`);
-    if (spare <= 0) return this.setBuyer(`no spare cash: ${cr(committed)} is committed to loads the fleet is about to buy`);
+    if (yards.size === 0 && !factorPriced) return this.setBuyer(`waiting for a ship to call at a shipyard (spare ${cr(spare)} after ${cr(committed)} for loads${chestNote})`);
 
-    const classes = world.catalog.ship_classes.filter((c) => settings.buyClasses.includes(c.id) && c.phase <= world.unlockedPhase);
     type Option = { yard: string; cls: string; hull: number; guns: number; cost: number; payback: number; net: number; lane: Lane; upkeepFloor: number };
     const options: Option[] = [];
     const notes: string[] = [];
     const now = world.now();
 
-    for (const yard of yards) {
+    for (const yard of factorPriced ? [factorYard!] : yards) {
       for (const cls of classes) {
-        let quote;
-        try {
-          quote = await this.client.shipyardQuote(yard, cls.id, "turnkey_cash");
-        } catch (e) {
-          if (this.isFatal(e)) throw e;
-          notes.push(`${cls.id}@${yard}: ${(e as Error).message}`);
-          continue;
-        }
-        if (!quote.available || !quote.total_cost_pence) {
-          notes.push(`${cls.id}@${yard}: materials not in stock`);
-          continue;
+        let price: number;
+        if (factorPriced) {
+          // Priced from the last quote seen (re-quoted for real once the factor is there).
+          const q = this.hullQuotes.get(`${yard}|${cls.id}`);
+          if (q === undefined) continue;
+          price = q;
+        } else {
+          let quote;
+          try {
+            quote = await this.client.shipyardQuote(yard, cls.id, "turnkey_cash");
+          } catch (e) {
+            if (this.isFatal(e)) throw e;
+            notes.push(`${cls.id}@${yard}: ${(e as Error).message}`);
+            continue;
+          }
+          if (!quote.available || !quote.total_cost_pence) {
+            this.hullQuotes.delete(`${yard}|${cls.id}`);
+            notes.push(`${cls.id}@${yard}: materials not in stock`);
+            continue;
+          }
+          this.hullQuotes.set(`${yard}|${cls.id}`, quote.total_cost_pence);
+          price = quote.total_cost_pence;
         }
         // "full" arms new hulls at once; "auto" builds them bare and refits on a pirate-heavy lane.
         const guns = settings.guns === "full" ? cls.max_cannons : 0;
-        const hull = quote.total_cost_pence;
-        const cost = hull + guns * GUN_PRICE_PENCE;
+        const hull = price;
+        // A build at a factor's yard pays the factor's fee too.
+        const cost = hull + guns * GUN_PRICE_PENCE + (yard === factorYard ? FACTOR_FEE_PENCE : 0);
         // The home reserve must rise to cover the new hull's upkeep too.
         const oceanic = cls.hull_category === "oceanic";
         const upkeepFloor = this.homeFloor({ tons: cls.hold_capacity_tons, oceanic }) - this.homeFloor();
@@ -1315,14 +1576,31 @@ export class FleetManager implements FleetHost {
           notes.push(`${cls.id}@${yard}: upkeep eats the profit`);
           continue;
         }
-        // The charters it would serve must last, and hold enough tons, to pay the ship back.
-        const expiries = lane.fills.map(([id]) => world.charters.find((c) => c.id === id)?.expiresAt ?? null).filter((x): x is number => x !== null);
+        // The charters it would serve must last, and hold enough tons, to pay the ship back. Expansion
+        // charters re-post when they lapse: they last as long as the tier (at its recent pace) and
+        // together take no more than the tier still needs.
+        const tierHours = world.tierEtaMs !== null ? world.tierEtaMs / 3_600_000 : Infinity;
+        const expiries = lane.fills.map(([id]) => {
+          const c = world.charters.find((x) => x.id === id);
+          if (!c) return null;
+          return world.renews(c) ? now + tierHours * 3_600_000 : c.expiresAt;
+        }).filter((x): x is number => x !== null);
         const hoursLeft = expiries.length ? (Math.min(...expiries) - now) / 3_600_000 : Infinity;
         const res = this.reservations();
+        // What the tier still needs beyond the fleet's own loads for it.
+        let claimed = 0;
+        for (const [id, t] of res.charterTons) if (world.renews({ id })) claimed += t;
+        let expansionTons = 0;
         const tonsLeft = lane.fills.reduce((n, [id]) => {
           const c = world.charters.find((x) => x.id === id);
-          return n + (c ? Math.max(0, c.remaining - (res.charterTons.get(id) ?? 0)) : 0);
-        }, 0);
+          if (!c) return n;
+          const t = Math.max(0, c.remaining - (res.charterTons.get(id) ?? 0));
+          if (world.renews(c)) {
+            expansionTons += t;
+            return n;
+          }
+          return n + t;
+        }, 0) + Math.min(expansionTons, Math.max(0, world.expansionTonsLeft - claimed));
         // A lane mostly served by charters ends when they fill; a mostly-market lane repeats.
         // (One-off freight lots don't count as repeatable work.)
         const marketTons = lane.parts.filter((p) => p.kind === "market").reduce((n, p) => n + p.tons, 0);
@@ -1339,6 +1617,8 @@ export class FleetManager implements FleetHost {
     options.sort((a, b) => a.payback - b.payback);
     const pick = options.find((o) => o.payback <= settings.maxPaybackHours);
     if (!pick) {
+      // A factor hired to price builds led to none: don't hire again for a while.
+      if (factorYard && !factorPriced) this.factorFailed();
       const best = options[0];
       return this.setBuyer(
         best
@@ -1347,12 +1627,18 @@ export class FleetManager implements FleetHost {
         true,
       );
     }
+    // Priced without presence: hire the factor now, then the build below quotes it for real.
+    if (factorPriced && !(await this.hireTempFactor(pick.yard))) {
+      return this.setBuyer(`a ${pick.cls} at ${pick.yard} would pay back in ${pick.payback.toFixed(1)} h, but no factor could be hired there`, true);
+    }
 
     // Name first: the TopStats fetch must not sit between raising the cash and spending it.
     const name = await pickShipName(new Set([...this.agents.values()].map((a) => a.name)));
     const region = world.region(pick.yard);
     const failLater = (why: string) => {
       this.lastBuy = Date.now() - BUY_COOLDOWN_MS + BUY_FAIL_COOLDOWN_MS;
+      // A factor hired for this build earned nothing: don't hire one again straight away.
+      if (pick.yard === factorYard) this.factorFailed();
       this.setBuyer(why, true);
       return null;
     };
@@ -1361,14 +1647,16 @@ export class FleetManager implements FleetHost {
       // The quote may be minutes old by now: price it again and re-check what the fleet needs.
       const q = await this.client.shipyardQuote(pick.yard, pick.cls, "turnkey_cash").catch(() => null);
       if (!q?.available || !q.total_cost_pence || q.total_cost_pence > pick.hull * 1.05) {
+        if (q?.total_cost_pence) this.hullQuotes.set(`${pick.yard}|${pick.cls}`, q.total_cost_pence);
+        else this.hullQuotes.delete(`${pick.yard}|${pick.cls}`);
         return failLater(`the price of a ${pick.cls} at ${pick.yard} moved or it can't be built now`);
       }
       const price = q.total_cost_pence;
       await world.refreshVaults();
       let committedNow = 0;
       for (const a of this.agents.values()) committedNow += this.committedBy(a);
-      if (this.spareCash() - committedNow - pick.upkeepFloor < price) {
-        return failLater(`after the fleet's loads there is no longer ${cr(price)} spare for a ${pick.cls}`);
+      if (this.spareCash() - committedNow - pick.upkeepFloor - chest < price) {
+        return failLater(`after the fleet's loads${chest > 0 ? " and the cash kept for the next phase" : ""} there is no longer ${cr(price)} spare for a ${pick.cls}`);
       }
       const cash = await this.ensureCash(region, price);
       if (cash < price) return failLater(`could not raise ${cr(price)} in ${region} for a ${pick.cls}`);
@@ -1397,6 +1685,7 @@ export class FleetManager implements FleetHost {
     if (!built) return;
 
     this.lastBuy = Date.now();
+    this.factorFails = 0;
     this.shipSpendPence += built.total_cost_pence;
     world.vaults.set(region, world.vault(region) - built.total_cost_pence);
     this.log(

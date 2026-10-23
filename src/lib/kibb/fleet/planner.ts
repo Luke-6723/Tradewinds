@@ -19,9 +19,15 @@
  * expected to take on the way. Charters count a weighted share of the phase-completion bonus, but
  * their cash pay must cover the cost by itself. Loads are capped by hold room and spare cash.
  *
+ * Expansion charters are re-posted when they lapse, so their expiry doesn't end them: a load landing
+ * after it is valued at the re-post's terms (richer, on fewer tons, when the posting looks stalled).
+ * With holding allowed, a load landing shortly before a stalled posting lapses may wait for it.
+ *
  * Lanes are ranked by profit per real hour over the leg plus the best leg visible from D, so a lane
  * that ends where a paid return cargo waits beats one ending in a dead end. With nothing paying from
- * D, an empty sail back to S stands in for what comes next.
+ * D, an empty sail back to S stands in for what comes next. When cash is what limits the fleet, the
+ * money a load ties up is charged at the fleet's own return on cash, so thin-margin loads that lock
+ * up a lot of it rank lower.
  */
 
 import type { RoutePlan, ZoneClass } from "../types";
@@ -60,6 +66,8 @@ export interface Part {
   costPerTon: number;
   /** Per ton delivered: pay + bonus − cost. */
   margin: number;
+  /** Server time to hold the load until (a stalled expansion charter's re-post), or null to deliver on arrival. */
+  holdUntil: number | null;
 }
 
 /** A freight lot to accept at the source, bound for the destination. */
@@ -97,6 +105,12 @@ export interface Lane {
   askKnown: boolean;
   /** Expected cash profit of this leg (the phase bonus is paid later and isn't in it). */
   cashProfit: number;
+  /** Cash the load ties up at the source: goods and freight collateral. */
+  capital: number;
+  /** Real ms planned waiting at the destination for a re-post (0 when delivering on arrival). */
+  holdMs: number;
+  /** Server time the load is expected to be delivered (after any hold). */
+  deliverAt: number;
   /** Real ms from now until this leg is delivered. */
   deliverMs: number;
   /** This leg plus the best leg seen from its destination (or an empty sail back). */
@@ -115,6 +129,8 @@ export interface Reservations {
   /** Per `dest|good`: tons other ships will sell to that port's buyers. */
   sellTons: Map<string, number>;
   freightIds: Set<string>;
+  /** Per charter id: the soonest one of our other ships delivers into it (a stalled posting's stall ends then). */
+  charterLandsAt?: Map<string, number>;
 }
 
 export interface PlanOptions {
@@ -126,6 +142,10 @@ export interface PlanOptions {
   bonusWeight: number;
   /** Pence the fleet can spend on this load, or null for no limit. */
   cash: number | null;
+  /** Charge per pence of cash a load ties up, per real hour (0 while cash isn't scarce). */
+  capitalRate?: number;
+  /** Wait at the destination for a stalled expansion charter's richer re-post when it lapses soon after arrival. */
+  holdForRepost?: boolean;
 }
 
 /** Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). */
@@ -155,6 +175,12 @@ const GOSSIP_TRUST_PER_DAY = 0.15;
 const GOSSIP_TRUST_MIN = 0.15;
 /** A ton's worth at a gossiped charter's port if the charter is gone and no bid is known there. */
 const SALVAGE_OF_BASE = 0.6;
+/** Chance a posting that looks stalled now is still stalled when it lapses (someone may deliver first). */
+const STALL_SURVIVES = 0.75;
+/** Longest wait (game hours) for a stalled posting to lapse and re-post richer. */
+export const HOLD_MAX_GAME_H = 4;
+/** Allowance (game minutes) for the re-post to appear after the lapse. */
+export const REPOST_GRACE_GAME_MIN = 30;
 
 interface Ctx {
   world: World;
@@ -202,12 +228,57 @@ function trust(ctx: Ctx, c: CharterInfo): number {
   return Math.max(GOSSIP_TRUST_MIN, Math.min(GOSSIP_TRUST_MAX, GOSSIP_TRUST_MAX - GOSSIP_TRUST_PER_DAY * ageDays));
 }
 
+/** What a charter pays and takes for a load landing at `arriveAt`, and how long to hold it. */
+interface Terms {
+  pay: number;
+  remaining: number;
+  holdUntil: number | null;
+}
+
+/**
+ * An expansion charter re-posts when it lapses: at the same rate, or (if nothing was delivered in
+ * the posting) at a higher rate on fewer tons. A load landing after the lapse gets the re-post's
+ * terms, weighted by the chance the stall lasts; one landing shortly before it may wait for it.
+ */
+function terms(ctx: Ctx, c: CharterInfo, arriveAt: number): Terms {
+  const plain = { pay: c.payPerTon, remaining: c.remaining, holdUntil: null };
+  const w = c.expiresAt === null || !renewing(ctx, c) ? undefined : ctx.world.stallWatch(c);
+  if (!w || c.expiresAt === null) return plain;
+  const esc = ctx.world.escalation;
+  // One of our own ships delivering before the lapse ends the stall.
+  const ours = ctx.res.charterLandsAt?.get(c.id);
+  const stalled = w.stalled && !(ours !== undefined && ours < c.expiresAt);
+  const p = stalled ? STALL_SURVIVES : 0;
+  const reposted = {
+    pay: Math.round(c.payPerTon * (1 + (esc.pay - 1) * p)),
+    remaining: Math.floor(c.remaining * (1 - (1 - esc.tons) * p)),
+  };
+  if (arriveAt > c.expiresAt) return { ...reposted, holdUntil: null };
+  const holdMax = HOLD_MAX_GAME_H * 60 * ctx.world.gameMinuteMs;
+  if (ctx.opts.holdForRepost && stalled && c.expiresAt - arriveAt <= holdMax) {
+    return { ...reposted, holdUntil: c.expiresAt + REPOST_GRACE_GAME_MIN * ctx.world.gameMinuteMs };
+  }
+  return plain;
+}
+
+/**
+ * Whether a charter will still be re-posted when it lapses: an expansion charter of the tier in
+ * play, while the tier still needs tons beyond our fleet's loads and isn't due to complete first
+ * (its charters end with it).
+ */
+function renewing(ctx: Ctx, c: CharterInfo): boolean {
+  const { world } = ctx;
+  if (!world.renews(c) || ctx.bonusTons <= 0) return false;
+  const lapse = (c.expiresAt ?? ctx.now) + REPOST_GRACE_GAME_MIN * world.gameMinuteMs;
+  return world.tierEtaMs === null || ctx.now + world.tierEtaMs > lapse;
+}
+
 /** Expected cash per ton for a charter: its pay if open, else what the goods fetch at its port. */
-function charterCash(ctx: Ctx, c: CharterInfo): number {
+function charterCash(ctx: Ctx, c: CharterInfo, pay = c.payPerTon): number {
   const t = trust(ctx, c);
-  if (t >= 1) return c.payPerTon;
+  if (t >= 1) return pay;
   const salvage = expectedBid(ctx, c.port, c.good) ?? ctx.world.basePrice(c.good) * SALVAGE_OF_BASE;
-  return t * c.payPerTon + (1 - t) * Math.min(salvage, c.payPerTon);
+  return t * pay + (1 - t) * Math.min(salvage, pay);
 }
 
 function charterBonus(ctx: Ctx, c: CharterInfo): number {
@@ -227,6 +298,8 @@ interface PartArgs {
   piracy: number;
   /** Server time the load can be delivered by (charters closing sooner are skipped). */
   deliverBy: number;
+  /** Expected server time of delivery: landing plus the base lock (without the safety slack in deliverBy). */
+  arriveAt: number;
   /** Phase-bonus tons still unclaimed in this lane (read only: taking a part claims them). */
   bonusTons: number;
 }
@@ -243,14 +316,16 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   const est = world.estAsk(a.source, a.good);
   if (!est || a.room < MIN_PART_TONS) return null;
   const reserved = res.sourceTons.get(`${a.source}|${a.good}`) ?? 0;
-  const value = (c: CharterInfo) => charterCash(ctx, c) + charterBonus(ctx, c);
-  const usable = charters
-    .filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy)
-    .sort((x, y) => value(y) - value(x));
+  // Re-posted charters outlive their expiry; the rest must still be open when the load lands.
+  const usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
+  const t = new Map(usable.map((c) => [c.id, terms(ctx, c, a.arriveAt)]));
+  const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay);
+  const value = (c: CharterInfo) => cashOf(c) + charterBonus(ctx, c);
+  usable.sort((x, y) => value(y) - value(x));
 
   const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + a.room / 2))).cash, 1));
   const cap = Math.min(a.room, cashTons);
-  const roomOf = (c: CharterInfo) => Math.max(0, Math.floor((c.remaining - (res.charterTons.get(c.id) ?? 0)) * trust(ctx, c)));
+  const roomOf = (c: CharterInfo) => Math.max(0, Math.floor((t.get(c.id)!.remaining - (res.charterTons.get(c.id) ?? 0)) * trust(ctx, c)));
   const avail = Math.min(cap, usable.reduce((n, c) => n + roomOf(c), 0));
   const fullCost = costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + avail / 2))).landed;
 
@@ -260,21 +335,24 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   let bonusLeft = a.bonusTons;
   let minPay = Infinity;
   let cashPay = Infinity;
+  let holdUntil: number | null = null;
   const fills: Array<[string, number]> = [];
   for (const c of usable) {
     if (value(c) - fullCost < opts.minMargin) break; // sorted by value: the rest are worth even less
     // The bonus may rank a charter, but its cash must cover the cost by itself.
-    if (charterCash(ctx, c) < fullCost) continue;
+    if (cashOf(c) < fullCost) continue;
     const take = Math.min(roomOf(c), cap - tons);
     if (take <= 0) continue;
     tons += take;
-    cashTotal += take * charterCash(ctx, c);
+    cashTotal += take * cashOf(c);
+    const hold = t.get(c.id)!.holdUntil;
+    if (hold !== null) holdUntil = Math.max(holdUntil ?? 0, hold);
     if (world.expansionCharters.has(c.id)) {
       bonusTotal += Math.min(take, bonusLeft) * charterBonus(ctx, c);
       bonusLeft = Math.max(0, bonusLeft - take);
     }
     minPay = Math.min(minPay, value(c));
-    cashPay = Math.min(cashPay, charterCash(ctx, c));
+    cashPay = Math.min(cashPay, cashOf(c));
     fills.push([c.id, take]);
     if (tons >= cap) break;
   }
@@ -298,6 +376,7 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
     askKnown: est.known,
     costPerTon: Math.round(costPerTon),
     margin: Math.round(margin),
+    holdUntil,
   };
 }
 
@@ -339,6 +418,7 @@ function marketPart(ctx: Ctx, a: PartArgs): Part | null {
     askKnown: est.known,
     costPerTon: Math.round(best.landed),
     margin: Math.round(best.sale - best.landed),
+    holdUntil: null,
   };
 }
 
@@ -386,14 +466,16 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
 
   const piracy = world.piracyLoss(out, ship.guns, ship.knots * 0.8);
   const deadMs = dead ? world.sailMs(dead.total_distance_nm, ship.knots) : 0;
-  const deliverBy =
-    ctx.now + deadMs + ctx.baseLockMs + ship.cap * world.handlingMsPerTon(source) + world.sailMs(out.total_distance_nm, ship.knots * 0.8) + ctx.baseLockMs + EXPIRY_SLACK_MS;
+  const landsAt = ctx.now + deadMs + ctx.baseLockMs + ship.cap * world.handlingMsPerTon(source) + world.sailMs(out.total_distance_nm, ship.knots * 0.8);
+  // Delivered once the destination's base lock clears.
+  const arriveAt = landsAt + ctx.baseLockMs;
+  const deliverBy = arriveAt + EXPIRY_SLACK_MS;
   let bonusTons = ctx.bonusTons;
   let room = ship.cap;
   let cash = opts.cash ?? Number.MAX_SAFE_INTEGER;
   const parts: Part[] = [];
   let freight: FreightPick[] = [];
-  const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, deliverBy, bonusTons });
+  const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, deliverBy, arriveAt, bonusTons });
   const charterAt = (good: string) => ctx.charters.get(`${dest}|${good}`) ?? [];
   const take = (p: Part) => {
     parts.push(p);
@@ -457,7 +539,11 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const ladenMs = world.sailMs(out.total_distance_nm, ship.knots * (1 - 0.2 * fill));
   // Charters and freight are delivered from the roadstead once the base lock clears; selling needs the berth.
   const unloadMs = ctx.baseLockMs + marketTons * world.handlingMsPerTon(dest);
-  const ms = deadMs + loadMs + ladenMs + unloadMs + LEG_OVERHEAD_MS;
+  // A load held for a re-post waits at the destination until then.
+  const landAt = ctx.now + deadMs + loadMs + ladenMs;
+  const holdUntil = parts.reduce<number | null>((m, p) => (p.holdUntil === null ? m : Math.max(m ?? 0, p.holdUntil)), null);
+  const holdMs = holdUntil === null ? 0 : Math.max(0, holdUntil - landAt);
+  const ms = deadMs + loadMs + ladenMs + holdMs + unloadMs + LEG_OVERHEAD_MS;
 
   const kept = 1 - piracy;
   const freightReward = freight.reduce((n, f) => n + f.reward, 0);
@@ -470,6 +556,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const pay = (sum((p) => p.pay) + freightReward) / tons;
   const bonusAvg = sum((p) => p.bonus) / tons;
   const costPerTon = sum((p) => p.costPerTon) / tons;
+  const capital = parts.reduce((n, p) => n + costs(ctx, args(p.good), p.estAsk).cash * p.tons, 0) + freight.reduce((n, f) => n + f.collateral, 0);
 
   return {
     profit,
@@ -491,6 +578,9 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       piracyBps: Math.round(piracy * 10_000),
       askKnown: main?.askKnown ?? true,
       cashProfit: Math.round(cashProfit),
+      capital: Math.round(capital),
+      holdMs: Math.round(holdMs),
+      deliverAt: Math.round(ctx.now + ms - LEG_OVERHEAD_MS),
       deliverMs: ms,
       loopMs: ms,
       profitPerHour: Math.round(rate(profit, ms)),
@@ -582,7 +672,7 @@ function overlaps(a: Lane, b: Lane): boolean {
 export async function rankLanes(world: World, ship: ShipSpec, from: string, res: Reservations, opts: PlanOptions): Promise<Lane[]> {
   if (ship.cap <= 0) return [];
   let reservedExpansion = 0;
-  for (const [id, t] of res.charterTons) if (world.expansionCharters.has(id)) reservedExpansion += t;
+  for (const [id, t] of res.charterTons) if (world.renews({ id })) reservedExpansion += t;
   const ctx: Ctx = {
     world,
     ship,
@@ -638,7 +728,10 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     }
     lanes.push({ ...leg.lane, loopMs: ms, profitPerHour: Math.round(rate(profit, ms)), next });
   }
-  return lanes.sort((a, b) => b.profitPerHour - a.profitPerHour);
+  // Scarce cash: what a load ties up is charged at the fleet's return on cash.
+  const charge = opts.capitalRate ?? 0;
+  const score = (l: Lane) => l.profitPerHour - charge * l.capital;
+  return lanes.sort((a, b) => score(b) - score(a));
 }
 
 /** A lane for cargo already aboard (restart at sea, leftovers): carry it to one charter. */
@@ -656,6 +749,7 @@ export function cargoLane(good: string, source: string, dest: string, charterId:
     askKnown: false,
     costPerTon: 0,
     margin: 0,
+    holdUntil: null,
   };
   return {
     key: `${good}:${source}>${dest}`,
@@ -674,6 +768,9 @@ export function cargoLane(good: string, source: string, dest: string, charterId:
     piracyBps: 0,
     askKnown: false,
     cashProfit: 0,
+    capital: 0,
+    holdMs: 0,
+    deliverAt: 0,
     deliverMs: 0,
     loopMs: 0,
     profitPerHour: 0,

@@ -21,7 +21,7 @@
 import { isApiError, KibbApiError, type KibbClient } from "../client";
 import type { BankingRegion, ContractListing, DeliverCharterResult, OrderBookLevel, RoutePlan, ShipResult } from "../types";
 import type { FleetSettings } from "./manager";
-import { cargoLane, type FreightPick, type Lane, type Part } from "./planner";
+import { cargoLane, HOLD_MAX_GAME_H, REPOST_GRACE_GAME_MIN, type FreightPick, type Lane, type Part } from "./planner";
 import type { World } from "./world";
 
 const POLL_MS              = 15_000;
@@ -37,6 +37,8 @@ const HOLD_WAIT_MS         = 3 * 60_000;
 const ERROR_BACKOFF_MS     = 30_000;
 /** A lane that just failed at its source is skipped for one NPC re-quote (6 game hours at 60×). */
 const LANE_COOLDOWN_MS     = 6 * 60_000;
+/** Fewest tons worth holding a whole ship for a stalled charter's re-post. */
+const MIN_HOLD_TONS        = 3;
 /** Stores kept beyond the next legs' safe figures, in game days of eating in port. */
 const STORES_BUFFER_DAYS   = 2;
 const STORES_GOOD          = "provisions";
@@ -75,6 +77,19 @@ export interface FleetHost {
   charterRoomFor(agent: ShipAgent, charterId: string, remaining: number): number;
   /** Whether another ship's lane means to take this freight lot. */
   freightClaimed(agent: ShipAgent, id: string): boolean;
+  /** Another of our ships' hold at this port on this good for a re-post, if any. */
+  siblingHold(agent: ShipAgent, port: string, good: string): HoldInfo | undefined;
+}
+
+/** Cargo held for an expansion charter's re-post. */
+export interface HoldInfo {
+  /** The posting held for, and its lapse (server ms). */
+  id: string;
+  expiresAt: number;
+  /** When the hold ends at the latest. */
+  until: number;
+  /** A stalled posting lapsing soon, or a load that landed just after a lapse. */
+  why: "stall" | "lapse";
 }
 
 export interface AgentStats {
@@ -155,6 +170,8 @@ interface Stay {
   boughtHere: Map<string, number>;
   /** Charters that refused our cargo during this stay. */
   refused: Set<string>;
+  /** Goods held for an expansion charter's re-post, by good. */
+  holds: Map<string, HoldInfo>;
 }
 
 const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
@@ -528,7 +545,7 @@ export class ShipAgent {
     const port = s.current_port_id;
     if (!port) return POLL_MS;
     if (!this.stay || this.stay.port !== port) {
-      this.stay = { port, key: `${port}@${Date.now()}`, scouted: false, traded: new Set(), boughtHere: new Map(), refused: new Set() };
+      this.stay = { port, key: `${port}@${Date.now()}`, scouted: false, traded: new Set(), boughtHere: new Map(), refused: new Set(), holds: new Map() };
       await this.syncFreight();
       await this.refreshPortCharters(port);
     }
@@ -602,7 +619,15 @@ export class ShipAgent {
 
     // 2. Our own cargo that a charter here takes. Goods loaded at this port never count.
     const deliverable = (good: string) => this.ownTons(r, good) - (stay.boughtHere.get(good) ?? 0);
-    const due = world.charters.filter((c) => c.port === port && this.roomIn(c) > 0 && !stay.refused.has(c.id) && deliverable(c.good) > 0);
+    await this.updateHolds(stay, deliverable);
+    // Held goods wait for their re-post (ours, or another of our ships' here: delivering would end
+    // the stall); the rest is delivered now (never into a lapsed posting).
+    const deliverNow = (good: string) => (stay.holds.has(good) || this.host.siblingHold(this, port, good) ? 0 : deliverable(good));
+    const nowMs = world.now();
+    const due = world.charters.filter(
+      (c) =>
+        c.port === port && (c.expiresAt === null || c.expiresAt > nowMs) && this.roomIn(c) > 0 && !stay.refused.has(c.id) && deliverNow(c.good) > 0,
+    );
     // Market goods still to sell here need the berth: don't leave it to deliver from the roadstead.
     const sellingHere =
       this.loaded && this.lane!.dest === port && !stay.traded.has("sold") && this.lane!.parts.some((p) => p.kind === "market" && this.ownTons(r, p.good) > 0);
@@ -628,13 +653,28 @@ export class ShipAgent {
           }
         }
       }
-      const res = await this.deliverCharters(r, port, stay, deliverable);
+      const res = await this.deliverCharters(r, port, stay, deliverNow);
       if (res.delivered > 0) this.stats.trips++;
       r = await this.reread();
       if (res.retry) {
         this.activity = "delivery hit a temporary error; retrying";
         return 15_000;
       }
+    }
+    // Still holding: wait here (before the lane is finished or the cargo counted as leftover).
+    for (const good of [...stay.holds.keys()]) if (deliverable(good) <= 0) stay.holds.delete(good);
+    if (stay.holds.size > 0) {
+      // The lane's market goods are sold first: that needs the berth, the wait doesn't.
+      if (this.loaded && this.lane!.dest === port && !stay.traded.has("sold")) {
+        const wait = await this.sellLaneCargo(r, stay);
+        if (wait !== null) return wait;
+        r = await this.reread();
+      }
+      const until = Math.max(...[...stay.holds.values()].map((h) => h.until));
+      // Wait in the roadstead: the berth isn't needed, and its lock shouldn't run up meanwhile.
+      if (r.ship.status === "berthed" && !this.locked(r)) await client.offshore(this.shipId).catch(() => undefined);
+      this.activity = `holding cargo for an expansion charter's re-post at ${port}, ${secs(until - world.now())} left`;
+      return Math.min(Math.max(until - world.now(), 2_000), 15_000);
     }
 
     // 2b. At the loaded lane's destination: sell its market goods, then the lane is done.
@@ -856,8 +896,11 @@ export class ShipAgent {
   private liveTons(part: Part): number {
     if (part.kind !== "charter") return part.tons;
     const now = this.host.world.now();
+    const { world } = this.host;
     return part.fills.reduce((n, [id, t]) => {
-      const c = this.host.world.charters.find((x) => x.id === id && x.remaining > 0 && (x.expiresAt === null || x.expiresAt > now));
+      // The posting that now stands for it; an expansion posting that lapsed is re-posted.
+      const cur = world.currentId(id);
+      const c = world.charters.find((x) => x.id === cur && x.remaining > 0 && (x.expiresAt === null || x.expiresAt > now || world.renews(x)));
       return n + (c ? Math.min(t, c.remaining) : 0);
     }, 0);
   }
@@ -1041,8 +1084,9 @@ export class ShipAgent {
     const { client, world } = this.host;
     let delivered = 0;
     let retry = false;
+    const now = world.now();
     const charters = world.charters
-      .filter((c) => c.port === port && !stay.refused.has(c.id) && this.roomIn(c) > 0)
+      .filter((c) => c.port === port && (c.expiresAt === null || c.expiresAt > now) && !stay.refused.has(c.id) && this.roomIn(c) > 0)
       .sort((a, b) => b.payPerTon - a.payPerTon);
 
     // Several charters at once: one all-or-nothing batch call; on any refusal, one at a time below.
@@ -1096,6 +1140,95 @@ export class ShipAgent {
     }
     if (delivered > 0) this.host.cashArrived();
     return { delivered, retry };
+  }
+
+  /**
+   * Keeps the stay's holds for stalled charters' re-posts current: lists the port again once a held
+   * posting has lapsed (so its re-post shows), drops a hold once the re-post is listed, the stall
+   * breaks or the hold runs out, and starts new ones where this ship's voyage ends.
+   */
+  private async updateHolds(stay: Stay, deliverable: (good: string) => number): Promise<void> {
+    const { world } = this.host;
+    const port = stay.port;
+    const grace = REPOST_GRACE_GAME_MIN * world.gameMinuteMs;
+    if ([...stay.holds.values()].some((h) => world.now() >= h.expiresAt)) await this.refreshPortCharters(port);
+    const now = world.now();
+    // The re-post of a held posting: the same id with a later lapse, its recorded successor, or the
+    // expansion charter now standing for this port and good (never an unrelated charter).
+    const repostOf = (c: World["charters"][number], h: { id: string; expiresAt: number }) =>
+      c.expiresAt !== null && c.expiresAt > h.expiresAt && (c.id === h.id || world.currentId(h.id) === c.id || (world.renews(c) && !!world.stallWatch(c)));
+    for (const [good, h] of [...stay.holds]) {
+      const reposted = world.charters.some((c) => c.port === port && c.good === good && repostOf(c, h));
+      let drop = reposted || now >= h.until || deliverable(good) <= 0;
+      // Before the lapse, a stall hold stands only while its reasons do (still listed and stalled,
+      // holding still on, the tier not completing first).
+      if (!drop && h.why === "stall" && now < h.expiresAt) {
+        const c = world.charters.find((x) => x.id === h.id);
+        drop = !c || this.holdFor(c, deliverable(good)) === null;
+      }
+      if (drop) {
+        stay.holds.delete(good);
+        if (!reposted && now >= h.until) this.log(`no re-post of the ${good} charter at ${port} turned up in time: delivering what is open`);
+      }
+    }
+    // Only where this ship's voyage ends: not at the source of a lane it is about to load.
+    const endsHere = this.loaded ? this.lane!.dest === port : !this.lane;
+    if (!endsHere) return;
+    for (const c of world.charters) {
+      if (c.port !== port || stay.holds.has(c.good) || stay.refused.has(c.id) || this.roomIn(c) <= 0) continue;
+      const tons = deliverable(c.good);
+      if (tons < MIN_HOLD_TONS) continue;
+      const until = this.holdFor(c, tons);
+      if (until === null) continue;
+      stay.holds.set(c.good, { id: c.id, expiresAt: c.expiresAt!, until, why: "stall" });
+      this.log(`holding ${tons} t ${c.good} at ${port} for ${secs(until - now)}: ${c.title} is stalled and re-posts richer when it lapses`);
+    }
+    // Another of our ships here is holding a good we carry too: hold it alongside, not deliver it
+    // (that would end the stall) nor sell it off.
+    for (const good of Object.keys(this.last?.cargo_manifest ?? {})) {
+      if (stay.holds.has(good) || deliverable(good) <= 0) continue;
+      const sib = this.host.siblingHold(this, port, good);
+      if (sib) stay.holds.set(good, { ...sib });
+    }
+    // A load planned on an expansion charter that landed just after it lapsed (whatever the hold
+    // setting): wait out the grace for its re-post rather than selling the cargo off.
+    if (!this.loaded) return;
+    for (const p of this.lane!.parts) {
+      if (p.kind !== "charter" || stay.holds.has(p.good) || deliverable(p.good) <= 0) continue;
+      if (world.charters.some((c) => c.port === port && c.good === p.good && (c.expiresAt === null || c.expiresAt > now) && this.roomIn(c) > 0)) continue;
+      const lapsed = world.lapsedPosting(port, p.good);
+      for (const [id] of p.fills) {
+        const cur = world.currentId(id);
+        const c = world.charters.find((x) => x.id === cur);
+        const renewing = world.renews({ id }) || lapsed?.id === cur;
+        const expiresAt = c?.expiresAt ?? (lapsed?.id === cur ? lapsed.expiresAt : null);
+        if (!renewing || expiresAt === null || now < expiresAt || now >= expiresAt + grace) continue;
+        stay.holds.set(p.good, { id: cur, expiresAt, until: expiresAt + grace, why: "lapse" });
+        this.log(`waiting up to ${secs(expiresAt + grace - now)} at ${port} for the re-post of the lapsed ${p.good} charter`);
+        break;
+      }
+    }
+  }
+
+  /** This ship's hold at `port` on `good` for a re-post, if any. */
+  holdAt(port: string, good: string): HoldInfo | undefined {
+    return this.stay?.port === port ? this.stay.holds.get(good) : undefined;
+  }
+
+  /**
+   * Server time to hold `tons` for this charter until (its re-post), or null to deliver now: holding
+   * is on, the charter is a stalled expansion posting lapsing within the hold window, and the tier
+   * isn't about to complete first (its charters end with it).
+   */
+  private holdFor(c: World["charters"][number], tons: number): number | null {
+    const { world, settings } = this.host;
+    if (!settings.holdForRepost || c.expiresAt === null || !world.renews(c) || !world.stallWatch(c)?.stalled) return null;
+    const now = world.now();
+    const left = c.expiresAt - now;
+    if (left <= 0 || left > HOLD_MAX_GAME_H * 60 * world.gameMinuteMs) return null;
+    const until = c.expiresAt + REPOST_GRACE_GAME_MIN * world.gameMinuteMs;
+    if (tons >= world.expansionTonsLeft || (world.tierEtaMs !== null && now + world.tierEtaMs < until)) return null;
+    return until;
   }
 
   /**

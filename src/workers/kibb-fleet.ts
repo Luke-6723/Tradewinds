@@ -14,6 +14,9 @@
  *   KIBB_FREIGHT=0        don't carry freight on empty legs
  *   KIBB_GUNS             auto (refit each ship to its lane's piracy, default) | full | off
  *   KIBB_BONUS_WEIGHT     % of the expected phase-completion bonus counted in charter pay (default 75)
+ *   KIBB_YARD_FACTOR=0    don't hire a factor at a shipyard so the buyer can build there any time
+ *   KIBB_HOLD_REPOST=1    hold cargo for a stalled expansion charter's richer re-post
+ *   KIBB_PHASE_CHEST      % of spare cash the buyer keeps back when the tier nears completion (default 40)
  *
  * Run: pnpm exec tsx --env-file=.env.local src/workers/kibb-fleet.ts
  */
@@ -38,6 +41,9 @@ try {
       useFreight: env.KIBB_FREIGHT ? env.KIBB_FREIGHT !== "0" : undefined,
       guns: env.KIBB_GUNS ? (env.KIBB_GUNS as FleetSettings["guns"]) : undefined,
       bonusWeightPct: env.KIBB_BONUS_WEIGHT ? Number(env.KIBB_BONUS_WEIGHT) : undefined,
+      yardFactor: env.KIBB_YARD_FACTOR ? env.KIBB_YARD_FACTOR !== "0" : undefined,
+      holdForRepost: env.KIBB_HOLD_REPOST ? env.KIBB_HOLD_REPOST !== "0" : undefined,
+      phaseChestPct: env.KIBB_PHASE_CHEST ? Number(env.KIBB_PHASE_CHEST) : undefined,
     }),
   };
 } catch (e) {

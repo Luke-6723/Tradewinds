@@ -129,6 +129,36 @@ function SettingsForm({
           <input type="checkbox" checked={d.useFreight} onChange={(e) => setD({ ...d, useFreight: e.target.checked })} />
           Carry freight on empty legs
         </label>
+        <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={d.yardFactor} onChange={(e) => setD({ ...d, yardFactor: e.target.checked })} />
+          With no ship at a shipyard, hire a factor there for a build (dismissed after)
+        </label>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="space-y-1">
+            <Label>Cash kept back near a new phase (%)</Label>
+            <Input
+              type="number"
+              min={0}
+              max={90}
+              step={5}
+              value={d.phaseChestPct}
+              onChange={(e) => setD({ ...d, phaseChestPct: Math.min(90, Math.max(0, Number(e.target.value))) })}
+            />
+          </div>
+          <label className="flex items-center gap-1.5 text-sm sm:col-span-2">
+            <input type="checkbox" checked={d.holdForRepost} onChange={(e) => setD({ ...d, holdForRepost: e.target.checked })} />
+            Hold cargo for a stalled expansion charter&apos;s richer re-post (off by default)
+          </label>
+        </div>
+        <p className="text-muted-foreground text-xs">
+          Expansion charters re-post when they lapse; one nobody delivered to comes back at higher pay on fewer tons. Lanes already count
+          that for loads landing after the lapse. Holding goes further: a load landing up to 4 game hours before a stalled posting lapses
+          waits for the re-post instead of delivering at today&apos;s rate (if anyone delivers meanwhile, it delivers at once). Once the
+          tier is 90% done or due within 2 hours, and for an hour after it turns over, the buyer leaves the kept-back share of spare cash
+          for the next tier&apos;s charters.
+        </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
         <label className="flex items-center gap-1.5 text-sm">
@@ -144,8 +174,9 @@ function SettingsForm({
           </div>
         </div>
         <p className="text-muted-foreground text-xs">
-          Writes small slices only on fresh policies whose premium beats the loss Lloyd&apos;s accepting the same lane implies,
-          by the least edge. A sinking pays out the whole slice of the sum insured. All escrow counts against the budget.
+          Writes small slices only on fresh policies someone else (in practice Lloyd&apos;s) has already partly covered, whose premium
+          beats the loss that cover implies by the least edge. A sinking pays out the whole slice of the sum insured. All escrow counts
+          against the budget.
         </p>
       </div>
       <p className="col-span-full text-muted-foreground text-xs">
@@ -232,6 +263,11 @@ export function FleetPanel() {
           {st ? `${agents.length} ship${agents.length === 1 ? "" : "s"} under command` : "Not running since the server started"}
           {" · "}
           Buyer: {view.settings.autoBuy ? (st?.buyer ?? "idle") : "off"}
+          {st && st.capitalRate > 0 && (
+            <span title="Cash is what limits the fleet: lanes are charged for the money their loads tie up, at part of the fleet's own return on cash">
+              {" · "}cash is scarce: loads charged {(st.capitalRate * 100).toFixed(2)}%/h of the money they tie up
+            </span>
+          )}
         </p>
 
         <ErrorNote error={actionError ?? st?.error ?? null} />
@@ -316,6 +352,8 @@ export function FleetPanel() {
         )}
 
         {agents.length > 0 && <Efficiency agents={agents} startedAt={st?.startedAt ?? null} stoppedAt={st?.stoppedAt ?? null} />}
+
+        {st?.expansion && <ExpansionWatchView x={st.expansion} />}
 
         {st?.underwriting && (
           <details className="text-sm">
@@ -493,5 +531,49 @@ function Efficiency({
         )}
       </div>
     </div>
+  );
+}
+
+/** The expansion tier as the autopilot follows it: pace, the cash kept back, and each charter's posting. */
+function ExpansionWatchView({ x }: { x: NonNullable<NonNullable<FleetView["state"]>["expansion"]> }) {
+  const { portName, goodName } = useCatalog();
+  const stalled = x.charters.filter((c) => c.stalled);
+  const eta = x.etaMs !== null ? fmtIn(new Date(Date.now() + x.etaMs).toISOString()) : "no pace yet";
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Phase {x.targetPhase} tier: {fmtBps(x.progressBps)} done, completes {eta}
+        {x.phaseSoon ? " · buyer keeping cash back for it" : ""}
+        {stalled.length > 0 ? ` · ${stalled.length} stalled charter${stalled.length === 1 ? "" : "s"}` : ""}
+      </summary>
+      {x.charters.length === 0 ? (
+        <Empty>No open expansion charters.</Empty>
+      ) : (
+        <Table head={["Charter", "Pay now", "Tons left", "Lapses", "If it re-posts stalled", "State"]} className="mt-2">
+          {x.charters.map((c) => (
+            <tr key={`${c.port}|${c.good}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">
+                  {goodName(c.good)} → {portName(c.port)}
+                </div>
+                {c.beyondCoastal && <Badge variant="warning" size="sm">beyond coastal water</Badge>}
+                {c.escalations > 0 && <span className="ml-1 text-muted-foreground">re-posted ×{c.escalations}</span>}
+              </td>
+              <td className="tabular-nums">{fmtCr(c.rate)}/t</td>
+              <td className="tabular-nums">{fmtTons(c.remaining)}</td>
+              <td className="whitespace-nowrap text-xs">{c.expiresAt ? fmtIn(new Date(c.expiresAt).toISOString()) : "—"}</td>
+              <td className="whitespace-nowrap tabular-nums text-xs">
+                {fmtCr(Math.round(c.rate * x.escalation.pay))}/t on {fmtTons(Math.floor(c.remaining * x.escalation.tons))}
+              </td>
+              <td className="text-xs">{c.stalled ? <Badge variant="warning" size="sm">stalled</Badge> : <span className="text-muted-foreground">being filled</span>}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Stalled: nothing delivered in this posting yet. If that lasts until it lapses, it re-posts at about {Math.round((x.escalation.pay - 1) * 100)}% more
+        pay on {Math.round(x.escalation.tons * 100)}% of the tons (learned from escalations seen). Lanes landing after the lapse count that.
+      </p>
+    </details>
   );
 }

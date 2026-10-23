@@ -12,6 +12,7 @@ import type {
   CatalogPort,
   CatalogShipClass,
   ContractListing,
+  ExpansionTier,
   PortDetail,
   PortOrderBook,
   RoutePlan,
@@ -36,6 +37,42 @@ const GUN_DETERRENCE = 0.5;
  * movements bear out; this is the fallback rate when the pool can't be projected.
  */
 const EXPANSION_BONUS_SHARE = 0.12;
+/**
+ * A posting nobody delivers to before it lapses is re-posted richer: by default +25% pay on 75% of
+ * the tons left (refined from what the feed shows when an escalation happens).
+ */
+const ESCALATION_PAY = 1.25;
+const ESCALATION_TONS = 0.75;
+/** Our own watch calls a posting stalled only after following it from its start for this long (game hours). */
+const STALL_MIN_WATCH_GAME_H = 6;
+/** Tier pace is measured over at most this much real time. */
+const TIER_PACE_WINDOW_MS = 2 * 60 * 60 * 1000;
+/** ...and needs at least this much before it is trusted. */
+const TIER_PACE_MIN_MS = 10 * 60 * 1000;
+
+/** One expansion charter as the autopilot watches it across its postings. */
+export interface ExpansionWatch {
+  /** The current posting's contract id. */
+  id: string;
+  port: string;
+  good: string;
+  /** Pay per ton now, and tons it still takes. */
+  rate: number;
+  remaining: number;
+  expiresAt: number | null;
+  escalations: number;
+  /** Beyond coastal water from every home: a starter hoy can't reach it. */
+  beyondCoastal: boolean;
+  /** Tons delivered across its postings. */
+  deliveredTotal: number;
+  /** Nothing delivered in this posting so far (as far as we can tell): it re-posts richer if that lasts. */
+  stalled: boolean;
+  /** When we first saw this posting (server ms) and its delivered total then. */
+  postingSeenAt: number;
+  postingBase: number;
+  /** We saw this posting replace the previous one, so postingBase is its start. */
+  sawStart: boolean;
+}
 
 export interface CharterInfo {
   id: string;
@@ -135,6 +172,22 @@ export class World {
   expansionCharters = new Set<string>();
   /** Tons the tier still needs; tons beyond that arrive after it completes and earn no bonus. */
   expansionTonsLeft = 0;
+  /** The tier's progress (bps of its target) and the real ms until it completes at the recent pace (null: no pace yet). */
+  tierProgressBps = 0;
+  tierEtaMs: number | null = null;
+  /** The phase the tier in play unlocks. */
+  tierTargetPhase: number | null = null;
+  /** Server time the tier in play last completed or gave way to the next (null: not seen). */
+  tierTurnedAt: number | null = null;
+  /** A lapsed posting's id → the id of the posting that replaced it. */
+  private readonly repostOf = new Map<string, string>();
+  /** Expansion postings that dropped out of the tier listing (lapsed, awaiting a re-post), by `port|good`. */
+  private readonly lapsedPostings = new Map<string, { id: string; expiresAt: number | null }>();
+  /** Expansion charters by `port|good`, followed across re-posts. */
+  readonly expansionWatch = new Map<string, ExpansionWatch>();
+  /** What a stalled posting's re-post multiplies: pay and tons (learned when one is seen). */
+  escalation = { pay: ESCALATION_PAY, tons: ESCALATION_TONS };
+  private tierSamples: Array<{ at: number; delivered: number; phase: number }> = [];
   /** Share value of a ton per expansion charter (pence: base price × premium), and the pool's rate on it. */
   private expansionValue = new Map<string, number>();
   private expansionRate = EXPANSION_BONUS_SHARE;
@@ -192,8 +245,9 @@ export class World {
     if (zones) this.piracy = new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps]));
     if (expansion) {
       const tier = expansion.current_tier;
-      this.expansionCharters = new Set(tier && !tier.completed ? tier.charters.map((c) => c.contract_id) : []);
+      this.expansionCharters = new Set(tier && !tier.completed ? tier.charters.filter((c) => c.status === "open").map((c) => c.contract_id) : []);
       this.expansionTonsLeft = tier && !tier.completed ? tier.tons_remaining : 0;
+      this.watchExpansion(tier && !tier.completed ? tier : null);
       if (tier && !tier.completed) {
         // Project the tier's final value: what is delivered, plus the tons still needed at the mix
         // delivered so far. The pool over that is the bonus per unit of value.
@@ -227,6 +281,111 @@ export class World {
     this.rates = new Map(rates.map((r) => [`${r.from_region}>${r.to_region}`, r.fee_bps]));
   }
 
+  /**
+   * Follows each expansion charter across its postings: whether the current one is stalled (it
+   * re-posts richer if nothing is delivered before it lapses), what an escalation did to the pay
+   * and tons when we saw one, and how fast the tier as a whole is filling.
+   */
+  private watchExpansion(tier: ExpansionTier | null): void {
+    const now = this.now();
+    if (!tier) {
+      if (this.tierTargetPhase !== null) this.tierTurnedAt = now;
+      this.expansionWatch.clear();
+      this.tierSamples = [];
+      this.tierEtaMs = null;
+      this.tierProgressBps = 0;
+      this.tierTargetPhase = null;
+      return;
+    }
+    // A new tier starts its pace afresh.
+    if (this.tierTargetPhase !== tier.target_phase) {
+      if (this.tierTargetPhase !== null) this.tierTurnedAt = now;
+      this.tierSamples = [];
+    }
+    this.tierTargetPhase = tier.target_phase;
+    this.tierProgressBps = tier.progress_bps;
+    this.tierSamples.push({ at: now, delivered: tier.tons_delivered, phase: tier.target_phase });
+    this.tierSamples = this.tierSamples.filter((s) => now - s.at <= TIER_PACE_WINDOW_MS);
+    const first = this.tierSamples[0];
+    const span = now - first.at;
+    const pace = span >= TIER_PACE_MIN_MS ? (tier.tons_delivered - first.delivered) / span : 0;
+    this.tierEtaMs = pace > 0 ? tier.tons_remaining / pace : null;
+
+    const seen = new Set<string>();
+    for (const c of tier.charters) {
+      if (c.status !== "open") continue;
+      const key = `${c.port_id}|${c.commodity_id}`;
+      seen.add(key);
+      const expiresAt = c.expires_at ? Date.parse(c.expires_at) : null;
+      const total = c.tons_delivered_total ?? c.quantity_delivered;
+      const prev = this.expansionWatch.get(key);
+      const newPosting = !prev || prev.id !== c.contract_id || prev.expiresAt !== expiresAt;
+      // An escalation seen happen: learn what it did (within sane bounds).
+      if (prev && c.escalations > prev.escalations && prev.rate > 0) {
+        this.escalation.pay = Math.min(2, Math.max(1, c.reward_per_ton_pence / prev.rate));
+        if (prev.remaining > 0) this.escalation.tons = Math.min(1, Math.max(0.3, c.quantity_remaining / prev.remaining));
+      }
+      if (prev && prev.id !== c.contract_id) this.repostOf.set(prev.id, c.contract_id);
+      const postingSeenAt = newPosting ? now : prev.postingSeenAt;
+      const postingBase = newPosting ? total : prev.postingBase;
+      // Seen from its start (it replaced one we watched), so the base really is the posting's start.
+      const sawStart = newPosting ? !!prev : prev.sawStart;
+      const watchedLongEnough = sawStart && now - postingSeenAt >= STALL_MIN_WATCH_GAME_H * 60 * this.gameMinuteMs;
+      this.expansionWatch.set(key, {
+        id: c.contract_id,
+        port: c.port_id,
+        good: c.commodity_id,
+        rate: c.reward_per_ton_pence,
+        remaining: c.quantity_remaining,
+        expiresAt,
+        escalations: c.escalations,
+        beyondCoastal: c.beyond_coastal_water,
+        deliveredTotal: total,
+        // Nothing delivered in this posting (the feed counts it per posting; across postings is
+        // tons_delivered_total). Only if the feed gives no lineage total (so the count may be
+        // cumulative): nothing since we watched this posting start, for a while.
+        stalled: c.quantity_delivered === 0 || (c.tons_delivered_total === undefined && watchedLongEnough && total === postingBase),
+        postingSeenAt,
+        postingBase,
+        sawStart,
+      });
+    }
+    for (const [k, w] of [...this.expansionWatch]) {
+      if (seen.has(k)) continue;
+      // Gone from the listing before its lapse: filled or closed. After it: awaiting its re-post.
+      if (w.expiresAt !== null && w.expiresAt <= now) this.lapsedPostings.set(k, { id: w.id, expiresAt: w.expiresAt });
+      this.expansionWatch.delete(k);
+    }
+    for (const k of seen) this.lapsedPostings.delete(k);
+  }
+
+  /** An expansion posting at this port for this good that lapsed and hasn't been re-posted yet (as far as we know). */
+  lapsedPosting(port: string, good: string): { id: string; expiresAt: number | null } | undefined {
+    return this.lapsedPostings.get(`${port}|${good}`);
+  }
+
+  /** The watch on an expansion charter of the tier in play (live or by its port and good), if it is one. */
+  stallWatch(c: { id: string; port: string; good: string }): ExpansionWatch | undefined {
+    const w = this.expansionWatch.get(`${c.port}|${c.good}`);
+    return w && (w.id === c.id || this.expansionCharters.has(c.id)) ? w : undefined;
+  }
+
+  /** Whether a charter is re-posted when it lapses (an open expansion charter of the tier in play). */
+  renews(c: { id: string }): boolean {
+    return this.expansionCharters.has(this.currentId(c.id));
+  }
+
+  /** The id of the posting that now stands for this charter (itself unless it lapsed and was re-posted). */
+  currentId(id: string): string {
+    let cur = id;
+    for (let i = 0; i < 20; i++) {
+      const next = this.repostOf.get(cur);
+      if (!next || next === cur) break;
+      cur = next;
+    }
+    return cur;
+  }
+
   /** Replaces what we know about one port's charters with a live listing taken there. */
   mergePortCharters(port: string, list: ContractListing[]): void {
     const fresh = toCharters(list.filter((c) => c.origin_port_id === port)).filter((c) => !this.closed.has(c.id));
@@ -248,9 +407,13 @@ export class World {
     this.freight = this.freight.filter((f) => f.id !== id);
   }
 
-  /** A charter was filled or closed: drop it now and ignore it in listings already in flight. */
-  markClosed(id: string): void {
-    this.closed.add(id);
+  /**
+   * A charter was filled or closed: drop it now and ignore it in listings already in flight. One
+   * that only `lapsed` and is an expansion posting may come back under the same id when re-posted,
+   * so it isn't ignored for good.
+   */
+  markClosed(id: string, lapsed = false): void {
+    if (!lapsed || !this.renews({ id })) this.closed.add(id);
     this.liveSeen.delete(id);
     this.charters = this.charters.filter((c) => c.id !== id);
   }
