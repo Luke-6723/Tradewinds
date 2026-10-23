@@ -17,6 +17,9 @@
  *   KIBB_YARD_FACTOR=0    don't hire a factor at a shipyard so the buyer can build there any time
  *   KIBB_HOLD_REPOST=1    hold cargo for a stalled expansion charter's richer re-post
  *   KIBB_PHASE_CHEST      % of spare cash the buyer keeps back when the tier nears completion (default 40)
+ *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY
+ *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 10)
+ *   KIBB_AI_TOTAL_USD     AI spend cap in total in US$ (default 180)
  *
  * Run: pnpm exec tsx --env-file=.env.local src/workers/kibb-fleet.ts
  */
@@ -44,6 +47,9 @@ try {
       yardFactor: env.KIBB_YARD_FACTOR ? env.KIBB_YARD_FACTOR !== "0" : undefined,
       holdForRepost: env.KIBB_HOLD_REPOST ? env.KIBB_HOLD_REPOST !== "0" : undefined,
       phaseChestPct: env.KIBB_PHASE_CHEST ? Number(env.KIBB_PHASE_CHEST) : undefined,
+      ai: env.KIBB_AI ? (env.KIBB_AI as FleetSettings["ai"]) : undefined,
+      aiDailyCapUsd: env.KIBB_AI_DAILY_USD ? Number(env.KIBB_AI_DAILY_USD) : undefined,
+      aiTotalCapUsd: env.KIBB_AI_TOTAL_USD ? Number(env.KIBB_AI_TOTAL_USD) : undefined,
     }),
   };
 } catch (e) {

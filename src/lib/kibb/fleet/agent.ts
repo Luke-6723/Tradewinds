@@ -79,6 +79,8 @@ export interface FleetHost {
   freightClaimed(agent: ShipAgent, id: string): boolean;
   /** Another of our ships' hold at this port on this good for a re-post, if any. */
   siblingHold(agent: ShipAgent, port: string, good: string): HoldInfo | undefined;
+  /** The AI's call on a stalled expansion charter here: hold for its re-post ("wait") or not ("deliver"). */
+  stallCall(port: string, good: string): "wait" | "deliver" | undefined;
   /** The fleet's progress changed: save it (`now` for a trip, a load or a delivery). */
   persist(now?: boolean): void;
   /** A trip finished: add it to the saved history. */
@@ -1334,7 +1336,10 @@ export class ShipAgent {
    */
   private holdFor(c: World["charters"][number], tons: number): number | null {
     const { world, settings } = this.host;
-    if (!settings.holdForRepost || c.expiresAt === null || !world.renews(c) || !world.stallWatch(c)?.stalled) return null;
+    // Holding is on for all stalled postings, or the AI called this one; an AI "deliver" call vetoes it.
+    const call = this.host.stallCall(c.port, c.good);
+    if (call === "deliver" || (!settings.holdForRepost && call !== "wait")) return null;
+    if (c.expiresAt === null || !world.renews(c) || !world.stallWatch(c)?.stalled) return null;
     const now = world.now();
     const left = c.expiresAt - now;
     if (left <= 0 || left > HOLD_MAX_GAME_H * 60 * world.gameMinuteMs) return null;
@@ -1364,6 +1369,7 @@ export class ShipAgent {
       world.markClosed(c.id);
     }
     r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
+    if (res.delivered_quantity > 0) world.noteOwnDelivery(c.id);
     this.host.persist(true);
     this.stats.deliveredTons += res.delivered_quantity;
     this.stats.rewardPence += res.reward_paid_pence;

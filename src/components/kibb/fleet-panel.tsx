@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Empty, ErrorNote, Loading, Metrics, NativeSelect, Panel, Table } from "@/components/kibb/bits";
+import { Segmented } from "@/components/kibb/naval-common";
+import type { AiMode, AiReport } from "@/lib/kibb/ai/advisor";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash } from "@/lib/kibb/browser";
@@ -135,6 +137,21 @@ function SettingsForm({
         </label>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label>AI spend cap per day (US$)</Label>
+            <Input type="number" min={0} step="any" value={d.aiDailyCapUsd} onChange={(e) => setD({ ...d, aiDailyCapUsd: Math.max(0, Number(e.target.value) || 0) })} />
+          </div>
+          <div className="space-y-1">
+            <Label>AI spend cap in total (US$)</Label>
+            <Input type="number" min={0} step="any" value={d.aiTotalCapUsd} onChange={(e) => setD({ ...d, aiTotalCapUsd: Math.max(0, Number(e.target.value) || 0) })} />
+          </div>
+        </div>
+        <p className="text-muted-foreground text-xs">
+          The AI (Claude) is switched on and off on the panel itself. A call is skipped when its worst case could pass either cap.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
         <div className="grid gap-3 sm:grid-cols-3">
           <div className="space-y-1">
             <Label>Cash kept back near a new phase (%)</Label>
@@ -212,6 +229,19 @@ export function FleetPanel() {
   const t = st?.totals;
   const net = t ? t.rewardPence + t.freightPence - t.spentPence - t.shipSpendPence : 0;
 
+  async function command(ai: "run" | "clear" | "retry") {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await dash.post<FleetView>("/api/kibb/fleet", { ai });
+      await reload();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function send(body: { enabled?: boolean; settings?: Partial<FleetSettings> }) {
     setBusy(true);
     setActionError(null);
@@ -271,6 +301,19 @@ export function FleetPanel() {
         </p>
 
         <ErrorNote error={actionError ?? st?.error ?? null} />
+
+        <AiPanel
+          mode={view.settings.ai ?? "off"}
+          report={st?.ai ?? null}
+          running={st?.status === "running"}
+          busy={busy}
+          caps={{ daily: view.settings.aiDailyCapUsd, total: view.settings.aiTotalCapUsd }}
+          onMode={(m) => {
+            if (m === "live" && !confirm(`Let Claude steer the autopilot: temporary setting changes within limits, lane bias, stall calls and holding the ship buyer? Spend is capped at $${view.settings.aiDailyCapUsd} a day and $${view.settings.aiTotalCapUsd} in total.`)) return;
+            void send({ settings: { ai: m } });
+          }}
+          onCommand={(cmd) => void command(cmd)}
+        />
 
         {editing && (
           <SettingsForm
@@ -578,5 +621,169 @@ function ExpansionWatchView({ x }: { x: NonNullable<NonNullable<FleetView["state
         pay on {Math.round(x.escalation.tons * 100)}% of the tons (learned from escalations seen). Lanes landing after the lapse count that.
       </p>
     </details>
+  );
+}
+
+const usd = (n: number) => `$${n.toFixed(n < 1 ? 3 : 2)}`;
+
+/** AI support (Claude as strategist): the switch, what it costs, what it's doing and why. */
+function AiPanel({
+  mode,
+  report,
+  running,
+  busy,
+  caps,
+  onMode,
+  onCommand,
+}: {
+  mode: AiMode;
+  report: AiReport | null;
+  running: boolean;
+  busy: boolean;
+  caps: { daily: number; total: number };
+  onMode: (m: AiMode) => void;
+  onCommand: (cmd: "run" | "clear" | "retry") => void;
+}) {
+  const r = report;
+  const a = r?.active ?? null;
+  const status = !r
+    ? mode === "off"
+      ? "Off."
+      : "Starts with the autopilot."
+    : r.effective === "off"
+      ? "Off."
+      : !r.configured
+        ? "ANTHROPIC_API_KEY isn't set in .env.local: no calls are made."
+        : r.running
+          ? "Thinking…"
+          : `${!running ? "Paused while the autopilot is stopped. " : ""}${r.demoted ? "Demoted to shadow by its own record. " : ""}${r.lastRunAt ? `Last call ${fmtTime(r.lastRunAt)}` : "No call yet"}${running && r.nextRunAt ? `, next ${fmtIn(r.nextRunAt)}` : ""}.`;
+  return (
+    <div className="space-y-3 rounded-lg border p-3 sm:p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-0.5">
+          <div className="font-medium text-sm">AI support (Claude)</div>
+          <div className="text-muted-foreground text-xs">{status}</div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="w-full sm:w-64">
+            <Segmented<AiMode>
+              value={mode}
+              onChange={(m) => m !== mode && !busy && onMode(m)}
+              options={[
+                { value: "off", label: "Off" },
+                { value: "shadow", label: "Shadow" },
+                { value: "live", label: "Live" },
+              ]}
+            />
+          </div>
+          {running && mode !== "off" && (
+            <Button size="sm" variant="outline" disabled={busy || !!r?.running || !r?.configured} onClick={() => onCommand("run")}>
+              Ask now
+            </Button>
+          )}
+          {r?.demoted && mode === "live" && (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => onCommand("retry")}>
+              Retry live
+            </Button>
+          )}
+          {a && (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => onCommand("clear")}>
+              Clear its changes
+            </Button>
+          )}
+        </div>
+      </div>
+      <p className="text-muted-foreground text-xs">
+        Shadow: Claude advises and every answer is logged, nothing changes. Live: its directives apply until they lapse (15-180 min):
+        setting overrides within limits, a bias on lane ranks, calls on stalled expansion charters, and holding the ship buyer. Every
+        autopilot check still runs. It drops back to shadow by itself if trips under its advice earn clearly less.
+      </p>
+      {r && (
+        <>
+          <ErrorNote error={r.lastError} />
+          <Metrics
+            className="sm:grid-cols-4 xl:grid-cols-4"
+            items={[
+              { label: "Spent today", value: usd(r.spend.today), hint: `cap ${usd(caps.daily)}` },
+              { label: "Spent in total", value: usd(r.spend.total), hint: `cap ${usd(caps.total)}` },
+              {
+                label: "Trips under its advice",
+                value: r.uplift.aiTrips,
+                hint: r.uplift.aiPerHour !== null ? `${fmtCr(r.uplift.aiPerHour)}/h on average` : undefined,
+              },
+              {
+                label: "Trips without",
+                value: r.uplift.baseTrips,
+                hint: r.uplift.basePerHour !== null ? `${fmtCr(r.uplift.basePerHour)}/h on average` : undefined,
+              },
+            ]}
+          />
+          {a && (
+            <div className="space-y-1 rounded-md bg-accent/40 px-3 py-2 text-sm">
+              <div className="font-medium">{running ? `In force until ${fmtTime(a.until)}` : `Paused (autopilot stopped); in force until ${fmtTime(a.until)} if it restarts`}</div>
+              {Object.keys(a.settings).length > 0 && (
+                <div className="text-xs">
+                  Settings:{" "}
+                  {Object.entries(a.settings)
+                    .map(([k, v]) => `${k} ${k === "minMarginPence" ? fmtCr(v as number) : String(v)}`)
+                    .join(", ")}
+                </div>
+              )}
+              {a.biases.length > 0 && <div className="text-xs">Lane bias: {a.biases.map((b) => `${b.label} x${b.factor}`).join(", ")}</div>}
+              {a.stallCalls.length > 0 && <div className="text-xs">Stall calls: {a.stallCalls.map((s) => `${s.label}: ${s.call}`).join(", ")}</div>}
+              {a.buyHold && <div className="text-xs">Ship buyer on hold: {a.buyHold}</div>}
+            </div>
+          )}
+          {r.decisions.length > 0 && (
+            <details className="text-sm">
+              <summary className="cursor-pointer text-muted-foreground text-xs">
+                Recent advice ({r.decisions.length}): latest {r.decisions[0].posture}, {r.decisions[0].status}
+              </summary>
+              <div className="mt-2 space-y-2">
+                {r.decisions.map((x) => (
+                  <div key={x.id} className="space-y-1 rounded-md border px-3 py-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-medium">{fmtTime(x.at)}</span>
+                      <Badge variant={x.status === "applied" ? "success" : x.status === "discarded" || x.status === "tripwire" || x.status === "demoted" ? "warning" : "secondary"} size="sm">
+                        {x.status}
+                      </Badge>
+                      <span className="text-muted-foreground">
+                        {x.mode} · {x.posture} · {x.trigger} · {usd(x.costUsd)}
+                        {x.model !== "claude-opus-5-5" ? ` · answered by ${x.model}` : ""}
+                        {x.trips > 0 ? ` · ${x.trips} trips, ${fmtCr(x.profitPence)}` : ""}
+                      </span>
+                    </div>
+                    <div>{x.rationale}</div>
+                    {Object.keys(x.settings).length > 0 && <div className="text-muted-foreground">Settings: {JSON.stringify(x.settings)}</div>}
+                    {x.biases.length > 0 && <div className="text-muted-foreground">Bias: {x.biases.map((b) => `${b.label} x${b.factor} (${b.reason})`).join("; ")}</div>}
+                    {x.stallCalls.length > 0 && <div className="text-muted-foreground">Stall calls: {x.stallCalls.map((s) => `${s.label}: ${s.call} (${s.reason})`).join("; ")}</div>}
+                    {x.buy.action === "hold" && <div className="text-muted-foreground">Buyer held: {x.buy.reason}</div>}
+                    {x.alerts.map((t, i) => (
+                      <div key={i} className="text-warning-foreground">Note: {t}</div>
+                    ))}
+                    {x.note && <div className="text-muted-foreground">{x.note}</div>}
+                    {x.dropped > 0 && <div className="text-muted-foreground">{x.dropped} invalid item{x.dropped === 1 ? "" : "s"} dropped</div>}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+          {r.events.length > 0 && (
+            <details className="text-sm">
+              <summary className="cursor-pointer text-muted-foreground text-xs">Notices it was told about ({r.events.length})</summary>
+              <ul className="mt-2 space-y-1 text-xs">
+                {r.events.map((e, i) => (
+                  <li key={i}>
+                    {e.kind.replace(/_/g, " ")}, {e.direction}, {e.severity}
+                    {e.ports.length ? ` · ${e.ports.join(", ")}` : ""}
+                    {e.goods.length ? ` · ${e.goods.join(", ")}` : ""}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </>
+      )}
+    </div>
   );
 }

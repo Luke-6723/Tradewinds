@@ -31,7 +31,7 @@
  */
 
 import type { RoutePlan, ZoneClass } from "../types";
-import type { CharterInfo, World } from "./world";
+import { BID_HAIRCUT_BASE, type CharterInfo, type World } from "./world";
 
 export interface ShipSpec {
   shipClass: string;
@@ -146,6 +146,13 @@ export interface PlanOptions {
   capitalRate?: number;
   /** Wait at the destination for a stalled expansion charter's richer re-post when it lapses soon after arrival. */
   holdForRepost?: boolean;
+  /**
+   * A multiplier on a lane's rank (the AI advisor's lane bias). It only reorders lanes that already
+   * passed every check and earn something; it never makes a lane eligible.
+   */
+  bias?: (lane: Lane) => number;
+  /** Per expansion charter (`port|good`): wait for a stalled posting's re-post, or deliver now (AI stall calls). */
+  stallCalls?: Map<string, "wait" | "deliver">;
 }
 
 /** Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). */
@@ -166,17 +173,15 @@ const LEG_OVERHEAD_MS = 60_000;
 const MIN_PART_TONS = 3;
 /** Bids seen longer ago than this (game hours) aren't planned on. */
 const MARKET_MAX_AGE_GAME_H = 72;
-/** A remembered bid is marked down by this, plus the per-game-day rate for its age. */
-const BID_HAIRCUT_BASE = 0.03;
-const BID_HAIRCUT_PER_DAY = 0.03;
+// A remembered bid is marked down by World's BID_HAIRCUT_BASE, plus its learned rate per game day of age.
 /** A gossiped charter's chance of still being open: this when fresh, less per game day of age. */
 const GOSSIP_TRUST_MAX = 0.85;
 const GOSSIP_TRUST_PER_DAY = 0.15;
 const GOSSIP_TRUST_MIN = 0.15;
 /** A ton's worth at a gossiped charter's port if the charter is gone and no bid is known there. */
 const SALVAGE_OF_BASE = 0.6;
-/** Chance a posting that looks stalled now is still stalled when it lapses (someone may deliver first). */
-const STALL_SURVIVES = 0.75;
+/** Each laden rival seen bound for a public charter's port before we land takes this share of its room (to at most 60%). */
+const RIVAL_CROWD_SHARE = 0.15;
 /** Longest wait (game hours) for a stalled posting to lapse and re-post richer. */
 export const HOLD_MAX_GAME_H = 4;
 /** Allowance (game minutes) for the re-post to appear after the lapse. */
@@ -217,7 +222,7 @@ function expectedBid(ctx: Ctx, port: string, good: string): number | null {
   const age = Math.max(0, ctx.now - obs.at);
   if (age > MARKET_MAX_AGE_GAME_H * 60 * ctx.world.gameMinuteMs) return null;
   const fresh = obs.live && age < 60 * ctx.world.gameMinuteMs;
-  const haircut = fresh ? 0 : BID_HAIRCUT_BASE + BID_HAIRCUT_PER_DAY * (age / ctx.gameDayMs);
+  const haircut = fresh ? 0 : BID_HAIRCUT_BASE + ctx.world.bidHaircutPerDay * (age / ctx.gameDayMs);
   return obs.bid * Math.max(0, 1 - haircut);
 }
 
@@ -245,17 +250,19 @@ function terms(ctx: Ctx, c: CharterInfo, arriveAt: number): Terms {
   const w = c.expiresAt === null || !renewing(ctx, c) ? undefined : ctx.world.stallWatch(c);
   if (!w || c.expiresAt === null) return plain;
   const esc = ctx.world.escalation;
-  // One of our own ships delivering before the lapse ends the stall.
+  // One of our own ships delivering before the lapse ends the stall; so does an AI call to deliver.
   const ours = ctx.res.charterLandsAt?.get(c.id);
-  const stalled = w.stalled && !(ours !== undefined && ours < c.expiresAt);
-  const p = stalled ? STALL_SURVIVES : 0;
+  const call = ctx.opts.stallCalls?.get(`${c.port}|${c.good}`);
+  const stalled = w.stalled && call !== "deliver" && !(ours !== undefined && ours < c.expiresAt);
+  // How often stalls seen lapse did re-post richer (learned).
+  const p = stalled ? ctx.world.stallSurvives : 0;
   const reposted = {
     pay: Math.round(c.payPerTon * (1 + (esc.pay - 1) * p)),
     remaining: Math.floor(c.remaining * (1 - (1 - esc.tons) * p)),
   };
   if (arriveAt > c.expiresAt) return { ...reposted, holdUntil: null };
   const holdMax = HOLD_MAX_GAME_H * 60 * ctx.world.gameMinuteMs;
-  if (ctx.opts.holdForRepost && stalled && c.expiresAt - arriveAt <= holdMax) {
+  if ((ctx.opts.holdForRepost || call === "wait") && stalled && c.expiresAt - arriveAt <= holdMax) {
     return { ...reposted, holdUntil: c.expiresAt + REPOST_GRACE_GAME_MIN * ctx.world.gameMinuteMs };
   }
   return plain;
@@ -325,7 +332,10 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
 
   const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + a.room / 2))).cash, 1));
   const cap = Math.min(a.room, cashTons);
-  const roomOf = (c: CharterInfo) => Math.max(0, Math.floor((t.get(c.id)!.remaining - (res.charterTons.get(c.id) ?? 0)) * trust(ctx, c)));
+  // Public charters can be raced: laden rivals seen bound for the port before we land take some of the room.
+  const crowd = (c: CharterInfo) => (c.isPublic ? Math.max(0.4, 1 - RIVAL_CROWD_SHARE * world.rivalsLanding(c.port, a.arriveAt)) : 1);
+  const roomOf = (c: CharterInfo) =>
+    Math.max(0, Math.floor((t.get(c.id)!.remaining - (res.charterTons.get(c.id) ?? 0)) * trust(ctx, c) * crowd(c)));
   const avail = Math.min(cap, usable.reduce((n, c) => n + roomOf(c), 0));
   const fullCost = costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + avail / 2))).landed;
 
@@ -730,7 +740,11 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
   }
   // Scarce cash: what a load ties up is charged at the fleet's return on cash.
   const charge = opts.capitalRate ?? 0;
-  const score = (l: Lane) => l.profitPerHour - charge * l.capital;
+  // The AI's bias scales only lanes that score above zero, so it can't turn a loser into a pick.
+  const score = (l: Lane) => {
+    const base = l.profitPerHour - charge * l.capital;
+    return base > 0 && opts.bias ? base * Math.min(1.5, Math.max(0.5, opts.bias(l))) : base;
+  };
   return lanes.sort((a, b) => score(b) - score(a));
 }
 

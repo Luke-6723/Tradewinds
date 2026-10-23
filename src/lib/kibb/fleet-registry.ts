@@ -112,8 +112,23 @@ export function updateFleet(
     } else {
       await saveStoredFleet(companyId, { enabled, settings });
       if (!enabled && manager) await manager.stop();
-      else if (manager) manager.settings = settings;
+      // A stopped one too: its AI panel then shows the mode just chosen.
+      if (manager) manager.settings = settings;
     }
+    return getFleetView(companyId);
+  });
+}
+
+/**
+ * The AI strategist: ask it now (the autopilot must be running), clear its directives, or retry
+ * live after it demoted itself (those two work on a stopped autopilot too, and are saved).
+ */
+export function aiCommand(companyId: string, cmd: "run" | "clear" | "retry"): Promise<FleetView> {
+  return serial(companyId, async () => {
+    const m = fleets.get(companyId);
+    if (!m) throw new Error("The autopilot hasn't run since the server started");
+    if (cmd === "run" && !isActive(m)) throw new Error("The autopilot isn't running");
+    m.aiCommand(cmd);
     return getFleetView(companyId);
   });
 }

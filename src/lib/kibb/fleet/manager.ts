@@ -38,6 +38,8 @@ import type { StreamEvent } from "../schema";
 import type { BankingRegion, ShipResult } from "../types";
 import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
 import { openJournal, type Journal } from "./journal";
+import { Advisor, AI_MODES, type AdvisorSnapshot, type AiMode, type AiReport } from "../ai/advisor";
+import type { DigestInput, DigestShip } from "../ai/digest";
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
 import { rankLanes, type Lane, type Reservations, type ShipSpec } from "./planner";
@@ -101,6 +103,14 @@ export interface FleetSettings {
   holdForRepost: boolean;
   /** Share (0–90%) of spare cash the buyer leaves alone while the expansion tier is close to completing. */
   phaseChestPct: number;
+  /**
+   * AI support (Claude as strategist): "off", "shadow" (advises and logs, changes nothing) or "live"
+   * (its directives apply within limits). Off by default; needs ANTHROPIC_API_KEY.
+   */
+  ai: AiMode;
+  /** Most the AI may spend on the Claude API in a UTC day, and in total (US dollars). */
+  aiDailyCapUsd: number;
+  aiTotalCapUsd: number;
 }
 
 export type GunPolicy = "auto" | "full" | "off";
@@ -125,6 +135,9 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   yardFactor: true,
   holdForRepost: false,
   phaseChestPct: 40,
+  ai: "off",
+  aiDailyCapUsd: 10,
+  aiTotalCapUsd: 180,
 };
 
 export class FleetSettingsError extends Error {}
@@ -162,6 +175,12 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   bool("holdForRepost");
   num("phaseChestPct", 0);
   if (out.phaseChestPct !== undefined && out.phaseChestPct > 90) throw new FleetSettingsError("phaseChestPct must be 0 to 90");
+  if (patch.ai !== undefined) {
+    if (!AI_MODES.includes(patch.ai)) throw new FleetSettingsError(`ai must be one of ${AI_MODES.join(", ")}`);
+    out.ai = patch.ai;
+  }
+  num("aiDailyCapUsd", 0);
+  num("aiTotalCapUsd", 0);
   if (patch.guns !== undefined) {
     if (!GUN_POLICIES.includes(patch.guns)) throw new FleetSettingsError(`guns must be one of ${GUN_POLICIES.join(", ")}`);
     out.guns = patch.guns;
@@ -217,6 +236,8 @@ export interface FleetState {
   expansion: ExpansionReport | null;
   /** Charge on cash a load ties up (per pence per real hour; 0 while cash isn't scarce). */
   capitalRate: number;
+  /** AI support: mode, spend, the directives in force, recent decisions. */
+  ai: AiReport;
   log: FleetLogLine[];
 }
 
@@ -282,6 +303,7 @@ interface FleetSnapshot {
   pendingBuild: FleetManager["pendingBuild"];
   agents: Record<string, AgentSnapshot>;
   world: WorldSnapshot;
+  ai?: AdvisorSnapshot;
 }
 
 /** How often the progress is saved even when nothing much happened (time use, prices). */
@@ -359,7 +381,10 @@ class InitFatal extends Error {}
 export class FleetManager implements FleetHost {
   readonly client: KibbClient;
   readonly world: World;
-  settings: FleetSettings;
+  /** The AI strategist (off unless the settings say otherwise). */
+  readonly advisor: Advisor;
+  /** The user's own settings; `settings` adds the AI's overrides on top while they are in force. */
+  private ownSettings: FleetSettings;
 
   private readonly agents = new Map<string, ShipAgent>();
   private readonly onLog?: (line: FleetLogLine) => void;
@@ -376,6 +401,9 @@ export class FleetManager implements FleetHost {
   /** Saved agents waiting for their ship to be taken command of again. */
   private restoredAgents = new Map<string, AgentSnapshot>();
   private lastPersist = 0;
+  /** Rival ships and zone traffic from the last rival analysis (for the AI digest). */
+  private rivalSummary: DigestInput["rivals"] = { companies: [], zones: [] };
+  private lastEscalations: number | null = null;
   /** The last hull quote per `yard|class` (pence): prices a build at a yard where we have no presence yet. */
   private readonly hullQuotes = new Map<string, number>();
   /** Factor passes in a row that built nothing: each one backs off longer. */
@@ -423,7 +451,23 @@ export class FleetManager implements FleetHost {
   ) {
     this.client = new KibbClient({ baseUrl: cfg.baseUrl ?? KIBB_DEFAULT_URL, apiKey: cfg.apiKey });
     this.world = new World(this.client);
-    this.settings = cfg.settings;
+    this.ownSettings = cfg.settings;
+    const self = this;
+    this.advisor = new Advisor({
+      get world() {
+        return self.world;
+      },
+      userSettings: () => self.ownSettings,
+      digestInput: () => self.digestInput(),
+      idleShare: () => (self.agents.size ? [...self.agents.values()].filter((a) => a.idle).length / self.agents.size : 0),
+      log: (msg) => self.log("fleet", msg),
+      persist: (now) => self.persist(now),
+      directivesChanged: () => {
+        // New limits or biases: ships idling for want of a lane look again.
+        for (const a of self.agents.values()) if (a.idle) a.nudge();
+      },
+      companyId: () => self.world.companyId,
+    });
     this.leaseDir = cfg.leaseDir;
     this.onLog = opts.onLog;
     if (opts.carryOver) {
@@ -458,6 +502,7 @@ export class FleetManager implements FleetHost {
       buyer: this.buyer,
       marques: this.marqueReport,
       underwriting: this.underwriteReport,
+      ai: this.advisor.report(),
       expansion: this.expansionReport(),
       capitalRate: this.capitalRate(),
       log: [...this.logLines],
@@ -484,6 +529,81 @@ export class FleetManager implements FleetHost {
     if (w.tierTurnedAt !== null && w.now() - w.tierTurnedAt < PHASE_CHEST_GRACE_MS) return true;
     if (w.tierTargetPhase === null) return false;
     return w.tierProgressBps >= PHASE_SOON_BPS || (w.tierEtaMs !== null && w.tierEtaMs < PHASE_SOON_MS);
+  }
+
+  /** The settings in force: the user's, with the AI's overrides while they last. */
+  get settings(): FleetSettings {
+    const o = this.advisor?.overrides();
+    return o ? { ...this.ownSettings, ...o } : this.ownSettings;
+  }
+
+  /** The user's settings changed (dashboard, CLI): applied live. */
+  set settings(v: FleetSettings) {
+    const prev = this.ownSettings;
+    this.ownSettings = v;
+    if (prev) this.advisor.settingsChanged(prev, v);
+  }
+
+  /** The AI's stall call on an expansion charter at this port for this good, if any. */
+  stallCall(port: string, good: string): "wait" | "deliver" | undefined {
+    return this.advisor.stallCall(port, good);
+  }
+
+  /** From the dashboard: ask the AI now, or clear its directives. */
+  aiCommand(cmd: "run" | "clear" | "retry"): void {
+    this.advisor.command(cmd);
+    this.persist(true);
+  }
+
+  /** What the AI strategist reads (digest.ts): the fleet, cash, lanes, charters, the tier, rivals. */
+  private digestInput(): Omit<DigestInput, "events" | "decisions"> {
+    const w = this.world;
+    const now = w.now();
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    const ships: DigestShip[] = [...this.agents.values()]
+      .filter((a) => !a.gone && a.last)
+      .map((a) => {
+        const r = a.last!;
+        const s = r.ship;
+        const eta = Date.parse(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at ?? "");
+        const state =
+          s.status === "sailing" ? "sailing" : a.idle ? "idle" : a.waitingForCash ? "waiting_cash" : a.activity.startsWith("holding") ? "holding" : "working";
+        return {
+          id: a.shipId,
+          cls: a.shipClass,
+          status: s.status,
+          port: s.current_port_id ?? null,
+          dest: s.status === "sailing" ? (r.route_legs.at(-1)?.to_node ?? null) : null,
+          etaMs: s.status === "sailing" && Number.isFinite(eta) ? Math.max(0, eta - now) : null,
+          state,
+          cargoTons: r.cargo_used_tons,
+          hold: r.effective_hold_capacity_tons,
+          lane: a.lane,
+          trips: a.state.trips,
+        };
+      });
+    const x = this.expansionReport();
+    const value = (c: (typeof w.charters)[number]) => c.payPerTon * c.remaining;
+    return {
+      now,
+      gameMinuteMs: w.gameMinuteMs,
+      phase: w.unlockedPhase,
+      tier: x
+        ? { targetPhase: x.targetPhase, progressBps: x.progressBps, etaMs: x.etaMs, phaseSoon: x.phaseSoon, stallSurvives: w.stallSurvives, escalation: x.escalation, charters: x.charters }
+        : null,
+      ships,
+      maxShips: this.ownSettings.maxShips,
+      buyer: this.buyer,
+      cash: { vaults: [...w.vaults], homeRegion: this.homeRegion, spare: this.spareCash(), committed, capitalRate: this.capitalRate() },
+      user: this.ownSettings,
+      active: this.advisor.overrides(),
+      topLanes: this.topLanes,
+      charters: w.charters.filter((c) => c.remaining > 0 && w.isOpen(c.port)).sort((a, b) => value(b) - value(a)),
+      piracy: [...w.piracy].filter(([, b]) => b > 0).sort((a, b) => b[1] - a[1]),
+      rivals: this.rivalSummary,
+      bidHaircutPerDay: w.bidHaircutPerDay,
+    };
   }
 
   start(): void {
@@ -513,6 +633,8 @@ export class FleetManager implements FleetHost {
       if (i > 0) await new Promise((r) => setTimeout(r, 1_000));
       await this.dismissTempFactors();
     }
+    // An AI call in flight is cancelled (its reserved cost stays counted) before the last save.
+    await this.advisor.stop();
     await this.journal?.flush();
     await this.lease?.release();
     this.lease = null;
@@ -549,7 +671,9 @@ export class FleetManager implements FleetHost {
   }
 
   tripFinished(agent: ShipAgent, trip: TripRecord & { goods: string[]; spentPence: number; rewardPence: number }): void {
-    this.journal?.recordTrip({ shipId: agent.shipId, ship: agent.name, shipClass: agent.shipClass, ...trip });
+    const decision = this.advisor.report().active?.decisionId ?? null;
+    this.advisor.tripFinished(trip);
+    this.journal?.recordTrip({ shipId: agent.shipId, ship: agent.name, shipClass: agent.shipClass, aiDecision: decision, ...trip });
   }
 
   private snapshot(): FleetSnapshot {
@@ -576,6 +700,7 @@ export class FleetManager implements FleetHost {
       pendingBuild: this.pendingBuild,
       agents,
       world: this.world.snapshot(),
+      ai: this.advisor.snapshot(),
     };
   }
 
@@ -592,6 +717,7 @@ export class FleetManager implements FleetHost {
     this.factorFails = s.factorFails ?? 0;
     this.pendingBuild = s.pendingBuild ?? null;
     this.restoredAgents = new Map(Object.entries(s.agents ?? {}));
+    this.advisor.restore(s.ai);
   }
 
   fatal(msg: string): void {
@@ -606,7 +732,13 @@ export class FleetManager implements FleetHost {
     this.eventsAbort?.abort();
     const lease = this.lease;
     this.lease = null;
-    void Promise.all([...this.agents.values()].map((a) => a.stop())).finally(() => lease?.release());
+    void Promise.all([...[...this.agents.values()].map((a) => a.stop()), this.advisor.stop()])
+      .then(() => this.journal?.flush())
+      .finally(() => {
+        // Whoever runs this company next owns its saved progress: nothing more is written from here.
+        this.journal = null;
+        void lease?.release();
+      });
   }
 
   private sleep(ms: number): Promise<void> {
@@ -666,7 +798,7 @@ export class FleetManager implements FleetHost {
     if (missing.length) throw new InitFatal(`key is missing scopes: ${missing.join(", ")}`);
     if (this.settings.autoBuy && !who.scopes.includes("infra_manage")) {
       this.log("fleet", "key lacks infra_manage: automatic ship buying is off");
-      this.settings = { ...this.settings, autoBuy: false };
+      this.settings = { ...this.ownSettings, autoBuy: false };
     }
     this.canRemit = who.scopes.includes("treasury_remit");
     if (!this.canRemit) this.log("fleet", "key lacks treasury_remit: cash stays in the region it lands in");
@@ -733,7 +865,12 @@ export class FleetManager implements FleetHost {
       // New charters: ships idling for want of a lane look again now, not in minutes.
       if (dirty) for (const a of this.agents.values()) if (a.idle) a.nudge();
       await this.refreshTopLanes();
+      // A stalled posting re-posted richer: worth the AI's look.
+      const esc = this.world.escalationsSeen;
+      if (this.lastEscalations !== null && esc > this.lastEscalations) this.advisor.trigger("a stalled expansion charter re-posted richer");
+      this.lastEscalations = esc;
     }
+    this.advisor.tick();
     if (now - this.lastScan > SHIP_SCAN_MS) await this.scanShips();
     if (now - this.lastPersist > PERSIST_MS) this.persist();
     if (now - this.lastBuyCheck > BUY_CHECK_MS) await this.runBuyer(null);
@@ -830,7 +967,8 @@ export class FleetManager implements FleetHost {
     const from = r?.ship.current_port_id ?? r?.route_legs.at(-1)?.to_node;
     if (!from || !r || !ref) return;
     try {
-      this.topLanes = await rankLanes(this.world, this.specFor(ref, r), from, this.reservations(ref), this.planOptions(this.loadCash(ref), ref));
+      // Ranked without the AI's bias: this is what the AI itself reads as the planner's own view.
+      this.topLanes = await rankLanes(this.world, this.specFor(ref, r), from, this.reservations(ref), { ...this.planOptions(this.loadCash(ref), ref), bias: undefined });
     } catch (e) {
       this.log("fleet", `lane overview failed: ${(e as Error).message}`);
     }
@@ -872,6 +1010,8 @@ export class FleetManager implements FleetHost {
       cash,
       capitalRate: this.capitalRate(except),
       holdForRepost: this.settings.holdForRepost,
+      bias: this.advisor.hasBias() ? (l: Lane) => this.advisor.bias(l) : undefined,
+      stallCalls: this.advisor.stallCalls(),
     };
   }
 
@@ -1030,12 +1170,14 @@ export class FleetManager implements FleetHost {
       case "voyage_hazard": {
         const loss = num("cargo_loss_pct");
         this.log(agent?.name ?? "fleet", `${str("hazard") ?? "hazard"} at sea${p.sunk ? ": SUNK" : loss ? `: lost ${loss}% of cargo` : ""}`);
+        if (p.sunk && agent) this.advisor.trigger("a ship was lost");
         agent?.nudge();
         break;
       }
       case "ship_mutinied":
       case "ship_provisions_exhausted":
         this.log(agent?.name ?? "fleet", e.event_type === "ship_mutinied" ? "the crew mutinied: ship lost" : "stores ran out at sea");
+        if (e.event_type === "ship_mutinied" && agent) this.advisor.trigger("a ship was lost");
         agent?.nudge();
         break;
       case "charter_delivered":
@@ -1061,6 +1203,9 @@ export class FleetManager implements FleetHost {
       case "expansion_target_rescaled":
       case "world_event":
         if (e.event_type === "world_phase_unlocked") this.log("fleet", "a new phase opened: re-planning across the new ports");
+        if (e.event_type === "world_phase_unlocked" || e.event_type === "expansion_target_rescaled") this.advisor.trigger(e.event_type.replace(/_/g, " "));
+        // A world event's text goes to the AI only through its screen.
+        if (e.event_type === "world_event") this.advisor.noteEvent("world_event", str("description", "message", "summary", "title", "text") ?? JSON.stringify(e.payload ?? {}).slice(0, 800), Date.parse(e.timestamp) || this.world.now());
         this.worldDirty = true;
         this.wake?.();
         break;
@@ -1070,6 +1215,7 @@ export class FleetManager implements FleetHost {
         break;
       case "server_announcement":
         this.log("fleet", `server ${str("severity") ?? "notice"}: ${str("message") ?? ""}`);
+        this.advisor.noteEvent("server_announcement", str("message") ?? "", Date.parse(e.timestamp) || this.world.now());
         break;
       case "expansion_bonus_paid":
       case "marque_prize_paid": {
@@ -1306,13 +1452,32 @@ export class FleetManager implements FleetHost {
     const spent = ours.filter((m) => now - Date.parse(m.created_at) < 24 * 3_600_000).reduce((n, m) => n + m.cost_pence, 0);
     const prize = ours.reduce((n, m) => n + m.prize_earned_pence, 0);
     const active = new Set(ours.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
-    const { zones: traffic } = await analyseRivals(world.rivals.all(), {
+    const { ships: rivalShips, zones: traffic } = await analyseRivals(world.rivals.all(), {
       catalog: world.catalog,
       route: (f, t, c) => world.route(f, t, c).catch(() => null),
       now,
       gameMinuteMs: world.gameMinuteMs,
       piracy: new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps])),
     });
+    // Laden rivals still at sea, by the port they're bound for: the planner discounts public
+    // charters there; and a summary for the AI digest (companies aliased, never named).
+    const arrivals = new Map<string, number[]>();
+    const byCompany = new Map<string, { ships: number; laden: number; sailing: number }>();
+    for (const r of rivalShips) {
+      const c = byCompany.get(r.company) ?? { ships: 0, laden: 0, sailing: 0 };
+      c.ships++;
+      if (r.loadState !== "ballast") c.laden++;
+      if (r.voyage && r.voyage.arriveAt > now) {
+        c.sailing++;
+        if (r.loadState !== "ballast") arrivals.set(r.voyage.to, [...(arrivals.get(r.voyage.to) ?? []), r.voyage.arriveAt]);
+      }
+      byCompany.set(r.company, c);
+    }
+    world.rivalArrivals = arrivals;
+    this.rivalSummary = {
+      companies: [...byCompany.values()].sort((a, b) => b.ships - a.ships),
+      zones: traffic.map((t) => ({ zone: t.zone, passages: t.passages, laden: t.laden })),
+    };
     const own = await this.ownExposure();
 
     // Marques are sized to what the budget has left (a game day of it), not refused for being big.
@@ -1601,6 +1766,8 @@ export class FleetManager implements FleetHost {
   private async considerPurchaseNow(only: string[] | null): Promise<void> {
     const { world, settings } = this;
     if (this.agents.size >= settings.maxShips) return this.setBuyer(`fleet at the ${settings.maxShips}-ship limit`);
+    const aiHold = this.advisor.buyHold();
+    if (aiHold) return this.setBuyer(`AI: holding cash (${aiHold.slice(0, 160)})`);
     const classes = world.catalog.ship_classes.filter((c) => settings.buyClasses.includes(c.id) && c.phase <= world.unlockedPhase);
     if (classes.length === 0) return this.setBuyer("no allowed hull class can be built in this phase");
     if ([...this.agents.values()].some((a) => a.waitingForCash)) return this.setBuyer("a ship is waiting for cash to load: not buying");
@@ -1701,7 +1868,8 @@ export class FleetManager implements FleetHost {
           continue;
         }
         // Planned with the cash left after building it, so the load it is credited with is one it can buy.
-        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), this.planOptions(afterBuy)))[0];
+        // Without the AI's lane bias: it may only hold the buyer, never talk it into a ship.
+        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), { ...this.planOptions(afterBuy), bias: undefined }))[0];
         if (!lane) {
           notes.push(`${cls.id}@${yard}: no paying lane it could afford`);
           continue;

@@ -50,6 +50,15 @@ const TIER_PACE_WINDOW_MS = 2 * 60 * 60 * 1000;
 /** ...and needs at least this much before it is trusted. */
 const TIER_PACE_MIN_MS = 10 * 60 * 1000;
 
+/** An expansion posting that dropped out of the listing after its lapse, awaiting its re-post. */
+interface LapsedPosting {
+  id: string;
+  expiresAt: number | null;
+  /** It was stalled late in its window, and its escalation count then (to learn whether the stall held). */
+  lateStalled?: boolean;
+  escalations?: number;
+}
+
 /** What the world model had learned, saved so a restart doesn't start blind. */
 export interface WorldSnapshot {
   prices: Array<[string, PriceObs]>;
@@ -59,14 +68,28 @@ export interface WorldSnapshot {
   tierTargetPhase: number | null;
   tierTurnedAt: number | null;
   repostOf: Array<[string, string]>;
-  lapsedPostings: Array<[string, { id: string; expiresAt: number | null }]>;
+  lapsedPostings: Array<[string, LapsedPosting]>;
   liveSeen: Array<[string, { c: CharterInfo; seenAt: number }]>;
   closed: string[];
   sightings: Sighting[];
+  /** Learned figures (calibrators): stalled postings seen lapse and whether they escalated; bid drift samples. */
+  stallFates?: { escalated: number; not: number };
+  bidSamples?: Array<[ageDays: number, ratio: number]>;
 }
 
 /** Ids of closed charters kept in a snapshot (the newest). */
 const SNAPSHOT_CLOSED = 1_000;
+/** A stalled posting this close to its lapse (game hours) counts towards the stall-survival figure. */
+const LATE_STALL_GAME_H = 2;
+/** Prior for the stall-survival odds: as if this many lapses had been seen at 75%. */
+const STALL_PRIOR_N = 4;
+const STALL_PRIOR_P = 0.75;
+/** Bid drift: per-game-day markdown used until enough samples are in, bounds, and samples kept. */
+const BID_HAIRCUT_DEFAULT = 0.03;
+/** Every remembered bid is marked down this much before its age is counted (the planner adds the per-day rate). */
+export const BID_HAIRCUT_BASE = 0.03;
+const BID_SAMPLES_MIN = 10;
+const BID_SAMPLES_MAX = 200;
 
 /** One expansion charter as the autopilot watches it across its postings. */
 export interface ExpansionWatch {
@@ -85,6 +108,10 @@ export interface ExpansionWatch {
   deliveredTotal: number;
   /** Nothing delivered in this posting so far (as far as we can tell): it re-posts richer if that lasts. */
   stalled: boolean;
+  /** Seen stalled within a couple of game hours of its lapse (for learning how often stalls hold). */
+  lateStalled?: boolean;
+  /** One of our own ships delivered to this posting: its fate says nothing about rivals. */
+  ourDelivery?: boolean;
   /** When we first saw this posting (server ms) and its delivered total then. */
   postingSeenAt: number;
   postingBase: number;
@@ -200,11 +227,24 @@ export class World {
   /** A lapsed posting's id → the id of the posting that replaced it. */
   private readonly repostOf = new Map<string, string>();
   /** Expansion postings that dropped out of the tier listing (lapsed, awaiting a re-post), by `port|good`. */
-  private readonly lapsedPostings = new Map<string, { id: string; expiresAt: number | null }>();
+  private readonly lapsedPostings = new Map<string, LapsedPosting>();
+  /** Escalations seen happen (a stalled posting re-posted richer), counted as they are noticed. */
+  escalationsSeen = 0;
   /** Expansion charters by `port|good`, followed across re-posts. */
   readonly expansionWatch = new Map<string, ExpansionWatch>();
   /** What a stalled posting's re-post multiplies: pay and tons (learned when one is seen). */
   escalation = { pay: ESCALATION_PAY, tons: ESCALATION_TONS };
+  /** Stalled postings seen lapse, and whether they re-posted richer. */
+  private stallFates = { escalated: 0, not: 0 };
+  /** A remembered bid against the next live one at the same port: (age in game days, live/remembered). */
+  private bidSamples: Array<[number, number]> = [];
+  /** bidHaircutPerDay, recomputed when a sample comes in (read thousands of times per plan). */
+  private bidHaircut = BID_HAIRCUT_DEFAULT;
+  /**
+   * Laden rival ships expected at each port (server ms of arrival), from the rival analysis: they
+   * may take charter room before we land.
+   */
+  rivalArrivals = new Map<string, number[]>();
   private tierSamples: Array<{ at: number; delivered: number; phase: number }> = [];
   /** Share value of a ton per expansion charter (pence: base price × premium), and the pool's rate on it. */
   private expansionValue = new Map<string, number>();
@@ -252,6 +292,8 @@ export class World {
       liveSeen: [...this.liveSeen],
       closed: [...this.closed].slice(-SNAPSHOT_CLOSED),
       sightings: this.rivals.all(),
+      stallFates: { ...this.stallFates },
+      bidSamples: [...this.bidSamples],
     };
   }
 
@@ -268,6 +310,9 @@ export class World {
     for (const [k, v] of s.liveSeen ?? []) this.liveSeen.set(k, v);
     for (const id of s.closed ?? []) this.closed.add(id);
     for (const x of s.sightings ?? []) this.rivals.add(x);
+    if (s.stallFates) this.stallFates = { ...s.stallFates };
+    if (s.bidSamples) this.bidSamples = s.bidSamples.slice(-BID_SAMPLES_MAX);
+    this.updateBidHaircut();
   }
 
   /** Clock, charters, fees and vaults. */
@@ -373,6 +418,20 @@ export class World {
       if (prev && c.escalations > prev.escalations && prev.rate > 0) {
         this.escalation.pay = Math.min(2, Math.max(1, c.reward_per_ton_pence / prev.rate));
         if (prev.remaining > 0) this.escalation.tons = Math.min(1, Math.max(0.3, c.quantity_remaining / prev.remaining));
+        this.escalationsSeen++;
+      }
+      // A posting we saw stalled late in its window has lapsed: did it re-post richer? (Seen
+      // either in one step, or after it dropped out of the listing for a while.) Postings our own
+      // ships delivered to don't count: the planner allows for those separately.
+      const lapsed = !prev ? this.lapsedPostings.get(key) : undefined;
+      if (prev && newPosting && prev.lateStalled && !prev.ourDelivery) {
+        if (c.escalations > prev.escalations) this.stallFates.escalated++;
+        else this.stallFates.not++;
+      } else if (lapsed?.lateStalled) {
+        if (c.escalations > (lapsed.escalations ?? 0)) {
+          this.stallFates.escalated++;
+          this.escalationsSeen++;
+        } else this.stallFates.not++;
       }
       if (prev && prev.id !== c.contract_id) {
         this.repostOf.set(prev.id, c.contract_id);
@@ -401,19 +460,34 @@ export class World {
         postingSeenAt,
         postingBase,
         sawStart,
+        lateStalled: false,
       });
+      const w = this.expansionWatch.get(key)!;
+      const late = expiresAt !== null && expiresAt - now <= LATE_STALL_GAME_H * 60 * this.gameMinuteMs && expiresAt > now;
+      // Kept within a posting; a new posting starts clean.
+      w.ourDelivery = !newPosting && !!prev?.ourDelivery;
+      // A late stall broken by someone else's delivery before the lapse: it didn't hold.
+      if (prev && !newPosting && prev.lateStalled && !w.stalled && !w.ourDelivery) this.stallFates.not++;
+      // Carried over within a posting.
+      w.lateStalled = w.stalled && ((!newPosting && !!prev?.lateStalled) || late);
     }
     for (const [k, w] of [...this.expansionWatch]) {
       if (seen.has(k)) continue;
       // Gone from the listing before its lapse: filled or closed. After it: awaiting its re-post.
-      if (w.expiresAt !== null && w.expiresAt <= now) this.lapsedPostings.set(k, { id: w.id, expiresAt: w.expiresAt });
+      if (w.expiresAt !== null && w.expiresAt <= now) this.lapsedPostings.set(k, { id: w.id, expiresAt: w.expiresAt, lateStalled: w.lateStalled && !w.ourDelivery, escalations: w.escalations });
       this.expansionWatch.delete(k);
     }
     for (const k of seen) this.lapsedPostings.delete(k);
   }
 
+  /** One of our ships delivered to this charter: an expansion posting's stall fate then isn't learned from it. */
+  noteOwnDelivery(charterId: string): void {
+    const id = this.currentId(charterId);
+    for (const w of this.expansionWatch.values()) if (w.id === id) w.ourDelivery = true;
+  }
+
   /** An expansion posting at this port for this good that lapsed and hasn't been re-posted yet (as far as we know). */
-  lapsedPosting(port: string, good: string): { id: string; expiresAt: number | null } | undefined {
+  lapsedPosting(port: string, good: string): LapsedPosting | undefined {
     return this.lapsedPostings.get(`${port}|${good}`);
   }
 
@@ -421,6 +495,40 @@ export class World {
   stallWatch(c: { id: string; port: string; good: string }): ExpansionWatch | undefined {
     const w = this.expansionWatch.get(`${c.port}|${c.good}`);
     return w && (w.id === c.id || this.expansionCharters.has(c.id)) ? w : undefined;
+  }
+
+  /**
+   * Chance a posting that looks stalled now is still stalled when it lapses: from the stalled
+   * postings seen lapse (re-posted richer or not), starting from 75%.
+   */
+  get stallSurvives(): number {
+    const { escalated, not } = this.stallFates;
+    return Math.min(0.95, Math.max(0.2, (escalated + STALL_PRIOR_P * STALL_PRIOR_N) / (escalated + not + STALL_PRIOR_N)));
+  }
+
+  /**
+   * How much a remembered bid is marked down per game day of age: the median drop seen when a live
+   * book followed an older price (3% until enough samples, kept within 0.5–15%).
+   */
+  get bidHaircutPerDay(): number {
+    return this.bidHaircut;
+  }
+
+  private updateBidHaircut(): void {
+    this.bidHaircut = this.fitBidHaircut();
+  }
+
+  private fitBidHaircut(): number {
+    if (this.bidSamples.length < BID_SAMPLES_MIN) return BID_HAIRCUT_DEFAULT;
+    // Fitted to how the planner uses it: a fixed base markdown plus this rate per day.
+    const rates = this.bidSamples.map(([days, ratio]) => Math.max(0, 1 - ratio - BID_HAIRCUT_BASE) / Math.max(days, 0.25)).sort((a, b) => a - b);
+    return Math.min(0.15, Math.max(0.005, rates[Math.floor(rates.length / 2)]));
+  }
+
+  /** Laden rival ships expected at `port` between now and `by` (server ms). */
+  rivalsLanding(port: string, by: number): number {
+    const now = this.now();
+    return (this.rivalArrivals.get(port) ?? []).filter((t) => t >= now && t <= by).length;
   }
 
   /** Whether a charter is re-posted when it lapses (an open expansion charter of the tier in play). */
@@ -635,6 +743,17 @@ export class World {
     const at = book.as_of ? Date.parse(book.as_of) : this.now();
     const live = book.visibility === "quay" || book.visibility === "counting_house";
     for (const b of book.books) {
+      // A live bid after an older remembered one: how far did it drift for its age?
+      const prev = this.prices.get(`${book.port_id}|${b.commodity_id}`);
+      const bid = b.best_bid?.price_pence ?? null;
+      if (live && bid && prev?.bid && at > prev.at) {
+        const days = (at - prev.at) / (24 * 60 * this.gameMinuteMs);
+        if (days >= 0.25 && days <= 3) {
+          this.bidSamples.push([days, bid / prev.bid]);
+          if (this.bidSamples.length > BID_SAMPLES_MAX) this.bidSamples.shift();
+          this.updateBidHaircut();
+        }
+      }
       this.prices.set(`${book.port_id}|${b.commodity_id}`, {
         ask: b.best_ask?.price_pence ?? null,
         askQty: b.best_ask?.quantity ?? 0,
