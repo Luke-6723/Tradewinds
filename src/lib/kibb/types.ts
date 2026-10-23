@@ -274,6 +274,8 @@ export interface ExpansionCharterProgress {
   escalations: number;
   game_hours_left: number;
   expires_at?: string | null;
+  /** Tons delivered to this charter across all its postings. */
+  tons_delivered_total?: number;
 }
 
 export interface ExpansionTier {

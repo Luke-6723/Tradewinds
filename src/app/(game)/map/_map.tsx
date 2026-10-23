@@ -10,8 +10,9 @@ import Link from "next/link";
 import L from "leaflet";
 import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { NODE_COORDS, legPath, seaLanes, shipFix, type LatLng, type ShipFix } from "@/lib/kibb/geo";
-import { fmtBps, fmtIn, fmtTons } from "@/lib/kibb/format";
+import { NODE_COORDS, legPath, rivalFix, seaLanes, shipFix, type LatLng, type ShipFix } from "@/lib/kibb/geo";
+import { fmtAgo, fmtBps, fmtIn, fmtTons } from "@/lib/kibb/format";
+import type { RivalShip } from "@/lib/kibb/rivals";
 import type { Catalog, SeaZoneStatus, ShipResult, ShipStatus } from "@/lib/kibb/types";
 
 const SHIP_COLOR: Record<ShipStatus, string> = {
@@ -37,6 +38,17 @@ function shipIcon(status: ShipStatus, heading: number, stackIdx: number): L.DivI
   });
 }
 
+const RIVAL_COLOR = "#c084fc";
+
+/** A rival ship: a hollow marker, since its position is an estimate. */
+function rivalIcon(atSea: boolean, heading: number): L.DivIcon {
+  const body = atSea
+    ? `<svg viewBox="0 0 24 24" width="16" height="16" style="transform:rotate(${heading}deg)"><path d="M12 3 18 20 12 16.5 6 20Z" fill="none" stroke="${RIVAL_COLOR}" stroke-width="2.5" stroke-linejoin="round"/></svg>`
+    : `<svg viewBox="0 0 24 24" width="12" height="12"><rect x="5" y="5" width="14" height="14" transform="rotate(45 12 12)" fill="none" stroke="${RIVAL_COLOR}" stroke-width="3"/></svg>`;
+  const size = atSea ? 16 : 12;
+  return L.divIcon({ className: "kibb-ship-icon", html: body, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
+}
+
 /** Flies to the focused ship once per focus change. */
 function FlyTo({ target, nonce }: { target: LatLng | null; nonce: number }) {
   const map = useMap();
@@ -58,6 +70,9 @@ export interface MapProps {
   portName: (id: string | null | undefined) => string;
   goodName: (id: string | null | undefined) => string;
   shipClassName: (id: string | null | undefined) => string;
+  /** Other companies' ships (estimated positions), and the server clock's lead over ours (ms). */
+  rivals?: RivalShip[];
+  serverOffsetMs?: number;
 }
 
 export default function KibbMap({
@@ -71,6 +86,8 @@ export default function KibbMap({
   portName,
   goodName,
   shipClassName,
+  rivals = [],
+  serverOffsetMs = 0,
 }: MapProps) {
   // Re-place sailing ships every second.
   const [now, setNow] = useState(() => Date.now());
@@ -248,6 +265,35 @@ export default function KibbMap({
                 </div>
                 <div className="pt-1">
                   <Link href={`/fleet/${s.id}`}>Ship page →</Link>
+                </div>
+              </div>
+            </Popup>
+          </Marker>
+        );
+      })}
+
+      {rivals.map((r) => {
+        const fix = rivalFix(r, now + serverOffsetMs);
+        if (!fix) return null;
+        const atSea = !!r.voyage && now + serverOffsetMs < r.voyage.arriveAt;
+        return (
+          <Marker key={`rival-${r.key}`} position={fix.pos} icon={rivalIcon(atSea, fix.heading)} zIndexOffset={500}>
+            <Tooltip direction="top">
+              {r.ship} · {r.company}
+            </Tooltip>
+            <Popup>
+              <div className="space-y-1 text-xs">
+                <div className="font-semibold text-sm">{r.ship}</div>
+                <div>
+                  {r.company} · {shipClassName(r.shipClass)} · {r.loadState.replace("_", " ")}
+                </div>
+                <div>
+                  {r.seen.direction === "sailed" ? "Sailed from" : "Arrived at"} {portName(r.seen.port)}
+                  {r.seen.otherPort ? ` ${r.seen.direction === "sailed" ? "for" : "from"} ${portName(r.seen.otherPort)}` : ""},{" "}
+                  {fmtAgo(new Date(r.seen.at - serverOffsetMs).toISOString())}
+                </div>
+                <div className="text-muted-foreground">
+                  {atSea ? `Estimated position; due ${fmtIn(new Date(r.voyage!.arriveAt - serverOffsetMs).toISOString())}` : fix.estimated ? "Probably in port" : "Last seen here"}
                 </div>
               </div>
             </Popup>

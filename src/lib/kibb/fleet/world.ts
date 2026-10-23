@@ -5,6 +5,7 @@
  */
 
 import type { KibbClient } from "../client";
+import { RivalTracker } from "../rivals";
 import type {
   BankingRegion,
   Catalog,
@@ -30,8 +31,9 @@ const HIT_LOSS = 0.25;
 /** Assumed cut in interception odds per gun ("cut sharply by cannons"; the formula isn't published). */
 const GUN_DETERRENCE = 0.5;
 /**
- * A tier's completion bonus is 12% of its base value, split by base value delivered: once the tier's
- * tons are in, each ton is worth about this share of its good's base price on top of the charter pay.
+ * A tier's completion bonus is 12% of its value, split by the value each company delivered. Shares
+ * value a ton at its charter's premium-inclusive rate (base price × premium), which the live share
+ * movements bear out; this is the fallback rate when the pool can't be projected.
  */
 const EXPANSION_BONUS_SHARE = 0.12;
 
@@ -124,6 +126,8 @@ export class World {
   freight: FreightInfo[] = [];
   /** Our company (to skip freight we posted ourselves). */
   companyId: string | null = null;
+  /** Other companies' ships seen at ports where we have presence. */
+  readonly rivals = new RivalTracker();
   vaults = new Map<BankingRegion, number>();
   /** Live net piracy per sea zone (bps): base + letters of marque − naval patrols. */
   piracy = new Map<string, number>();
@@ -131,6 +135,9 @@ export class World {
   expansionCharters = new Set<string>();
   /** Tons the tier still needs; tons beyond that arrive after it completes and earn no bonus. */
   expansionTonsLeft = 0;
+  /** Share value of a ton per expansion charter (pence: base price × premium), and the pool's rate on it. */
+  private expansionValue = new Map<string, number>();
+  private expansionRate = EXPANSION_BONUS_SHARE;
   private rates = new Map<string, number>();
   private prices = new Map<string, PriceObs>();
   /** Last live copy of each charter seen live, for recall when it drops out of a listing. */
@@ -187,6 +194,22 @@ export class World {
       const tier = expansion.current_tier;
       this.expansionCharters = new Set(tier && !tier.completed ? tier.charters.map((c) => c.contract_id) : []);
       this.expansionTonsLeft = tier && !tier.completed ? tier.tons_remaining : 0;
+      if (tier && !tier.completed) {
+        // Project the tier's final value: what is delivered, plus the tons still needed at the mix
+        // delivered so far. The pool over that is the bonus per unit of value.
+        const value = new Map(tier.charters.map((c) => [c.contract_id, this.basePrice(c.commodity_id) * (c.premium_bps / 10_000)]));
+        let delivered = 0;
+        let tons = 0;
+        for (const c of tier.charters) {
+          const t = c.tons_delivered_total ?? c.quantity_delivered;
+          delivered += t * value.get(c.contract_id)!;
+          tons += t;
+        }
+        const avg = tons > 0 ? delivered / tons : [...value.values()].reduce((n, v) => n + v, 0) / Math.max(value.size, 1);
+        const projected = delivered + tier.tons_remaining * avg;
+        this.expansionValue = value;
+        this.expansionRate = projected > 0 ? Math.min(0.2, Math.max(0.06, tier.completion_bonus_pence / projected)) : EXPANSION_BONUS_SHARE;
+      }
     }
     const fresh = toCharters(list).filter((c) => !this.closed.has(c.id));
     // Ports re-listed live on arrival while this request was in flight keep that newer view.
@@ -370,7 +393,8 @@ export class World {
 
   /** Phase-completion bonus a ton delivered to this charter is expected to earn (pence, unweighted). */
   charterBonus(c: { id: string; good: string }): number {
-    return this.expansionCharters.has(c.id) ? Math.round(this.basePrice(c.good) * EXPANSION_BONUS_SHARE) : 0;
+    if (!this.expansionCharters.has(c.id)) return 0;
+    return Math.round((this.expansionValue.get(c.id) ?? this.basePrice(c.good) * 1.3) * this.expansionRate);
   }
 
   /**
@@ -409,8 +433,9 @@ export class World {
     }
   }
 
-  /** Learns other ports' prices from the coffee-house gossip at a quay we stand on. */
+  /** Learns other ports' prices from the coffee-house gossip at a quay we stand on, and who sailed there. */
   observeGossip(detail: PortDetail): void {
+    this.rivals.addNotices(detail.recent_sailings);
     for (const g of detail.coffee_house_gossip ?? []) {
       const at = this.now() - g.age_seconds * 1000;
       for (const c of g.commodities) {

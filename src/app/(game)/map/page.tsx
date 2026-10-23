@@ -7,7 +7,8 @@ import { Empty, ErrorNote, Loading, ShipStatusBadge } from "@/components/kibb/bi
 import { Card } from "@/components/ui/card";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
-import { kibbGet } from "@/lib/kibb/browser";
+import { dash, kibbGet } from "@/lib/kibb/browser";
+import type { RivalsView } from "@/lib/kibb/rivals";
 import { fmtIn, fmtTons } from "@/lib/kibb/format";
 import type { SeaZoneStatus, ShipResult, WorldClock } from "@/lib/kibb/types";
 
@@ -29,6 +30,14 @@ export default function MapPage() {
   const { data: zones } = usePoll(() => kibbGet<SeaZoneStatus[]>("/v1/world/zones"), 60_000);
   const [focus, setFocus] = useState<{ shipId: string; nonce: number } | null>(null);
   const [showLocked, setShowLocked] = useState(false);
+  const [showRivals, setShowRivals] = useState(true);
+  // Rival positions are on the server's clock: keep the time each answer arrived with it.
+  const { data: rivalData } = usePoll(
+    showRivals ? async () => ({ view: await dash.get<RivalsView>("/api/kibb/rivals"), at: Date.now() }) : null,
+    60_000,
+    [showRivals],
+  );
+  const rivals = rivalData?.view;
 
   const select = (shipId: string) => setFocus({ shipId, nonce: Date.now() });
 
@@ -52,6 +61,8 @@ export default function MapPage() {
             portName={portName}
             goodName={goodName}
             shipClassName={shipClassName}
+            rivals={showRivals ? rivals?.rivals : undefined}
+            serverOffsetMs={rivalData ? rivalData.view.now - rivalData.at : 0}
           />
         ) : (
           <Loading />
@@ -114,9 +125,17 @@ export default function MapPage() {
             <span className="inline-block w-4 border-t border-dashed border-slate-500" />
             Sea lane
           </div>
+          <div className="flex items-center gap-2">
+            <span className="inline-block size-2.5 rotate-45 border-2" style={{ borderColor: "#c084fc" }} />
+            Rival ship (estimated)
+          </div>
           <label className="flex items-center gap-2 pt-1.5">
             <input type="checkbox" checked={showLocked} onChange={(e) => setShowLocked(e.target.checked)} />
             Show ports not yet open
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={showRivals} onChange={(e) => setShowRivals(e.target.checked)} />
+            Show rival ships{rivals ? ` (${rivals.rivals.length} seen)` : ""}
           </label>
           <p className="pt-1 text-muted-foreground">
             Hover a sea zone for its live piracy. Click a port or ship for details. Positions at sea are estimated from

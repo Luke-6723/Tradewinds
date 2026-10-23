@@ -47,12 +47,15 @@ function SettingsForm({
 }: {
   settings: FleetSettings;
   busy: boolean;
-  onSave: (s: FleetSettings) => void;
+  /** Only the fields that changed. */
+  onSave: (patch: Partial<FleetSettings>) => void;
   onCancel: () => void;
 }) {
   const { catalog, shipClassName } = useCatalog();
   const [d, setD] = useState(settings);
-  const crField = (label: string, key: "reservePence" | "minMarginPence") => (
+  // What the form opened with: the diff is what the user changed here, not what changed elsewhere since.
+  const [initial] = useState(settings);
+  const crField = (label: string, key: "reservePence" | "minMarginPence" | "underwriteBudgetPence" | "underwriteMaxPerPolicyPence") => (
     <div className="space-y-1">
       <Label>{label}</Label>
       <Input type="number" min={0} value={d[key] / 100} onChange={(e) => setD({ ...d, [key]: Math.round(Number(e.target.value) * 100) })} />
@@ -63,7 +66,12 @@ function SettingsForm({
       className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2 sm:p-4 lg:grid-cols-3"
       onSubmit={(e) => {
         e.preventDefault();
-        onSave(d);
+        // Send only what changed: a stale copy of another setting (say, marques) must not overwrite it.
+        const patch = Object.fromEntries(
+          Object.entries(d).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(initial[k as keyof FleetSettings])),
+        ) as Partial<FleetSettings>;
+        if (patch.underwrite && !confirm(`Let the autopilot underwrite other companies' voyages, locking up to ${fmtCr(d.underwriteBudgetPence)} of collateral?`)) return;
+        onSave(patch);
       }}
     >
       {crField("Cash reserve (Cr)", "reservePence")}
@@ -121,6 +129,24 @@ function SettingsForm({
           <input type="checkbox" checked={d.useFreight} onChange={(e) => setD({ ...d, useFreight: e.target.checked })} />
           Carry freight on empty legs
         </label>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.underwrite} onChange={(e) => setD({ ...d, underwrite: e.target.checked })} />
+          Underwrite other companies&apos; voyages (off by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {crField("Collateral budget (Cr)", "underwriteBudgetPence")}
+          {crField("Most per policy (Cr)", "underwriteMaxPerPolicyPence")}
+          <div className="space-y-1">
+            <Label>Least edge (bps)</Label>
+            <Input type="number" min={0} step={10} value={d.underwriteMinEdgeBps} onChange={(e) => setD({ ...d, underwriteMinEdgeBps: Math.max(0, Math.floor(Number(e.target.value))) })} />
+          </div>
+        </div>
+        <p className="text-muted-foreground text-xs">
+          Writes small slices only on fresh policies whose premium beats the loss Lloyd&apos;s accepting the same lane implies,
+          by the least edge. A sinking pays out the whole slice of the sum insured. All escrow counts against the budget.
+        </p>
       </div>
       <p className="col-span-full text-muted-foreground text-xs">
         Each gun takes 2 t of hold. Auto refits a ship at shipyard calls when it pays: in quiet Channel and North Sea water that means none.
@@ -290,6 +316,33 @@ export function FleetPanel() {
         )}
 
         {agents.length > 0 && <Efficiency agents={agents} startedAt={st?.startedAt ?? null} stoppedAt={st?.stoppedAt ?? null} />}
+
+        {st?.underwriting && (
+          <details className="text-sm">
+            <summary className="cursor-pointer text-muted-foreground text-xs">
+              Underwriting: {st.underwriting.action} · escrow {fmtCr(st.underwriting.lockedPence)} of {fmtCr(st.underwriting.budgetPence)}
+            </summary>
+            {st.underwriting.rows.length === 0 ? (
+              <Empty>No open policies from other companies.</Empty>
+            ) : (
+              <Table head={["Policy", "Premium", "Loss bound", "Edge", "Slice", "Verdict"]} className="mt-2">
+                {st.underwriting.rows.map((u) => (
+                  <tr key={u.policy} className="align-top">
+                    <td className="text-xs">
+                      <div className="font-medium text-sm">{u.lane}</div>
+                      {u.cover === "hull" ? "hull only" : "with cargo"} · {fmtCr(u.insured)}
+                    </td>
+                    <td className="tabular-nums">{fmtBps(u.premiumBps)}</td>
+                    <td className="tabular-nums">{u.lossBoundBps === null ? "—" : fmtBps(u.lossBoundBps)}</td>
+                    <td className="tabular-nums">{u.edgeBps === null ? "—" : fmtBps(u.edgeBps)}</td>
+                    <td className="whitespace-nowrap tabular-nums">{u.sliceBps ? `${fmtBps(u.sliceBps)} · ${fmtCr(u.collateral)}` : "—"}</td>
+                    <td className="text-muted-foreground text-xs">{u.verdict}</td>
+                  </tr>
+                ))}
+              </Table>
+            )}
+          </details>
+        )}
 
         <div className="grid items-start gap-5 xl:grid-cols-5">
           <div className="space-y-1.5 xl:col-span-3">

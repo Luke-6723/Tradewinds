@@ -11,17 +11,32 @@ import { ContractsPanel, ConvoysPanel, GunsPanel, InsurancePanel, StoresPanel, W
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
-import { fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
+import { fmtBps, fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type * as S from "@/lib/kibb/schema";
 import type { DepartResult, DockActionResult, RoutePlan, ShipResult, WorldClock, ZoneClass } from "@/lib/kibb/types";
 
 const HULL_RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
 
-function DepartForm({ r, blocked, locked, onDone }: { r: ShipResult; blocked: boolean; locked: boolean; onDone: () => void }) {
+function DepartForm({
+  r,
+  blocked,
+  locked,
+  policy,
+  onDone,
+}: {
+  r: ShipResult;
+  blocked: boolean;
+  locked: boolean;
+  /** The ship's open or active policy: it covers only the voyage to its port. */
+  policy: S.InsurancePolicy | undefined;
+  onDone: () => void;
+}) {
   const { catalog, portName } = useCatalog();
   const { data: clock } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"));
-  const [dest, setDest] = useState("");
+  const [picked, setPicked] = useState<string | null>(null);
+  const dest = picked ?? policy?.dest_port_id ?? "";
+  const voids = !!policy && !!dest && dest !== policy.dest_port_id;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DepartResult | null>(null);
@@ -34,7 +49,8 @@ function DepartForm({ r, blocked, locked, onDone }: { r: ShipResult; blocked: bo
 
   const hull = catalog?.ship_classes.find((c) => c.id === r.ship.ship_class)?.hull_category ?? "coastal";
   const ports = (catalog?.ports ?? [])
-    .filter((p) => p.id !== from && p.phase <= (clock?.unlocked_phase ?? 1))
+    // The policy's port stays listed while the clock loads, so a defaulted destination always shows.
+    .filter((p) => p.id !== from && (p.phase <= (clock?.unlocked_phase ?? 1) || p.id === policy?.dest_port_id))
     .sort((a, b) => a.name.localeCompare(b.name));
   // A leg is rated when the hull covers both the lane and the sea zone it ends in (hazards roll there).
   const legClass = (l: RoutePlan["legs"][number]): ZoneClass => {
@@ -61,11 +77,19 @@ function DepartForm({ r, blocked, locked, onDone }: { r: ShipResult; blocked: bo
     <div className="space-y-3">
       <div className="space-y-1">
         <Label>Sail to</Label>
-        <NativeSelect value={dest} onChange={(e) => { setDest(e.target.value); setResult(null); }}>
+        <NativeSelect value={dest} onChange={(e) => { setPicked(e.target.value); setResult(null); }}>
           <option value="">Choose a port…</option>
           {ports.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </NativeSelect>
       </div>
+      {voids && policy && <ErrorNote error={`Sailing here voids the ${policy.status} policy to ${portName(policy.dest_port_id)}: no claim would ever be paid.`} />}
+      {policy && !voids && dest && policy.covered_bps < 10_000 && (
+        <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+          {policy.covered_bps === 0
+            ? "No underwriter has written this policy yet: the voyage sails uninsured."
+            : `The policy is covered ${fmtBps(policy.covered_bps)}: the rest is uninsured.`}
+        </p>
+      )}
       <ErrorNote error={planError} />
       {plan && (
         <div className="space-y-2 rounded-lg border p-3 text-sm">
@@ -252,7 +276,13 @@ export default function ShipPage() {
             </div>
           </Panel>
           <Panel title="Depart" className="lg:col-span-2">
-            <DepartForm r={r} blocked={blocked} locked={locked} onDone={done} />
+            <DepartForm
+              r={r}
+              blocked={blocked}
+              locked={locked}
+              policy={(policies ?? []).find((p) => p.status === "open" || p.status === "active")}
+              onDone={done}
+            />
           </Panel>
         </div>
       )}

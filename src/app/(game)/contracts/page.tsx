@@ -7,12 +7,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
+import { Checkbox } from "@/components/kibb/naval-common";
 import { Field, GoodSelect, PortSelect, ShipSelect } from "@/components/kibb/pickers";
 import {
   AutopilotWarning,
   BatchError,
+  fetchAll,
   LoadMore,
   postBatch,
+  type SealedTons,
   toPence,
   useAutopilotShips,
   usePaged,
@@ -21,7 +24,7 @@ import {
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
-import { kibbGet, kibbPost } from "@/lib/kibb/browser";
+import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
 import { fmtAgo, fmtCr, fmtDateTime, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
 import type { CompanyProfile, ShipResult, WorldClock } from "@/lib/kibb/types";
@@ -53,14 +56,50 @@ interface CharterPlan {
   qty: number;
 }
 
-function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undefined; autopilot: Set<string>; onDone: () => void }) {
+/** When a ship in port got there: the earlier of its berthing and its last arrival, if known. */
+function arrivedAt(r: ShipResult): number | null {
+  const now = Date.now();
+  const times = [r.ship.berthed_at, r.ship.leg_arrives_at].map((t) => Date.parse(t ?? "")).filter((t) => t <= now);
+  return times.length ? Math.min(...times) : null;
+}
+
+/** Our bid fills at a port, back to `since` (all of them when the order isn't newest first). */
+async function bidsSince(port: string, since: number): Promise<S.CompanyTradeFillResult[]> {
+  const all: S.CompanyTradeFillResult[] = [];
+  let cursor: string | undefined;
+  for (let i = 0; i < 10; i++) {
+    const page = await kibbGet<S.CompanyTradeFillResult[]>("/v1/market/fills", { port_id: port, side: "bid", cursor, limit: 200 });
+    all.push(...page);
+    if (page.length < 200) break;
+    const first = Date.parse(page[0].created_at);
+    const last = Date.parse(page.at(-1)!.created_at);
+    if (first >= last && last < since) break;
+    cursor = page.at(-1)?.id;
+  }
+  return all;
+}
+
+function ChartersTab({
+  ships,
+  sealed,
+  unlockedPhase,
+  autopilot,
+  onDone,
+}: {
+  ships: ShipResult[] | undefined;
+  sealed: SealedTons;
+  unlockedPhase: number | undefined;
+  autopilot: Set<string>;
+  onDone: () => void;
+}) {
   const { portName, goodName } = useCatalog();
   const [port, setPort] = useState("");
   const [good, setGood] = useState("");
   const [status, setStatus] = useState<string>("open");
   const [plan, setPlan] = useState<Record<string, CharterPlan>>({});
-  const sealed = useSealedTons();
   const [failed, setFailed] = useState<number | null>(null);
+  const [phaseBefore, setPhaseBefore] = useState<number | null>(null);
+  const [ignoreFills, setIgnoreFills] = useState(false);
   const list = usePaged(
     (cursor) =>
       kibbGet<S.ContractListing[]>("/v1/contract/list", {
@@ -79,13 +118,66 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
     void list.reload();
     onDone();
   });
+  // Our bids filled at charter ports where our ships lie: bought there since arrival, so never carried in.
+  const fillPorts = [
+    ...new Set(
+      (ships ?? [])
+        .filter((r) => AT_PORT.has(r.ship.status) && list.items.some((c) => c.origin_port_id === r.ship.current_port_id))
+        .map((r) => r.ship.current_port_id ?? ""),
+    ),
+  ]
+    .sort()
+    .join(",");
+  const { data: fills, error: fillsError } = usePoll(
+    fillPorts
+      ? async () => {
+          const ports = fillPorts.split(",");
+          const pages = await Promise.all(
+            ports.map((p) => {
+              const times = (ships ?? [])
+                .filter((r) => AT_PORT.has(r.ship.status) && r.ship.current_port_id === p)
+                .map(arrivedAt)
+                .filter((t): t is number => t !== null);
+              return times.length ? bidsSince(p, Math.min(...times)) : Promise.resolve<S.CompanyTradeFillResult[]>([]);
+            }),
+          );
+          return Object.fromEntries(ports.map((p, i) => [p, pages[i]])) as Record<string, S.CompanyTradeFillResult[]>;
+        }
+      : null,
+    30_000,
+    [fillPorts],
+  );
 
+  const shipOf = (id: string) => ships?.find((r) => r.ship.id === id);
+  // Tons of the good bought at the ship's port since it arrived. Only an IOC (taker) bid can fill a hold,
+  // but a fill doesn't say which ship or warehouse took it, so all of them are left out.
+  const fillsIn = (shipId: string, good: string | null | undefined) => {
+    const r = shipOf(shipId);
+    const since = r ? arrivedAt(r) : null;
+    if (!r || since === null) return 0;
+    return (fills?.[r.ship.current_port_id ?? ""] ?? [])
+      .filter((f) => f.commodity_id === good && !f.is_maker && Date.parse(f.created_at) >= since)
+      .reduce((n, f) => n + f.quantity, 0);
+  };
+  // The user can count the fills out (they may have gone into the warehouse): the server still checks.
+  const bought = (shipId: string, good: string | null | undefined) => (ignoreFills ? 0 : fillsIn(shipId, good));
   // Our own tons of the good aboard: sealed freight of the same good is someone else's.
-  const held = (shipId: string, good: string | null | undefined) =>
-    Math.max(0, (ships?.find((r) => r.ship.id === shipId)?.cargo_manifest[good ?? ""] ?? 0) - sealed(shipId, good));
-  // Ships at the charter port with the good aboard (carried-in cargo is all that counts).
-  const candidates = (c: S.ContractListing) =>
-    (ships ?? []).filter((r) => AT_PORT.has(r.ship.status) && r.ship.current_port_id === c.origin_port_id && held(r.ship.id, c.commodity_id) > 0);
+  const raw = (shipId: string, good: string | null | undefined) =>
+    Math.max(0, (shipOf(shipId)?.cargo_manifest[good ?? ""] ?? 0) - sealed(shipId, good));
+  // ...less what was bought at the port since arrival (carried-in cargo is all that counts).
+  const held = (shipId: string, good: string | null | undefined) => Math.max(0, raw(shipId, good) - bought(shipId, good));
+  const atPort = (c: S.ContractListing) =>
+    (ships ?? []).filter((r) => AT_PORT.has(r.ship.status) && r.ship.current_port_id === c.origin_port_id);
+  // Ships at the charter port with the good aboard.
+  const candidates = (c: S.ContractListing) => atPort(c).filter((r) => held(r.ship.id, c.commodity_id) > 0);
+  // Ships whose whole load of the good is taken off as bought here.
+  const allBought = (c: S.ContractListing) => atPort(c).filter((r) => raw(r.ship.id, c.commodity_id) > 0 && held(r.ship.id, c.commodity_id) === 0);
+  // Tons of a good already planned from a ship on the other ticked charters.
+  const usedElsewhere = (p: Record<string, CharterPlan>, shipId: string, good: string | null | undefined, except: string) =>
+    list.items.reduce((n, x) => (x.id !== except && p[x.id]?.ship === shipId && x.commodity_id === good ? n + p[x.id].qty : n), 0);
+  // Most a charter can take from a ship, beside what the other rows plan from it.
+  const cap = (p: Record<string, CharterPlan>, c: S.ContractListing, shipId: string) =>
+    Math.max(0, Math.min(c.remaining_quantity, Math.floor(held(shipId, c.commodity_id)) - usedElsewhere(p, shipId, c.commodity_id, c.id)));
 
   function pick(c: S.ContractListing, on: boolean) {
     setFailed(null);
@@ -93,22 +185,51 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
       const next = { ...p };
       if (!on) delete next[c.id];
       else {
-        const first = candidates(c)[0];
-        const ship = first?.ship.id ?? "";
-        next[c.id] = { ship, qty: Math.max(1, Math.min(c.remaining_quantity, Math.floor(held(ship, c.commodity_id)))) };
+        const ship = candidates(c).sort((a, b) => cap(p, c, b.ship.id) - cap(p, c, a.ship.id))[0]?.ship.id ?? "";
+        next[c.id] = { ship, qty: Math.max(1, cap(p, c, ship)) };
       }
       return next;
     });
   }
 
+  function setShip(c: S.ContractListing, ship: string) {
+    setPlan((x) => {
+      const prev = x[c.id];
+      // An untouched row (full load) follows the new ship's room; a typed amount is only clamped.
+      const qty = prev.qty >= cap(x, c, prev.ship) ? cap(x, c, ship) : Math.min(prev.qty, cap(x, c, ship));
+      return { ...x, [c.id]: { ship, qty: Math.max(1, qty) } };
+    });
+  }
+
+  function setQty(c: S.ContractListing, value: number) {
+    setPlan((x) => ({ ...x, [c.id]: { ...x[c.id], qty: Math.max(1, Math.min(Math.floor(value) || 1, cap(x, c, x[c.id].ship))) } }));
+  }
+
   const planned = list.items.filter((c) => plan[c.id]);
-  const ready = planned.length > 0 && planned.length <= 25 && planned.every((c) => plan[c.id].ship && plan[c.id].qty >= 1);
+  const over = (c: S.ContractListing) => {
+    const p = plan[c.id];
+    return p.qty > c.remaining_quantity || usedElsewhere(plan, p.ship, c.commodity_id, c.id) + p.qty > held(p.ship, c.commodity_id);
+  };
+  // Until the fills are in, what was carried in is unknown.
+  const fillsReady = ignoreFills || !fillPorts || fillPorts.split(",").every((p) => fills?.[p]);
+  const ready =
+    fillsReady && planned.length > 0 && planned.length <= 25 && planned.every((c) => plan[c.id].ship && plan[c.id].qty >= 1 && !over(c));
+  // Every ship at a ticked charter's port with fills of its good taken off, not just the planned one.
+  const boughtHere = planned.flatMap((c) =>
+    atPort(c)
+      .filter((r) => raw(r.ship.id, c.commodity_id) > 0 && fillsIn(r.ship.id, c.commodity_id) > 0)
+      .map((r) => ({ c, r })),
+  );
   const results = deliver.result;
+  const unlocked = Math.max(0, ...(results ?? []).map((r) => r.unlocked_phase));
 
   function submit() {
     setFailed(null);
+    setPhaseBefore(null);
     const deliveries = planned.map((c) => ({ contract_id: c.id, ship_id: plan[c.id].ship, quantity: plan[c.id].qty }));
     void deliver.run(async () => {
+      // Read just before delivering: another company may have unlocked a phase since the page loaded.
+      setPhaseBefore(await kibbGet<WorldClock>("/v1/world/clock").then((c) => c.unlocked_phase, () => unlockedPhase ?? null));
       if (deliveries.length === 1) return [await kibbPost<S.DeliverCharterResult>("/v1/contract/deliver-charter", deliveries[0])];
       try {
         return await postBatch<S.DeliverCharterResult[]>("/v1/contract/deliver-charters-batch", { deliveries });
@@ -185,7 +306,9 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
                     </td>
                     <td className="tabular-nums">{fmtCr(payPerTon(c), 2)}</td>
                     <td className="whitespace-nowrap">{fmtIn(c.expires_at)}</td>
-                    <td className="text-muted-foreground">{here.length ? here.map((r) => r.ship.name).join(", ") : "—"}</td>
+                    <td className="text-muted-foreground">
+                      {[...here.map((r) => r.ship.name), ...allBought(c).map((r) => `${r.ship.name} (bought here since arrival)`)].join(", ") || "—"}
+                    </td>
                   </tr>
                 );
               })}
@@ -202,33 +325,30 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
       {planned.length > 0 && (
         <Panel title={`Deliver ${planned.length} charter${planned.length === 1 ? "" : "s"}`}>
           <div className="space-y-4">
-            <Table head={["#", "Charter", "Ship at the port", "Aboard", "Tons to deliver", "Pays"]}>
+            <Table head={["#", "Charter", "Ship at the port", "Carried in", "Tons to deliver", "Pays"]}>
               {planned.map((c, i) => {
                 const p = plan[c.id];
+                const elsewhere = usedElsewhere(plan, p.ship, c.commodity_id, c.id);
                 return (
-                  <tr key={c.id} className={failed === i ? "bg-destructive/10" : undefined}>
+                  <tr key={c.id} className={failed === i || over(c) ? "bg-destructive/10" : undefined}>
                     <td className="text-muted-foreground">{i + 1}</td>
                     <td>
                       {goodName(c.commodity_id)} to {portName(c.origin_port_id)}
                     </td>
                     <td className="min-w-52">
-                      <ShipSelect
-                        value={p.ship}
-                        onChange={(v) => setPlan((x) => ({ ...x, [c.id]: { ...x[c.id], ship: v } }))}
-                        placeholder="No ship here with this good"
-                        ships={candidates(c)}
-                      />
+                      <ShipSelect value={p.ship} onChange={(v) => setShip(c, v)} placeholder="No ship here with this good" ships={candidates(c)} />
                     </td>
-                    <td className="tabular-nums">{fmtTons(held(p.ship, c.commodity_id))}</td>
+                    <td className="tabular-nums">
+                      {fmtTons(held(p.ship, c.commodity_id))}
+                      {elsewhere > 0 && <div className="text-muted-foreground text-xs">{fmtTons(elsewhere)} on other rows</div>}
+                    </td>
                     <td className="w-28">
                       <Input
                         type="number"
                         min={1}
-                        max={c.remaining_quantity}
+                        max={Math.max(1, cap(plan, c, p.ship))}
                         value={p.qty}
-                        onChange={(e) =>
-                          setPlan((x) => ({ ...x, [c.id]: { ...x[c.id], qty: Math.max(1, Math.floor(Number(e.target.value))) } }))
-                        }
+                        onChange={(e) => setQty(c, Number(e.target.value))}
                       />
                     </td>
                     <td className="tabular-nums">{fmtCr(payPerTon(c) * p.qty)}</td>
@@ -236,6 +356,35 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
                 );
               })}
             </Table>
+            {planned.some(over) && (
+              <p className="text-destructive text-sm">
+                A red row asks for more than its ship carried in (less what the other rows take from it) or than the charter still wants.
+              </p>
+            )}
+            {boughtHere.length > 0 && (
+              <div className="space-y-2 rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+                <p>
+                  Bought at the charter port since the ship arrived{ignoreFills ? " (counted as carried in)" : ", and left out of what it can deliver"}:{" "}
+                  {[...new Map(boughtHere.map((x) => [`${x.r.ship.id}|${x.c.commodity_id}`, x])).values()]
+                    .map(({ c, r }) => `${fmtTons(fillsIn(r.ship.id, c.commodity_id))} ${goodName(c.commodity_id)} (${r.ship.name})`)
+                    .join(", ")}
+                  . Your fills don&apos;t say which ship or warehouse took them, so all are taken off; goods loaded from the warehouse
+                  here don&apos;t count either.
+                </p>
+                <Checkbox checked={ignoreFills} onChange={setIgnoreFills}>
+                  Those went to the warehouse or another ship: count this cargo as carried in (the server refuses it if not)
+                </Checkbox>
+              </div>
+            )}
+            {!fillsReady && !fillsError && <p className="text-muted-foreground text-xs">Checking what was bought at these ports since arrival…</p>}
+            {fillsError && !ignoreFills && (
+              <ErrorNote error={`Couldn't read your fills (${fillsError.message}), so what was carried in is unknown. Tick below to deliver anyway.`} />
+            )}
+            {fillsError && boughtHere.length === 0 && (
+              <Checkbox checked={ignoreFills} onChange={setIgnoreFills}>
+                Deliver without checking fills (the server refuses cargo not carried in)
+              </Checkbox>
+            )}
             {planned.some((c) => autopilot.has(plan[c.id].ship)) && <AutopilotWarning shipName="one of these ships" />}
             <ErrorNote error={deliver.error} />
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -268,8 +417,8 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
               </tr>
             ))}
           </Table>
-          {results.some((r) => r.unlocked_phase > 1) && (
-            <p className="mt-3 text-muted-foreground text-xs">World phase open: {Math.max(...results.map((r) => r.unlocked_phase))}.</p>
+          {phaseBefore !== null && unlocked > phaseBefore && (
+            <p className="mt-3 text-muted-foreground text-xs">Phase {unlocked} unlocked.</p>
           )}
         </Panel>
       )}
@@ -282,12 +431,14 @@ function ChartersTab({ ships, autopilot, onDone }: { ships: ShipResult[] | undef
 function FreightTab({
   ships,
   companyId,
+  ourIds,
   maxPhase,
   autopilot,
   onDone,
 }: {
   ships: ShipResult[] | undefined;
   companyId: string | undefined;
+  ourIds: Set<string>;
   maxPhase: number | undefined;
   autopilot: Set<string>;
   onDone: () => void;
@@ -310,13 +461,11 @@ function FreightTab({
     100,
     [origin, dest],
   );
-  // Our side of freight: what we carry and what we issued.
+  // Our side of freight: what we carry and what we issued. Every open lot in reach shares the list, so read it all.
   const { data: ours, error: oursError, reload: reloadOurs } = usePoll(
     async () => {
       const [active, listed] = await Promise.all(
-        (["active", "open"] as const).map((status) =>
-          kibbGet<S.ContractListing[]>("/v1/contract/list", { contract_type: "freight", status, limit: 200 }),
-        ),
+        (["active", "open"] as const).map((status) => fetchAll<S.ContractListing>("/v1/contract/list", { contract_type: "freight", status })),
       );
       return [...active, ...listed];
     },
@@ -333,21 +482,29 @@ function FreightTab({
     onDone();
   });
 
-  const free = (r: ShipResult) => r.effective_hold_capacity_tons - r.cargo_used_tons;
-  const candidates = (c: S.ContractListing) =>
-    (ships ?? []).filter((r) => r.ship.status === "berthed" && r.ship.current_port_id === c.origin_port_id && free(r) >= c.quantity_required);
-
-  const listings = open.items.filter((c) => !companyId || c.issuer_company_id !== companyId);
+  // Lots from any of our companies would be same-player dealing, refused.
+  const listings = open.items.filter((c) => !c.issuer_company_id || !ourIds.has(c.issuer_company_id));
   const planned = listings.filter((c) => plan[c.id] !== undefined);
   const carried = (ours ?? []).filter((c) => c.carrier_company_id && c.carrier_company_id === companyId);
   const issued = (ours ?? []).filter((c) => c.issuer_company_id && c.issuer_company_id === companyId);
   const shipOf = (id: string | null | undefined) => ships?.find((r) => r.ship.id === id);
 
+  const free = (r: ShipResult) => r.effective_hold_capacity_tons - r.cargo_used_tons;
+  // Tons of the ticked lots planned on a ship, leaving one lot out.
+  const plannedOn = (p: Record<string, string>, shipId: string, except?: string) =>
+    listings.reduce((n, x) => (x.id !== except && p[x.id] === shipId ? n + x.quantity_required : n), 0);
+  const fits = (c: S.ContractListing, r: ShipResult, p: Record<string, string>) => free(r) - plannedOn(p, r.ship.id, c.id) >= c.quantity_required;
+  const berthedAt = (c: S.ContractListing) =>
+    (ships ?? []).filter((r) => r.ship.status === "berthed" && r.ship.current_port_id === c.origin_port_id);
+  // Ships berthed at the origin with room for the lot beside the other lots planned on them.
+  const candidates = (c: S.ContractListing, p = plan) => berthedAt(c).filter((r) => fits(c, r, p));
+  const overfull = (ships ?? []).filter((r) => planned.some((c) => plan[c.id] === r.ship.id) && plannedOn(plan, r.ship.id) > free(r));
+
   function pick(c: S.ContractListing, on: boolean) {
     setFailed(null);
     setPlan((p) => {
       const next = { ...p };
-      if (on) next[c.id] = candidates(c)[0]?.ship.id ?? "";
+      if (on) next[c.id] = candidates(c, p)[0]?.ship.id ?? "";
       else delete next[c.id];
       return next;
     });
@@ -395,8 +552,8 @@ function FreightTab({
                     <td>
                       <input
                         type="checkbox"
-                        disabled={!can}
-                        title={can ? undefined : "Needs a ship berthed at the origin with room for the lot"}
+                        disabled={!can && plan[c.id] === undefined}
+                        title={can ? undefined : "Needs a ship berthed at the origin with room for the lot, beside the lots already ticked"}
                         checked={plan[c.id] !== undefined}
                         onChange={(e) => pick(c, e.target.checked)}
                       />
@@ -423,7 +580,10 @@ function FreightTab({
           <div className="space-y-4">
             <Table head={["#", "Lot", "Ship berthed at origin", "Collateral escrowed"]}>
               {planned.map((c, i) => (
-                <tr key={c.id} className={failed === i ? "bg-destructive/10" : undefined}>
+                <tr
+                  key={c.id}
+                  className={failed === i || overfull.some((r) => r.ship.id === plan[c.id]) ? "bg-destructive/10" : undefined}
+                >
                   <td className="text-muted-foreground">{i + 1}</td>
                   <td>
                     {fmtTons(c.quantity_required)} {goodName(c.commodity_id)}, {portName(c.origin_port_id)} → {portName(c.dest_port_id)}
@@ -433,13 +593,21 @@ function FreightTab({
                       value={plan[c.id]}
                       onChange={(v) => setPlan((p) => ({ ...p, [c.id]: v }))}
                       placeholder="No ship with room here"
-                      ships={candidates(c)}
+                      ships={berthedAt(c)}
+                      filter={(r) => r.ship.id === plan[c.id] || fits(c, r, plan)}
                     />
                   </td>
                   <td className="tabular-nums">{fmtCr(c.collateral_pence)}</td>
                 </tr>
               ))}
             </Table>
+            {overfull.length > 0 && (
+              <p className="text-destructive text-sm">
+                Too much on{" "}
+                {overfull.map((r) => `${r.ship.name} (${fmtTons(plannedOn(plan, r.ship.id))} planned, ${fmtTons(free(r))} free)`).join(", ")}
+                : move a lot to another ship or untick one.
+              </p>
+            )}
             {planned.some((c) => autopilot.has(plan[c.id])) && <AutopilotWarning shipName="one of these ships" />}
             <ErrorNote error={accept.error} />
             {accept.result && (
@@ -454,7 +622,10 @@ function FreightTab({
                 collateral is escrowed and comes back with the reward on delivery; miss the deadline and both the collateral and the
                 cargo are lost. Each ton loaded adds to the berth&apos;s turnaround lock.
               </p>
-              <Button disabled={accept.busy || planned.length > 25 || planned.some((c) => !plan[c.id])} onClick={submitAccept}>
+              <Button
+                disabled={accept.busy || planned.length > 25 || planned.some((c) => !plan[c.id]) || overfull.length > 0}
+                onClick={submitAccept}
+              >
                 {accept.busy ? "Accepting…" : "Accept"}
               </Button>
             </div>
@@ -558,9 +729,22 @@ function FreightTab({
 
 // ── Issue freight ─────────────────────────────────────────────────────────────
 
-function IssueFreightTab({ maxPhase, onDone }: { maxPhase: number | undefined; onDone: () => void }) {
+function IssueFreightTab({ companyId, maxPhase, onDone }: { companyId: string | undefined; maxPhase: number | undefined; onDone: () => void }) {
   const { catalog, portName, goodName } = useCatalog();
   const { data: warehouses, error, reload } = usePoll(() => kibbGet<S.PortWarehouseResult[]>("/v1/warehouse/list"), 30_000);
+  // Our freight still to arrive: each lot needs its own room at its destination.
+  const { data: ourFreight, error: freightError, reload: reloadOurFreight } = usePoll(
+    companyId
+      ? async () => {
+          const pages = await Promise.all(
+            (["open", "active"] as const).map((status) => fetchAll<S.ContractListing>("/v1/contract/list", { contract_type: "freight", status })),
+          );
+          return pages.flat().filter((c) => c.issuer_company_id === companyId);
+        }
+      : null,
+    30_000,
+    [companyId],
+  );
   const [origin, setOrigin] = useState("");
   const [good, setGood] = useState("");
   const [dest, setDest] = useState("");
@@ -569,6 +753,7 @@ function IssueFreightTab({ maxPhase, onDone }: { maxPhase: number | undefined; o
   const [collateralCr, setCollateralCr] = useState(0);
   const create = useAction<S.Contract>(() => {
     void reload();
+    void reloadOurFreight();
     onDone();
   });
 
@@ -580,9 +765,23 @@ function IssueFreightTab({ maxPhase, onDone }: { maxPhase: number | undefined; o
   const base = catalog?.commodities.find((c) => c.id === good)?.base_price_pence ?? 0;
   // Merchant Adventurers ask 25% of the cargo's value as collateral up to 30 t, 40% above.
   const suggestedCollateral = Math.round((base * qty * (qty > 30 ? 40 : 25)) / 100);
+  // The goods land in our warehouse at the destination: without the room there the delivery is refused.
+  const destWh = (warehouses ?? []).find((w) => w.port_id === dest);
+  const pending = (ourFreight ?? []).filter((c) => c.dest_port_id === dest).reduce((n, c) => n + c.remaining_quantity, 0);
+  const destFree = Math.max(0, (destWh?.free_tonnage ?? 0) - pending);
+  // Until our other freight is known, the room isn't: ask before posting.
+  const pendingKnown = ourFreight !== undefined;
+  const noRoom = !!dest && (!pendingKnown || destFree < qty);
 
   function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (
+      noRoom &&
+      !confirm(
+        `${pendingKnown ? `Your warehouse at ${portName(dest)} has ${fmtTons(destFree)} free, short of ${fmtTons(qty)}.` : `Your other freight bound for ${portName(dest)} couldn't be read, so the free room there is unknown.`} Unless you lease the room before the carrier arrives, the delivery is refused and you are in breach when the contract expires (the carrier is paid and keeps the cargo). Post anyway?`,
+      )
+    )
+      return;
     void create.run(() =>
       kibbPost<S.Contract>("/v1/contract/create-freight", {
         origin_port_id: origin,
@@ -662,6 +861,22 @@ function IssueFreightTab({ maxPhase, onDone }: { maxPhase: number | undefined; o
                 ]}
               />
             )}
+            {dest && (
+              <p className={noRoom ? "rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground" : "text-muted-foreground text-xs"}>
+                {!pendingKnown
+                  ? `${freightError ? `Couldn't read your other freight (${freightError.message})` : "Reading your other freight"} bound for ${portName(dest)}, so the free room there is unknown. `
+                  : destWh
+                    ? `${fmtTons(destFree)} free in your warehouse at ${portName(dest)}${pending > 0 ? ` after the ${fmtTons(pending)} your other freight brings there` : ""}`
+                    : `You lease no warehouse space at ${portName(dest)}`}
+                {!pendingKnown ? "" : noRoom ? `, short of the ${fmtTons(qty)} this lot needs. ` : ". "}
+                The goods go there on delivery, so that room must stay free until the carrier arrives (other freight you issued to
+                this port needs its own). With no room the delivery is refused, and if the contract expires meanwhile you are in
+                breach.{" "}
+                <Link href="/warehouses" className="text-primary hover:underline">
+                  Lease space
+                </Link>
+              </p>
+            )}
             <ErrorNote error={create.error} />
             {create.result && (
               <p className="text-sm">
@@ -696,9 +911,17 @@ function IssueFreightTab({ maxPhase, onDone }: { maxPhase: number | undefined; o
 export default function ContractsPage() {
   const { data: ships, reload: reloadShips } = usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { limit: 200 }), 15_000);
   const { data: profile } = usePoll(() => kibbGet<CompanyProfile>("/v1/company/profile"));
-  const { data: clock } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"));
+  const { data: clock, reload: reloadClock } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"));
+  const { data: player } = usePoll(() => dash.get<{ companies: Array<{ id: string; name: string }> }>("/api/kibb/companies"));
   const autopilot = useAutopilotShips();
-  const refresh = () => void reloadShips();
+  // One sealed-freight lookup for every tab, refetched with each ships poll so the two always agree.
+  const sealed = useSealedTons([ships]);
+  const ourIds = new Set([...(player?.companies.map((c) => c.id) ?? []), ...(profile ? [profile.company.id] : [])]);
+  // The sealed tons follow the ships reload on their own.
+  const refresh = () => {
+    void reloadShips();
+    void reloadClock();
+  };
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
@@ -710,13 +933,20 @@ export default function ContractsPage() {
           <TabsTab value="issue">Issue freight</TabsTab>
         </TabsList>
         <TabsPanel value="charters" className="pt-2">
-          <ChartersTab ships={ships} autopilot={autopilot} onDone={refresh} />
+          <ChartersTab ships={ships} sealed={sealed} unlockedPhase={clock?.unlocked_phase} autopilot={autopilot} onDone={refresh} />
         </TabsPanel>
         <TabsPanel value="freight" className="pt-2">
-          <FreightTab ships={ships} companyId={profile?.company.id} maxPhase={clock?.unlocked_phase} autopilot={autopilot} onDone={refresh} />
+          <FreightTab
+            ships={ships}
+            companyId={profile?.company.id}
+            ourIds={ourIds}
+            maxPhase={clock?.unlocked_phase}
+            autopilot={autopilot}
+            onDone={refresh}
+          />
         </TabsPanel>
         <TabsPanel value="issue" className="pt-2">
-          <IssueFreightTab maxPhase={clock?.unlocked_phase} onDone={refresh} />
+          <IssueFreightTab companyId={profile?.company.id} maxPhase={clock?.unlocked_phase} onDone={refresh} />
         </TabsPanel>
       </Tabs>
     </div>

@@ -4,6 +4,7 @@
  * (the node ids `/v1/world/route` legs use). Lanes that would cut across land get waypoints.
  */
 
+import type { RivalShip } from "./rivals";
 import type { ShipResult } from "./types";
 
 export type LatLng = [number, number];
@@ -242,4 +243,24 @@ export function shipFix(r: ShipResult, now = Date.now()): ShipFix | null {
   for (const l of legs.slice(idx + 1)) ahead.push(...legPath(l.from_node, l.to_node).slice(1));
 
   return { pos, heading: hdg, ahead, dest: legs[legs.length - 1].to_node };
+}
+
+/**
+ * Where a rival ship probably is: along its route by the share of the estimated passage elapsed,
+ * or on the port it was seen in (or bound for, once it should have arrived).
+ */
+export function rivalFix(r: RivalShip, now = Date.now()): (ShipFix & { estimated: boolean }) | null {
+  const v = r.voyage;
+  if (v && now < v.arriveAt) {
+    const path: LatLng[] = [];
+    for (const [a, b] of v.legs) path.push(...legPath(a, b).slice(path.length ? 1 : 0));
+    if (path.length < 2) return null;
+    const t = (now - v.departAt) / Math.max(v.arriveAt - v.departAt, 1);
+    const { pos, heading } = pointAlong(path, t);
+    return { pos, heading, ahead: [], dest: v.to, estimated: true };
+  }
+  // Past its estimated arrival: in the port it was bound for, whatever the server thought then.
+  const port = r.inPort ?? (v && now >= v.arriveAt ? v.to : null);
+  const at = port ? NODE_COORDS[port] : undefined;
+  return at ? { pos: at, heading: 0, ahead: [], dest: null, estimated: r.voyage !== null } : null;
 }

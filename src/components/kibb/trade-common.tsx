@@ -26,16 +26,43 @@ export function AutopilotWarning({ shipName }: { shipName?: string }) {
 }
 
 /**
- * Tons of sealed freight each of our ships carries, by good: aboard, but not ours to deliver to a
- * charter, sell or unload. Returns a lookup `(shipId, good) => tons`.
+ * Every row of a cursor-paged list (`cursor` = last id), fetched page by page until a short one.
+ * Stops after `maxPages` as a guard.
  */
-export function useSealedTons(): (shipId: string, good: string | null | undefined) => number {
-  const { data } = usePoll(
-    () => kibbGet<ContractListing[]>("/v1/contract/list", { contract_type: "freight", status: "active", limit: 200 }),
+export async function fetchAll<T extends { id: string }>(
+  path: string,
+  query: NonNullable<Parameters<typeof kibbGet>[1]>,
+  pageSize = 200,
+  maxPages = 50,
+): Promise<T[]> {
+  const all: T[] = [];
+  let cursor: string | undefined;
+  for (let i = 0; i < maxPages; i++) {
+    const page = await kibbGet<T[]>(path, { ...query, cursor, limit: pageSize });
+    all.push(...page);
+    if (page.length < pageSize) break;
+    cursor = page.at(-1)?.id;
+  }
+  return all;
+}
+
+export type SealedTons = ((shipId: string, good: string | null | undefined) => number) & { reload: () => Promise<void> };
+
+/**
+ * Tons of sealed freight each of our ships carries, by good: aboard, but not ours to deliver to a
+ * charter, sell or unload. Returns a lookup `(shipId, good) => tons`; its `reload()` refetches at
+ * once (call it after accepting or delivering freight).
+ */
+/** `deps` refetch it, e.g. with each ships poll, so sealed tons never lag the manifests they're taken from. */
+export function useSealedTons(deps: unknown[] = []): SealedTons {
+  const { data, reload } = usePoll(
+    () => fetchAll<ContractListing>("/v1/contract/list", { contract_type: "freight", status: "active" }),
     30_000,
+    deps,
   );
-  return (shipId, good) =>
+  const tons = (shipId: string, good: string | null | undefined) =>
     (data ?? []).filter((c) => c.carrier_ship_id === shipId && c.commodity_id === good).reduce((n, c) => n + c.remaining_quantity, 0);
+  return Object.assign(tons, { reload });
 }
 
 /** An all-or-nothing batch was refused; `batchIndex` is the item that failed (nothing applied). */

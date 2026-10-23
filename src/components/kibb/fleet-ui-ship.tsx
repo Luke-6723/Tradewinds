@@ -10,6 +10,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, Panel, Table } from "@/components/kibb/bits";
 import { Field, PortSelect } from "@/components/kibb/pickers";
+import { InsurableCap, LaneGuide, capFrom, createPolicy, laneKey, useLaneFloors, type InsurableValue } from "@/components/kibb/insurance-common";
+import { num } from "@/components/kibb/naval-common";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
@@ -525,14 +527,33 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
   const inPort = s.status === "berthed" || s.status === "anchored_roadstead";
   const current = (policies ?? []).filter((p) => p.status === "open" || p.status === "active");
   const [dest, setDest] = useState("");
-  const [valueCr, setValueCr] = useState(0);
-  const [premium, setPremium] = useState("200");
-  const bps = Number(premium);
+  const [valueCr, setValueCr] = useState("");
+  const [premium, setPremium] = useState("");
+  const [cap, setCap] = useState<InsurableValue | null>(null);
+  const value = Math.round(num(valueCr) * 100);
+  const valueOk = Number.isFinite(value) && value > 0;
+  const bps = num(premium);
   const bpsOk = Number.isInteger(bps) && bps >= 10 && bps <= 3000;
+  const floors = useLaneFloors(port && dest ? [[port, dest]] : []).get(laneKey(port, dest));
+  // Cover type: from the cap once seen; an empty hold can only be hull-only; otherwise unknown.
+  const hullOnly = cap && valueOk ? value <= cap.hull_value_pence : r.cargo_used_tons <= 0 ? true : null;
   const act = useAction<S.InsurancePolicy>(() => {
     onDone();
     reload();
   });
+
+  async function submit() {
+    const res = await act.run(async () => {
+      try {
+        return await createPolicy({ ship_id: s.id, dest_port_id: dest, insured_value_pence: value, premium_bps: bps });
+      } catch (e) {
+        const c = capFrom(e);
+        if (c) setCap(c);
+        throw e;
+      }
+    });
+    if (res) setCap(null);
+  }
 
   return (
     <Panel title="Insurance" action={<Link href="/insurance" className="text-muted-foreground text-xs hover:text-foreground">Insurance →</Link>}>
@@ -562,29 +583,21 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
             <PortSelect value={dest} onChange={setDest} placeholder="Bound for…" maxPhase={clock?.unlocked_phase} filter={(id) => id !== port} />
             <div className="grid gap-2 sm:grid-cols-2">
               <Field label="Sum insured (Cr)">
-                <Input type="number" min={1} value={valueCr} onChange={(e) => setValueCr(Number(e.target.value))} />
+                <Input type="number" min={0.01} step={0.01} value={valueCr} onChange={(e) => setValueCr(e.target.value)} />
               </Field>
               <Field label="Premium (bps)">
-                <Input type="number" min={10} max={3000} step={1} value={premium} onChange={(e) => setPremium(e.target.value)} />
+                <Input type="number" min={10} max={3000} step={1} placeholder="10–3,000" value={premium} onChange={(e) => setPremium(e.target.value)} />
               </Field>
             </div>
             {premium !== "" && !bpsOk && <ErrorNote error="The premium must be a whole number of bps from 10 to 3,000." />}
+            {dest && <LaneGuide floors={floors} hullOnly={hullOnly} premiumBps={bps} />}
+            {cap && <InsurableCap cap={cap} valueCr={valueCr} onUseMax={setValueCr} />}
             <p className="text-muted-foreground text-xs">
-              Premium {bpsOk ? fmtCr(Math.ceil((Math.round(valueCr * 100) * bps) / 10_000)) : "—"} escrowed. Cap: hull rebuild quote + cargo aboard (the error
-              tells you the cap). Sailing anywhere but the named port voids it; Lloyd&apos;s looks after about a game hour.
+              Premium {bpsOk && valueOk ? fmtCr(Math.ceil((value * bps) / 10_000)) : "—"} escrowed. Cap: hull rebuild quote + 150 Cr a gun + cargo aboard (ask for
+              more and the cap shows here). Sailing anywhere but the named port voids it; Lloyd&apos;s looks after about a game hour.
             </p>
             <ErrorNote error={act.error} />
-            <Button size="sm" disabled={blocked || act.busy || !dest || valueCr <= 0 || !bpsOk}
-              onClick={() =>
-                void act.run(() =>
-                  kibbPost<S.InsurancePolicy>("/v1/insurance/create", {
-                    ship_id: s.id,
-                    dest_port_id: dest,
-                    insured_value_pence: Math.round(valueCr * 100),
-                    premium_bps: bps,
-                  }),
-                )
-              }>
+            <Button size="sm" disabled={blocked || act.busy || !dest || !valueOk || !bpsOk} onClick={() => void submit()}>
               Request cover
             </Button>
           </div>

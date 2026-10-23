@@ -21,6 +21,7 @@ import {
   ShipIcon,
   ShipWheelIcon,
   SkullIcon,
+  SwordsIcon,
   TrophyIcon,
   WarehouseIcon,
 } from "lucide-react";
@@ -61,6 +62,7 @@ const nav = [
     items: [
       { href: "/ports", label: "Ports", icon: MapIcon },
       { href: "/zones", label: "Sea zones", icon: SkullIcon },
+      { href: "/rivals", label: "Rivals", icon: SwordsIcon },
       { href: "/leaderboard", label: "Leaderboard", icon: TrophyIcon },
     ],
   },

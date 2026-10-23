@@ -22,6 +22,9 @@
  */
 
 import { KibbClient, KIBB_DEFAULT_URL, isApiError } from "../client";
+import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, zoneDays, type MarqueOption } from "../rivals";
+import type { LetterOfMarque } from "../schema";
+import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
 import type { BankingRegion, ShipResult } from "../types";
 import { ShipAgent, type AgentState, type AgentStats, type FleetHost } from "./agent";
@@ -56,6 +59,24 @@ export interface FleetSettings {
    * completes, so this discounts it for the wait and for rivals.
    */
   bonusWeightPct: number;
+  /**
+   * Sponsor letters of marque automatically where the rival traffic seen makes the prize money beat
+   * the cost and our own ships' extra losses by a safety margin. Off by default.
+   */
+  marques: boolean;
+  /** Most spent on letters of marque in any 24 real hours (pence). */
+  marqueBudgetPence: number;
+  /**
+   * Underwrite other companies' voyage policies that Lloyd's has already priced on the same lane
+   * (its acceptance bounds the expected loss), in small slices. Off by default.
+   */
+  underwrite: boolean;
+  /** Most collateral locked in escrow at once (pence; all escrow counts, to stay on the safe side). */
+  underwriteBudgetPence: number;
+  /** Most collateral on any one policy (pence). */
+  underwriteMaxPerPolicyPence: number;
+  /** Least edge over the Lloyd's-implied expected loss (bps of the sum insured). */
+  underwriteMinEdgeBps: number;
   /** Carry Merchant Adventurers freight on legs we sail anyway, when it pays for its berth time. */
   useFreight: boolean;
 }
@@ -72,6 +93,12 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   buyClasses: ["collier", "brigantine", "fluyt", "cutter"],
   guns: "auto",
   bonusWeightPct: 75,
+  marques: false,
+  marqueBudgetPence: 100_000,
+  underwrite: false,
+  underwriteBudgetPence: 500_000,
+  underwriteMaxPerPolicyPence: 300_000,
+  underwriteMinEdgeBps: 150,
   useFreight: true,
 };
 
@@ -100,6 +127,12 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   if (out.bonusWeightPct !== undefined && out.bonusWeightPct > 100) throw new FleetSettingsError("bonusWeightPct must be 0 to 100");
   bool("autoBuy");
   bool("useFreight");
+  bool("marques");
+  num("marqueBudgetPence", 0, true);
+  bool("underwrite");
+  num("underwriteBudgetPence", 0, true);
+  num("underwriteMaxPerPolicyPence", 0, true);
+  num("underwriteMinEdgeBps", 0, true);
   if (patch.guns !== undefined) {
     if (!GUN_POLICIES.includes(patch.guns)) throw new FleetSettingsError(`guns must be one of ${GUN_POLICIES.join(", ")}`);
     out.guns = patch.guns;
@@ -145,7 +178,46 @@ export interface FleetState {
   topLanes: Lane[];
   purchases: PurchaseRecord[];
   buyer: string;
+  /** The last letter-of-marque check (also run, as a dry run, while auto-marques are off). */
+  marques: MarqueReport | null;
+  /** The last underwriting check (a dry run while it is off). */
+  underwriting: UnderwriteReport | null;
   log: FleetLogLine[];
+}
+
+export interface MarqueZoneReport {
+  zone: string;
+  /** Rival passages and laden passages a game day, and their cargo (pence) at base prices. */
+  passages: number;
+  laden: number;
+  cargo: number;
+  /** Best marque there (per game day, pence): prize, cost, our own extra losses, profit. */
+  best: MarqueOption;
+  active: boolean;
+  verdict: string;
+}
+
+export interface UnderwriteReport {
+  checkedAt: string;
+  enabled: boolean;
+  budgetPence: number;
+  /** All escrow across regions (underwriting collateral included). */
+  lockedPence: number;
+  /** Policies judged, best first (at most 25). */
+  rows: UnderwriteRow[];
+  action: string;
+}
+
+export interface MarqueReport {
+  checkedAt: string;
+  enabled: boolean;
+  budgetPence: number;
+  /** Spent on our marques created in the last 24 real hours. */
+  spentPence: number;
+  /** Prize money our marques have earned (all listed). */
+  prizePence: number;
+  zones: MarqueZoneReport[];
+  action: string;
 }
 
 export interface FleetConfig {
@@ -179,6 +251,18 @@ const REGION_FLOOR_PENCE = 20_000;
 const UPKEEP_DAYS_RESERVED = 1.5;
 /** A refit must improve a load's expected profit by this share to be worth the berth call. */
 const REFIT_MIN_GAIN = 0.02;
+/** How often letters of marque are judged (and presence ports re-read for sightings). */
+const MARQUE_CHECK_MS = 5 * 60_000;
+/** Marques are bought one game day at a time and judged again before another. */
+const MARQUE_GAME_HOURS = 24;
+/** Expected prize money must cover the cost plus our own extra losses this many times over. */
+const MARQUE_SAFETY = 1.5;
+/** Fewest laden rival passages a game day before a zone is considered at all. */
+const MARQUE_MIN_LADEN = 3;
+/** The Crown's minimum charge for a marque (100 Cr). */
+const MARQUE_MIN_PENCE = 10_000;
+/** How often the open insurance policies are judged. */
+const UNDERWRITE_CHECK_MS = 60_000;
 /** Trips a refit should pay for itself within. */
 const GUN_PAYBACK_TRIPS = 5;
 /** Whole tons of stores never counted as trimmable room (the voyage always needs some). */
@@ -211,6 +295,12 @@ export class FleetManager implements FleetHost {
   private purchases: PurchaseRecord[] = [];
   private topLanes: Lane[] = [];
   private buyer = "not checked yet";
+  private marqueReport: MarqueReport | null = null;
+  private lastMarqueCheck = 0;
+  private underwriteReport: UnderwriteReport | null = null;
+  private lastUnderwriteCheck = 0;
+  /** The player's companies (ids), never traded with as rivals. */
+  private readonly ourCompanyIds = new Set<string>();
   private retired: AgentStats = { trips: 0, deliveredTons: 0, rewardPence: 0, spentPence: 0, freightPence: 0 };
   private shipSpendPence = 0;
   private readonly missingScans = new Map<string, number>();
@@ -272,6 +362,8 @@ export class FleetManager implements FleetHost {
       topLanes: this.topLanes.slice(0, 8),
       purchases: [...this.purchases],
       buyer: this.buyer,
+      marques: this.marqueReport,
+      underwriting: this.underwriteReport,
       log: [...this.logLines],
     };
   }
@@ -402,6 +494,14 @@ export class FleetManager implements FleetHost {
     const profile = await this.client.companyProfile();
     this.homeRegion = this.world.region(profile.company.home_port_id);
     this.world.companyId = profile.company.id;
+    // Every company of this player: their ships aren't rivals and their policies aren't ours to write.
+    this.ourCompanyIds.add(profile.company.id);
+    this.world.rivals.ours.add(profile.company.name);
+    const player = await this.client.playerProfile().catch(() => null);
+    for (const c of player?.companies ?? []) {
+      this.ourCompanyIds.add(c.id);
+      this.world.rivals.ours.add(c.name);
+    }
     this.log(
       "fleet",
       `started for ${profile.company.name}: phase ${this.world.unlockedPhase} open, server clock ${this.world.skewMs >= 0 ? "+" : ""}${Math.round(this.world.skewMs / 1000)}s vs this machine, ` +
@@ -430,6 +530,20 @@ export class FleetManager implements FleetHost {
     }
     if (now - this.lastScan > SHIP_SCAN_MS) await this.scanShips();
     if (now - this.lastBuyCheck > BUY_CHECK_MS) await this.runBuyer(null);
+    if (now - this.lastMarqueCheck > MARQUE_CHECK_MS) {
+      this.lastMarqueCheck = now;
+      await this.runMarques().catch((e) => {
+        if (this.isFatal(e)) throw e;
+        this.log("fleet", `marque check failed: ${(e as Error).message}`);
+      });
+    }
+    if (now - this.lastUnderwriteCheck > UNDERWRITE_CHECK_MS) {
+      this.lastUnderwriteCheck = now;
+      await this.runUnderwriting().catch((e) => {
+        if (this.isFatal(e)) throw e;
+        this.log("fleet", `underwriting check failed: ${(e as Error).message}`);
+      });
+    }
   }
 
   private async scanShips(): Promise<void> {
@@ -651,6 +765,10 @@ export class FleetManager implements FleetHost {
       return id ? this.agents.get(id) : undefined;
     })();
     switch (e.event_type) {
+      case "ship_sailed":
+      case "ship_entered_port":
+        this.world.rivals.addEvent(e.event_type, e.port_id, e.payload, e.timestamp);
+        break;
       case "ship_arrived":
       case "ship_berthed":
       case "ship_evicted":
@@ -700,10 +818,18 @@ export class FleetManager implements FleetHost {
         this.log("fleet", `server ${str("severity") ?? "notice"}: ${str("message") ?? ""}`);
         break;
       case "expansion_bonus_paid":
-      case "marque_prize_paid":
-      case "insurance_claim_paid": {
-        const amount = num("amount_pence") ?? num("bonus_pence") ?? num("payout_pence");
+      case "marque_prize_paid": {
+        const amount = num("amount_pence") ?? num("bonus_pence") ?? num("payout_pence") ?? num("prize_pence");
         this.log("fleet", `${e.event_type.replace(/_/g, " ")}${amount ? `: ${cr(amount)}` : ""}`);
+        break;
+      }
+      case "insurance_claim_paid": {
+        // Sent to the insured and to every underwriter: for us it is income or a payout.
+        const amount = num("amount_pence") ?? num("payout_pence") ?? num("claim_pence");
+        const insured = str("insured_company_id");
+        const ours = insured !== undefined && this.ourCompanyIds.has(insured);
+        const what = insured === undefined ? "insurance claim paid" : ours ? "insurance claim received" : "insurance claim paid out of our collateral";
+        this.log("fleet", `${what}${amount ? `: ${ours ? "" : insured === undefined ? "" : "−"}${cr(amount)}` : ""}${str("policy_id") ? ` (policy ${str("policy_id")!.slice(0, 8)})` : ""}`);
         break;
       }
     }
@@ -848,6 +974,236 @@ export class FleetManager implements FleetHost {
     let n = 0;
     for (const [r, v] of this.world.vaults) n += Math.max(0, v - this.floorIn(r));
     return n;
+  }
+
+  // ── Letters of marque ───────────────────────────────────────────────────────
+
+  /**
+   * Our own ships' exposure per sea zone (cargo value × game days in the zone × gun deterrence, a
+   * game day): a marque raises piracy on our passages too.
+   */
+  private async ownExposure(): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const dayMs = 24 * 60 * this.world.gameMinuteMs;
+    for (const a of this.agents.values()) {
+      const lane = a.lane;
+      const knots = ((this.world.shipClass(a.shipClass)?.base_speed_centiknots ?? 800) / 100) * 0.85;
+      const det = 1 / (1 + 0.5 * (a.last?.ship.cannons_count ?? 0));
+      if (!lane) {
+        // No lane (yet): a ship at sea still carries its cargo through the rest of its voyage.
+        const r = a.last;
+        if (!r || r.ship.status !== "sailing") continue;
+        const value = Object.entries(r.cargo_manifest).reduce((n, [g, t]) => n + t * this.world.basePrice(g), 0);
+        if (value <= 0) continue;
+        const rest = { legs: r.route_legs.slice(r.ship.current_leg_idx) };
+        for (const [zone, days] of zoneDays(this.world.catalog, rest, knots)) out.set(zone, (out.get(zone) ?? 0) + value * days * det);
+        continue;
+      }
+      const plan = await this.world.route(lane.source, lane.dest, a.shipClass).catch(() => null);
+      if (!plan) continue;
+      // Goods at what they fetch or cost (whichever is more); sealed freight at ~3x its collateral.
+      const value =
+        lane.parts.reduce((n, p) => n + p.tons * Math.max(p.costPerTon, p.pay), 0) + lane.freight.reduce((n, f) => n + 3 * f.collateral, 0);
+      const tripsPerDay = lane.loopMs > 0 ? dayMs / Math.max(lane.loopMs, 60_000) : 1;
+      for (const [zone, days] of zoneDays(this.world.catalog, plan, knots)) out.set(zone, (out.get(zone) ?? 0) + value * days * det * tripsPerDay);
+    }
+    return out;
+  }
+
+  /**
+   * Re-reads the ports where we have presence for rival sailings, judges a marque in every zone
+   * rival traffic crosses, and (when enabled, within the budget) sponsors the most profitable one
+   * that clears the safety margin, for one game day.
+   */
+  private async runMarques(): Promise<void> {
+    const { world, client, settings } = this;
+    const ports = new Set<string>();
+    for (const a of this.agents.values()) {
+      const s = a.last?.ship;
+      if (s && s.status !== "sailing" && s.current_port_id) ports.add(s.current_port_id);
+    }
+    for (const p of await client.factors().catch(() => [] as string[])) ports.add(p);
+    await Promise.all(
+      [...ports].map(async (p) => {
+        const detail = await client.port(p).catch(() => null);
+        if (detail) world.observeGossip(detail);
+      }),
+    );
+    const now = world.now();
+    world.rivals.prune(now, world.gameMinuteMs);
+
+    const [zones, ours] = await Promise.all([client.zones(), this.recentMarques(now)]);
+    const spent = ours.filter((m) => now - Date.parse(m.created_at) < 24 * 3_600_000).reduce((n, m) => n + m.cost_pence, 0);
+    const prize = ours.reduce((n, m) => n + m.prize_earned_pence, 0);
+    const active = new Set(ours.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
+    const { zones: traffic } = await analyseRivals(world.rivals.all(), {
+      catalog: world.catalog,
+      route: (f, t, c) => world.route(f, t, c).catch(() => null),
+      now,
+      gameMinuteMs: world.gameMinuteMs,
+      piracy: new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps])),
+    });
+    const own = await this.ownExposure();
+
+    // Marques are sized to what the budget has left (a game day of it), not refused for being big.
+    const days = MARQUE_GAME_HOURS / 24;
+    const left = Math.max(0, settings.marqueBudgetPence - spent);
+    const maxBps = left >= MARQUE_MIN_PENCE ? Math.floor(left / (MARQUE_PENCE_PER_BPS_DAY * days) / 50) * 50 : 0;
+
+    const rows: MarqueZoneReport[] = [];
+    for (const t of traffic) {
+      const z = zones.find((x) => x.sea_zone_id === t.zone);
+      if (!z || z.phase > world.unlockedPhase) continue;
+      const best = bestMarque(z, t.exposure, own.get(t.zone) ?? 0, Math.max(50, maxBps));
+      const verdict = active.has(t.zone)
+        ? "our marque is in force"
+        : best.bps === 0
+          ? "the zone's marques are at their cap"
+          : t.laden < MARQUE_MIN_LADEN
+            ? `too little laden traffic seen (${t.laden.toFixed(1)} a game day; needs ${MARQUE_MIN_LADEN})`
+            : best.profit <= 0 || best.prize < MARQUE_SAFETY * (best.cost + best.ownLoss)
+              ? `doesn't pay: prize ~${cr(best.prize)} vs cost ${cr(best.cost)} + our losses ${cr(best.ownLoss)} a game day`
+              : "pays";
+      rows.push({ zone: t.zone, passages: t.passages, laden: t.laden, cargo: Math.round(t.cargo), best, active: active.has(t.zone), verdict });
+    }
+    rows.sort((a, b) => b.best.profit - a.best.profit);
+
+    const pick = rows.find((r) => r.verdict === "pays");
+    const cost = pick ? Math.max(MARQUE_MIN_PENCE, Math.round(MARQUE_PENCE_PER_BPS_DAY * pick.best.bps * days)) : 0;
+    let action = rows.length === 0 ? "no rival traffic seen yet" : "no zone pays";
+    // Our own exposure is only known once every ship has reported in.
+    const unready = [...this.agents.values()].some((a) => !a.last);
+    if (pick && !settings.marques) action = `off: would sponsor ${pick.best.bps} bps in ${pick.zone} for ${cr(cost)} (~${cr(pick.best.profit)} a game day)`;
+    else if (pick && unready) action = "waiting for every ship to report before weighing our own losses";
+    else if (pick && (maxBps < 50 || spent + cost > settings.marqueBudgetPence)) action = `budget: ${cr(spent)} of ${cr(settings.marqueBudgetPence)} spent in the last 24 h`;
+    else if (pick) {
+      action = await this.withCash(async () => {
+        // Anything may have changed while waiting for the lock: the setting, the budget, a stop.
+        if (this.stopRequested || !this.settings.marques) return "cancelled: auto-marques were turned off";
+        if (spent + cost > this.settings.marqueBudgetPence) return `budget: ${cr(spent)} of ${cr(this.settings.marqueBudgetPence)} spent in the last 24 h`;
+        // Only spare money: never what the fleet's loads need, never by remitting.
+        if ([...this.agents.values()].some((a) => a.waitingForCash)) return "a ship is waiting for cash: no marque";
+        await world.refreshVaults();
+        const home = this.homeRegion ?? "channel";
+        let committed = 0;
+        for (const a of this.agents.values()) committed += this.committedBy(a);
+        if (this.spareCash() - committed < cost || world.vault(home) - this.floorIn(home) < cost) return `no spare cash for a ${cr(cost)} marque`;
+        try {
+          const m = await client.issueMarque({ sea_zone_id: pick.zone, added_piracy_bps: pick.best.bps, duration_game_hours: MARQUE_GAME_HOURS });
+          world.vaults.set(home, world.vault(home) - m.cost_pence);
+          this.log("fleet", `letter of marque: +${m.added_piracy_bps} bps in ${pick.zone} for ${cr(m.cost_pence)} (expect ~${cr(pick.best.prize)} prize a game day)`);
+          this.worldDirty = true;
+          pick.active = true;
+          pick.verdict = "our marque is in force";
+          return `sponsored ${m.added_piracy_bps} bps in ${pick.zone} for ${cr(m.cost_pence)}`;
+        } catch (e) {
+          if (this.isFatal(e)) throw e;
+          this.log("fleet", `letter of marque in ${pick.zone} refused: ${(e as Error).message}`);
+          return `marque refused: ${(e as Error).message}`;
+        }
+      });
+    }
+    this.marqueReport = {
+      checkedAt: new Date().toISOString(),
+      enabled: settings.marques,
+      budgetPence: settings.marqueBudgetPence,
+      spentPence: spent,
+      prizePence: prize,
+      zones: rows,
+      action,
+    };
+  }
+
+  /** Our marques, paged back until one is older than a real day (enough for the spending window). */
+  private async recentMarques(now: number): Promise<LetterOfMarque[]> {
+    const out: LetterOfMarque[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const batch = await this.client.marques({ cursor, limit: 200 });
+      out.push(...batch);
+      if (batch.length < 200 || batch.some((m) => now - Date.parse(m.created_at) > 24 * 3_600_000)) break;
+      cursor = batch[batch.length - 1].id;
+    }
+    return out;
+  }
+
+  // ── Underwriting ────────────────────────────────────────────────────────────
+
+  /**
+   * Judges the open policies of other companies and (when enabled) writes slices on those whose
+   * premium beats the loss bound Lloyd's acceptance implies by the minimum edge, within the budget.
+   */
+  private async runUnderwriting(): Promise<void> {
+    const { world, client, settings } = this;
+    if (!world.companyId) return;
+    const [open, active, held, vaults] = await Promise.all([
+      client.policies({ status: "open", limit: 200 }),
+      client.policies({ status: "active", limit: 200 }),
+      // Slices any of our companies wrote, whatever their status: that cover says nothing about Lloyd's.
+      Promise.all([...this.ourCompanyIds].map((id) => client.policies({ underwriter_company_id: id, limit: 200 }))).then((x) => x.flat()),
+      client.vaults(),
+    ]);
+    const locked = vaults.vaults.filter((v) => v.account_type === "escrow").reduce((n, v) => n + Math.max(0, v.balance_pence), 0);
+    const rows = judgePolicies([...open, ...active], {
+      ours: this.ourCompanyIds,
+      now: world.now(),
+      gameMinuteMs: world.gameMinuteMs,
+      budgetPence: settings.underwriteBudgetPence,
+      lockedPence: locked,
+      maxPerPolicyPence: settings.underwriteMaxPerPolicyPence,
+      minEdgeBps: settings.underwriteMinEdgeBps,
+      held: new Set(held.map((p) => p.id)),
+    });
+
+    const toWrite = rows.filter((r) => r.verdict === "write");
+    let action = toWrite.length === 0 ? "nothing to write" : `off: would write ${toWrite.length} slice${toWrite.length === 1 ? "" : "s"}`;
+    let lockedNow = locked;
+    if (settings.underwrite && toWrite.length > 0) {
+      let written = 0;
+      for (const r of toWrite) {
+        const ok = await this.withCash(async () => {
+          // Anything may have changed while waiting for the lock: the setting, the caps, a stop.
+          if (this.stopRequested || !this.settings.underwrite) return false;
+          if (r.collateral > this.settings.underwriteMaxPerPolicyPence || lockedNow + r.collateral > this.settings.underwriteBudgetPence) return false;
+          if ([...this.agents.values()].some((a) => a.waitingForCash)) return false;
+          await world.refreshVaults();
+          let committed = 0;
+          for (const a of this.agents.values()) committed += this.committedBy(a);
+          if (this.spareCash() - committed < r.collateral) return false;
+          // The docs don't say which region's vault the collateral leaves: each candidate keeps its floor.
+          const home = this.homeRegion ?? "channel";
+          for (const reg of new Set([home, world.region(r.origin)])) if (world.vault(reg) - this.floorIn(reg) < r.collateral) return false;
+          try {
+            await client.underwrite({ policy_id: r.policy, slice_bps: r.sliceBps });
+            this.log("fleet", `underwrote ${r.sliceBps / 100}% of ${r.lane} (${r.cover}, ${r.premiumBps} bps): ${cr(r.collateral)} collateral for ${cr(r.premiumShare)} premium`);
+            r.verdict = "written";
+            lockedNow += r.collateral;
+            await world.refreshVaults().catch(() => undefined);
+            return true;
+          } catch (e) {
+            if (this.isFatal(e)) throw e;
+            r.verdict = `refused: ${(e as Error).message}`;
+            return false;
+          }
+        });
+        if (ok) written++;
+        else if (r.verdict === "write") r.verdict = "no spare cash, or the budget changed";
+      }
+      action = written ? `wrote ${written} slice${written === 1 ? "" : "s"}` : "no slice written (cash or refusals)";
+    } else if (!settings.underwrite && toWrite.length === 0) action = "off: nothing would be written";
+    this.underwriteReport = {
+      checkedAt: new Date().toISOString(),
+      enabled: settings.underwrite,
+      budgetPence: settings.underwriteBudgetPence,
+      lockedPence: lockedNow,
+      rows: rows.slice(0, 25),
+      action,
+    };
+  }
+
+  /** Sightings and the last marque report, for the dashboard. */
+  get rivalSightings() {
+    return this.world.rivals.all();
   }
 
   // ── Buying ships ────────────────────────────────────────────────────────────
