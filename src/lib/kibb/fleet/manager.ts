@@ -5,7 +5,11 @@
  *
  * Buying: whenever one of our ships is at a shipyard (building needs presence there), quote every
  * allowed hull class, score each by payback hours on its best lane net of the extra fleet upkeep,
- * and build the quickest payback within the limits. Agents mount the guns on their next yard call.
+ * and build the quickest payback within the limits.
+ *
+ * Guns: every gun takes 2 t of hold. With the "auto" policy a ship calling at a yard is refitted to
+ * the count that earns most on its lane: hold space against the cargo pirates are expected to take
+ * there (live zone piracy). In phase-1 waters that is usually none.
  *
  * Cash: one lock for the whole company, so "raise cash, then spend it" never interleaves between
  * ships. The home region keeps a reserve sized to the fleet's daily upkeep (bills come from it).
@@ -41,11 +45,23 @@ export interface FleetSettings {
   maxPaybackHours: number;
   /** Hull classes the buyer may build. */
   buyClasses: string[];
-  /** Mount the class's full battery on new ships (150 Cr a gun, 2 t of hold each). */
-  armNewShips: boolean;
+  /**
+   * Guns (150 Cr each to mount, 2 t of hold each): "auto" refits each ship at yard calls to what its
+   * lane's piracy justifies, "full" arms every ship to its class maximum, "off" never refits.
+   */
+  guns: GunPolicy;
+  /**
+   * Share (0–100%) of the expected phase-completion bonus counted in an expansion charter's pay. The
+   * bonus (12% of the tier's base value, split by base value delivered) is paid only when the tier
+   * completes, so this discounts it for the wait and for rivals.
+   */
+  bonusWeightPct: number;
   /** Carry Merchant Adventurers freight on legs we sail anyway, when it pays for its berth time. */
   useFreight: boolean;
 }
+
+export type GunPolicy = "auto" | "full" | "off";
+const GUN_POLICIES: GunPolicy[] = ["auto", "full", "off"];
 
 export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   autoBuy: true,
@@ -54,7 +70,8 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   minMarginPence: 1_500,
   maxPaybackHours: 8,
   buyClasses: ["collier", "brigantine", "fluyt", "cutter"],
-  armNewShips: true,
+  guns: "auto",
+  bonusWeightPct: 75,
   useFreight: true,
 };
 
@@ -79,9 +96,14 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   num("reservePence", 0, true);
   num("minMarginPence", 0, true);
   num("maxPaybackHours", 0.1);
+  num("bonusWeightPct", 0);
+  if (out.bonusWeightPct !== undefined && out.bonusWeightPct > 100) throw new FleetSettingsError("bonusWeightPct must be 0 to 100");
   bool("autoBuy");
-  bool("armNewShips");
   bool("useFreight");
+  if (patch.guns !== undefined) {
+    if (!GUN_POLICIES.includes(patch.guns)) throw new FleetSettingsError(`guns must be one of ${GUN_POLICIES.join(", ")}`);
+    out.guns = patch.guns;
+  }
   if (patch.buyClasses !== undefined) {
     if (!Array.isArray(patch.buyClasses) || !patch.buyClasses.every((c) => typeof c === "string" && /^[a-z_]{2,32}$/.test(c))) {
       throw new FleetSettingsError("buyClasses must be a list of ship class ids");
@@ -114,6 +136,8 @@ export interface FleetState {
   status: FleetStatus;
   error: string | null;
   startedAt: string | null;
+  /** When it stopped or failed; null while running. */
+  stoppedAt: string | null;
   homeRegion: BankingRegion | null;
   totals: AgentStats & { shipsBought: number; shipSpendPence: number };
   agents: AgentState[];
@@ -130,10 +154,6 @@ export interface FleetConfig {
   settings: FleetSettings;
   /** Directory for the per-company lease file; omit to skip the cross-process guard. */
   leaseDir?: string;
-  /** Guns still to mount on ships the buyer built (persisted across restarts by the caller). */
-  armTargets?: Record<string, number>;
-  /** Called whenever the pending gun targets change, so the caller can persist them. */
-  onArmTargets?: (targets: Record<string, number>) => void;
 }
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
@@ -157,6 +177,12 @@ const GUN_PRICE_PENCE  = 15_000;
 const REGION_FLOOR_PENCE = 20_000;
 /** The home reserve covers at least this many game days of fleet upkeep. */
 const UPKEEP_DAYS_RESERVED = 1.5;
+/** A refit must improve a load's expected profit by this share to be worth the berth call. */
+const REFIT_MIN_GAIN = 0.02;
+/** Trips a refit should pay for itself within. */
+const GUN_PAYBACK_TRIPS = 5;
+/** Whole tons of stores never counted as trimmable room (the voyage always needs some). */
+const STORES_KEPT_TONS = 1;
 const FATAL_CODES      = ["account_suspended", "company_frozen"];
 
 const cr = (pence: number) => `${Math.round(pence / 100).toLocaleString("en-GB")} Cr`;
@@ -178,6 +204,7 @@ export class FleetManager implements FleetHost {
   private status: FleetStatus = "stopped";
   private error: string | null = null;
   private startedAt: string | null = null;
+  private stoppedAt: string | null = null;
   private homeRegion: BankingRegion | null = null;
   private canRemit = true;
   private logLines: FleetLogLine[] = [];
@@ -186,8 +213,6 @@ export class FleetManager implements FleetHost {
   private buyer = "not checked yet";
   private retired: AgentStats = { trips: 0, deliveredTons: 0, rewardPence: 0, spentPence: 0, freightPence: 0 };
   private shipSpendPence = 0;
-  private readonly armTargets = new Map<string, number>();
-  private readonly onArmTargets?: (targets: Record<string, number>) => void;
   private readonly missingScans = new Map<string, number>();
 
   private stopRequested = false;
@@ -199,8 +224,8 @@ export class FleetManager implements FleetHost {
   private lastBuy = 0;
   private buying = false;
   private readonly lastYardCheck = new Map<string, number>();
-  /** A build whose response never arrived: adopted (guns, record) if the ship shows up. */
-  private pendingBuild: { name: string; yard: string; cls: string; guns: number; price: number; payback: number; lane: string } | null = null;
+  /** A build whose response never arrived: adopted (its purchase record) if the ship shows up. */
+  private pendingBuild: { name: string; yard: string; cls: string; price: number; payback: number; lane: string } | null = null;
   private cashQueue: Promise<unknown> = Promise.resolve();
   private assignQueue: Promise<unknown> = Promise.resolve();
   private events: Promise<void> | null = null;
@@ -218,8 +243,6 @@ export class FleetManager implements FleetHost {
     this.settings = cfg.settings;
     this.leaseDir = cfg.leaseDir;
     this.onLog = opts.onLog;
-    this.onArmTargets = cfg.onArmTargets;
-    for (const [id, guns] of Object.entries(cfg.armTargets ?? {})) this.armTargets.set(id, guns);
     if (opts.carryOver) {
       this.logLines = opts.carryOver.log.slice(-LOG_LIMIT);
       this.purchases = opts.carryOver.purchases.slice(-50);
@@ -242,6 +265,7 @@ export class FleetManager implements FleetHost {
       status: this.status,
       error: this.error,
       startedAt: this.startedAt,
+      stoppedAt: this.stoppedAt,
       homeRegion: this.homeRegion,
       totals,
       agents,
@@ -258,6 +282,7 @@ export class FleetManager implements FleetHost {
     this.error = null;
     this.status = "starting";
     this.startedAt = new Date().toISOString();
+    this.stoppedAt = null;
     this.loop = this.run().finally(() => {
       this.loop = null;
     });
@@ -276,6 +301,7 @@ export class FleetManager implements FleetHost {
     await this.lease?.release();
     this.lease = null;
     if (this.status !== "failed") this.status = "stopped";
+    this.stoppedAt ??= new Date().toISOString();
   }
 
   get done(): Promise<void> {
@@ -293,6 +319,7 @@ export class FleetManager implements FleetHost {
     if (this.status === "failed") return;
     this.status = "failed";
     this.error = msg;
+    this.stoppedAt = new Date().toISOString();
     this.log("fleet", `FATAL: ${msg}`);
     this.stopRequested = true;
     this.wake?.();
@@ -414,10 +441,6 @@ export class FleetManager implements FleetHost {
       if (found) {
         this.pendingBuild = null;
         this.shipSpendPence += pending.price;
-        if (pending.guns > 0) {
-          this.armTargets.set(found.ship.id, pending.guns);
-          this.onArmTargets?.(Object.fromEntries(this.armTargets));
-        }
         this.purchases.push({
           at: new Date().toISOString(),
           shipId: found.ship.id,
@@ -466,7 +489,7 @@ export class FleetManager implements FleetHost {
     const from = r?.ship.current_port_id ?? r?.route_legs.at(-1)?.to_node;
     if (!from || !r || !ref) return;
     try {
-      this.topLanes = await rankLanes(this.world, this.specFor(ref, r), from, this.reservations(ref), this.settings.minMarginPence);
+      this.topLanes = await rankLanes(this.world, this.specFor(ref, r), from, this.reservations(ref), this.planOptions(this.loadCash(ref)));
     } catch (e) {
       this.log("fleet", `lane overview failed: ${(e as Error).message}`);
     }
@@ -481,7 +504,8 @@ export class FleetManager implements FleetHost {
       shipClass: agent.shipClass,
       hull: cls?.hull_category ?? "coastal",
       knots: (cls?.base_speed_centiknots ?? 800) / 100,
-      cap: Math.max(0, r.effective_hold_capacity_tons - agent.sealedTons()),
+      // Surplus stores can be trimmed and sold at the source to make room (see ShipAgent.trimStores).
+      cap: Math.max(0, r.effective_hold_capacity_tons - agent.sealedTons() + Math.max(0, Math.floor(r.stores.provisions_tons) - STORES_KEPT_TONS)),
       guns: r.ship.cannons_count,
     };
   }
@@ -498,8 +522,67 @@ export class FleetManager implements FleetHost {
     };
   }
 
+  private planOptions(cash: number | null) {
+    return { minMargin: this.settings.minMarginPence, bonusWeight: this.settings.bonusWeightPct / 100, cash };
+  }
+
+  /** Cash a ship can spend on its next load: spare cash in every region, less loads other ships are bound to buy. */
+  private loadCash(except?: ShipAgent): number {
+    let committed = 0;
+    for (const a of this.agents.values()) if (a !== except && a.lane && a.boundToBuy) committed += a.lane.tons * a.lane.costPerTon;
+    return Math.max(0, this.spareCash() - committed);
+  }
+
   cashArrived(): void {
-    for (const a of this.agents.values()) if (a.waitingForCash) a.nudge();
+    // Idle ships too: with loads sized to cash, a ship short of it finds no lane rather than waiting.
+    for (const a of this.agents.values()) if (a.waitingForCash || a.idle) a.nudge();
+  }
+
+  // ── Guns ────────────────────────────────────────────────────────────────────
+
+  /**
+   * Guns this ship should carry after a refit at the yard it is berthed at, or undefined to leave
+   * them. "auto" weighs each count by the expected profit of the ship's lane: cargo room (2 t a gun)
+   * against the share of the load pirates are expected to take on the laden passage.
+   */
+  async gunTarget(agent: ShipAgent, r: ShipResult): Promise<number | undefined> {
+    const policy = this.settings.guns;
+    const max = this.world.shipClass(agent.shipClass)?.max_cannons ?? 0;
+    if (policy === "off") return undefined;
+    if (policy === "full") return max;
+    const lane = agent.lane;
+    if (!lane) return undefined;
+    const cls = this.world.shipClass(agent.shipClass);
+    const knots = ((cls?.base_speed_centiknots ?? 800) / 100) * 0.8;
+    const plan = await this.world.route(lane.source, lane.dest, agent.shipClass).catch(() => null);
+    if (!plan) return undefined;
+
+    const now = r.ship.cannons_count;
+    // Room each count leaves, and whether the load is limited by room at all (charter or cash may bind first).
+    const room = (g: number) => r.effective_hold_capacity_tons + 2 * (now - g) - agent.sealedTons();
+    const roomBound = lane.tons >= room(now) - 0.5;
+    const tonsAt = (g: number) => Math.max(0, roomBound ? room(g) : Math.min(lane.tons, room(g)));
+    // Landed cost without the piracy markup the planner priced in for the current guns.
+    const landed = lane.costPerTon * (1 - lane.piracyBps / 10_000);
+    const payPerTon = lane.pay + (lane.bonus ?? 0);
+    const profit = (g: number) => tonsAt(g) * (payPerTon * (1 - this.world.piracyLoss(plan, g, knots)) - landed);
+
+    // Hysteresis, so a ship moving between quiet and pirate water doesn't buy and land guns on
+    // alternate calls: mounting must repay twice its price (it may be landed again), landing must
+    // repay what re-mounting would cost.
+    const perGun = GUN_PRICE_PENCE / GUN_PAYBACK_TRIPS;
+    let best = now;
+    let bestProfit = profit(now);
+    for (let g = 0; g <= max; g++) {
+      const p = profit(g) - (g > now ? (g - now) * 2 * perGun : (now - g) * perGun);
+      if (p > bestProfit) {
+        best = g;
+        bestProfit = p;
+      }
+    }
+    if (best === now) return undefined;
+    const base = Math.abs(profit(now)) || 1;
+    return (bestProfit - profit(now)) / base >= REFIT_MIN_GAIN ? best : undefined;
   }
 
   // ── Events ──────────────────────────────────────────────────────────────────
@@ -644,17 +727,19 @@ export class FleetManager implements FleetHost {
 
   private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult): Promise<Lane | null> {
     const prev = agent.lane;
-    const lanes = await rankLanes(this.world, this.specFor(agent, r), from, this.reservations(agent), this.settings.minMarginPence);
+    const cash = this.loadCash(agent);
+    const lanes = await rankLanes(this.world, this.specFor(agent, r), from, this.reservations(agent), this.planOptions(cash));
     const best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
     agent.lane = best;
     if (best) agent.noteLane(best);
     if (best && best.key !== prev?.key) {
       this.log(
         agent.name,
-        `lane: ${best.tons} t ${best.good} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t${best.askKnown ? "" : " (ask estimated)"}, ~${cr(best.profitPerHour)}/h`,
+        `lane: ${best.tons} t ${best.good} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t` +
+          `${best.bonus > 0 ? ` incl. ~${cr(best.bonus)}/t phase bonus` : ""}${best.askKnown ? "" : " (ask estimated)"}, ~${cr(best.profitPerHour)}/h`,
       );
     } else if (!best && prev) {
-      this.log(agent.name, "no lane clears the minimum margin right now");
+      this.log(agent.name, `no lane clears the minimum margin with the ${cr(cash)} the fleet can spend right now`);
     }
     return best;
   }
@@ -734,17 +819,11 @@ export class FleetManager implements FleetHost {
 
   // ── Buying ships ────────────────────────────────────────────────────────────
 
-  armTarget(shipId: string): number | undefined {
-    return this.armTargets.get(shipId);
-  }
-
-  noteArmed(shipId: string, guns: number, costPence: number): void {
-    this.armTargets.delete(shipId);
-    this.onArmTargets?.(Object.fromEntries(this.armTargets));
+  /** Money spent mounting guns counts with the fleet's ship spending. */
+  noteArmed(shipId: string, costPence: number): void {
     this.shipSpendPence += costPence;
     const p = this.purchases.find((x) => x.shipId === shipId);
     if (p) p.costPence += costPence;
-    void guns;
   }
 
   async visitShipyard(port: string): Promise<void> {
@@ -818,25 +897,31 @@ export class FleetManager implements FleetHost {
           notes.push(`${cls.id}@${yard}: materials not in stock`);
           continue;
         }
-        const guns = settings.armNewShips ? cls.max_cannons : 0;
+        // "full" arms new hulls at once; "auto" builds them bare and refits on a pirate-heavy lane.
+        const guns = settings.guns === "full" ? cls.max_cannons : 0;
         const hull = quote.total_cost_pence;
         const cost = hull + guns * GUN_PRICE_PENCE;
-        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), settings.minMarginPence))[0];
-        if (!lane) {
-          notes.push(`${cls.id}@${yard}: no paying lane`);
-          continue;
-        }
         // The home reserve must rise to cover the new hull's upkeep too.
         const oceanic = cls.hull_category === "oceanic";
         const upkeepFloor = this.homeFloor({ tons: cls.hold_capacity_tons, oceanic }) - this.homeFloor();
         const afterBuy = spare - cost - upkeepFloor;
-        const tons = Math.min(lane.tons, Math.floor(afterBuy / Math.max(lane.costPerTon, 1)));
-        if (tons < lane.tons * 0.3) {
+        if (afterBuy <= 0) {
+          notes.push(`${cls.id}@${yard}: ${cr(cost)} leaves nothing for cargo`);
+          continue;
+        }
+        // Planned with the cash left after building it, so the load it is credited with is one it can buy.
+        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), this.planOptions(afterBuy)))[0];
+        if (!lane) {
+          notes.push(`${cls.id}@${yard}: no paying lane it could afford`);
+          continue;
+        }
+        const capacity = Math.max(1, (cls.hold_capacity_tons ?? 40) - 2 * guns - 2);
+        if (lane.tons < capacity * 0.3) {
           notes.push(`${cls.id}@${yard}: ${cr(cost)} leaves too little for cargo`);
           continue;
         }
         const upkeepPerHour = world.upkeepDeltaPerHour(this.fleetTons(oceanic), cls.hold_capacity_tons, oceanic);
-        const net = lane.profitPerHour * (tons / lane.tons) - upkeepPerHour;
+        const net = lane.profitPerHour - upkeepPerHour;
         if (net <= 0) {
           notes.push(`${cls.id}@${yard}: upkeep eats the profit`);
           continue;
@@ -908,7 +993,7 @@ export class FleetManager implements FleetHost {
           }
           // Still unknown: don't build again for a full cooldown; adopt the ship if it turns up.
           this.lastBuy = Date.now();
-          this.pendingBuild = { name, yard: pick.yard, cls: pick.cls, guns: pick.guns, price, payback: pick.payback, lane: pick.lane.key };
+          this.pendingBuild = { name, yard: pick.yard, cls: pick.cls, price, payback: pick.payback, lane: pick.lane.key };
           this.setBuyer(`building a ${pick.cls} at ${pick.yard}: outcome unknown (${(e as Error).message}); watching for "${name}"`, true);
           return null;
         }
@@ -921,10 +1006,6 @@ export class FleetManager implements FleetHost {
     this.lastBuy = Date.now();
     this.shipSpendPence += built.total_cost_pence;
     world.vaults.set(region, world.vault(region) - built.total_cost_pence);
-    if (pick.guns > 0) {
-      this.armTargets.set(built.ship_id, pick.guns);
-      this.onArmTargets?.(Object.fromEntries(this.armTargets));
-    }
     this.log(
       "fleet",
       `built ${pick.cls} "${name}" at ${pick.yard} for ${cr(built.total_cost_pence)}: lane ${pick.lane.key}, ~${cr(pick.net)}/h net, pays back in ~${pick.payback.toFixed(1)} h`,

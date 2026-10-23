@@ -56,9 +56,9 @@ export interface FleetHost {
   withCash<T>(fn: () => Promise<T>): Promise<T>;
   /** Called while this ship gives us presence at a shipyard: the buyer's chance to build there. */
   visitShipyard(port: string): Promise<void>;
-  /** Guns a ship should carry (set for ships the buyer built), or undefined. */
-  armTarget(shipId: string): number | undefined;
-  noteArmed(shipId: string, guns: number, costPence: number): void;
+  /** Guns this ship should carry after a refit here, or undefined to leave them as they are. */
+  gunTarget(agent: ShipAgent, r: ShipResult): Promise<number | undefined>;
+  noteArmed(shipId: string, costPence: number): void;
   /** Money landed in a region (a delivery paid): ships waiting for cash can try again. */
   cashArrived(): void;
 }
@@ -70,6 +70,32 @@ export interface AgentStats {
   spentPence: number;
   freightPence: number;
 }
+
+/** Real milliseconds spent in each kind of work since the autopilot took command. */
+export interface TimeUse {
+  /** At sea with cargo or freight aboard. */
+  laden: number;
+  /** At sea empty. */
+  ballast: number;
+  /** In port working: docking, trading, berth locks, delivering. */
+  port: number;
+  /** In port with nothing to do: no lane pays, waiting for cash, standing by. */
+  idle: number;
+}
+
+/** One completed lane: what the planner expected per hour against what it made. */
+export interface TripRecord {
+  at: string;
+  lane: string;
+  tons: number;
+  hours: number;
+  profitPence: number;
+  estPerHour: number;
+  actualPerHour: number;
+}
+
+const IDLE_RE = /^(no lane pays|waiting for cash|standing by|holding)/;
+const TRIP_HISTORY = 8;
 
 export interface CarriedFreight {
   dest: string;
@@ -98,6 +124,9 @@ export interface AgentState {
   stores: number;
   freight: CarriedFreight[];
   stats: AgentStats;
+  time: TimeUse;
+  trips: TripRecord[];
+  guns: number;
   nextTickAt: string | null;
 }
 
@@ -142,6 +171,14 @@ export class ShipAgent {
   private nudged = false;
   private loop: Promise<void> | null = null;
   private nextTickAt: number | null = null;
+  private readonly time: TimeUse = { laden: 0, ballast: 0, port: 0, idle: 0 };
+  private mode: keyof TimeUse | null = null;
+  private modeSince = 0;
+  /** When the lane in hand was assigned (local ms), for timing the trip. */
+  private laneSince = 0;
+  private laneKey: string | null = null;
+  private trip: { key: string; label: string; good: string; est: number; startedAt: number; spent: number; reward: number; tons: number } | null = null;
+  private readonly trips: TripRecord[] = [];
 
   constructor(
     private readonly host: FleetHost,
@@ -174,8 +211,59 @@ export class ShipAgent {
       stores: r?.stores.provisions_tons ?? 0,
       freight: [...this.freight.values()],
       stats: { ...this.stats },
+      time: this.timeUse(),
+      trips: [...this.trips],
+      guns: s?.cannons_count ?? 0,
       nextTickAt: this.nextTickAt ? new Date(this.nextTickAt).toISOString() : null,
     };
+  }
+
+  /** Time use so far, including the stretch in progress. */
+  private timeUse(): TimeUse {
+    const t = { ...this.time };
+    if (this.mode) t[this.mode] += Date.now() - this.modeSince;
+    return t;
+  }
+
+  /** Closes the stretch in progress and starts one for what the ship is doing now. */
+  private markTime(): void {
+    const now = Date.now();
+    if (this.mode) this.time[this.mode] += now - this.modeSince;
+    const r = this.last;
+    if (this.gone || !r) {
+      this.mode = null;
+      return;
+    }
+    this.mode =
+      r.ship.status === "sailing"
+        ? r.cargo_used_tons > 0
+          ? "laden"
+          : "ballast"
+        : IDLE_RE.test(this.activity)
+          ? "idle"
+          : "port";
+    this.modeSince = now;
+  }
+
+  /** Records the lane's trip once its cargo has been delivered. */
+  private finishTrip(): void {
+    const t = this.trip;
+    // A delivery of some other good (pinned freight port, leftovers) doesn't end this trip.
+    if (!t || t.reward <= 0) return;
+    this.trip = null;
+    this.laneKey = null;
+    const hours = Math.max((Date.now() - t.startedAt) / 3_600_000, 1 / 3_600);
+    const profit = t.reward - t.spent;
+    this.trips.push({
+      at: new Date().toISOString(),
+      lane: t.label,
+      tons: t.tons,
+      hours: Math.round(hours * 100) / 100,
+      profitPence: profit,
+      estPerHour: Math.round(t.est),
+      actualPerHour: Math.round(profit / hours),
+    });
+    if (this.trips.length > TRIP_HISTORY) this.trips.splice(0, this.trips.length - TRIP_HISTORY);
   }
 
   /** Tons of this good aboard that belong to us (not sealed freight). */
@@ -220,6 +308,10 @@ export class ShipAgent {
 
   noteLane(lane: Lane): void {
     if (lane.profitPerHour > 0) this.ratePerHour = lane.profitPerHour;
+    if (lane.key !== this.laneKey) {
+      this.laneKey = lane.key;
+      this.laneSince = Date.now();
+    }
   }
 
   start(): void {
@@ -254,8 +346,11 @@ export class ShipAgent {
         this.log(`tick failed: ${(e as Error).message}`);
         wait = ERROR_BACKOFF_MS;
       }
+      this.markTime();
       await this.sleep(wait);
     }
+    if (this.mode) this.time[this.mode] += Date.now() - this.modeSince;
+    this.mode = null;
   }
 
   private sleep(ms: number): Promise<void> {
@@ -400,6 +495,7 @@ export class ShipAgent {
       dest,
       fills: [[charterId, tons]],
       pay,
+      bonus: 0,
       minPay: pay,
       estAsk: 0,
       askKnown: false,
@@ -408,6 +504,7 @@ export class ShipAgent {
       margin: 0,
       tons,
       loopMs: 0,
+      deliverMs: 0,
       profitPerHour: 0,
     };
   }
@@ -477,6 +574,7 @@ export class ShipAgent {
       const res = await this.deliverCharters(r, port, stay, deliverable);
       if (res.delivered > 0) {
         this.stats.trips++;
+        this.finishTrip();
         this.host.releaseLane(this);
       }
       r = await this.reread();
@@ -495,7 +593,11 @@ export class ShipAgent {
       return STAND_BY_MS;
     }
 
-    if (atYard && (await this.armIfNeeded(r, stay))) r = await this.reread();
+    if (atYard && (await this.refitGuns(r, stay))) {
+      r = await this.reread();
+      // Still to load here: plan again so the load uses the room the refit freed (or gave up).
+      if (this.lane && this.lane.source === port && this.ownTons(r, this.lane.good) === 0) this.host.releaseLane(this);
+    }
     // Building needs presence, which we have only while here: give the buyer a look before leaving,
     // after this ship's own next lane is reserved so its load money is counted.
     const yardVisit = async () => {
@@ -539,7 +641,12 @@ export class ShipAgent {
     }
     this.holds = 0;
 
-    const lane = await this.host.assignLane(this, port, r);
+    let lane = await this.host.assignLane(this, port, r);
+    // Guns suit a lane: refit for the new one while still at the yard, then size the load to the new room.
+    if (lane && atYard && (await this.refitGuns(r, stay))) {
+      r = await this.reread();
+      lane = await this.host.assignLane(this, port, r);
+    }
     await yardVisit();
     if (!lane) {
       this.activity = "no lane pays right now; waiting";
@@ -577,32 +684,40 @@ export class ShipAgent {
   }
 
   /**
-   * Mounts the guns the buyer decided on while berthed at a yard, if the hold has room for them
-   * (2 t each) plus a ton to spare for stores. Returns whether guns were mounted.
+   * Refits the guns to the manager's target while berthed at a yard, once per stay. Mounting needs
+   * hold room (2 t a gun, plus a ton for stores) and 150 Cr a gun; landing guns frees the hold.
+   * Returns whether the guns changed.
    */
-  private async armIfNeeded(r: ShipResult, stay: Stay): Promise<boolean> {
-    const target = this.host.armTarget(this.shipId);
-    if (target === undefined || r.ship.cannons_count >= target || stay.traded.has("arm") || r.ship.status !== "berthed") return false;
-    const adding = target - r.ship.cannons_count;
-    if (r.effective_hold_capacity_tons - r.cargo_used_tons < 2 * adding + 1) return false;
+  private async refitGuns(r: ShipResult, stay: Stay): Promise<boolean> {
+    if (stay.traded.has("arm") || r.ship.status !== "berthed") return false;
+    // The guns were chosen for the passage this cargo makes: don't change them under it.
+    if (stay.traded.has("cargo") || (this.lane && this.ownTons(r, this.lane.good) > 0)) return false;
+    const target = await this.host.gunTarget(this, r);
+    const now = r.ship.cannons_count;
+    if (target === undefined || target === now) return false;
+    const adding = Math.max(0, target - now);
+    if (adding > 0 && r.effective_hold_capacity_tons - r.cargo_used_tons < 2 * adding + 1) return false;
     stay.traded.add("arm");
     const cost = adding * GUN_PRICE_PENCE;
     const region = this.host.world.region(stay.port);
     return this.host.withCash(async () => {
-      const cash = await this.host.ensureCash(region, cost);
-      if (cash < cost) {
+      if (cost > 0 && (await this.host.ensureCash(region, cost)) < cost) {
         this.log(`can't afford ${adding} guns yet`);
         return false;
       }
       try {
         await this.host.client.modifyShip(this.shipId, target);
-        this.host.world.vaults.set(region, this.host.world.vault(region) - cost);
-        this.host.noteArmed(this.shipId, target, cost);
-        this.log(`mounted guns: now ${target}`);
+        if (cost > 0) {
+          this.host.world.vaults.set(region, this.host.world.vault(region) - cost);
+          this.host.noteArmed(this.shipId, cost);
+          this.log(`mounted ${adding} gun${adding === 1 ? "" : "s"} for this lane's pirates: now ${target}`);
+        } else {
+          this.log(`landed ${now - target} gun${now - target === 1 ? "" : "s"} for ${2 * (now - target)} t more cargo room: now ${target}`);
+        }
         return true;
       } catch (e) {
         if (!isApiError(e) || e.status >= 500) throw e;
-        this.log(`arming refused: ${e.message}`);
+        this.log(`refit to ${target} guns refused: ${e.message}`);
         return false;
       }
     });
@@ -623,7 +738,7 @@ export class ShipAgent {
       return this.dockOrWait(r);
     }
 
-    const trimmed = lane.good === STORES_GOOD ? await this.trimStores(r, lane, stay) : 0;
+    const trimmed = await this.trimStores(r, lane, stay);
     await this.topUpStoresFor(await this.reread(), lane.source, lane.dest, stay, lane.source);
     r = await this.reread();
 
@@ -668,7 +783,12 @@ export class ShipAgent {
       // Every ton must clear the margin against the lowest-paying charter in the load, after the
       // share of it the planner expects pirates to take on the way.
       const kept = 1 - (lane.piracyBps ?? 0) / 10_000;
-      const limit = Math.floor(((lane.minPay - settings.minMarginPence) * kept) / (customs * fee));
+      // The phase bonus may pick the lane, but never pay more than the charters' cash covers:
+      // the bonus is paid later, and only if the tier completes.
+      const cashPay = Math.min(...lane.fills.map(([id]) => world.charters.find((c) => c.id === id)?.payPerTon ?? lane.pay));
+      const limit = Math.floor(
+        Math.min((lane.minPay - settings.minMarginPence) * kept, cashPay * kept) / (customs * fee),
+      );
       if (b.best_ask.price_pence > limit) {
         this.log(`${lane.good} at ${port} asks ${cr(b.best_ask.price_pence)}/t, above the ${cr(limit)}/t break-even for ${lane.dest}`);
         return { bought: 0, reason: `${lane.good} too dear at ${port}` };
@@ -712,6 +832,24 @@ export class ShipAgent {
         this.stats.spentPence += paid;
         world.vaults.set(world.region(port), world.vault(world.region(port)) - paid);
         stay.boughtHere.set(lane.good, (stay.boughtHere.get(lane.good) ?? 0) + res.filled_quantity);
+        if (res.filled_quantity > 0) {
+          // A trip of the same lane whose cargo never arrived (charter filled, sold off) is stale.
+          if (this.trip?.key !== lane.key || this.ownTons(r, lane.good) === 0) {
+            this.trip = {
+              key: lane.key,
+              label: `${lane.good} ${lane.source} → ${lane.dest}`,
+              good: lane.good,
+              // Cash only (the phase bonus comes later) and up to delivery (no return leg), like what a trip makes.
+              est: ((lane.pay - lane.costPerTon) * lane.tons * 3_600_000) / Math.max(lane.deliverMs, 60_000),
+              startedAt: this.laneKey === lane.key && this.laneSince ? this.laneSince : Date.now(),
+              spent: 0,
+              reward: 0,
+              tons: 0,
+            };
+          }
+          this.trip.spent += paid;
+          this.trip.tons += res.filled_quantity;
+        }
         this.log(`bought ${res.filled_quantity}/${qty} t for ${cr(paid)} (${cr(res.filled_quantity ? paid / res.filled_quantity : 0)}/t landed)`);
         return { bought: res.filled_quantity, reason: res.filled_quantity ? "ok" : "nothing filled" };
       } catch (e) {
@@ -801,6 +939,7 @@ export class ShipAgent {
     r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
     this.stats.deliveredTons += res.delivered_quantity;
     this.stats.rewardPence += res.reward_paid_pence;
+    if (this.trip && this.trip.good === c.good) this.trip.reward += res.reward_paid_pence;
     world.vaults.set(world.region(port), world.vault(world.region(port)) + res.reward_paid_pence);
     this.log(`delivered ${res.delivered_quantity} t ${c.good} at ${port}: ${cr(res.reward_paid_pence)} (${c.title}; ${res.contract_status}, phase ${res.unlocked_phase})`);
     return res.delivered_quantity;
@@ -1001,16 +1140,60 @@ export class ShipAgent {
     return first.safe_provisions_tons + (second?.safe_provisions_tons ?? 0) + STORES_BUFFER_DAYS * first.port_provisions_tons_per_day;
   }
 
-  /** Whole tons of surplus stores into cargo, carried on to the provisions charter. Returns tons moved. */
+  /**
+   * Surplus stores (whole tons above what the voyage needs) are dead weight in the hold. On a
+   * provisions lane they go into cargo for the charter. On any other lane, when the hold is what
+   * limits the load, they come out and are sold here. Returns the tons left in cargo, which the
+   * caller puts back if the load falls through.
+   */
   private async trimStores(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
     if (stay.port === lane.dest) return 0;
     const target = await this.storesTarget(lane.source, lane.dest, lane.source);
-    const surplus = Math.floor(r.stores.provisions_tons - target);
+    let surplus = Math.floor(r.stores.provisions_tons - target);
     if (surplus < 1) return 0;
-    await this.host.client.unprovision(this.shipId, surplus, "cargo");
-    stay.boughtHere.set(STORES_GOOD, (stay.boughtHere.get(STORES_GOOD) ?? 0) + surplus);
-    this.log(`moved ${surplus} t of surplus stores into cargo for the ${lane.dest} charter`);
-    return surplus;
+    if (lane.good !== STORES_GOOD) {
+      const room = r.effective_hold_capacity_tons - r.cargo_used_tons;
+      const want = lane.tons - this.ownTons(r, lane.good);
+      surplus = Math.min(surplus, Math.max(0, want - room));
+      if (surplus < 1) return 0;
+    }
+    if (lane.good === STORES_GOOD) {
+      await this.host.client.unprovision(this.shipId, surplus, "cargo");
+      stay.boughtHere.set(STORES_GOOD, (stay.boughtHere.get(STORES_GOOD) ?? 0) + surplus);
+      this.log(`moved ${surplus} t of surplus stores into cargo for the ${lane.dest} charter`);
+      return surplus;
+    }
+    // Moving stores into cargo frees nothing by itself: only worth it if they sell here, so look first.
+    const { client, world } = this.host;
+    const book = await client.book(stay.port, STORES_GOOD).catch(() => null);
+    if (book) world.observeBook(book);
+    const bid = book?.books.find((b) => b.commodity_id === STORES_GOOD)?.best_bid;
+    if (!bid || bid.price_pence < world.basePrice(STORES_GOOD) * 0.5) return 0;
+    const n = Math.min(surplus, bid.quantity);
+    await client.unprovision(this.shipId, n, "cargo");
+    const sold = await this.sellHere(stay.port, STORES_GOOD, n);
+    if (sold < n) await client.provision(this.shipId, n - sold, "cargo").catch(() => undefined);
+    if (sold > 0) this.log(`sold ${sold} t of surplus stores at ${stay.port} to make room for the ${lane.good} load`);
+    return 0;
+  }
+
+  /** Sells our own goods here at the best bid if it is a fair one (half the base price or more). Returns tons sold. */
+  private async sellHere(port: string, good: string, tons: number): Promise<number> {
+    const { client, world } = this.host;
+    try {
+      const book = await client.book(port, good);
+      world.observeBook(book);
+      const bid = book.books.find((b) => b.commodity_id === good)?.best_bid?.price_pence ?? 0;
+      if (bid < world.basePrice(good) * 0.5) return 0;
+      const res = await client.placeOrder({ port_id: port, commodity_id: good, side: "ask", time_in_force: "ioc", price_pence: bid, quantity: tons, ship_id: this.shipId });
+      this.stats.rewardPence += res.total_gross_pence;
+      world.vaults.set(world.region(port), world.vault(world.region(port)) + res.total_gross_pence);
+      return res.filled_quantity;
+    } catch (e) {
+      if (!isApiError(e) || e.status >= 500 || e.status === 401) throw e;
+      this.log(`selling ${good} at ${port} refused: ${e.message}`);
+      return 0;
+    }
   }
 
   /**

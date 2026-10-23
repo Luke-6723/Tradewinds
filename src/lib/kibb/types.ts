@@ -287,6 +287,8 @@ export interface ExpansionTier {
   progress_bps: number;
   active_companies: number;
   charters: ExpansionCharterProgress[];
+  /** Share of the tier so far by company: tons, and share of base value delivered (= share of the bonus). */
+  contributors?: Array<{ company_name: string; tons: number; share_bps: number }>;
 }
 
 export interface ExpansionStatus {

@@ -25,8 +25,6 @@ export interface StoredCompanyKey {
 export interface StoredFleet {
   enabled: boolean;
   settings: Partial<FleetSettings>;
-  /** Guns still to mount on ships the buyer built. */
-  armTargets?: Record<string, number>;
   updatedAt: string;
 }
 
@@ -116,17 +114,10 @@ export async function getStoredFleet(companyId: string): Promise<StoredFleet | n
   return d.fleets[companyId] ?? (legacy ? { enabled: legacy.enabled, settings: {}, updatedAt: "" } : null);
 }
 
-export async function saveStoredFleet(companyId: string, fleet: Omit<StoredFleet, "updatedAt" | "armTargets">): Promise<void> {
+export async function saveStoredFleet(companyId: string, fleet: Omit<StoredFleet, "updatedAt">): Promise<void> {
   await update((d) => {
     d.fleets[companyId] = { ...d.fleets[companyId], ...fleet, updatedAt: new Date().toISOString() };
     if (d.runners) delete d.runners[companyId];
-  });
-}
-
-export async function saveArmTargets(companyId: string, armTargets: Record<string, number>): Promise<void> {
-  await update((d) => {
-    const cur = d.fleets[companyId] ?? { enabled: false, settings: {}, updatedAt: "" };
-    d.fleets[companyId] = { ...cur, armTargets, updatedAt: new Date().toISOString() };
   });
 }
 

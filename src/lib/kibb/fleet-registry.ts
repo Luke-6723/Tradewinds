@@ -16,7 +16,7 @@ import {
   type FleetState,
 } from "./fleet/manager";
 import { KIBB_URL } from "./server";
-import { getCompanyKey, getStoredFleet, listStoredFleets, saveArmTargets, saveStoredFleet, STORE_DIR } from "./store";
+import { getCompanyKey, getStoredFleet, listStoredFleets, saveStoredFleet, STORE_DIR } from "./store";
 
 // globalThis keeps one registry across Next.js HMR and route bundles.
 const g = globalThis as { __kibbFleets?: Map<string, FleetManager>; __kibbFleetLocks?: Map<string, Promise<unknown>> };
@@ -61,16 +61,8 @@ async function start(companyId: string, settings: FleetSettings): Promise<void> 
   if (!key) throw new Error("No usable API key stored for this company; select it again on the companies page");
   const previous = fleets.get(companyId);
   await previous?.stop();
-  const stored = await getStoredFleet(companyId);
   const manager = new FleetManager(
-    {
-      apiKey: key.apiKey,
-      baseUrl: KIBB_URL,
-      settings,
-      leaseDir: STORE_DIR,
-      armTargets: stored?.armTargets,
-      onArmTargets: (t) => void saveArmTargets(companyId, t).catch(() => undefined),
-    },
+    { apiKey: key.apiKey, baseUrl: KIBB_URL, settings, leaseDir: STORE_DIR },
     {
       onLog: ({ source, msg }) => console.log(`[fleet:${key.companyName}] ${source}: ${msg}`),
       carryOver: previous?.state,

@@ -10,6 +10,10 @@
  * Only live charters are planned for: gossip copies may already be filled. A load only draws on
  * charters whose own pay clears the landed cost by the minimum margin. The landed cost includes the
  * cargo expected to be lost to pirates on the laden passage (live zone piracy, net of our guns).
+ *
+ * Expansion charters also earn a share of the phase-completion bonus (about 12% of the good's base
+ * price per ton), counted at the caller's weight. Loads are sized to the cash the fleet can spend,
+ * so a dear good the ship can only part-fill competes on what it would really carry.
  */
 
 import type { ZoneClass } from "../types";
@@ -32,9 +36,11 @@ export interface Lane {
   dest: string;
   /** Charters this load fills, best pay first, with the tons going to each. */
   fills: Array<[charterId: string, tons: number]>;
-  /** Weighted pay per ton across the charters this load would fill. */
+  /** Weighted cash pay per ton across the charters this load would fill. */
   pay: number;
-  /** Lowest pay per ton among those charters: the buy limit is set from this. */
+  /** Weighted phase-bonus share per ton (already discounted by the bonus weight), paid at tier completion. */
+  bonus: number;
+  /** Lowest pay per ton (bonus included) among those charters: the buy limit is set from this. */
   minPay: number;
   estAsk: number;
   askKnown: boolean;
@@ -45,6 +51,8 @@ export interface Lane {
   margin: number;
   tons: number;
   loopMs: number;
+  /** Real ms from now until this load is delivered (no return leg): for comparing with what a trip makes. */
+  deliverMs: number;
   profitPerHour: number;
 }
 
@@ -61,17 +69,27 @@ const EXPIRY_SLACK_MS = 10 * 60_000;
 /** Fixed per-loop overhead: arrival processing, polling, depart retries. */
 const LOOP_OVERHEAD_MS = 60_000;
 
-export async function rankLanes(
-  world: World,
-  ship: ShipSpec,
-  from: string,
-  res: Reservations,
-  minMargin: number,
-): Promise<Lane[]> {
+export interface PlanOptions {
+  /** Minimum profit per ton (pence) after every cost. */
+  minMargin: number;
+  /** 0–1: how much of the expected phase-completion bonus to count. */
+  bonusWeight: number;
+  /** Pence the fleet can spend on this load, or null for no limit. */
+  cash: number | null;
+}
+
+export async function rankLanes(world: World, ship: ShipSpec, from: string, res: Reservations, opts: PlanOptions): Promise<Lane[]> {
   const lanes: Lane[] = [];
   if (ship.cap <= 0) return lanes;
+  const { minMargin } = opts;
   const now = world.now();
   const baseLockMs = 30 * world.gameMinuteMs;
+  const bonusOf = (c: (typeof world.charters)[number]) => Math.round(world.charterBonus(c) * opts.bonusWeight);
+  const payOf = (c: (typeof world.charters)[number]) => c.payPerTon + bonusOf(c);
+  // Tons that can still earn the phase bonus: the tier's remainder less what our other ships carry to it.
+  let reservedExpansion = 0;
+  for (const [id, t] of res.charterTons) if (world.expansionCharters.has(id)) reservedExpansion += t;
+  const bonusTons = Math.max(0, world.expansionTonsLeft - reservedExpansion);
 
   // Group live charters by delivery port and good, best pay first.
   const groups = new Map<string, typeof world.charters>();
@@ -83,7 +101,7 @@ export async function rankLanes(
 
   for (const [k, charters] of groups) {
     const [dest, good] = k.split("|");
-    charters.sort((a, b) => b.payPerTon - a.payPerTon);
+    charters.sort((a, b) => payOf(b) - payOf(a));
 
     for (const source of world.sourcesOf(good)) {
       if (source === dest) continue;
@@ -107,6 +125,9 @@ export async function rankLanes(
       const fee = world.remitBps(world.region(dest), world.region(source));
       const piracy = world.piracyLoss(out, ship.guns, ship.knots * 0.8);
       const landed = (ask: number) => (ask * (1 + world.customsBps(source) / 10_000) * (1 + fee / 10_000)) / (1 - piracy);
+      // Tons the fleet's cash can buy here (cash out per ton: the ask with impact, plus customs).
+      const cashPerTon = est.ask * (1 + IMPACT_PER_TON * (reserved + ship.cap / 2)) * (1 + world.customsBps(source) / 10_000);
+      const cap = opts.cash === null ? ship.cap : Math.min(ship.cap, Math.floor(opts.cash / Math.max(cashPerTon, 1)));
 
       // Arrival auto-berths: one base lock at the source, extended per ton handled.
       const deadMs = dead ? world.sailMs(dead.total_distance_nm, ship.knots) : 0;
@@ -116,31 +137,43 @@ export async function rankLanes(
 
       // Conservative landed cost for the load this ship could actually take, for deciding which
       // charters are worth filling at all.
-      const avail = Math.min(ship.cap, usable.reduce((n, c) => n + Math.max(0, c.remaining - (res.charterTons.get(c.id) ?? 0)), 0));
+      const avail = Math.min(cap, usable.reduce((n, c) => n + Math.max(0, c.remaining - (res.charterTons.get(c.id) ?? 0)), 0));
       const fullCost = landed(est.ask * (1 + IMPACT_PER_TON * (reserved + avail / 2)));
 
       let tons = 0;
       let payTotal = 0;
+      let bonusTotal = 0;
+      let bonusLeft = bonusTons;
       let minPay = Infinity;
       const fills: Array<[string, number]> = [];
       for (const c of usable) {
-        if (c.payPerTon - fullCost < minMargin) break; // sorted by pay: the rest pay even less
+        if (payOf(c) - fullCost < minMargin) break; // sorted by pay: the rest pay even less
+        // The bonus may rank a charter, but its cash pay must cover the cost by itself: the buyer
+        // never pays more than that (the bonus comes later, and only if the tier completes).
+        if (c.payPerTon < fullCost) continue;
         const room = c.remaining - (res.charterTons.get(c.id) ?? 0);
         if (room <= 0) continue;
-        const take = Math.min(room, ship.cap - tons);
+        const take = Math.min(room, cap - tons);
+        if (take <= 0) break;
         tons += take;
         payTotal += take * c.payPerTon;
-        minPay = Math.min(minPay, c.payPerTon);
+        if (world.expansionCharters.has(c.id)) {
+          bonusTotal += Math.min(take, bonusLeft) * bonusOf(c);
+          bonusLeft = Math.max(0, bonusLeft - take);
+        }
+        minPay = Math.min(minPay, payOf(c));
         fills.push([c.id, take]);
-        if (tons >= ship.cap) break;
+        if (tons >= cap) break;
       }
+      // Too small a load (by room or by cash) isn't worth the berth calls.
       if (tons < Math.min(10, ship.cap * 0.5)) continue;
       const pay = payTotal / tons;
+      const bonus = bonusTotal / tons;
 
       const ask = est.ask * (1 + IMPACT_PER_TON * (reserved + tons / 2));
       const costPerTon = landed(ask);
-      const margin = pay - costPerTon;
-      if (margin < minMargin) continue;
+      const margin = pay + bonus - costPerTon;
+      if (margin < minMargin || pay < costPerTon) continue;
 
       const fill = tons / ship.cap;
       const loadMs = baseLockMs + tons * world.handlingMsPerTon(source);
@@ -148,6 +181,7 @@ export async function rankLanes(
       const unloadMs = baseLockMs; // delivered from the roadstead once the base lock clears
       const backMs = world.sailMs(back.total_distance_nm, ship.knots);
       const loopMs = deadMs + loadMs + ladenMs + unloadMs + backMs + LOOP_OVERHEAD_MS;
+      const deliverMs = loopMs - backMs;
 
       lanes.push({
         key: `${good}:${source}>${dest}`,
@@ -156,6 +190,7 @@ export async function rankLanes(
         dest,
         fills,
         pay: Math.round(pay),
+        bonus: Math.round(bonus),
         minPay,
         estAsk: Math.round(ask),
         askKnown: est.known,
@@ -164,6 +199,7 @@ export async function rankLanes(
         margin: Math.round(margin),
         tons,
         loopMs,
+        deliverMs,
         // Margin is per ton delivered; pirates are expected to take `piracy` of the tons bought.
         profitPerHour: Math.round((tons * (1 - piracy) * margin * 3_600_000) / loopMs),
       });

@@ -108,7 +108,15 @@ function VaultsPanel({ profile }: { profile: CompanyProfile | undefined }) {
 
 // ── Charters ──────────────────────────────────────────────────────────────────
 
-function ChartersPanel({ expansion, charters }: { expansion: ExpansionStatus | undefined; charters: ContractListing[] | undefined }) {
+function ChartersPanel({
+  expansion,
+  charters,
+  companyName,
+}: {
+  expansion: ExpansionStatus | undefined;
+  charters: ContractListing[] | undefined;
+  companyName: string | undefined;
+}) {
   const { portName, goodName } = useCatalog();
   const tier = expansion?.current_tier;
   const tierIds = new Set(tier?.charters.map((c) => c.contract_id));
@@ -130,6 +138,18 @@ function ChartersPanel({ expansion, charters }: { expansion: ExpansionStatus | u
               <div className="text-muted-foreground text-xs">
                 {fmtTons(tier.tons_delivered)} of {fmtTons(tier.target_tons)} delivered · {expansion.active_trading_companies} active companies
               </div>
+              {tier.contributors && tier.contributors.length > 0 && (
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                  {tier.contributors
+                    .slice()
+                    .sort((a, b) => b.share_bps - a.share_bps)
+                    .map((c) => (
+                      <span key={c.company_name} className={c.company_name === companyName ? "font-medium" : "text-muted-foreground"}>
+                        {c.company_name} {(c.share_bps / 100).toFixed(1)}% · ~{fmtCr((tier.completion_bonus_pence * c.share_bps) / 10_000)}
+                      </span>
+                    ))}
+                </div>
+              )}
               <Table head={["Deliver to", "Good", "Remaining", "Pay", "Closes"]}>
                 {tier.charters.map((c) => (
                   <tr key={c.contract_id}>
@@ -189,6 +209,8 @@ export default function DashboardPage() {
   const escrow = profile?.vaults.filter((v) => v.account_type === "escrow").reduce((n, v) => n + v.balance_pence, 0);
   const sailing = ships?.filter((s) => s.ship.status === "sailing").length ?? 0;
   const tier = expansion?.current_tier;
+  const ours = tier?.contributors?.find((c) => c.company_name === profile?.company.name);
+  const leader = tier?.contributors?.slice().sort((a, b) => b.share_bps - a.share_bps)[0];
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
@@ -215,7 +237,13 @@ export default function DashboardPage() {
           label={tier ? `Phase ${tier.target_phase} progress` : "Expansion"}
           icon={<FlagIcon className="size-4" />}
           value={tier ? `${(tier.progress_bps / 100).toFixed(1)}%` : "—"}
-          sub={tier ? `${fmtTons(tier.tons_remaining)} to go` : undefined}
+          sub={
+            tier
+              ? `${fmtTons(tier.tons_remaining)} to go · your bonus share ${((ours?.share_bps ?? 0) / 100).toFixed(1)}%${
+                  leader && leader.company_name !== profile?.company.name ? ` (leader ${(leader.share_bps / 100).toFixed(0)}%)` : ""
+                }`
+              : undefined
+          }
         />
         <StatTile
           label="Leaderboard"
@@ -233,7 +261,7 @@ export default function DashboardPage() {
           <ShipsPanel ships={ships} />
         </div>
         <div className="min-w-0 lg:col-span-2">
-          <ChartersPanel expansion={expansion} charters={charters} />
+          <ChartersPanel expansion={expansion} charters={charters} companyName={profile?.company.name} />
         </div>
       </div>
     </div>

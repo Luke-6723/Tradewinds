@@ -7,13 +7,36 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Empty, ErrorNote, Loading, Metrics, Panel, Table } from "@/components/kibb/bits";
+import { Empty, ErrorNote, Loading, Metrics, NativeSelect, Panel, Table } from "@/components/kibb/bits";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash } from "@/lib/kibb/browser";
 import { fmtBps, fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
-import type { FleetSettings } from "@/lib/kibb/fleet/manager";
+import type { TimeUse } from "@/lib/kibb/fleet/agent";
+import type { FleetSettings, GunPolicy } from "@/lib/kibb/fleet/manager";
+
+const TIME_PARTS: Array<{ key: keyof TimeUse; label: string; className: string }> = [
+  { key: "laden", label: "Laden", className: "bg-success" },
+  { key: "ballast", label: "Empty at sea", className: "bg-info" },
+  { key: "port", label: "In port", className: "bg-warning" },
+  { key: "idle", label: "Idle", className: "bg-destructive" },
+];
+
+const pct = (part: number, total: number) => (total > 0 ? Math.round((part / total) * 100) : 0);
+
+/** One bar split by where the time went. */
+function TimeBar({ t }: { t: TimeUse }) {
+  const total = t.laden + t.ballast + t.port + t.idle;
+  if (!total) return <div className="h-2 w-full rounded-full bg-muted" />;
+  return (
+    <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
+      {TIME_PARTS.map((p) => (
+        <div key={p.key} className={p.className} style={{ width: `${(t[p.key] / total) * 100}%` }} title={`${p.label} ${pct(t[p.key], total)}%`} />
+      ))}
+    </div>
+  );
+}
 
 function SettingsForm({
   settings,
@@ -36,7 +59,7 @@ function SettingsForm({
   );
   return (
     <form
-      className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2 sm:p-4 lg:grid-cols-4"
+      className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2 sm:p-4 lg:grid-cols-3"
       onSubmit={(e) => {
         e.preventDefault();
         onSave(d);
@@ -51,6 +74,25 @@ function SettingsForm({
       <div className="space-y-1">
         <Label>Max payback (hours)</Label>
         <Input type="number" min={0.5} step={0.5} value={d.maxPaybackHours} onChange={(e) => setD({ ...d, maxPaybackHours: Number(e.target.value) })} />
+      </div>
+      <div className="space-y-1">
+        <Label>Guns</Label>
+        <NativeSelect value={d.guns} onChange={(e) => setD({ ...d, guns: e.target.value as GunPolicy })}>
+          <option value="auto">Auto: what each lane&apos;s pirates justify</option>
+          <option value="full">Full battery on every ship</option>
+          <option value="off">Leave guns as they are</option>
+        </NativeSelect>
+      </div>
+      <div className="space-y-1">
+        <Label>Phase bonus counted (%)</Label>
+        <Input
+          type="number"
+          min={0}
+          max={100}
+          step={5}
+          value={d.bonusWeightPct}
+          onChange={(e) => setD({ ...d, bonusWeightPct: Math.min(100, Math.max(0, Number(e.target.value))) })}
+        />
       </div>
       <div className="col-span-full space-y-1.5">
         <Label>Classes the buyer may build</Label>
@@ -75,14 +117,15 @@ function SettingsForm({
           Buy ships automatically
         </label>
         <label className="flex items-center gap-1.5">
-          <input type="checkbox" checked={d.armNewShips} onChange={(e) => setD({ ...d, armNewShips: e.target.checked })} />
-          Arm new ships fully
-        </label>
-        <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.useFreight} onChange={(e) => setD({ ...d, useFreight: e.target.checked })} />
           Carry freight on empty legs
         </label>
       </div>
+      <p className="col-span-full text-muted-foreground text-xs">
+        Each gun takes 2 t of hold. Auto refits a ship at shipyard calls when it pays: in quiet Channel and North Sea water that means none.
+        Expansion charters also earn a share of the phase-completion bonus when the tier fills; the percentage is how much of that
+        expected share counts when choosing lanes and buy prices.
+      </p>
       <div className="col-span-full flex justify-end gap-2">
         <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
         <Button size="sm" type="submit" disabled={busy}>Save (applies immediately)</Button>
@@ -239,6 +282,8 @@ export function FleetPanel() {
           </>
         )}
 
+        {agents.length > 0 && <Efficiency agents={agents} startedAt={st?.startedAt ?? null} stoppedAt={st?.stoppedAt ?? null} />}
+
         <div className="grid items-start gap-5 xl:grid-cols-5">
           <div className="space-y-1.5 xl:col-span-3">
             <div className="text-muted-foreground text-xs">Log</div>
@@ -270,6 +315,7 @@ export function FleetPanel() {
                       <td className="tabular-nums">{fmtTons(l.tons)}</td>
                       <td className="whitespace-nowrap tabular-nums">
                         {fmtCr(l.margin)}/t{!l.askKnown && <span className="text-muted-foreground"> est.</span>}
+                        {l.bonus > 0 && <div className="text-muted-foreground text-xs">incl. {fmtCr(l.bonus)} bonus</div>}
                       </td>
                       <td className="text-muted-foreground tabular-nums" title="Expected share of the load lost to pirates, priced into the margin">
                         {fmtBps(l.piracyBps ?? 0)}
@@ -298,5 +344,93 @@ export function FleetPanel() {
         </div>
       </div>
     </Panel>
+  );
+}
+
+/** Where each ship's time goes, what it earns an hour, and its recent trips against the planner's estimate. */
+function Efficiency({
+  agents,
+  startedAt,
+  stoppedAt,
+}: {
+  agents: NonNullable<FleetView["state"]>["agents"];
+  startedAt: string | null;
+  stoppedAt: string | null;
+}) {
+  const { portName, goodName } = useCatalog();
+  const zero: TimeUse = { laden: 0, ballast: 0, port: 0, idle: 0 };
+  const timeOf = (a: (typeof agents)[number]) => a.time ?? zero;
+  const fleet = agents.reduce<TimeUse>((t, a) => {
+    const x = timeOf(a);
+    return { laden: t.laden + x.laden, ballast: t.ballast + x.ballast, port: t.port + x.port, idle: t.idle + x.idle };
+  }, zero);
+  const total = fleet.laden + fleet.ballast + fleet.port + fleet.idle;
+  const end = stoppedAt ? Date.parse(stoppedAt) : Date.now();
+  const hours = startedAt ? Math.max((end - Date.parse(startedAt)) / 3_600_000, 1 / 60) : null;
+  const trips = agents
+    .flatMap((a) => (a.trips ?? []).map((t) => ({ ...t, ship: a.name })))
+    .sort((a, b) => b.at.localeCompare(a.at))
+    .slice(0, 8);
+  const laneLabel = (lane: string) => {
+    const m = /^(\S+) (\S+) → (\S+)$/.exec(lane);
+    return m ? `${goodName(m[1])}: ${portName(m[2])} → ${portName(m[3])}` : lane;
+  };
+
+  return (
+    <div className="grid items-start gap-5 lg:grid-cols-2">
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <span className="text-muted-foreground text-xs">Where the time goes</span>
+          <span className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground text-xs">
+            {TIME_PARTS.map((p) => (
+              <span key={p.key} className="flex items-center gap-1">
+                <span className={`inline-block size-2 rounded-full ${p.className}`} />
+                {p.label} {pct(fleet[p.key], total)}%
+              </span>
+            ))}
+          </span>
+        </div>
+        <ul className="space-y-2">
+          {agents.map((a) => {
+            const net = a.stats.rewardPence + a.stats.freightPence - a.stats.spentPence;
+            return (
+              <li key={a.shipId} className="space-y-1">
+                <div className="flex items-baseline justify-between gap-2 text-xs">
+                  <span className="truncate font-medium">
+                    {a.name} <span className="font-normal text-muted-foreground">· {a.guns ?? "?"} guns</span>
+                  </span>
+                  <span className="shrink-0 text-muted-foreground tabular-nums">{hours ? `${fmtCr(net / hours)}/h` : "—"}</span>
+                </div>
+                <TimeBar t={timeOf(a)} />
+              </li>
+            );
+          })}
+        </ul>
+        <p className="text-muted-foreground text-xs">Cr/h is net cash since the autopilot started; cargo still aboard counts as spent until it is delivered.</p>
+      </div>
+
+      <div className="space-y-1.5">
+        <div className="text-muted-foreground text-xs">Recent trips: planner&apos;s cash estimate against what it made (both up to delivery, phase bonus excluded)</div>
+        {trips.length === 0 ? (
+          <Empty>No completed trips yet.</Empty>
+        ) : (
+          <Table head={["Trip", "Tons", "Est. /h", "Made /h"]}>
+            {trips.map((t) => (
+              <tr key={`${t.ship}-${t.at}`}>
+                <td className="text-xs">
+                  <div className="font-medium text-sm">{t.ship}</div>
+                  {laneLabel(t.lane)} · {t.hours} h
+                </td>
+                <td className="tabular-nums">{fmtTons(t.tons)}</td>
+                <td className="whitespace-nowrap tabular-nums">{fmtCr(t.estPerHour)}</td>
+                <td className={`whitespace-nowrap tabular-nums ${t.actualPerHour < t.estPerHour * 0.7 ? "text-destructive" : ""}`}>
+                  {fmtCr(t.actualPerHour)}
+                </td>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </div>
+    </div>
   );
 }

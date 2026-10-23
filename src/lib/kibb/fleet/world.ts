@@ -29,6 +29,11 @@ const RECALL_MS = 2 * 24 * 60 * 1000;
 const HIT_LOSS = 0.25;
 /** Assumed cut in interception odds per gun ("cut sharply by cannons"; the formula isn't published). */
 const GUN_DETERRENCE = 0.5;
+/**
+ * A tier's completion bonus is 12% of its base value, split by base value delivered: once the tier's
+ * tons are in, each ton is worth about this share of its good's base price on top of the charter pay.
+ */
+const EXPANSION_BONUS_SHARE = 0.12;
 
 export interface CharterInfo {
   id: string;
@@ -84,6 +89,10 @@ export class World {
   vaults = new Map<BankingRegion, number>();
   /** Live net piracy per sea zone (bps): base + letters of marque − naval patrols. */
   piracy = new Map<string, number>();
+  /** Charters of the expansion tier in play (their deliveries earn a share of its completion bonus). */
+  expansionCharters = new Set<string>();
+  /** Tons the tier still needs; tons beyond that arrive after it completes and earn no bonus. */
+  expansionTonsLeft = 0;
   private rates = new Map<string, number>();
   private prices = new Map<string, PriceObs>();
   /** Last live copy of each charter seen live, for recall when it drops out of a listing. */
@@ -122,13 +131,19 @@ export class World {
     this.paused = clock.paused;
 
     const asked = Date.now();
-    const [list, rates, zones] = await Promise.all([
+    const [list, rates, zones, expansion] = await Promise.all([
       this.client.listContracts({ contract_type: "charter", status: "open", limit: 200 }),
       this.client.rates(),
       this.client.zones().catch(() => null),
+      this.client.expansion().catch(() => null),
       this.refreshVaults(),
     ]);
     if (zones) this.piracy = new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps]));
+    if (expansion) {
+      const tier = expansion.current_tier;
+      this.expansionCharters = new Set(tier && !tier.completed ? tier.charters.map((c) => c.contract_id) : []);
+      this.expansionTonsLeft = tier && !tier.completed ? tier.tons_remaining : 0;
+    }
     const fresh = toCharters(list).filter((c) => !this.closed.has(c.id));
     // Ports re-listed live on arrival while this request was in flight keep that newer view.
     const newer = new Set([...this.mergedAt].filter(([, t]) => t > asked).map(([p]) => p));
@@ -263,6 +278,11 @@ export class World {
       const zone = this.catalog.sea_zones.find((z) => z.id === l.to_node);
       return ZONE_RANK[l.edge_class] <= max && (!zone || ZONE_RANK[zone.zone_class] <= max);
     });
+  }
+
+  /** Phase-completion bonus a ton delivered to this charter is expected to earn (pence, unweighted). */
+  charterBonus(c: { id: string; good: string }): number {
+    return this.expansionCharters.has(c.id) ? Math.round(this.basePrice(c.good) * EXPANSION_BONUS_SHARE) : 0;
   }
 
   /**
