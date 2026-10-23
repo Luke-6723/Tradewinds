@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
     await client.register(handle, passphrase);
     const { api_key } = await client.login({ handle, passphrase, label: "dashboard", ttl_seconds: PLAYER_KEY_TTL_S });
     const res = NextResponse.json({ ok: true, handle });
-    res.cookies.set(COOKIE_PLAYER_KEY, api_key, cookieOptions(PLAYER_KEY_TTL_S));
+    res.cookies.set(COOKIE_PLAYER_KEY, api_key, cookieOptions(req, PLAYER_KEY_TTL_S));
     res.cookies.delete(COOKIE_COMPANY_ID);
     return res;
   } catch (e) {

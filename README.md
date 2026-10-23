@@ -29,6 +29,7 @@ Open [http://localhost:3000](http://localhost:3000), register or sign in, then f
 | `KIBB_API_URL` | Game API base URL | `https://tradewinds.kibb.io` |
 | `KIBB_STORE_DIR` | Where keys and autopilot settings are kept | `.kibb/` |
 | `TOPSTATS_API_KEY` | TopStats token for naming new ships after Discord bots | bundled names |
+| `COOKIE_SECURE` | Force the session cookies' `Secure` flag (`true`/`false`) | on when the request came over HTTPS |
 
 ## Fleet autopilot
 

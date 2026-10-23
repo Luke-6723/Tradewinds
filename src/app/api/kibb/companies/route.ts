@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
     await ensureCompanyKey(playerKey, created.company);
     forgetOwner(playerKey);
     const res = NextResponse.json(created, { status: 201 });
-    res.cookies.set(COOKIE_COMPANY_ID, created.company.id, cookieOptions(PLAYER_KEY_TTL_S));
+    res.cookies.set(COOKIE_COMPANY_ID, created.company.id, cookieOptions(req, PLAYER_KEY_TTL_S));
     return res;
   } catch (e) {
     return errorResponse(e);

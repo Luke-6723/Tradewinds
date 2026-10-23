@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
     await ensureCompanyKey(playerKey, company);
     forgetOwner(playerKey);
     const res = NextResponse.json({ ok: true, company });
-    res.cookies.set(COOKIE_COMPANY_ID, company.id, cookieOptions(PLAYER_KEY_TTL_S));
+    res.cookies.set(COOKIE_COMPANY_ID, company.id, cookieOptions(req, PLAYER_KEY_TTL_S));
     return res;
   } catch (e) {
     return errorResponse(e);

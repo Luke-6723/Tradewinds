@@ -33,10 +33,18 @@ export function kibb(apiKey?: string): KibbClient {
   return new KibbClient({ baseUrl: KIBB_URL, apiKey });
 }
 
-export function cookieOptions(maxAgeS: number) {
+/**
+ * Session cookie options. `Secure` only when the browser reached us over HTTPS (directly or via a
+ * proxy that says so): browsers drop Secure cookies sent over plain http (localhost aside), which
+ * would sign everyone out of a production build served on http://host:port.
+ * COOKIE_SECURE=true|false overrides the guess.
+ */
+export function cookieOptions(req: NextRequest, maxAgeS: number) {
+  const forced = process.env.COOKIE_SECURE;
+  const proto = req.headers.get("x-forwarded-proto")?.split(",")[0].trim() ?? req.nextUrl.protocol.replace(":", "");
   return {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: forced ? forced === "true" : proto === "https",
     sameSite: "lax" as const,
     path: "/",
     maxAge: maxAgeS,
