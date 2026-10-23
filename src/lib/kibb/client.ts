@@ -303,6 +303,22 @@ export class KibbClient {
   listContracts = (filter: ContractListFilter = {}) =>
     this.get<ContractListing[]>("/v1/contract/list", { ...filter });
 
+  /**
+   * Every page of a contract listing (cursor = last id), up to `maxPages` of 200. `complete` is
+   * false when it stopped at the page limit with more to come.
+   */
+  async contractPages(filter: Omit<ContractListFilter, "cursor" | "limit"> = {}, maxPages = 10): Promise<{ items: ContractListing[]; complete: boolean }> {
+    const byId = new Map<string, ContractListing>();
+    let cursor: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const batch = await this.listContracts({ ...filter, cursor, limit: 200 });
+      for (const c of batch) byId.set(c.id, c);
+      if (batch.length < 200) return { items: [...byId.values()], complete: true };
+      cursor = batch[batch.length - 1].id;
+    }
+    return { items: [...byId.values()], complete: false };
+  }
+
   deliverCharter = (req: DeliverCharterRequest) =>
     this.post<DeliverCharterResult>("/v1/contract/deliver-charter", req);
 

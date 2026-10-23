@@ -15,6 +15,7 @@ import { fmtBps, fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
 import type { FleetSettings, GunPolicy } from "@/lib/kibb/fleet/manager";
+import type { Lane } from "@/lib/kibb/fleet/planner";
 
 const TIME_PARTS: Array<{ key: keyof TimeUse; label: string; className: string }> = [
   { key: "laden", label: "Laden", className: "bg-success" },
@@ -136,6 +137,12 @@ function SettingsForm({
 
 export function FleetPanel() {
   const { portName, goodName, shipClassName } = useCatalog();
+  // "rye flour + timber (sell) + freight", main good first.
+  const loadText = (l: Lane) =>
+    [
+      ...(l.parts ?? []).map((p) => `${goodName(p.good)}${p.kind === "market" ? " (sell)" : ""}`),
+      ...((l.freight ?? []).length ? ["freight"] : []),
+    ].join(" + ") || goodName(l.good);
   const { data: view, error, reload } = usePoll(() => dash.get<FleetView>("/api/kibb/fleet"), 4_000);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -171,7 +178,7 @@ export function FleetPanel() {
 
   const agents = st?.agents ?? [];
   const doing = (a: (typeof agents)[number]) => (a.status === "sailing" ? `→ ${portName(a.dest)} ${fmtIn(a.eta)}` : a.activity);
-  const laneText = (a: (typeof agents)[number]) => (a.lane ? `${goodName(a.lane.good)}: ${portName(a.lane.source)} → ${portName(a.lane.dest)}` : null);
+  const laneText = (a: (typeof agents)[number]) => (a.lane ? `${loadText(a.lane)}: ${portName(a.lane.source)} → ${portName(a.lane.dest)}` : null);
   const agentNet = (a: (typeof agents)[number]) => a.stats.rewardPence + a.stats.freightPence - a.stats.spentPence;
 
   return (
@@ -307,10 +314,11 @@ export function FleetPanel() {
                 <div className="text-muted-foreground text-xs">Best lanes right now (planner&apos;s view)</div>
                 <Table head={["Lane", "Load", "Margin", "Piracy", "Est. /h"]}>
                   {st.topLanes.map((l) => (
-                    <tr key={l.key}>
+                    <tr key={l.key} className="align-top">
                       <td className="text-xs">
-                        <div className="font-medium text-sm">{goodName(l.good)}</div>
+                        <div className="font-medium text-sm">{loadText(l)}</div>
                         {portName(l.source)} → {portName(l.dest)}
+                        {l.next && <div className="text-muted-foreground">then {l.next}</div>}
                       </td>
                       <td className="tabular-nums">{fmtTons(l.tons)}</td>
                       <td className="whitespace-nowrap tabular-nums">

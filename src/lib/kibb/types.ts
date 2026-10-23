@@ -467,6 +467,8 @@ export interface ContractListing {
   expires_at?: string | null;
   /** Freight only: who is carrying it once accepted. */
   carrier_company_id?: string | null;
+  /** Who posted it (freight: the issuer; charters: null for the Crown and governors). */
+  issuer_company_id?: string | null;
   carrier_ship_id?: string | null;
   title?: string | null;
   funded_by?: "crown" | "mint" | null;

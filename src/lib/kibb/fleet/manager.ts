@@ -401,6 +401,7 @@ export class FleetManager implements FleetHost {
     await this.world.init();
     const profile = await this.client.companyProfile();
     this.homeRegion = this.world.region(profile.company.home_port_id);
+    this.world.companyId = profile.company.id;
     this.log(
       "fleet",
       `started for ${profile.company.name}: phase ${this.world.unlockedPhase} open, server clock ${this.world.skewMs >= 0 ? "+" : ""}${Math.round(this.world.skewMs / 1000)}s vs this machine, ` +
@@ -523,14 +524,19 @@ export class FleetManager implements FleetHost {
   }
 
   private planOptions(cash: number | null) {
-    return { minMargin: this.settings.minMarginPence, bonusWeight: this.settings.bonusWeightPct / 100, cash };
+    return { minMargin: this.settings.minMarginPence, freight: this.settings.useFreight, bonusWeight: this.settings.bonusWeightPct / 100, cash };
   }
 
   /** Cash a ship can spend on its next load: spare cash in every region, less loads other ships are bound to buy. */
   private loadCash(except?: ShipAgent): number {
     let committed = 0;
-    for (const a of this.agents.values()) if (a !== except && a.lane && a.boundToBuy) committed += a.lane.tons * a.lane.costPerTon;
+    for (const a of this.agents.values()) if (a !== except) committed += this.committedBy(a);
     return Math.max(0, this.spareCash() - committed);
+  }
+
+  /** Cash a ship's lane still has to spend: goods not yet bought, collateral for lots not yet taken. */
+  private committedBy(a: ShipAgent): number {
+    return a.partsToBuy().reduce((n, p) => n + p.tons * p.costPerTon, 0) + a.freightToTake().reduce((n, f) => n + f.collateral, 0);
   }
 
   cashArrived(): void {
@@ -703,19 +709,25 @@ export class FleetManager implements FleetHost {
     }
   }
 
-  /** Tons other ships are bound for: charter room they will fill, source depth they will buy. */
+  /**
+   * What other ships are bound for: charter room they will fill, source depth they will buy, buyers
+   * at a port they will sell to, and freight lots they mean to take.
+   */
   private reservations(except?: ShipAgent): Reservations {
     const charterTons = new Map<string, number>();
     const sourceTons = new Map<string, number>();
+    const sellTons = new Map<string, number>();
+    const freightIds = new Set<string>();
+    const add = (m: Map<string, number>, k: string, t: number) => m.set(k, (m.get(k) ?? 0) + t);
     for (const a of this.agents.values()) {
       if (a === except || !a.lane) continue;
-      for (const [id, t] of a.lane.fills) charterTons.set(id, (charterTons.get(id) ?? 0) + t);
-      if (a.boundToBuy) {
-        const k = `${a.lane.source}|${a.lane.good}`;
-        sourceTons.set(k, (sourceTons.get(k) ?? 0) + a.lane.tons);
-      }
+      const lane = a.lane;
+      for (const [id, t] of lane.fills) add(charterTons, id, t);
+      for (const p of a.partsToBuy()) add(sourceTons, `${lane.source}|${p.good}`, p.tons);
+      for (const p of lane.parts) if (p.kind === "market") add(sellTons, `${lane.dest}|${p.good}`, p.tons);
+      for (const f of a.freightToTake()) freightIds.add(f.id);
     }
-    return { charterTons, sourceTons };
+    return { charterTons, sourceTons, sellTons, freightIds };
   }
 
   /** One planning pass at a time, so each ship sees the others' fresh reservations. */
@@ -730,13 +742,18 @@ export class FleetManager implements FleetHost {
     const cash = this.loadCash(agent);
     const lanes = await rankLanes(this.world, this.specFor(agent, r), from, this.reservations(agent), this.planOptions(cash));
     const best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
-    agent.lane = best;
+    agent.setLane(best);
     if (best) agent.noteLane(best);
     if (best && best.key !== prev?.key) {
+      const load = [
+        ...best.parts.map((p) => `${p.tons} t ${p.good}${p.kind === "market" ? " to sell" : ""}`),
+        ...(best.freight.length ? [`${best.freight.reduce((n, f) => n + f.tons, 0)} t freight`] : []),
+      ].join(" + ");
       this.log(
         agent.name,
-        `lane: ${best.tons} t ${best.good} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t` +
-          `${best.bonus > 0 ? ` incl. ~${cr(best.bonus)}/t phase bonus` : ""}${best.askKnown ? "" : " (ask estimated)"}, ~${cr(best.profitPerHour)}/h`,
+        `lane: ${load} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t` +
+          `${best.bonus > 0 ? ` incl. ~${cr(best.bonus)}/t phase bonus` : ""}${best.askKnown ? "" : " (ask estimated)"}, ~${cr(best.profitPerHour)}/h` +
+          `${best.next ? `; then ${best.next}` : ""}`,
       );
     } else if (!best && prev) {
       this.log(agent.name, `no lane clears the minimum margin with the ${cr(cash)} the fleet can spend right now`);
@@ -745,7 +762,23 @@ export class FleetManager implements FleetHost {
   }
 
   releaseLane(agent: ShipAgent): void {
-    agent.lane = null;
+    agent.setLane(null);
+  }
+
+  /** Room in a charter this ship may deliver into: what other ships already carrying cargo for it leave. */
+  charterRoomFor(agent: ShipAgent, charterId: string, remaining: number): number {
+    let held = 0;
+    for (const a of this.agents.values()) {
+      if (a === agent || !a.lane || !a.loaded) continue;
+      for (const [id, t] of a.lane.fills) if (id === charterId) held += t;
+    }
+    return Math.max(0, remaining - held);
+  }
+
+  /** Whether another ship's lane means to take this freight lot. */
+  freightClaimed(agent: ShipAgent, id: string): boolean {
+    for (const a of this.agents.values()) if (a !== agent && a.lane?.freight.some((f) => f.id === id)) return true;
+    return false;
   }
 
   // ── Cash ────────────────────────────────────────────────────────────────────
@@ -861,7 +894,7 @@ export class FleetManager implements FleetHost {
     await world.refreshVaults();
     // Cash the existing fleet still needs for loads it is bound to buy comes first.
     let committed = 0;
-    for (const a of this.agents.values()) if (a.lane && a.boundToBuy) committed += a.lane.tons * a.lane.costPerTon;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
     const spare = this.spareCash() - committed;
 
     // Building needs presence: a ship of ours in a yard port (re-read when not called by that ship).
@@ -934,7 +967,11 @@ export class FleetManager implements FleetHost {
           const c = world.charters.find((x) => x.id === id);
           return n + (c ? Math.max(0, c.remaining - (res.charterTons.get(id) ?? 0)) : 0);
         }, 0);
-        const earnable = Math.min(net * Math.min(settings.maxPaybackHours, hoursLeft), lane.margin * tonsLeft);
+        // A lane mostly served by charters ends when they fill; a mostly-market lane repeats.
+        // (One-off freight lots don't count as repeatable work.)
+        const marketTons = lane.parts.filter((p) => p.kind === "market").reduce((n, p) => n + p.tons, 0);
+        const repeats = marketTons >= lane.tons * 0.3;
+        const earnable = Math.min(net * Math.min(settings.maxPaybackHours, hoursLeft), repeats ? Infinity : lane.margin * tonsLeft);
         if (earnable < cost) {
           notes.push(`${cls.id}@${yard}: its charters can't pay it back in time`);
           continue;
@@ -973,7 +1010,7 @@ export class FleetManager implements FleetHost {
       const price = q.total_cost_pence;
       await world.refreshVaults();
       let committedNow = 0;
-      for (const a of this.agents.values()) if (a.lane && a.boundToBuy) committedNow += a.lane.tons * a.lane.costPerTon;
+      for (const a of this.agents.values()) committedNow += this.committedBy(a);
       if (this.spareCash() - committedNow - pick.upkeepFloor < price) {
         return failLater(`after the fleet's loads there is no longer ${cr(price)} spare for a ${pick.cls}`);
       }

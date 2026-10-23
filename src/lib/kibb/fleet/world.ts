@@ -47,6 +47,37 @@ export interface CharterInfo {
   /** Listed to everyone (expansion/Admiralty): absent from an open listing means closed. */
   isPublic: boolean;
   title: string;
+  /** For gossip: server time the news describes (it may since have been filled). */
+  newsAt: number | null;
+}
+
+/** An open freight lot we can see (listed only at its origin port, to companies present there). */
+export interface FreightInfo {
+  id: string;
+  origin: string;
+  dest: string;
+  good: string;
+  tons: number;
+  reward: number;
+  collateral: number;
+  expiresAt: number | null;
+  issuer: string | null;
+}
+
+function toFreight(list: ContractListing[]): FreightInfo[] {
+  return list
+    .filter((c) => c.contract_type === "freight" && c.status === "open" && !c.stale && c.dest_port_id && c.commodity_id)
+    .map((c) => ({
+      id: c.id,
+      origin: c.origin_port_id,
+      dest: c.dest_port_id!,
+      good: c.commodity_id!,
+      tons: c.quantity_required,
+      reward: c.reward_pence,
+      collateral: c.collateral_pence,
+      expiresAt: c.expires_at ? Date.parse(c.expires_at) : null,
+      issuer: c.issuer_company_id ?? null,
+    }));
 }
 
 export interface PriceObs {
@@ -54,6 +85,8 @@ export interface PriceObs {
   askQty: number;
   bid: number | null;
   bidQty: number;
+  /** Tons the visible bid ladder takes in all (live books with depth only). */
+  bidDepth: number | null;
   stock: number | null;
   customsBps: number | null;
   /** Server time the observation describes. */
@@ -75,6 +108,7 @@ function toCharters(list: ContractListing[]): CharterInfo[] {
       stale: c.stale,
       isPublic: c.is_public,
       title: c.title ?? `${c.commodity_id} to ${c.origin_port_id}`,
+      newsAt: c.stale && c.gossip?.news_as_of ? Date.parse(c.gossip.news_as_of) : null,
     }));
 }
 
@@ -86,6 +120,10 @@ export class World {
   /** Server clock minus local clock, ms. */
   skewMs = 0;
   charters: CharterInfo[] = [];
+  /** Open freight lots we can see, at ports where we have presence. */
+  freight: FreightInfo[] = [];
+  /** Our company (to skip freight we posted ourselves). */
+  companyId: string | null = null;
   vaults = new Map<BankingRegion, number>();
   /** Live net piracy per sea zone (bps): base + letters of marque − naval patrols. */
   piracy = new Map<string, number>();
@@ -102,6 +140,9 @@ export class World {
   /** Charters we saw filled or closed. */
   private readonly closed = new Set<string>();
   private routes = new Map<string, Promise<RoutePlan>>();
+  private routeSlots = 8;
+  private portIndex: Map<string, CatalogPort> | null = null;
+  private readonly routeWaiters: Array<() => void> = [];
 
   constructor(readonly client: KibbClient) {}
 
@@ -131,13 +172,16 @@ export class World {
     this.paused = clock.paused;
 
     const asked = Date.now();
-    const [list, rates, zones, expansion] = await Promise.all([
-      this.client.listContracts({ contract_type: "charter", status: "open", limit: 200 }),
+    const [listing, freight, rates, zones, expansion] = await Promise.all([
+      this.client.contractPages({ contract_type: "charter", status: "open" }),
+      this.client.contractPages({ contract_type: "freight", status: "open" }).catch(() => null),
       this.client.rates(),
       this.client.zones().catch(() => null),
       this.client.expansion().catch(() => null),
       this.refreshVaults(),
     ]);
+    const list = listing.items;
+    if (freight) this.freight = toFreight(freight.items);
     if (zones) this.piracy = new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps]));
     if (expansion) {
       const tier = expansion.current_tier;
@@ -149,7 +193,7 @@ export class World {
     const newer = new Set([...this.mergedAt].filter(([, t]) => t > asked).map(([p]) => p));
     this.remember(fresh.filter((c) => !newer.has(c.port)));
     // Public charters are listed to everyone: one missing from a complete listing is closed.
-    if (list.length < 200) {
+    if (listing.complete) {
       const ids = new Set(fresh.map((c) => c.id));
       for (const [id, { c }] of this.liveSeen) if (c.isPublic && !newer.has(c.port) && !ids.has(id)) this.liveSeen.delete(id);
     }
@@ -169,6 +213,16 @@ export class World {
     this.remember(fresh);
     this.mergedAt.set(port, Date.now());
     this.charters = this.withRecalled([...this.charters.filter((c) => c.port !== port), ...fresh]);
+  }
+
+  /** Replaces the open freight we know of at one port with a listing taken there. */
+  mergePortFreight(port: string, list: ContractListing[]): void {
+    this.freight = [...this.freight.filter((f) => f.origin !== port), ...toFreight(list.filter((c) => c.origin_port_id === port))];
+  }
+
+  /** A freight lot was taken (by us or anyone): stop planning on it. */
+  dropFreight(id: string): void {
+    this.freight = this.freight.filter((f) => f.id !== id);
   }
 
   /** A charter was filled or closed: drop it now and ignore it in listings already in flight. */
@@ -212,7 +266,8 @@ export class World {
   // ── Catalog lookups ─────────────────────────────────────────────────────────
 
   port(id: string): CatalogPort | undefined {
-    return this.catalog.ports.find((p) => p.id === id);
+    if (!this.portIndex || this.portIndex.size !== this.catalog.ports.length) this.portIndex = new Map(this.catalog.ports.map((p) => [p.id, p]));
+    return this.portIndex.get(id);
   }
 
   shipClass(id: string): CatalogShipClass | undefined {
@@ -232,6 +287,27 @@ export class World {
     return this.catalog.ports
       .filter((p) => p.phase <= this.unlockedPhase && [...(p.produces ?? []), ...(p.manufactures ?? [])].includes(good))
       .map((p) => p.id);
+  }
+
+  /**
+   * Ports to buy the good at: the open ports that make it, plus any open port trading it where an
+   * ask has been seen lately (an importer with a glut can undercut the producers).
+   */
+  sellersOf(good: string): string[] {
+    const out = new Set(this.sourcesOf(good));
+    for (const p of this.catalog.ports) {
+      if (p.phase <= this.unlockedPhase && this.trades(p.id, good) && this.price(p.id, good)?.ask) out.add(p.id);
+    }
+    return [...out];
+  }
+
+  /** Goods on sale at a port: what it makes, plus anything with an ask seen there lately. */
+  goodsAt(portId: string): string[] {
+    const p = this.port(portId);
+    if (!p) return [];
+    const out = new Set([...(p.produces ?? []), ...(p.manufactures ?? [])]);
+    for (const c of this.catalog.commodities) if (this.trades(portId, c.id) && this.price(portId, c.id)?.ask) out.add(c.id);
+    return [...out];
   }
 
   /** Whether the port has a market for the good at all. */
@@ -261,11 +337,23 @@ export class World {
     const key = `${from}>${to}>${shipClass}`;
     let p = this.routes.get(key);
     if (!p) {
-      p = this.client.route(from, to, shipClass);
+      p = this.fetchRoute(from, to, shipClass);
       p.catch(() => this.routes.delete(key));
       this.routes.set(key, p);
     }
     return p;
+  }
+
+  /** At most a few route lookups in flight: a first planning pass asks for hundreds. */
+  private async fetchRoute(from: string, to: string, shipClass: string): Promise<RoutePlan> {
+    while (this.routeSlots === 0) await new Promise<void>((r) => this.routeWaiters.push(r));
+    this.routeSlots--;
+    try {
+      return await this.client.route(from, to, shipClass);
+    } finally {
+      this.routeSlots++;
+      this.routeWaiters.shift()?.();
+    }
   }
 
   /**
@@ -312,6 +400,7 @@ export class World {
         askQty: b.best_ask?.quantity ?? 0,
         bid: b.best_bid?.price_pence ?? null,
         bidQty: b.best_bid?.quantity ?? 0,
+        bidDepth: b.depth ? b.depth.bids.reduce((n, l) => n + l.remaining_quantity, 0) : null,
         stock: b.depth?.npc_current_stock ?? null,
         customsBps: book.customs_bps,
         at,
@@ -333,6 +422,7 @@ export class World {
           askQty: 0,
           bid: c.best_bid_pence ?? null,
           bidQty: 0,
+          bidDepth: null,
           stock: c.current_stock,
           customsBps: prev?.customsBps ?? null,
           at,
@@ -358,15 +448,19 @@ export class World {
     return { ask: Math.round(this.basePrice(good) * 1.05), known: false };
   }
 
-  /** Records that a port had nothing of this good on offer just now. */
-  observeNoAsk(portId: string, good: string): void {
+  /**
+   * Records that a port had nothing of this good on offer just now. The bid is what the same book
+   * showed (an older bid would otherwise be restamped as fresh).
+   */
+  observeNoAsk(portId: string, good: string, bid: { price_pence: number; quantity: number } | null = null): void {
     const key = `${portId}|${good}`;
     const prev = this.prices.get(key);
     this.prices.set(key, {
       ask: null,
       askQty: 0,
-      bid: prev?.bid ?? null,
-      bidQty: prev?.bidQty ?? 0,
+      bid: bid?.price_pence ?? null,
+      bidQty: bid?.quantity ?? 0,
+      bidDepth: null,
       stock: 0,
       customsBps: prev?.customsBps ?? null,
       at: this.now(),
