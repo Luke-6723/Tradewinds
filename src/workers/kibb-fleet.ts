@@ -62,11 +62,15 @@ async function main(): Promise<void> {
     console.error("KIBB_API_KEY is not set (log in with company_id to get a company-bound key)");
     process.exit(1);
   }
-  process.on("SIGINT", () => void manager.stop());
-  process.on("SIGTERM", () => void manager.stop());
+  // stop() saves the progress and releases the lease; exit explicitly, since the database
+  // connection would otherwise keep the process alive.
+  const shutdown = () => void manager.stop().finally(() => process.exit(manager.state.status === "failed" ? 1 : 0));
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
   manager.start();
   await manager.done;
-  if (manager.state.status === "failed") process.exit(1);
+  await manager.stop();
+  process.exit(manager.state.status === "failed" ? 1 : 0);
 }
 
 main().catch((e) => {

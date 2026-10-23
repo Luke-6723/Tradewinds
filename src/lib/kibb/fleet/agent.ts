@@ -79,6 +79,37 @@ export interface FleetHost {
   freightClaimed(agent: ShipAgent, id: string): boolean;
   /** Another of our ships' hold at this port on this good for a re-post, if any. */
   siblingHold(agent: ShipAgent, port: string, good: string): HoldInfo | undefined;
+  /** The fleet's progress changed: save it (`now` for a trip, a load or a delivery). */
+  persist(now?: boolean): void;
+  /** A trip finished: add it to the saved history. */
+  tripFinished(agent: ShipAgent, trip: TripRecord & { goods: string[]; spentPence: number; rewardPence: number }): void;
+}
+
+/** What one ship's agent saves, so a restart resumes its lane, sell floors and record. */
+export interface AgentSnapshot {
+  name: string;
+  stats: AgentStats;
+  time: TimeUse;
+  trips: TripRecord[];
+  trip: {
+    key: string;
+    label: string;
+    goods: string[];
+    freightIds: string[];
+    est: number;
+    startedAt: number;
+    spent: number;
+    reward: number;
+    tons: number;
+  } | null;
+  lane: Lane | null;
+  laneLoaded: string | null;
+  laneKey: string | null;
+  laneSince: number;
+  minSale: Array<[string, number]>;
+  avoid: Array<[string, number]>;
+  ratePerHour: number;
+  freight: Array<[string, CarriedFreight]>;
 }
 
 /** Cargo held for an expansion charter's re-post. */
@@ -224,6 +255,10 @@ export class ShipAgent {
   /** Lowest price per ton each good aboard may be sold at (its landed cost, or the market floor). */
   private readonly minSale = new Map<string, number>();
   private readonly trips: TripRecord[] = [];
+  /** Restored from a snapshot: the first tick checks the lane still fits the ship. */
+  private checkRestored = false;
+  /** A restored lane part-bought at this port: its goods aboard count as bought here. */
+  private resumeAt: string | null = null;
 
   constructor(
     private readonly host: FleetHost,
@@ -263,6 +298,71 @@ export class ShipAgent {
     };
   }
 
+  /** What to save for this ship. */
+  snapshot(): AgentSnapshot {
+    const t = this.trip;
+    return {
+      name: this.name,
+      stats: { ...this.stats },
+      time: this.timeUse(),
+      trips: [...this.trips],
+      trip: t ? { ...t, goods: [...t.goods], freightIds: [...t.freightIds] } : null,
+      lane: this.lane,
+      laneLoaded: this.laneLoaded,
+      laneKey: this.laneKey,
+      laneSince: this.laneSince,
+      minSale: [...this.minSale],
+      avoid: [...this.avoid],
+      ratePerHour: this.ratePerHour,
+      freight: [...this.freight],
+    };
+  }
+
+  /**
+   * Picks up from a snapshot taken before a restart (call before start()). A lane is kept only if
+   * its cargo was loaded or partly bought; the first tick checks the cargo is still aboard.
+   * Restored freight counts as listed, so the first sync drops lots settled while we were down.
+   */
+  restore(s: AgentSnapshot): void {
+    this.stats = { ...this.stats, ...s.stats };
+    Object.assign(this.time, s.time);
+    this.trips.splice(0, this.trips.length, ...(s.trips ?? []).slice(-TRIP_HISTORY));
+    this.trip = s.trip ? { ...s.trip, goods: new Set(s.trip.goods), freightIds: new Set(s.trip.freightIds) } : null;
+    this.laneKey = s.laneKey;
+    this.laneSince = s.laneSince;
+    if (s.lane) {
+      this.lane = s.lane;
+      this.laneLoaded = s.laneLoaded;
+      this.checkRestored = true;
+    }
+    for (const [g, p] of s.minSale ?? []) this.minSale.set(g, p);
+    for (const [k, until] of s.avoid ?? []) this.avoid.set(k, until);
+    if (s.ratePerHour > 0) this.ratePerHour = s.ratePerHour;
+    for (const [id, f] of s.freight ?? []) {
+      this.freight.set(id, f);
+      this.listedFreight.add(id);
+    }
+  }
+
+  /** After a restart: keep the restored lane only if its cargo (or freight) is still aboard, or nothing was loaded yet but some was bought. */
+  private checkRestoredLane(r: ShipResult): void {
+    this.checkRestored = false;
+    const lane = this.lane;
+    if (!lane) return;
+    const goods = this.laneGoodsAboard(r, lane);
+    const freight = lane.freight.some((f) => this.freight.has(f.id));
+    if (goods > 0 || freight) {
+      this.log(`resumed lane ${lane.key}${this.laneLoaded === lane.key ? " (loaded)" : " (part loaded)"}`);
+      // Part bought at the source: what's aboard was bought there, so loading carries on from it.
+      if (this.laneLoaded !== lane.key && r.ship.status !== "sailing" && r.ship.current_port_id === lane.source) this.resumeAt = lane.source;
+      return;
+    }
+    if (this.laneLoaded === lane.key) this.log(`the cargo for lane ${lane.key} is no longer aboard: planning afresh`);
+    // Delivered just before the restart: record the trip it finished.
+    if (this.trip?.key === lane.key) this.finishTrip();
+    this.host.releaseLane(this);
+  }
+
   /** Time use so far, including the stretch in progress. */
   private timeUse(): TimeUse {
     const t = { ...this.time };
@@ -299,7 +399,7 @@ export class ShipAgent {
     this.laneKey = null;
     const hours = Math.max((Date.now() - t.startedAt) / 3_600_000, 1 / 3_600);
     const profit = t.reward - t.spent;
-    this.trips.push({
+    const rec: TripRecord = {
       at: new Date().toISOString(),
       lane: t.label,
       tons: t.tons,
@@ -307,8 +407,11 @@ export class ShipAgent {
       profitPence: profit,
       estPerHour: Math.round(t.est),
       actualPerHour: Math.round(profit / hours),
-    });
+    };
+    this.trips.push(rec);
     if (this.trips.length > TRIP_HISTORY) this.trips.splice(0, this.trips.length - TRIP_HISTORY);
+    this.host.tripFinished(this, { ...rec, goods: [...t.goods], spentPence: t.spent, rewardPence: t.reward });
+    this.host.persist(true);
   }
 
   /** Tons of this good aboard that belong to us (not sealed freight). */
@@ -531,6 +634,7 @@ export class ShipAgent {
 
     if (s.status === "sunk") return this.leaveFleet("has sunk");
     if (!this.freightSynced) await this.syncFreight();
+    if (this.checkRestored && this.freightSynced) this.checkRestoredLane(r);
     for (const good of [...this.minSale.keys()]) if (this.ownTons(r, good) <= 0) this.minSale.delete(good);
 
     if (s.status === "sailing") {
@@ -546,6 +650,13 @@ export class ShipAgent {
     if (!port) return POLL_MS;
     if (!this.stay || this.stay.port !== port) {
       this.stay = { port, key: `${port}@${Date.now()}`, scouted: false, traded: new Set(), boughtHere: new Map(), refused: new Set(), holds: new Map() };
+      if (this.resumeAt === port && this.lane) {
+        for (const p of this.lane.parts) {
+          const t = this.ownTons(r, p.good);
+          if (t > 0) this.stay.boughtHere.set(p.good, t);
+        }
+      }
+      this.resumeAt = null;
       await this.syncFreight();
       await this.refreshPortCharters(port);
     }
@@ -720,7 +831,7 @@ export class ShipAgent {
     }
     // At the source of the lane we hold: load (keeping the lane, whose charter may only be visible
     // from its own port), topping up whatever of the good is already aboard.
-    if (this.lane && this.lane.source === port && !stay.traded.has("cargo") && !this.isAvoided(this.lane.key)) {
+    if (this.lane && this.lane.source === port && this.laneLoaded !== this.lane.key && !stay.traded.has("cargo") && !this.isAvoided(this.lane.key)) {
       // The lane was planned a while ago: a charter main must still have room for most of its load.
       const main = this.lane.kind === "charter" ? this.lane.parts[0] : null;
       if (!main || this.liveTons(main) >= Math.min(10, main.tons / 2)) {
@@ -887,6 +998,7 @@ export class ShipAgent {
     if (lane.kind !== "freight" && lane.freight.length > 0) await this.acceptLaneFreight(await this.reread(), lane, stay);
     stay.traded.add("cargo");
     this.laneLoaded = lane.key;
+    this.host.persist(true);
     // Any room still free: freight bound the same way, if it pays for its berth time.
     await this.takeFreight(await this.reread(), lane.dest, stay);
     return this.sailTo(await this.reread(), lane.dest, stay);
@@ -1252,6 +1364,7 @@ export class ShipAgent {
       world.markClosed(c.id);
     }
     r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
+    this.host.persist(true);
     this.stats.deliveredTons += res.delivered_quantity;
     this.stats.rewardPence += res.reward_paid_pence;
     if (this.trip?.goods.has(c.good)) this.trip.reward += res.reward_paid_pence;
@@ -1264,6 +1377,7 @@ export class ShipAgent {
     try {
       const res = await this.host.client.deliverFreight(id, this.shipId);
       this.freight.delete(id);
+      this.host.persist(true);
       this.stats.freightPence += res.reward_paid_pence;
       if (this.trip?.freightIds.has(id)) this.trip.reward += res.reward_paid_pence;
       this.host.cashArrived();

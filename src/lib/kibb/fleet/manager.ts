@@ -23,6 +23,10 @@
  * to it (arrival, berth from the queue, eviction, hazard) and refreshes the world as soon as a
  * charter is posted, filled or expires, so idle ships re-plan at once. Timers remain the fallback.
  *
+ * Progress (each ship's lane and cargo state, sell floors, trips, stats, purchases, the log, the
+ * event cursor and the world model's memory) is saved as it changes (journal.ts: MongoDB when
+ * MONGODB_URI is set, plus a local file) and picked up again on start, so a restart resumes work.
+ *
  * Runs in-process in the Next.js server (fleet-registry.ts) or from the CLI (workers/kibb-fleet.ts).
  */
 
@@ -32,11 +36,12 @@ import type { LetterOfMarque } from "../schema";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
 import type { BankingRegion, ShipResult } from "../types";
-import { ShipAgent, type AgentState, type AgentStats, type FleetHost, type HoldInfo } from "./agent";
+import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
+import { openJournal, type Journal } from "./journal";
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
 import { rankLanes, type Lane, type Reservations, type ShipSpec } from "./planner";
-import { World, type ExpansionWatch } from "./world";
+import { World, type ExpansionWatch, type WorldSnapshot } from "./world";
 
 // ── Settings & state ──────────────────────────────────────────────────────────
 
@@ -193,6 +198,8 @@ export interface FleetState {
   status: FleetStatus;
   error: string | null;
   startedAt: string | null;
+  /** Since when the totals, trips and time use run (the first start; kept across restarts). */
+  progressSince: string | null;
   /** When it stopped or failed; null while running. */
   stoppedAt: string | null;
   homeRegion: BankingRegion | null;
@@ -259,6 +266,26 @@ export interface MarqueReport {
   zones: MarqueZoneReport[];
   action: string;
 }
+
+/** Everything the manager saves (journal.ts) so a restart resumes where it left off. */
+interface FleetSnapshot {
+  progressSince: string;
+  log: FleetLogLine[];
+  purchases: PurchaseRecord[];
+  retired: AgentStats;
+  shipSpendPence: number;
+  eventCursor: string | null;
+  tempFactors: string[];
+  hullQuotes: Array<[string, number]>;
+  factorBlockedUntil: number;
+  factorFails: number;
+  pendingBuild: FleetManager["pendingBuild"];
+  agents: Record<string, AgentSnapshot>;
+  world: WorldSnapshot;
+}
+
+/** How often the progress is saved even when nothing much happened (time use, prices). */
+const PERSIST_MS = 30_000;
 
 export interface FleetConfig {
   apiKey: string;
@@ -344,6 +371,11 @@ export class FleetManager implements FleetHost {
   private stoppedAt: string | null = null;
   private homeRegion: BankingRegion | null = null;
   private homePort: string | null = null;
+  private journal: Journal<FleetSnapshot> | null = null;
+  private progressSince: string | null = null;
+  /** Saved agents waiting for their ship to be taken command of again. */
+  private restoredAgents = new Map<string, AgentSnapshot>();
+  private lastPersist = 0;
   /** The last hull quote per `yard|class` (pence): prices a build at a yard where we have no presence yet. */
   private readonly hullQuotes = new Map<string, number>();
   /** Factor passes in a row that built nothing: each one backs off longer. */
@@ -376,7 +408,7 @@ export class FleetManager implements FleetHost {
   private buying = false;
   private readonly lastYardCheck = new Map<string, number>();
   /** A build whose response never arrived: adopted (its purchase record) if the ship shows up. */
-  private pendingBuild: { name: string; yard: string; cls: string; price: number; payback: number; lane: string } | null = null;
+  pendingBuild: { name: string; yard: string; cls: string; price: number; payback: number; lane: string } | null = null;
   private cashQueue: Promise<unknown> = Promise.resolve();
   private assignQueue: Promise<unknown> = Promise.resolve();
   private events: Promise<void> | null = null;
@@ -416,6 +448,7 @@ export class FleetManager implements FleetHost {
       status: this.status,
       error: this.error,
       startedAt: this.startedAt,
+      progressSince: this.progressSince ?? this.startedAt,
       stoppedAt: this.stoppedAt,
       homeRegion: this.homeRegion,
       totals,
@@ -480,10 +513,17 @@ export class FleetManager implements FleetHost {
       if (i > 0) await new Promise((r) => setTimeout(r, 1_000));
       await this.dismissTempFactors();
     }
+    await this.journal?.flush();
     await this.lease?.release();
     this.lease = null;
     if (this.status !== "failed") this.status = "stopped";
     this.stoppedAt ??= new Date().toISOString();
+  }
+
+  /** Saves the progress now and waits for it (shutdown). */
+  async flush(): Promise<void> {
+    this.journal?.save(true);
+    await this.journal?.flush();
   }
 
   get done(): Promise<void> {
@@ -491,10 +531,67 @@ export class FleetManager implements FleetHost {
   }
 
   log(source: string, msg: string): void {
+    this.pushLog(source, msg);
+    this.persist();
+  }
+
+  /** Logs without asking for a save (the journal's own errors). */
+  private pushLog(source: string, msg: string): void {
     const line = { at: new Date().toISOString(), source, msg };
     this.logLines.push(line);
     if (this.logLines.length > LOG_LIMIT) this.logLines.splice(0, this.logLines.length - LOG_LIMIT);
     this.onLog?.(line);
+  }
+
+  persist(now = false): void {
+    this.lastPersist = Date.now();
+    this.journal?.save(now);
+  }
+
+  tripFinished(agent: ShipAgent, trip: TripRecord & { goods: string[]; spentPence: number; rewardPence: number }): void {
+    this.journal?.recordTrip({ shipId: agent.shipId, ship: agent.name, shipClass: agent.shipClass, ...trip });
+  }
+
+  private snapshot(): FleetSnapshot {
+    const agents: Record<string, AgentSnapshot> = {};
+    // A ship gone but not yet retired (that happens at the next scan) still counts in the totals.
+    const retired = { ...this.retired };
+    for (const [id, a] of this.agents) {
+      if (!a.gone) agents[id] = a.snapshot();
+      else for (const k of Object.keys(retired) as (keyof AgentStats)[]) retired[k] += a.stats[k];
+    }
+    // Ships not taken command of yet this run keep what was saved for them.
+    for (const [id, s] of this.restoredAgents) agents[id] ??= s;
+    return {
+      progressSince: this.progressSince ?? new Date().toISOString(),
+      log: this.logLines,
+      purchases: this.purchases,
+      retired,
+      shipSpendPence: this.shipSpendPence,
+      eventCursor: this.eventCursor ?? null,
+      tempFactors: [...this.tempFactors],
+      hullQuotes: [...this.hullQuotes],
+      factorBlockedUntil: this.factorBlockedUntil,
+      factorFails: this.factorFails,
+      pendingBuild: this.pendingBuild,
+      agents,
+      world: this.world.snapshot(),
+    };
+  }
+
+  private restoreFrom(s: FleetSnapshot): void {
+    this.progressSince = s.progressSince;
+    if (s.log?.length) this.logLines = s.log.slice(-LOG_LIMIT);
+    if (s.purchases?.length) this.purchases = s.purchases.slice(-50);
+    if (s.retired) this.retired = { ...this.retired, ...s.retired };
+    this.shipSpendPence = s.shipSpendPence ?? 0;
+    this.eventCursor = s.eventCursor ?? undefined;
+    for (const y of s.tempFactors ?? []) this.tempFactors.add(y);
+    for (const [k, v] of s.hullQuotes ?? []) this.hullQuotes.set(k, v);
+    this.factorBlockedUntil = s.factorBlockedUntil ?? 0;
+    this.factorFails = s.factorFails ?? 0;
+    this.pendingBuild = s.pendingBuild ?? null;
+    this.restoredAgents = new Map(Object.entries(s.agents ?? {}));
   }
 
   fatal(msg: string): void {
@@ -503,6 +600,7 @@ export class FleetManager implements FleetHost {
     this.error = msg;
     this.stoppedAt = new Date().toISOString();
     this.log("fleet", `FATAL: ${msg}`);
+    this.persist(true);
     this.stopRequested = true;
     this.wake?.();
     this.eventsAbort?.abort();
@@ -580,6 +678,20 @@ export class FleetManager implements FleetHost {
       this.lease = got.lease;
     }
 
+    // Pick up the progress saved before a restart (first start of this manager only).
+    let saved: FleetSnapshot | null = null;
+    if (this.leaseDir && !this.journal) {
+      this.journal = openJournal<FleetSnapshot>(this.leaseDir, who.company_id, () => this.snapshot(), (e) =>
+        this.pushLog("fleet", `saving progress failed (${e.message}); retrying with the next change`),
+      );
+      saved = await this.journal.load();
+      if (saved) {
+        this.restoreFrom(saved);
+        // Applied now, so a failed start-up attempt below can't save an empty world over it.
+        if (saved.world) this.world.restore(saved.world);
+      }
+    }
+    this.progressSince ??= new Date().toISOString();
     await this.world.init();
     const profile = await this.client.companyProfile();
     this.homeRegion = this.world.region(profile.company.home_port_id);
@@ -596,8 +708,11 @@ export class FleetManager implements FleetHost {
     this.log(
       "fleet",
       `started for ${profile.company.name}: phase ${this.world.unlockedPhase} open, server clock ${this.world.skewMs >= 0 ? "+" : ""}${Math.round(this.world.skewMs / 1000)}s vs this machine, ` +
-        `${this.world.charters.length} open charters, auto-buy ${this.settings.autoBuy ? "on" : "off"}`,
+        `${this.world.charters.length} open charters, auto-buy ${this.settings.autoBuy ? "on" : "off"}` +
+        `${saved ? `; resumed progress saved for ${this.restoredAgents.size} ship${this.restoredAgents.size === 1 ? "" : "s"}` : ""}`,
     );
+    // A factor hired for a build before the restart is dismissed now, not left drawing salary.
+    if (this.tempFactors.size > 0) await this.dismissTempFactors();
     this.lastWorld = Date.now();
     await this.scanShips();
   }
@@ -620,6 +735,7 @@ export class FleetManager implements FleetHost {
       await this.refreshTopLanes();
     }
     if (now - this.lastScan > SHIP_SCAN_MS) await this.scanShips();
+    if (now - this.lastPersist > PERSIST_MS) this.persist();
     if (now - this.lastBuyCheck > BUY_CHECK_MS) await this.runBuyer(null);
     if (now - this.lastMarqueCheck > MARQUE_CHECK_MS) {
       this.lastMarqueCheck = now;
@@ -664,9 +780,28 @@ export class FleetManager implements FleetHost {
       if (this.stopRequested || this.agents.has(r.ship.id) || r.ship.status === "sunk") continue;
       const agent = new ShipAgent(this, r.ship.id, r.ship.name, r.ship.ship_class);
       agent.last = r;
+      const saved = this.restoredAgents.get(r.ship.id);
+      if (saved) {
+        agent.restore(saved);
+        this.restoredAgents.delete(r.ship.id);
+      }
       this.agents.set(r.ship.id, agent);
       this.log("fleet", `taking command of ${r.ship.name} (${r.ship.ship_class})`);
       agent.start();
+    }
+    // Saved ships that sank or left while we were down: their record moves to the retired totals.
+    for (const [id, s] of [...this.restoredAgents]) {
+      const r = ships.find((x) => x.ship.id === id);
+      if (r && r.ship.status !== "sunk") continue;
+      if (!r) {
+        const misses = (this.missingScans.get(id) ?? 0) + 1;
+        this.missingScans.set(id, misses);
+        if (misses < 2) continue;
+      }
+      for (const k of Object.keys(this.retired) as (keyof AgentStats)[]) this.retired[k] += s.stats?.[k] ?? 0;
+      this.restoredAgents.delete(id);
+      this.missingScans.delete(id);
+      this.log("fleet", `${s.name ?? id} is no longer in the fleet: its record moves to the totals`);
     }
     for (const [id, a] of this.agents) {
       // Missing from the fleet list twice running (seized, lost) counts as gone.
@@ -1386,7 +1521,10 @@ export class FleetManager implements FleetHost {
         // Outcome unknown (network, 5xx): if the hire went through after all, it is ours to dismiss.
         if (!isApiError(e) || e.status >= 500) {
           const now = await this.client.factors().catch(() => [] as string[]);
-          if (now.includes(yard)) this.tempFactors.add(yard);
+          if (now.includes(yard)) {
+            this.tempFactors.add(yard);
+            this.persist(true);
+          }
         }
         return false;
       }
@@ -1396,6 +1534,8 @@ export class FleetManager implements FleetHost {
       return false;
     }
     this.tempFactors.add(yard);
+    // Saved at once: a restart before its dismissal must still know it is ours to dismiss.
+    this.persist(true);
     this.log("fleet", `hired a Resident Factor at ${yard} (${cr(FACTOR_FEE_PENCE)}) to build there; dismissing it after`);
     return true;
   }
@@ -1412,6 +1552,7 @@ export class FleetManager implements FleetHost {
       try {
         await this.client.dismissFactor(yard);
         this.tempFactors.delete(yard);
+        this.persist(true);
         this.log("fleet", `dismissed the factor at ${yard}`);
       } catch (e) {
         if (isApiError(e) && (e.status === 404 || e.status === 409)) this.tempFactors.delete(yard);
@@ -1675,6 +1816,7 @@ export class FleetManager implements FleetHost {
           // Still unknown: don't build again for a full cooldown; adopt the ship if it turns up.
           this.lastBuy = Date.now();
           this.pendingBuild = { name, yard: pick.yard, cls: pick.cls, price, payback: pick.payback, lane: pick.lane.key };
+          this.persist(true);
           this.setBuyer(`building a ${pick.cls} at ${pick.yard}: outcome unknown (${(e as Error).message}); watching for "${name}"`, true);
           return null;
         }

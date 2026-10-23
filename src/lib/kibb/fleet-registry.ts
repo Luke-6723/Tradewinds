@@ -141,6 +141,16 @@ export function fleetRivals(companyId: string) {
   return { sightings: m?.rivalSightings ?? [], report };
 }
 
+/**
+ * Server shutdown: saves every autopilot's progress at once, then gives them up to `graceMs` to
+ * stop cleanly (finish the call in flight, release the lease) before the process exits.
+ */
+export async function shutdownFleets(graceMs: number): Promise<void> {
+  const all = [...fleets.values()];
+  await Promise.allSettled(all.map((m) => m.flush()));
+  await Promise.race([Promise.allSettled(all.map((m) => m.stop())), new Promise((r) => setTimeout(r, graceMs))]);
+}
+
 /** Starts every autopilot left enabled by the previous server. */
 export async function resumeFleets(): Promise<void> {
   for (const f of await listStoredFleets()) {

@@ -5,7 +5,7 @@
  */
 
 import type { KibbClient } from "../client";
-import { RivalTracker } from "../rivals";
+import { RivalTracker, type Sighting } from "../rivals";
 import type {
   BankingRegion,
   Catalog,
@@ -49,6 +49,24 @@ const STALL_MIN_WATCH_GAME_H = 6;
 const TIER_PACE_WINDOW_MS = 2 * 60 * 60 * 1000;
 /** ...and needs at least this much before it is trusted. */
 const TIER_PACE_MIN_MS = 10 * 60 * 1000;
+
+/** What the world model had learned, saved so a restart doesn't start blind. */
+export interface WorldSnapshot {
+  prices: Array<[string, PriceObs]>;
+  expansionWatch: Array<[string, ExpansionWatch]>;
+  escalation: { pay: number; tons: number };
+  tierSamples: Array<{ at: number; delivered: number; phase: number }>;
+  tierTargetPhase: number | null;
+  tierTurnedAt: number | null;
+  repostOf: Array<[string, string]>;
+  lapsedPostings: Array<[string, { id: string; expiresAt: number | null }]>;
+  liveSeen: Array<[string, { c: CharterInfo; seenAt: number }]>;
+  closed: string[];
+  sightings: Sighting[];
+}
+
+/** Ids of closed charters kept in a snapshot (the newest). */
+const SNAPSHOT_CLOSED = 1_000;
 
 /** One expansion charter as the autopilot watches it across its postings. */
 export interface ExpansionWatch {
@@ -221,6 +239,37 @@ export class World {
     await this.refresh();
   }
 
+  snapshot(): WorldSnapshot {
+    return {
+      prices: [...this.prices],
+      expansionWatch: [...this.expansionWatch],
+      escalation: { ...this.escalation },
+      tierSamples: [...this.tierSamples],
+      tierTargetPhase: this.tierTargetPhase,
+      tierTurnedAt: this.tierTurnedAt,
+      repostOf: [...this.repostOf].slice(-SNAPSHOT_CLOSED),
+      lapsedPostings: [...this.lapsedPostings],
+      liveSeen: [...this.liveSeen],
+      closed: [...this.closed].slice(-SNAPSHOT_CLOSED),
+      sightings: this.rivals.all(),
+    };
+  }
+
+  /** Picks up a snapshot from before a restart. Call before the first refresh, so the stall watch carries on (needs no catalog). */
+  restore(s: WorldSnapshot): void {
+    for (const [k, v] of s.prices ?? []) this.prices.set(k, v);
+    for (const [k, v] of s.expansionWatch ?? []) this.expansionWatch.set(k, v);
+    if (s.escalation) this.escalation = { ...s.escalation };
+    this.tierSamples = [...(s.tierSamples ?? [])];
+    this.tierTargetPhase = s.tierTargetPhase ?? null;
+    this.tierTurnedAt = s.tierTurnedAt ?? null;
+    for (const [k, v] of s.repostOf ?? []) this.repostOf.set(k, v);
+    for (const [k, v] of s.lapsedPostings ?? []) this.lapsedPostings.set(k, v);
+    for (const [k, v] of s.liveSeen ?? []) this.liveSeen.set(k, v);
+    for (const id of s.closed ?? []) this.closed.add(id);
+    for (const x of s.sightings ?? []) this.rivals.add(x);
+  }
+
   /** Clock, charters, fees and vaults. */
   async refresh(): Promise<void> {
     const t0 = Date.now();
@@ -325,7 +374,11 @@ export class World {
         this.escalation.pay = Math.min(2, Math.max(1, c.reward_per_ton_pence / prev.rate));
         if (prev.remaining > 0) this.escalation.tons = Math.min(1, Math.max(0.3, c.quantity_remaining / prev.remaining));
       }
-      if (prev && prev.id !== c.contract_id) this.repostOf.set(prev.id, c.contract_id);
+      if (prev && prev.id !== c.contract_id) {
+        this.repostOf.set(prev.id, c.contract_id);
+        // Old links are long lapsed: keep the newest.
+        if (this.repostOf.size > SNAPSHOT_CLOSED) this.repostOf.delete(this.repostOf.keys().next().value!);
+      }
       const postingSeenAt = newPosting ? now : prev.postingSeenAt;
       const postingBase = newPosting ? total : prev.postingBase;
       // Seen from its start (it replaced one we watched), so the base really is the posting's start.

@@ -11,7 +11,7 @@ import { Empty, ErrorNote, Loading, Metrics, NativeSelect, Panel, Table } from "
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash } from "@/lib/kibb/browser";
-import { fmtBps, fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
+import { fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
 import type { FleetSettings, GunPolicy } from "@/lib/kibb/fleet/manager";
@@ -295,7 +295,10 @@ export function FleetPanel() {
                 { label: "Ships bought", value: t.shipsBought, hint: t.shipsBought ? fmtCr(t.shipSpendPence) : undefined },
               ]}
             />
-            <p className="text-muted-foreground text-xs">Since the autopilot started. Cargo bought includes loads still on their way to a charter.</p>
+            <p className="text-muted-foreground text-xs">
+              Since {st?.progressSince ? fmtDateTime(st.progressSince) : "the autopilot started"}, kept across restarts. Cargo bought includes loads still on
+              their way to a charter.
+            </p>
           </div>
         )}
 
@@ -351,7 +354,7 @@ export function FleetPanel() {
           </>
         )}
 
-        {agents.length > 0 && <Efficiency agents={agents} startedAt={st?.startedAt ?? null} stoppedAt={st?.stoppedAt ?? null} />}
+        {agents.length > 0 && <Efficiency agents={agents} startedAt={st?.progressSince ?? st?.startedAt ?? null} stoppedAt={st?.stoppedAt ?? null} />}
 
         {st?.expansion && <ExpansionWatchView x={st.expansion} />}
 
