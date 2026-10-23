@@ -39,6 +39,7 @@ import type { BankingRegion, ShipResult } from "../types";
 import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
 import { openJournal, type Journal } from "./journal";
 import { Advisor, AI_MODES, type AdvisorSnapshot, type AiMode, type AiReport } from "../ai/advisor";
+import { AI_EFFORTS, AI_MODELS, type AiEffort, type AiModel } from "../ai/claude";
 import type { DigestInput, DigestShip } from "../ai/digest";
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
@@ -111,6 +112,12 @@ export interface FleetSettings {
   /** Most the AI may spend on the Claude API in a UTC day, and in total (US dollars). */
   aiDailyCapUsd: number;
   aiTotalCapUsd: number;
+  /** The strategist's model: Claude Opus 5.5 (best) or Claude Sonnet 5.5 (half the price). */
+  aiModel: AiModel;
+  /** How hard it thinks per answer (most of a call's cost): low, medium or high. */
+  aiEffort: AiEffort;
+  /** Minutes between routine calls (halved near a phase turnover); events call sooner. */
+  aiIntervalMin: number;
 }
 
 export type GunPolicy = "auto" | "full" | "off";
@@ -136,8 +143,11 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   holdForRepost: false,
   phaseChestPct: 40,
   ai: "off",
-  aiDailyCapUsd: 10,
+  aiDailyCapUsd: 2,
   aiTotalCapUsd: 180,
+  aiModel: "claude-opus-5-5",
+  aiEffort: "low",
+  aiIntervalMin: 60,
 };
 
 export class FleetSettingsError extends Error {}
@@ -181,6 +191,16 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   }
   num("aiDailyCapUsd", 0);
   num("aiTotalCapUsd", 0);
+  if (patch.aiModel !== undefined) {
+    if (!AI_MODELS.includes(patch.aiModel)) throw new FleetSettingsError(`aiModel must be one of ${AI_MODELS.join(", ")}`);
+    out.aiModel = patch.aiModel;
+  }
+  if (patch.aiEffort !== undefined) {
+    if (!AI_EFFORTS.includes(patch.aiEffort)) throw new FleetSettingsError(`aiEffort must be one of ${AI_EFFORTS.join(", ")}`);
+    out.aiEffort = patch.aiEffort;
+  }
+  num("aiIntervalMin", 15, true);
+  if (out.aiIntervalMin !== undefined && out.aiIntervalMin > 240) throw new FleetSettingsError("aiIntervalMin must be 15 to 240");
   if (patch.guns !== undefined) {
     if (!GUN_POLICIES.includes(patch.guns)) throw new FleetSettingsError(`guns must be one of ${GUN_POLICIES.join(", ")}`);
     out.guns = patch.guns;

@@ -69,8 +69,10 @@ function SettingsForm({
       onSubmit={(e) => {
         e.preventDefault();
         // Send only what changed: a stale copy of another setting (say, marques) must not overwrite it.
+        // The AI interval is typed freely and settled to 15-240 minutes here.
+        const out = { ...d, aiIntervalMin: Math.min(240, Math.max(15, Math.floor(d.aiIntervalMin) || 60)) };
         const patch = Object.fromEntries(
-          Object.entries(d).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(initial[k as keyof FleetSettings])),
+          Object.entries(out).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(initial[k as keyof FleetSettings])),
         ) as Partial<FleetSettings>;
         if (patch.underwrite && !confirm(`Let the autopilot underwrite other companies' voyages, locking up to ${fmtCr(d.underwriteBudgetPence)} of collateral?`)) return;
         onSave(patch);
@@ -137,7 +139,33 @@ function SettingsForm({
         </label>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="space-y-1">
+            <Label>AI model</Label>
+            <NativeSelect value={d.aiModel} onChange={(e) => setD({ ...d, aiModel: e.target.value as FleetSettings["aiModel"] })}>
+              <option value="claude-opus-5-5">Claude Opus 5.5 (best; $4 / $20 per M tokens)</option>
+              <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (half the price; $2 / $10)</option>
+            </NativeSelect>
+          </div>
+          <div className="space-y-1">
+            <Label>AI thinking effort</Label>
+            <NativeSelect value={d.aiEffort} onChange={(e) => setD({ ...d, aiEffort: e.target.value as FleetSettings["aiEffort"] })}>
+              <option value="low">Low (cheapest)</option>
+              <option value="medium">Medium</option>
+              <option value="high">High (dearest)</option>
+            </NativeSelect>
+          </div>
+          <div className="space-y-1">
+            <Label>Minutes between AI calls</Label>
+            <Input
+              type="number"
+              min={15}
+              max={240}
+              step={5}
+              value={d.aiIntervalMin}
+              onChange={(e) => setD({ ...d, aiIntervalMin: Number(e.target.value) })}
+            />
+          </div>
           <div className="space-y-1">
             <Label>AI spend cap per day (US$)</Label>
             <Input type="number" min={0} step="any" value={d.aiDailyCapUsd} onChange={(e) => setD({ ...d, aiDailyCapUsd: Math.max(0, Number(e.target.value) || 0) })} />
@@ -148,7 +176,9 @@ function SettingsForm({
           </div>
         </div>
         <p className="text-muted-foreground text-xs">
-          The AI (Claude) is switched on and off on the panel itself. A call is skipped when its worst case could pass either cap.
+          The AI (Claude) is switched on and off on the panel itself. Thinking is most of a call&apos;s cost, so effort matters more than the
+          model; calls come half as far apart near a phase turnover, events call sooner, and a routine call is skipped when nothing important
+          changed. A call is skipped when its worst case could pass either cap.
         </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -656,7 +686,9 @@ function AiPanel({
         ? "ANTHROPIC_API_KEY isn't set in .env.local: no calls are made."
         : r.running
           ? "Thinking…"
-          : `${!running ? "Paused while the autopilot is stopped. " : ""}${r.demoted ? "Demoted to shadow by its own record. " : ""}${r.lastRunAt ? `Last call ${fmtTime(r.lastRunAt)}` : "No call yet"}${running && r.nextRunAt ? `, next ${fmtIn(r.nextRunAt)}` : ""}.`;
+          : `${!running ? "Paused while the autopilot is stopped. " : ""}${r.demoted ? "Demoted to shadow by its own record. " : ""}${r.model}, ${r.effort} effort, every ${r.intervalMin} min. ` +
+            `${r.lastRunAt ? `Last call ${fmtTime(r.lastRunAt)}` : "No call yet"}${running && r.nextRunAt ? `, next ${fmtIn(r.nextRunAt)}` : ""}` +
+            `${r.skipped ? ` (${r.skipped} quiet call${r.skipped === 1 ? "" : "s"} skipped)` : ""}.`;
   return (
     <div className="space-y-3 rounded-lg border p-3 sm:p-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -704,7 +736,7 @@ function AiPanel({
           <Metrics
             className="sm:grid-cols-4 xl:grid-cols-4"
             items={[
-              { label: "Spent today", value: usd(r.spend.today), hint: `cap ${usd(caps.daily)}` },
+              { label: "Spent today", value: usd(r.spend.today), hint: `cap ${usd(caps.daily)}${r.avgCostUsd !== null ? ` · ~${usd(r.avgCostUsd)} a call` : ""}` },
               { label: "Spent in total", value: usd(r.spend.total), hint: `cap ${usd(caps.total)}` },
               {
                 label: "Trips under its advice",

@@ -20,7 +20,7 @@ import type { FleetSettings } from "../fleet/manager";
 import type { Lane } from "../fleet/planner";
 import type { World } from "../fleet/world";
 import { mongoDb } from "../mongo";
-import { callStructured, ClaudeCallError, claudeConfigured, describeError, notBilled, STRATEGIST_MODEL, worstCaseUsd } from "./claude";
+import { AI_MODEL_NAMES, callStructured, ClaudeCallError, claudeConfigured, describeError, notBilled, worstCaseUsd, type AiEffort } from "./claude";
 import {
   ADVICE_SCHEMA,
   BIAS_MAX,
@@ -41,9 +41,12 @@ import { screenEvents, type RawEvent, type ScreenedEvent } from "./screen";
 export type AiMode = "off" | "shadow" | "live";
 export const AI_MODES: AiMode[] = ["off", "shadow", "live"];
 
-/** Routine cadence, and near a phase turnover. */
-const ROUTINE_MS = 30 * 60_000;
-const ROUTINE_SOON_MS = 15 * 60_000;
+/** Near a phase turnover the routine cadence (a setting) is halved, down to this. */
+const ROUTINE_MIN_MS = 15 * 60_000;
+/** A quiet stretch: at most this many routine calls in a row are skipped for an unchanged picture. */
+const MAX_SKIPS = 3;
+/** The system prompt is cached (one hour) only when calls come often enough to hit it. */
+const CACHE_WHEN_UNDER_MS = 50 * 60_000;
 /** Soonest a triggered call follows the last one, and the most calls in any hour. */
 const MIN_GAP_MS = 5 * 60_000;
 const MAX_PER_HOUR = 4;
@@ -51,7 +54,8 @@ const MAX_PER_HOUR = 4;
 const STALE_MS = 10 * 60_000;
 /** More than this share of an answer's items invalid: the whole answer is discarded. */
 const MAX_INVALID = 0.3;
-const MAX_TOKENS = 16_000;
+/** Room for the answer (thinking included) by effort: thinking is most of a call's cost. */
+const MAX_TOKENS: Record<AiEffort, number> = { low: 6_000, medium: 10_000, high: 16_000 };
 /** Idle tripwire: this share of the fleet idle under live directives for this long clears them. */
 const TRIPWIRE_IDLE = 0.5;
 const TRIPWIRE_MS = 20 * 60_000;
@@ -134,6 +138,13 @@ export interface AiReport {
   nextRunAt: string | null;
   lastError: string | null;
   spend: { day: string; today: number; total: number; dailyCap: number; totalCap: number };
+  /** What runs it: model name, effort, minutes between routine calls; the average cost of its answers. */
+  model: string;
+  effort: AiEffort;
+  intervalMin: number;
+  avgCostUsd: number | null;
+  /** Routine calls skipped because nothing important changed since the last answer. */
+  skipped: number;
   active: {
     decisionId: string;
     until: string;
@@ -199,6 +210,10 @@ export class Advisor {
   private lastMode: AiMode = "off";
   /** Set once the autopilot stops: nothing in flight may apply, log or save after that. */
   private stopped = false;
+  /** The picture the last answer was given (see fingerprint), and routine calls skipped since. */
+  private lastPrint: string | null = null;
+  private skips = 0;
+  private skippedTotal = 0;
   private abort = new AbortController();
   private readonly inflight = new Set<Promise<void>>();
 
@@ -226,6 +241,12 @@ export class Advisor {
       this.host.persist(true);
     }
     if (next.ai !== "off" && prev.ai === "off") this.nextRunAt = 0;
+    // A new mode gets a fresh look, not a skipped one.
+    if (next.ai !== prev.ai) {
+      this.lastPrint = null;
+      this.skips = 0;
+    }
+    if (next.aiIntervalMin !== prev.aiIntervalMin && this.lastRunAt) this.nextRunAt = this.lastRunAt + next.aiIntervalMin * 60_000;
     if (next.ai !== "live" && this.active) this.clear("cleared", `AI switched to ${next.ai}`);
     // The user changed a setting the AI had overridden: theirs wins for the rest of this advice.
     const a = this.active;
@@ -372,10 +393,12 @@ export class Advisor {
       return;
     }
     if (cmd === "retry") {
-      // After a demotion: back to live with a clean record.
+      // After a demotion: back to live with a clean record and a fresh look.
       this.demoted = false;
       this.aiTrips = [];
       this.nextRunAt = 0;
+      this.lastPrint = null;
+      this.skips = 0;
       this.host.persist(true);
       return;
     }
@@ -434,7 +457,30 @@ export class Advisor {
 
   private cadence(): number {
     const w = this.host.world;
-    return w.tierTargetPhase !== null && (w.tierProgressBps >= 9_000 || (w.tierEtaMs !== null && w.tierEtaMs < 2 * 60 * 60_000)) ? ROUTINE_SOON_MS : ROUTINE_MS;
+    const every = this.host.userSettings().aiIntervalMin * 60_000;
+    const soon = w.tierTargetPhase !== null && (w.tierProgressBps >= 9_000 || (w.tierEtaMs !== null && w.tierEtaMs < 2 * 60 * 60_000));
+    return soon ? Math.max(ROUTINE_MIN_MS, every / 2) : every;
+  }
+
+  /**
+   * The parts of the picture worth a fresh answer: the phase and tier (in 10% steps), which
+   * charters are stalled, where each ship is and on what lane, the best lanes, spare cash (by
+   * doubling), the newest notice, the mode, the user's settings it may move, and the advice in
+   * force. Unchanged, a routine call has nothing new to say.
+   */
+  private fingerprint(d: DigestInput, activeId: string | null): string {
+    const u = d.user;
+    return JSON.stringify([
+      this.effective,
+      [u.bonusWeightPct, u.phaseChestPct, u.minMarginPence, u.holdForRepost],
+      d.phase,
+      d.tier ? [Math.floor(d.tier.progressBps / 1_000), d.tier.phaseSoon, d.tier.charters.filter((c) => c.stalled).map((c) => c.id).sort()] : null,
+      d.ships.map((s) => [s.state, s.status === "sailing" ? s.dest : s.port, s.lane?.key ?? null]),
+      d.topLanes.slice(0, 5).map((l) => l.key),
+      Math.floor(Math.log2(Math.max(1, d.cash.spare / 100_000))),
+      d.events.at(-1)?.at ?? null,
+      activeId,
+    ]);
   }
 
   private addSpend(usd: number): void {
@@ -491,9 +537,8 @@ export class Advisor {
   private async run(trigger: string): Promise<void> {
     this.running = true;
     this.pending = null;
-    this.lastRunAt = Date.now();
-    this.calls.push(this.lastRunAt);
-    this.nextRunAt = this.lastRunAt + this.cadence();
+    const startedAt = Date.now();
+    this.nextRunAt = startedAt + this.cadence();
     // The worst case is counted (and saved) before the call goes out and settled to the real cost
     // after, so a restart, a cancel or a lost reply never lets spend slip past the caps.
     let reserved = 0;
@@ -511,9 +556,22 @@ export class Advisor {
           outcome: d.mode === "live" ? `${d.trips} trips under it, ${cr(d.profitPence)} profit` : "shadow (not applied)",
         })),
       };
+      // A quiet stretch: nothing important changed since the last answer, so a routine call is
+      // skipped (a few in a row at most, so slow drifts still get a look).
+      const print = this.fingerprint(input, this.active?.decisionId ?? null);
+      if (trigger === "routine" && print === this.lastPrint && this.skips < MAX_SKIPS) {
+        this.skips++;
+        this.skippedTotal++;
+        return;
+      }
+      this.lastRunAt = startedAt;
+      this.calls.push(startedAt);
+      const settings = this.host.userSettings();
+      const model = settings.aiModel;
+      const maxTokens = MAX_TOKENS[settings.aiEffort];
       const { text, aliases } = buildDigest(input);
       const system = systemPrompt(world.catalog);
-      const worst = worstCaseUsd(STRATEGIST_MODEL, system.length + text.length, MAX_TOKENS);
+      const worst = worstCaseUsd(model, system.length + text.length, maxTokens);
       const capped = this.capRoom(worst);
       if (capped) {
         this.lastError = `skipped: ${capped}`;
@@ -526,19 +584,24 @@ export class Advisor {
       reservedDay = this.spend.day;
       this.host.persist(true);
       const res = await callStructured({
-        model: STRATEGIST_MODEL,
+        model,
         system,
-        cacheSystem: true,
+        // Cached only when the next call should come within the hour the cache lives.
+        cacheSystem: this.cadence() <= CACHE_WHEN_UNDER_MS,
         user: text,
         schema: ADVICE_SCHEMA,
-        effort: "medium",
-        maxTokens: MAX_TOKENS,
+        effort: settings.aiEffort,
+        maxTokens,
         signal: this.abort.signal,
       });
       this.settle(res.costUsd - reserved, reservedDay);
       reserved = 0;
+      this.skips = 0;
       if (this.stopped) return;
       const d = this.apply(res.json as RawAdvice, aliases, { trigger, builtAt, phase, model: res.model, costUsd: res.costUsd });
+      // The picture as this answer left it (its own advice now in force); a discarded answer
+      // doesn't count as having seen it.
+      this.lastPrint = d.status === "discarded" ? null : this.fingerprint(input, this.active?.decisionId ?? null);
       this.lastError = null;
       void this.record(d, res.usage, text.length);
     } catch (e) {
@@ -739,6 +802,11 @@ export class Advisor {
       nextRunAt: this.effective !== "off" && this.nextRunAt ? new Date(Math.max(this.nextRunAt, Date.now())).toISOString() : null,
       lastError: this.lastError,
       spend: { ...this.spend, dailyCap: s.aiDailyCapUsd, totalCap: s.aiTotalCapUsd },
+      model: AI_MODEL_NAMES[s.aiModel] ?? s.aiModel,
+      effort: s.aiEffort,
+      intervalMin: s.aiIntervalMin,
+      avgCostUsd: mean(this.decisions.map((d) => d.costUsd)),
+      skipped: this.skippedTotal,
       active: a
         ? {
             decisionId: a.decisionId,
@@ -788,7 +856,7 @@ export class Advisor {
     this.events = (s.events ?? []).slice(-EVENTS_KEPT);
     this.lastRunAt = s.lastRunAt ?? 0;
     // After a restart the next routine call is due a cadence after the last one.
-    this.nextRunAt = this.lastRunAt ? this.lastRunAt + ROUTINE_MS : 0;
+    this.nextRunAt = this.lastRunAt ? this.lastRunAt + this.host.userSettings().aiIntervalMin * 60_000 : 0;
     this.lastMode = this.mode;
   }
 }

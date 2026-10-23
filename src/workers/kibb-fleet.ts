@@ -18,7 +18,10 @@
  *   KIBB_HOLD_REPOST=1    hold cargo for a stalled expansion charter's richer re-post
  *   KIBB_PHASE_CHEST      % of spare cash the buyer keeps back when the tier nears completion (default 40)
  *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY
- *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 10)
+ *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 2)
+ *   KIBB_AI_MODEL         claude-opus-5-5 (default) | claude-sonnet-5-5
+ *   KIBB_AI_EFFORT        low (default) | medium | high
+ *   KIBB_AI_INTERVAL_MIN  minutes between routine AI calls (default 60)
  *   KIBB_AI_TOTAL_USD     AI spend cap in total in US$ (default 180)
  *
  * Run: pnpm exec tsx --env-file=.env.local src/workers/kibb-fleet.ts
@@ -50,6 +53,9 @@ try {
       ai: env.KIBB_AI ? (env.KIBB_AI as FleetSettings["ai"]) : undefined,
       aiDailyCapUsd: env.KIBB_AI_DAILY_USD ? Number(env.KIBB_AI_DAILY_USD) : undefined,
       aiTotalCapUsd: env.KIBB_AI_TOTAL_USD ? Number(env.KIBB_AI_TOTAL_USD) : undefined,
+      aiModel: env.KIBB_AI_MODEL ? (env.KIBB_AI_MODEL as FleetSettings["aiModel"]) : undefined,
+      aiEffort: env.KIBB_AI_EFFORT ? (env.KIBB_AI_EFFORT as FleetSettings["aiEffort"]) : undefined,
+      aiIntervalMin: env.KIBB_AI_INTERVAL_MIN ? Number(env.KIBB_AI_INTERVAL_MIN) : undefined,
     }),
   };
 } catch (e) {

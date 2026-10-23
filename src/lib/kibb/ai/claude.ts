@@ -5,15 +5,23 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 
-/** The strategist (default model) and the free-text screen. */
-export const STRATEGIST_MODEL = "claude-opus-5-5";
+/** Models the strategist may run on (a setting), and the free-text screen. */
+export const AI_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5"] as const;
+export type AiModel = (typeof AI_MODELS)[number];
+export const AI_MODEL_NAMES: Record<AiModel, string> = { "claude-opus-5-5": "Claude Opus 5.5", "claude-sonnet-5-5": "Claude Sonnet 5.5" };
+export const AI_EFFORTS = ["low", "medium", "high"] as const;
+export type AiEffort = (typeof AI_EFFORTS)[number];
 export const SCREEN_MODEL = "claude-haiku-5-5";
+/** Models whose requests carry server-side fallbacks ("default"): a declined request is retried on another model. */
+const WITH_FALLBACKS = new Set<string>(AI_MODELS);
 
 /** Dollars per million tokens: input, output, cache read. A one-hour cache write costs 2x input. */
 const PRICES: Record<string, { input: number; output: number; cacheRead: number }> = {
   "claude-opus-5-5": { input: 4, output: 20, cacheRead: 0.2 },
   "claude-opus-5": { input: 5, output: 25, cacheRead: 0.5 },
   "claude-opus-4-8": { input: 5, output: 25, cacheRead: 0.5 },
+  "claude-sonnet-5-5": { input: 2, output: 10, cacheRead: 0.2 },
+  "claude-sonnet-5": { input: 2, output: 10, cacheRead: 0.2 },
   "claude-haiku-5-5": { input: 0.1, output: 0.5, cacheRead: 0.01 },
 };
 /** Unknown models (a fallback we didn't list) are priced like the dearest listed. */
@@ -46,13 +54,13 @@ export function costUsd(model: string, u: CallUsage): number {
 
 /**
  * The most a call can cost: every prompt token written to the cache and every output token used,
- * and for Opus (server-side fallbacks) a second full attempt on the fallback model.
+ * and with server-side fallbacks a second full attempt on the fallback model.
  */
 export function worstCaseUsd(model: string, promptChars: number, maxTokens: number): number {
   // ~3 characters a token for this mixed text and JSON: errs high.
   const one = (p: { input: number; output: number }) => ((promptChars / 3) * p.input * CACHE_WRITE_1H + maxTokens * p.output) / 1e6;
   const p = PRICES[model] ?? PRICE_FALLBACK;
-  return one(p) + (model.startsWith("claude-opus") ? one(PRICE_FALLBACK) : 0);
+  return one(p) + (WITH_FALLBACKS.has(model) ? one(PRICE_FALLBACK) : 0);
 }
 
 export class ClaudeCallError extends Error {
@@ -88,9 +96,9 @@ export interface StructuredResult {
 }
 
 /**
- * One request whose answer is JSON matching `schema` (structured outputs). Opus calls go through
- * the beta endpoint with server-side fallbacks ("default"), so a safety decline is retried on the
- * model Anthropic recommends instead of failing. Throws ClaudeCallError on a refusal, a truncated
+ * One request whose answer is JSON matching `schema` (structured outputs). Strategist calls carry
+ * server-side fallbacks ("default"), so a safety decline is retried on the model Anthropic
+ * recommends instead of failing. Throws ClaudeCallError on a refusal, a truncated
  * reply or unparseable JSON, carrying what the call cost.
  */
 export async function callStructured(c: StructuredCall): Promise<StructuredResult> {
@@ -99,7 +107,7 @@ export async function callStructured(c: StructuredCall): Promise<StructuredResul
       ? { type: "text" as const, text: c.system, cache_control: { type: "ephemeral" as const, ttl: "1h" as const } }
       : { type: "text" as const, text: c.system },
   ];
-  const opus = c.model.startsWith("claude-opus");
+  const fallbacks = WITH_FALLBACKS.has(c.model);
   // Streamed, so a long answer isn't cut off by an HTTP timeout; never retried behind our back
   // (an abandoned attempt may still be billed), except for the cheap screen.
   const res = await client()
@@ -107,12 +115,12 @@ export async function callStructured(c: StructuredCall): Promise<StructuredResul
       {
         model: c.model,
         max_tokens: c.maxTokens,
-        ...(opus ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const } : {}),
+        ...(fallbacks ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const } : {}),
         output_config: { effort: c.effort, format: { type: "json_schema", schema: c.schema } },
         system,
         messages: [{ role: "user", content: c.user }],
       },
-      { signal: c.signal, maxRetries: opus ? 0 : 2 },
+      { signal: c.signal, maxRetries: fallbacks ? 0 : 2 },
     )
     .finalMessage();
   const usage: CallUsage = {
