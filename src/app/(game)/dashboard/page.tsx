@@ -7,6 +7,7 @@ import {
   Empty,
   ErrorNote,
   Loading,
+  PageHeader,
   Panel,
   Progress,
   ShipStatusBadge,
@@ -37,7 +38,7 @@ function ShipsPanel({ ships }: { ships: ShipResult[] | undefined }) {
       ) : ships.length === 0 ? (
         <Empty>No ships.</Empty>
       ) : (
-        <div className="space-y-4">
+        <div className="space-y-3">
           {ships.map((r) => {
             const s = r.ship;
             const dest = r.route_legs.at(-1)?.to_node;
@@ -45,11 +46,11 @@ function ShipsPanel({ ships }: { ships: ShipResult[] | undefined }) {
             return (
               <Link key={s.id} href={`/fleet/${s.id}`} className="block rounded-lg border p-3 transition-colors hover:bg-accent/50">
                 <div className="flex items-center gap-2">
-                  <ShipIcon className="size-4 text-muted-foreground" />
-                  <span className="font-medium">{s.name}</span>
-                  <span className="text-muted-foreground text-xs">{shipClassName(s.ship_class)} · {s.cannons_count} guns</span>
-                  <span className="ml-auto"><ShipStatusBadge status={s.status} /></span>
+                  <ShipIcon className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="truncate font-medium">{s.name}</span>
+                  <span className="ml-auto shrink-0"><ShipStatusBadge status={s.status} /></span>
                 </div>
+                <div className="mt-0.5 text-muted-foreground text-xs">{shipClassName(s.ship_class)} · {s.cannons_count} guns</div>
                 <div className="mt-2 text-sm">
                   {s.status === "sailing"
                     ? `→ ${portName(dest)}, arrives ${fmtIn(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at)}`
@@ -121,7 +122,7 @@ function ChartersPanel({ expansion, charters }: { expansion: ExpansionStatus | u
         <div className="space-y-5">
           {tier ? (
             <div className="space-y-2">
-              <div className="flex items-baseline justify-between text-sm">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 text-sm">
                 <span className="font-medium">Phase {tier.target_phase}: {tier.title}</span>
                 <span className="text-muted-foreground text-xs">bonus {fmtCr(tier.completion_bonus_pence)} split by tons</span>
               </div>
@@ -190,13 +191,15 @@ export default function DashboardPage() {
   const tier = expansion?.current_tier;
 
   return (
-    <div className="space-y-6 pb-8">
-      <div>
-        <h1 className="font-bold text-2xl tracking-tight">{profile?.company.name ?? "Dashboard"}</h1>
-        <p className="mt-0.5 text-muted-foreground text-sm">
-          {profile ? `${profile.company.crown_prestige.toLocaleString()} Crown prestige · founded ${new Date(profile.company.created_at).toLocaleDateString("en-GB")}` : " "}
-        </p>
-      </div>
+    <div className="space-y-5 pb-8 sm:space-y-6">
+      <PageHeader
+        title={profile?.company.name ?? "Dashboard"}
+        subtitle={
+          profile
+            ? `${profile.company.crown_prestige.toLocaleString()} Crown prestige · founded ${new Date(profile.company.created_at).toLocaleDateString("en-GB")}`
+            : undefined
+        }
+      />
 
       <ErrorNote error={profileError} />
 
@@ -222,16 +225,16 @@ export default function DashboardPage() {
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-3">
-        <div className="xl:col-span-2">
-          <FleetPanel />
-        </div>
-        <VaultsPanel profile={profile} />
-      </div>
+      <FleetPanel />
 
-      <div className="grid gap-4 xl:grid-cols-2">
-        <ShipsPanel ships={ships} />
-        <ChartersPanel expansion={expansion} charters={charters} />
+      <div className="grid items-start gap-4 lg:grid-cols-3">
+        <div className="space-y-4">
+          <VaultsPanel profile={profile} />
+          <ShipsPanel ships={ships} />
+        </div>
+        <div className="min-w-0 lg:col-span-2">
+          <ChartersPanel expansion={expansion} charters={charters} />
+        </div>
       </div>
     </div>
   );

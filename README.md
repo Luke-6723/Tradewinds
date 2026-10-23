@@ -34,10 +34,11 @@ Open [http://localhost:3000](http://localhost:3000), register or sign in, then f
 
 Runs inside the Next.js server; start and stop it from the dashboard. It puts every ship under its own agent and keeps them busy:
 
-- **Lanes.** A planner scores every open charter × every port that makes the good, per hull: margin after customs, remittance fees and the price impact of what other ships are already bound to buy, divided by the whole loop's time (deadhead, berth locks, laden passage, return). Each ship takes the best lane still free; reservations spread ships across charters and sources.
-- **Sailing.** Buys up to the charter's break-even price, keeps stores at the route's safe figure, refuses water the hull isn't rated for (lane *and* sea-zone class), delivers from the roadstead when the per-ton berth lock would cost more than waiting out the base lock, and times everything on the server's clock.
+- **Lanes.** A planner scores every open charter × every port that makes the good, per hull: margin after customs, remittance fees, the price impact of what other ships are already bound to buy and the cargo pirates are expected to take on the way (live zone piracy from `/v1/world/zones`, net of letters of marque, patrols and the ship's guns), divided by the whole loop's time (deadhead, berth locks, laden passage, return). Each ship takes the best lane still free; reservations spread ships across charters and sources.
+- **Events.** It long-polls the company's event log: a ship's agent wakes the moment it arrives, is berthed from the queue, is evicted or hit by a hazard, and a posted, filled or expired charter refreshes the world within seconds so idle ships re-plan at once. Timers remain the fallback if the feed drops.
+- **Sailing.** Buys up to the charter's break-even price, keeps stores at the route's safe figure, refuses water the hull isn't rated for (lane *and* sea-zone class), delivers from the roadstead when the per-ton berth lock would cost more than waiting out the base lock (several charters in one batch call), and times everything on the server's clock.
 - **Freight.** Picks up Merchant Adventurers freight on legs it sails anyway when the reward beats the berth time it costs.
-- **Cash.** Buying is paid from the port's banking region; it remits from other regions on demand and always keeps the reserve in the home region.
+- **Cash.** Buying is paid from the port's banking region; it remits from other regions on demand and always keeps the reserve in the home region. A ship waiting for cash tries again as soon as another delivery pays.
 - **Buying ships.** Whenever a ship calls at a shipyard it quotes every allowed class, scores each by payback hours on its best lane net of the extra fleet upkeep, builds the quickest payback within your limit and arms it. New ships are named after random Discord bots from the [TopStats](https://topstats.gg) API (set `TOPSTATS_API_KEY`), or a bundled list without a key.
 
 Settings (cash reserve, minimum margin, max ships, max payback, allowed classes, arming, freight) apply live. The home-region reserve never drops below 1.5 game days of fleet upkeep, whatever the setting, and every other region keeps 200 Cr for dues and stores. The enabled flag persists, so a running autopilot resumes when the server restarts. A lease file in `.kibb/` stops a second process (another server or the CLI) from running the same company. Don't give manual orders to ships while it runs.
@@ -52,17 +53,29 @@ with `KIBB_API_KEY` (a company-bound key) in `.env.local`. See the header of [sr
 
 ## Pages
 
+Every page works on a phone: below 1024 px the sidebar becomes a drawer behind the header's menu button, panels stack, filters wrap and wide tables scroll sideways.
+
 | Route | Description |
 |---|---|
 | `/login`, `/register` | Player sign-in and registration |
 | `/companies` | Pick or found a company |
 | `/dashboard` | Cash, fleet, phase-2 progress, leaderboard; fleet autopilot controls, per-ship lanes, purchases and log; ships, vaults, charters |
 | `/map` | Live map: ships placed along their routes, sea lanes, ports, piracy per sea zone |
-| `/fleet` | All ships: status, position, cargo, stores |
-| `/fleet/[shipId]` | Ship detail; dock, move to the roadstead, depart with a route and stores check |
-| `/market` | Order books for ports you have presence at; IOC buy/sell into a berthed ship |
-| `/ports` | Every port: what it makes and imports, customs |
-| `/ports/[id]` | Port detail: berths, dues, local contracts, book, coffee-house gossip, recent sailings |
+| `/events` | Live company event feed (long poll) and the world events history |
+| `/fleet` | All ships; shipyard quotes and builds (turnkey or own materials), names from TopStats |
+| `/fleet/[shipId]` | Ship detail: dock/roadstead, depart with route and stores check, stores in/out, guns, warehouse load/unload, charters and freight here, insurance, convoys |
+| `/convoys` | Convoys: organise, join (as escort), leave; approve, reject, kick, invite |
+| `/market` | Order books; IOC or GTC orders (ship or warehouse), resting orders and cancels, fills, batch orders |
+| `/contracts` | Charters (deliver, batch deliver), freight (accept, batch accept, deliver, issue your own) |
+| `/warehouses` | Leases, inventories, load and unload ships |
+| `/treasury` | Vaults and escrow, ACH rates, remittances, ledger |
+| `/insurance` | Your policies, slices you underwrite, the open market; insure a voyage, underwrite (batch) |
+| `/futures` | Hub futures: create (batch), accept (batch), settle |
+| `/ports`, `/ports/[id]` | Every port with filters and your presence; berths, dues, book, gossip, sailings, factor hire, lease, port events |
+| `/zones` | Live piracy per sea zone; sponsor letters of marque or fund naval patrols; yours with prize money |
+| `/leaderboard` | Season leaderboard (your rank), hall of fame, company lookup, expansion progress |
+| `/company` | Profile, auto-remit settings, Resident Factors, bankruptcy |
+| `/account` | Your API keys (revoke one or all) and passphrase change |
 
 ## Project Structure
 
@@ -70,7 +83,7 @@ with `KIBB_API_KEY` (a company-bound key) in `.env.local`. See the header of [sr
 src/
 ├── app/
 │   ├── (auth)/              # Sign-in, register, company picker
-│   ├── (game)/              # Dashboard, fleet, market, ports
+│   ├── (game)/              # Every game page (see Pages)
 │   └── api/kibb/            # Session routes, autopilot control, and /v1 proxy to the game API
 ├── components/kibb/         # Shared panels, tables, badges
 ├── instrumentation.ts       # Resumes enabled autopilots on server start
@@ -79,11 +92,12 @@ src/
 │   ├── fleet/               # Autopilot: world model, lane planner, ship agents, manager, ship names
 │   ├── fleet-registry.ts    # In-process autopilots, one per company
 │   ├── store.ts             # .kibb/store.json
-│   └── types.ts             # API types
+│   ├── schema.ts            # Every API schema, generated: node scripts/gen-kibb-schema.mjs
+│   └── types.ts             # Hand-written API types used by the autopilot
 └── workers/kibb-fleet.ts    # CLI for the autopilot
 ```
 
-The browser never sees a company key: `/api/kibb/v1/*` forwards to the game with the active company's stored key, and refuses key management, company founding and bankruptcy. It, and the autopilot route, act only for a signed-in player who owns the selected company (checked against the game, cached for 5 minutes); the company cookie alone does nothing.
+The browser never sees a company key: `/api/kibb/v1/*` forwards to the game with the active company's stored key, and refuses key management, company founding and bankruptcy. Those go through dedicated routes: account actions use the signed-in player's key, changing company settings mints a two-minute `account_manage` key and revokes it straight after, and bankruptcy needs the company's name typed back and stops the autopilot first. Passphrases are passed through, never stored. It, and the autopilot route, act only for a signed-in player who owns the selected company (checked against the game, cached for 5 minutes); the company cookie alone does nothing.
 
 ## Scripts
 

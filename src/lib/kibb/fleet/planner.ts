@@ -8,7 +8,8 @@
  * other ships are already bound to buy at S.
  *
  * Only live charters are planned for: gossip copies may already be filled. A load only draws on
- * charters whose own pay clears the landed cost by the minimum margin.
+ * charters whose own pay clears the landed cost by the minimum margin. The landed cost includes the
+ * cargo expected to be lost to pirates on the laden passage (live zone piracy, net of our guns).
  */
 
 import type { ZoneClass } from "../types";
@@ -21,6 +22,7 @@ export interface ShipSpec {
   knots: number;
   /** Cargo room once guns, stores and sealed freight are aboard. */
   cap: number;
+  guns: number;
 }
 
 export interface Lane {
@@ -36,8 +38,10 @@ export interface Lane {
   minPay: number;
   estAsk: number;
   askKnown: boolean;
-  /** Landed cost per ton: ask + customs + remittance fee. */
+  /** Landed cost per ton: ask + customs + remittance fee + expected piracy loss. */
   costPerTon: number;
+  /** Expected share of the load lost to pirates on the laden passage (bps). */
+  piracyBps: number;
   margin: number;
   tons: number;
   loopMs: number;
@@ -101,7 +105,8 @@ export async function rankLanes(
 
       const reserved = res.sourceTons.get(`${source}|${good}`) ?? 0;
       const fee = world.remitBps(world.region(dest), world.region(source));
-      const landed = (ask: number) => ask * (1 + world.customsBps(source) / 10_000) * (1 + fee / 10_000);
+      const piracy = world.piracyLoss(out, ship.guns, ship.knots * 0.8);
+      const landed = (ask: number) => (ask * (1 + world.customsBps(source) / 10_000) * (1 + fee / 10_000)) / (1 - piracy);
 
       // Arrival auto-berths: one base lock at the source, extended per ton handled.
       const deadMs = dead ? world.sailMs(dead.total_distance_nm, ship.knots) : 0;
@@ -155,10 +160,12 @@ export async function rankLanes(
         estAsk: Math.round(ask),
         askKnown: est.known,
         costPerTon: Math.round(costPerTon),
+        piracyBps: Math.round(piracy * 10_000),
         margin: Math.round(margin),
         tons,
         loopMs,
-        profitPerHour: Math.round((tons * margin * 3_600_000) / loopMs),
+        // Margin is per ton delivered; pirates are expected to take `piracy` of the tons bought.
+        profitPerHour: Math.round((tons * (1 - piracy) * margin * 3_600_000) / loopMs),
       });
     }
   }

@@ -51,3 +51,17 @@ export function fmtTime(iso: string | null | undefined): string {
 export function titleCase(id: string): string {
   return id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
+
+/** "23 Oct, 14:05:12" (local time). */
+export function fmtDateTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** Game hours as "2d 6h" / "14h" (1 game day = 24 game hours). */
+export function fmtGameHours(hours: number | null | undefined): string {
+  if (hours === null || hours === undefined) return "—";
+  const d = Math.floor(hours / 24);
+  const h = Math.round(hours % 24);
+  return d ? `${d}d${h ? ` ${h}h` : ""} game` : `${h}h game`;
+}

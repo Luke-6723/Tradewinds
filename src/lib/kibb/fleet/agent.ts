@@ -16,7 +16,7 @@
  */
 
 import { isApiError, KibbApiError, type KibbClient } from "../client";
-import type { BankingRegion, ContractListing, OrderBookLevel, RoutePlan, ShipResult } from "../types";
+import type { BankingRegion, ContractListing, DeliverCharterResult, OrderBookLevel, RoutePlan, ShipResult } from "../types";
 import type { FleetSettings } from "./manager";
 import type { Lane } from "./planner";
 import type { World } from "./world";
@@ -59,6 +59,8 @@ export interface FleetHost {
   /** Guns a ship should carry (set for ships the buyer built), or undefined. */
   armTarget(shipId: string): number | undefined;
   noteArmed(shipId: string, guns: number, costPence: number): void;
+  /** Money landed in a region (a delivery paid): ships waiting for cash can try again. */
+  cashArrived(): void;
 }
 
 export interface AgentStats {
@@ -136,6 +138,8 @@ export class ShipAgent {
   private holds = 0;
   private stopRequested = false;
   private wake: (() => void) | null = null;
+  /** An event arrived mid-tick: skip the next sleep. */
+  private nudged = false;
   private loop: Promise<void> | null = null;
   private nextTickAt: number | null = null;
 
@@ -198,6 +202,17 @@ export class ShipAgent {
     return this.activity.startsWith("waiting for cash");
   }
 
+  /** True while idle because no lane pays. */
+  get idle(): boolean {
+    return this.activity.startsWith("no lane pays");
+  }
+
+  /** Something happened to this ship (an event, or cash for it): tick now instead of on the timer. */
+  nudge(): void {
+    if (this.wake) this.wake();
+    else if (this.loop) this.nudged = true;
+  }
+
   isAvoided(laneKey: string): boolean {
     const until = this.avoid.get(laneKey);
     return until !== undefined && until > this.host.world.now();
@@ -245,6 +260,10 @@ export class ShipAgent {
 
   private sleep(ms: number): Promise<void> {
     if (this.stopRequested) return Promise.resolve();
+    if (this.nudged) {
+      this.nudged = false;
+      return Promise.resolve();
+    }
     this.nextTickAt = Date.now() + ms;
     return new Promise((resolve) => {
       const timer = setTimeout(done, ms);
@@ -385,6 +404,7 @@ export class ShipAgent {
       estAsk: 0,
       askKnown: false,
       costPerTon: 0,
+      piracyBps: 0,
       margin: 0,
       tons,
       loopMs: 0,
@@ -415,6 +435,10 @@ export class ShipAgent {
     let refusedHere = false;
     let freightChanged = false;
     for (const [id, f] of [...this.freight].filter(([, x]) => x.dest === port && !x.undeliverable)) {
+      if (f.refusedAt && f.refusedAt + STAND_BY_MS > world.now()) {
+        refusedHere = true;
+        continue;
+      }
       const out = await this.deliverFreight(id, f);
       if (out === "retry") {
         this.activity = "freight delivery hit a temporary error; retrying";
@@ -430,7 +454,9 @@ export class ShipAgent {
     const due = world.charters.filter((c) => c.port === port && c.remaining > 0 && !stay.refused.has(c.id) && deliverable(c.good) > 0);
     if (due.length > 0) {
       const s = r.ship;
-      const tons = due.reduce((n, c) => Math.max(n, deliverable(c.good)), 0);
+      const roomByGood = new Map<string, number>();
+      for (const c of due) roomByGood.set(c.good, (roomByGood.get(c.good) ?? 0) + c.remaining);
+      const tons = [...roomByGood].reduce((n, [good, room]) => n + Math.min(deliverable(good), room), 0);
       if (s.status === "berthed") {
         const lockLeft = s.turnaround_unlocks_at ? Date.parse(s.turnaround_unlocks_at) - world.now() : 0;
         // At the berth each ton delivered extends the lock; from the roadstead it doesn't.
@@ -639,8 +665,10 @@ export class ShipAgent {
 
       const customs = 1 + book.customs_bps / 10_000;
       const fee = 1 + world.remitBps(world.region(lane.dest), world.region(port)) / 10_000;
-      // Every ton must clear the margin against the lowest-paying charter in the load.
-      const limit = Math.floor((lane.minPay - settings.minMarginPence) / (customs * fee));
+      // Every ton must clear the margin against the lowest-paying charter in the load, after the
+      // share of it the planner expects pirates to take on the way.
+      const kept = 1 - (lane.piracyBps ?? 0) / 10_000;
+      const limit = Math.floor(((lane.minPay - settings.minMarginPence) * kept) / (customs * fee));
       if (b.best_ask.price_pence > limit) {
         this.log(`${lane.good} at ${port} asks ${cr(b.best_ask.price_pence)}/t, above the ${cr(limit)}/t break-even for ${lane.dest}`);
         return { bought: 0, reason: `${lane.good} too dear at ${port}` };
@@ -708,22 +736,39 @@ export class ShipAgent {
     let delivered = 0;
     let retry = false;
     const charters = world.charters.filter((c) => c.port === port && !stay.refused.has(c.id)).sort((a, b) => b.payPerTon - a.payPerTon);
+
+    // Several charters at once: one all-or-nothing batch call; on any refusal, one at a time below.
+    const plan: Array<{ c: (typeof charters)[number]; qty: number }> = [];
+    const left = new Map<string, number>();
+    for (const c of charters) {
+      const have = left.get(c.good) ?? deliverable(c.good);
+      const qty = Math.min(have, c.remaining);
+      if (qty <= 0) continue;
+      plan.push({ c, qty });
+      left.set(c.good, have - qty);
+    }
+    if (plan.length > 1 && plan.length <= 25) {
+      try {
+        const results = await client.deliverCharters(plan.map(({ c, qty }) => ({ contract_id: c.id, quantity: qty, ship_id: this.shipId })));
+        results.forEach((res, i) => {
+          const c = plan.find((x) => x.c.id === res.contract_id)?.c ?? plan[i]?.c;
+          if (c) delivered += this.recordDelivery(r, port, c, res);
+        });
+        // A charter may have taken less than asked: the pass below offers the rest to the others.
+      } catch (e) {
+        if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
+        if (e.status === 401 || e.status === 403 || FATAL_CODES.includes(e.code ?? "")) throw e;
+        if (e.status === 429 || e.code === "idempotency_request_in_flight") return { delivered, retry: true };
+        // Nothing applied: find the refusal one charter at a time.
+      }
+    }
+
     for (const c of charters) {
       const qty = Math.min(deliverable(c.good), c.remaining);
       if (qty <= 0) continue;
       try {
         const res = await client.deliverCharter({ contract_id: c.id, quantity: qty, ship_id: this.shipId });
-        c.remaining -= res.delivered_quantity;
-        if (c.remaining <= 0 || res.contract_status !== "open") {
-          c.remaining = 0;
-          world.markClosed(c.id);
-        }
-        r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
-        delivered += res.delivered_quantity;
-        this.stats.deliveredTons += res.delivered_quantity;
-        this.stats.rewardPence += res.reward_paid_pence;
-        world.vaults.set(world.region(port), world.vault(world.region(port)) + res.reward_paid_pence);
-        this.log(`delivered ${res.delivered_quantity} t ${c.good} at ${port}: ${cr(res.reward_paid_pence)} (${c.title}; ${res.contract_status}, phase ${res.unlocked_phase})`);
+        delivered += this.recordDelivery(r, port, c, res);
       } catch (e) {
         if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
         if (e.status === 401 || e.status === 403 || FATAL_CODES.includes(e.code ?? "")) throw e;
@@ -741,7 +786,24 @@ export class ShipAgent {
         }
       }
     }
+    if (delivered > 0) this.host.cashArrived();
     return { delivered, retry };
+  }
+
+  /** Books one charter delivery into the charter, the ship's manifest, stats and vaults. */
+  private recordDelivery(r: ShipResult, port: string, c: World["charters"][number], res: DeliverCharterResult): number {
+    const { world } = this.host;
+    c.remaining = Math.max(0, c.remaining - res.delivered_quantity);
+    if (res.contract_status !== "open") {
+      c.remaining = 0;
+      world.markClosed(c.id);
+    }
+    r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
+    this.stats.deliveredTons += res.delivered_quantity;
+    this.stats.rewardPence += res.reward_paid_pence;
+    world.vaults.set(world.region(port), world.vault(world.region(port)) + res.reward_paid_pence);
+    this.log(`delivered ${res.delivered_quantity} t ${c.good} at ${port}: ${cr(res.reward_paid_pence)} (${c.title}; ${res.contract_status}, phase ${res.unlocked_phase})`);
+    return res.delivered_quantity;
   }
 
   private async deliverFreight(id: string, f: CarriedFreight): Promise<"delivered" | "refused" | "gone" | "retry" | "error"> {
@@ -749,6 +811,7 @@ export class ShipAgent {
       const res = await this.host.client.deliverFreight(id, this.shipId);
       this.freight.delete(id);
       this.stats.freightPence += res.reward_paid_pence;
+      this.host.cashArrived();
       this.log(`delivered freight: ${res.delivered_quantity} t ${f.good} at ${f.dest} for ${cr(res.reward_paid_pence)}`);
       return "delivered";
     } catch (e) {

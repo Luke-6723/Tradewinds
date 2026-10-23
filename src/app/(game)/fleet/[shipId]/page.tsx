@@ -6,17 +6,19 @@ import { useParams } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { Empty, ErrorNote, KV, Loading, NativeSelect, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { ContractsPanel, ConvoysPanel, GunsPanel, InsurancePanel, StoresPanel, WarehousePanel } from "@/components/kibb/fleet-ui-ship";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
 import { fmtCr, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
+import type * as S from "@/lib/kibb/schema";
 import type { DepartResult, DockActionResult, RoutePlan, ShipResult, WorldClock, ZoneClass } from "@/lib/kibb/types";
 
 const HULL_RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
 
-function DepartForm({ r, onDone }: { r: ShipResult; onDone: () => void }) {
+function DepartForm({ r, blocked, locked, onDone }: { r: ShipResult; blocked: boolean; locked: boolean; onDone: () => void }) {
   const { catalog, portName } = useCatalog();
   const { data: clock } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"));
   const [dest, setDest] = useState("");
@@ -95,8 +97,9 @@ function DepartForm({ r, onDone }: { r: ShipResult; onDone: () => void }) {
           {result.warnings.map((w) => ` ⚠ ${w.detail}`)}
         </p>
       )}
-      <Button disabled={!dest || busy || unrated.length > 0} onClick={depart}>
-        {busy ? "Departing…" : "Depart"}
+      {r.ship.convoy_id && <p className="text-muted-foreground text-xs">This ship is in a convoy: it sails with the convoy, not alone.</p>}
+      <Button disabled={!dest || busy || unrated.length > 0 || blocked || locked || !!r.ship.convoy_id} onClick={depart}>
+        {busy ? "Departing…" : locked ? `Locked ${fmtIn(r.ship.turnaround_unlocks_at)}` : "Depart"}
       </Button>
     </div>
   );
@@ -107,8 +110,14 @@ export default function ShipPage() {
   const { catalog, portName, goodName, shipClassName } = useCatalog();
   const { data: r, error, reload } = usePoll(() => kibbGet<ShipResult>("/v1/fleet/ship", { ship_id: shipId }), 5_000, [shipId]);
   const { data: fleet } = usePoll(() => dash.get<FleetView>("/api/kibb/fleet"), 10_000);
+  const { data: policies, reload: reloadPolicies } = usePoll(
+    () => kibbGet<S.InsurancePolicy[]>("/v1/insurance/list", { ship_id: shipId, limit: 20 }),
+    30_000,
+    [shipId],
+  );
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [override, setOverride] = useState(false);
 
   if (!r) {
     return error ? <ErrorNote error={error} /> : <Loading />;
@@ -117,6 +126,9 @@ export default function ShipPage() {
   const cls = catalog?.ship_classes.find((c) => c.id === s.ship_class);
   const runnerOwnsShip = !!fleet?.enabled && !!fleet.state?.agents.some((a) => a.shipId === s.id);
   const locked = s.status === "berthed" && !!s.turnaround_unlocks_at && Date.parse(s.turnaround_unlocks_at) > Date.now();
+  const blocked = runnerOwnsShip && !override;
+  const insured = (policies ?? []).some((p) => p.status === "open" || p.status === "active");
+  const done = () => void reload();
 
   async function dockAction(kind: "dock" | "offshore") {
     setBusy(true);
@@ -132,25 +144,25 @@ export default function ShipPage() {
   }
 
   return (
-    <div className="space-y-6 pb-8">
-      <div>
-        <Link href="/fleet" className="text-muted-foreground text-xs hover:text-foreground">← Fleet</Link>
-        <div className="mt-1 flex items-center gap-3">
-          <h1 className="font-bold text-2xl tracking-tight">{s.name}</h1>
-          <ShipStatusBadge status={s.status} />
-        </div>
-        <p className="mt-0.5 text-muted-foreground text-sm">
-          {shipClassName(s.ship_class)} · {cls?.hull_category ?? "?"} hull · {s.cannons_count}/{cls?.max_cannons ?? "?"} guns · crew {cls?.crew_required ?? "?"}
-        </p>
-      </div>
+    <div className="space-y-5 pb-8 sm:space-y-6">
+      <PageHeader
+        back={["/fleet", "Fleet"]}
+        title={s.name}
+        badges={<ShipStatusBadge status={s.status} />}
+        subtitle={`${shipClassName(s.ship_class)} · ${cls?.hull_category ?? "?"} hull · ${s.cannons_count}/${cls?.max_cannons ?? "?"} guns · crew ${cls?.crew_required ?? "?"}`}
+      />
 
       {runnerOwnsShip && (
-        <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
-          The fleet autopilot is sailing this ship. Stop it on the dashboard before giving manual orders.
-        </p>
+        <div className="space-y-1.5 rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+          <p>The fleet autopilot is sailing this ship. Stop it on the dashboard before giving manual orders.</p>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={override} onChange={(e) => setOverride(e.target.checked)} />
+            I know, act anyway
+          </label>
+        </div>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid items-start gap-4 lg:grid-cols-3">
         <Panel title="Position">
           <KV
             rows={[
@@ -193,17 +205,7 @@ export default function ShipPage() {
           </div>
         </Panel>
 
-        <Panel title="Stores">
-          <KV
-            rows={[
-              ["Provisions", fmtTons(r.stores.provisions_tons, 2)],
-              ["Feeds the crew at sea for", `${r.stores.sea_days_remaining.toFixed(1)} game days`],
-            ]}
-          />
-          <p className="mt-3 text-muted-foreground text-xs">
-            Crews eat in port too, at half the sea rate. Buy stores with an IOC provisions bid “into stores” on the Market page.
-          </p>
-        </Panel>
+        <StoresPanel r={r} blocked={blocked} onDone={done} />
       </div>
 
       {s.status === "sailing" && r.voyage && (
@@ -225,7 +227,7 @@ export default function ShipPage() {
       )}
 
       {(s.status === "berthed" || s.status === "anchored_roadstead") && (
-        <div className="grid gap-4 lg:grid-cols-3">
+        <div className="grid items-start gap-4 lg:grid-cols-3">
           <Panel title="Berth">
             <div className="space-y-3 text-sm">
               {s.status === "anchored_roadstead" ? (
@@ -233,14 +235,15 @@ export default function ShipPage() {
                   <p className="text-muted-foreground">
                     In the roadstead: free, but you can only deliver charters and freight from here. Dock to trade.
                   </p>
-                  <Button size="sm" disabled={busy || !!s.dock_queued_at} onClick={() => dockAction("dock")}>
+                  {s.convoy_id && <p className="text-muted-foreground text-xs">In a convoy: leave it before docking.</p>}
+                  <Button size="sm" disabled={busy || blocked || !!s.dock_queued_at || !!s.convoy_id} onClick={() => dockAction("dock")}>
                     {s.dock_queued_at ? "Queued for a berth" : "Dock"}
                   </Button>
                 </>
               ) : (
                 <>
                   <p className="text-muted-foreground">Berthed: berth dues accrue daily. Move to the roadstead to wait for free.</p>
-                  <Button size="sm" variant="outline" disabled={busy || locked} onClick={() => dockAction("offshore")}>
+                  <Button size="sm" variant="outline" disabled={busy || blocked || locked} onClick={() => dockAction("offshore")}>
                     {locked ? `Locked ${fmtIn(s.turnaround_unlocks_at)}` : "Move to roadstead"}
                   </Button>
                 </>
@@ -249,10 +252,23 @@ export default function ShipPage() {
             </div>
           </Panel>
           <Panel title="Depart" className="lg:col-span-2">
-            <DepartForm r={r} onDone={() => void reload()} />
+            <DepartForm r={r} blocked={blocked} locked={locked} onDone={done} />
           </Panel>
         </div>
       )}
+
+      <div className="grid items-start gap-4 lg:grid-cols-2">
+        <ContractsPanel r={r} blocked={blocked} onDone={done} />
+        <div className="space-y-4">
+          <WarehousePanel r={r} blocked={blocked} onDone={done} />
+          <GunsPanel r={r} blocked={blocked} onDone={done} insured={insured} />
+        </div>
+      </div>
+
+      <div className="grid items-start gap-4 lg:grid-cols-2">
+        <InsurancePanel r={r} blocked={blocked} onDone={done} policies={policies} reload={() => void reloadPolicies()} />
+        <ConvoysPanel r={r} blocked={blocked} onDone={done} />
+      </div>
     </div>
   );
 }

@@ -10,10 +10,15 @@
  * Cash: one lock for the whole company, so "raise cash, then spend it" never interleaves between
  * ships. The home region keeps a reserve sized to the fleet's daily upkeep (bills come from it).
  *
+ * Events: a long poll on the company's event log wakes a ship's agent the moment something happens
+ * to it (arrival, berth from the queue, eviction, hazard) and refreshes the world as soon as a
+ * charter is posted, filled or expires, so idle ships re-plan at once. Timers remain the fallback.
+ *
  * Runs in-process in the Next.js server (fleet-registry.ts) or from the CLI (workers/kibb-fleet.ts).
  */
 
 import { KibbClient, KIBB_DEFAULT_URL, isApiError } from "../client";
+import type { StreamEvent } from "../schema";
 import type { BankingRegion, ShipResult } from "../types";
 import { ShipAgent, type AgentState, type AgentStats, type FleetHost } from "./agent";
 import { acquireLease, type Lease } from "./lease";
@@ -135,6 +140,10 @@ export interface FleetConfig {
 
 const LOOP_MS          = 10_000;
 const WORLD_REFRESH_MS = 60_000;
+/** Soonest world refresh after an event says charters changed. */
+const EVENT_REFRESH_MS = 5_000;
+/** Long-poll wait per event request (the server allows up to 30 s). */
+const EVENT_POLL_MS    = 25_000;
 const SHIP_SCAN_MS     = 30_000;
 const BUY_CHECK_MS     = 60_000;
 const BUY_COOLDOWN_MS  = 3 * 60_000;
@@ -194,6 +203,11 @@ export class FleetManager implements FleetHost {
   private pendingBuild: { name: string; yard: string; cls: string; guns: number; price: number; payback: number; lane: string } | null = null;
   private cashQueue: Promise<unknown> = Promise.resolve();
   private assignQueue: Promise<unknown> = Promise.resolve();
+  private events: Promise<void> | null = null;
+  private eventsAbort: AbortController | null = null;
+  private eventCursor: string | undefined;
+  /** An event said charters or the phase changed: refresh the world soon, then wake idle ships. */
+  private worldDirty = false;
 
   constructor(
     cfg: FleetConfig,
@@ -252,7 +266,9 @@ export class FleetManager implements FleetHost {
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.wake?.();
+    this.eventsAbort?.abort();
     await this.loop;
+    await this.events;
     while (this.buying || [...this.agents.values()].some((a) => a.running)) {
       await Promise.all([...this.agents.values()].map((a) => a.stop()));
       if (this.buying) await new Promise((r) => setTimeout(r, 200));
@@ -280,6 +296,7 @@ export class FleetManager implements FleetHost {
     this.log("fleet", `FATAL: ${msg}`);
     this.stopRequested = true;
     this.wake?.();
+    this.eventsAbort?.abort();
     const lease = this.lease;
     this.lease = null;
     void Promise.all([...this.agents.values()].map((a) => a.stop())).finally(() => lease?.release());
@@ -318,6 +335,10 @@ export class FleetManager implements FleetHost {
     }
     if (this.stopRequested) return;
     this.status = "running";
+    this.eventsAbort = new AbortController();
+    this.events = this.runEvents(this.eventsAbort.signal).finally(() => {
+      this.events = null;
+    });
     while (!this.stopRequested) {
       try {
         await this.housekeeping();
@@ -365,9 +386,18 @@ export class FleetManager implements FleetHost {
   /** World refresh, new/lost ships, lane overview, purchases. */
   private async housekeeping(): Promise<void> {
     const now = Date.now();
-    if (now - this.lastWorld > WORLD_REFRESH_MS) {
-      await this.world.refresh();
+    if (now - this.lastWorld > WORLD_REFRESH_MS || (this.worldDirty && now - this.lastWorld > EVENT_REFRESH_MS)) {
+      const dirty = this.worldDirty;
+      this.worldDirty = false;
+      try {
+        await this.world.refresh();
+      } catch (e) {
+        this.worldDirty ||= dirty;
+        throw e;
+      }
       this.lastWorld = now;
+      // New charters: ships idling for want of a lane look again now, not in minutes.
+      if (dirty) for (const a of this.agents.values()) if (a.idle) a.nudge();
       await this.refreshTopLanes();
     }
     if (now - this.lastScan > SHIP_SCAN_MS) await this.scanShips();
@@ -452,6 +482,7 @@ export class FleetManager implements FleetHost {
       hull: cls?.hull_category ?? "coastal",
       knots: (cls?.base_speed_centiknots ?? 800) / 100,
       cap: Math.max(0, r.effective_hold_capacity_tons - agent.sealedTons()),
+      guns: r.ship.cannons_count,
     };
   }
 
@@ -463,7 +494,130 @@ export class FleetManager implements FleetHost {
       hull: cls?.hull_category ?? "coastal",
       knots: (cls?.base_speed_centiknots ?? 800) / 100,
       cap: Math.max(0, (cls?.hold_capacity_tons ?? 40) - 2 * guns - 2),
+      guns,
     };
+  }
+
+  cashArrived(): void {
+    for (const a of this.agents.values()) if (a.waitingForCash) a.nudge();
+  }
+
+  // ── Events ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Long-polls the company's event log for as long as the fleet runs. Without a cursor the server
+   * sends only events after the request, so the first quiet polls can miss a moment between calls;
+   * the timers cover that. A cursor older than the 7-day log (410) restarts from now.
+   */
+  private async runEvents(signal: AbortSignal): Promise<void> {
+    let failures = 0;
+    const pause = (ms: number) =>
+      new Promise<void>((r) => {
+        const done = () => {
+          clearTimeout(t);
+          signal.removeEventListener("abort", done);
+          r();
+        };
+        const t = setTimeout(done, ms);
+        signal.addEventListener("abort", done, { once: true });
+      });
+    while (!this.stopRequested && !signal.aborted) {
+      try {
+        const asked = Date.now();
+        const batch = await this.client.events({ after_id: this.eventCursor, timeout_ms: EVENT_POLL_MS, limit: 200 }, signal);
+        failures = 0;
+        for (const e of batch) {
+          this.eventCursor = e.id;
+          this.onEvent(e);
+        }
+        // A server answering an empty poll at once (paused, shedding load) shouldn't be hammered.
+        if (batch.length === 0 && Date.now() - asked < 1_000) await pause(2_000);
+      } catch (e) {
+        if (signal.aborted || this.stopRequested) return;
+        if (isApiError(e, "events_expired")) {
+          this.eventCursor = undefined;
+          this.worldDirty = true;
+          continue;
+        }
+        if (isApiError(e) && (e.status === 401 || e.status === 403)) {
+          this.log("fleet", `event feed stopped (${e.message}); running on timers`);
+          return;
+        }
+        failures++;
+        if (failures === 3) this.log("fleet", `event feed failing (${(e as Error).message}); running on timers until it recovers`);
+        await pause(Math.min(60_000, 2_000 * 2 ** Math.min(failures, 5)));
+      }
+    }
+  }
+
+  private onEvent(e: StreamEvent): void {
+    const p = (e.payload && typeof e.payload === "object" ? e.payload : {}) as Record<string, unknown>;
+    const str = (...keys: string[]) => {
+      for (const k of keys) if (typeof p[k] === "string") return p[k] as string;
+      return undefined;
+    };
+    const num = (k: string) => (typeof p[k] === "number" ? (p[k] as number) : undefined);
+    const agent = (() => {
+      const id = str("ship_id", "carrier_ship_id");
+      return id ? this.agents.get(id) : undefined;
+    })();
+    switch (e.event_type) {
+      case "ship_arrived":
+      case "ship_berthed":
+      case "ship_evicted":
+      case "ship_leg_completed":
+      case "freight_delivered":
+      case "freight_issuer_breach":
+      case "freight_defaulted":
+        agent?.nudge();
+        break;
+      case "voyage_hazard": {
+        const loss = num("cargo_loss_pct");
+        this.log(agent?.name ?? "fleet", `${str("hazard") ?? "hazard"} at sea${p.sunk ? ": SUNK" : loss ? `: lost ${loss}% of cargo` : ""}`);
+        agent?.nudge();
+        break;
+      }
+      case "ship_mutinied":
+      case "ship_provisions_exhausted":
+        this.log(agent?.name ?? "fleet", e.event_type === "ship_mutinied" ? "the crew mutinied: ship lost" : "stores ran out at sea");
+        agent?.nudge();
+        break;
+      case "charter_delivered":
+      case "charter_expired": {
+        // Filled or lapsed: drop it now. A partial delivery (ours or a rival's) shows in the next
+        // listing; adjusting `remaining` here could count our own delivery twice.
+        const id = str("contract_id", "charter_id");
+        const remaining = e.event_type === "charter_expired" ? 0 : num("remaining_quantity");
+        if (id && remaining === 0) this.world.markClosed(id);
+        else if (!id || remaining === undefined) {
+          this.worldDirty = true;
+          this.wake?.();
+        }
+        break;
+      }
+      case "charter_posted":
+      case "world_phase_unlocked":
+      case "expansion_target_rescaled":
+      case "world_event":
+        if (e.event_type === "world_phase_unlocked") this.log("fleet", "a new phase opened: re-planning across the new ports");
+        this.worldDirty = true;
+        this.wake?.();
+        break;
+      case "crown_bailiff_warehouse_seizure":
+      case "crown_bailiff_upkeep_seizure":
+        this.log("fleet", `BAILIFF: ${e.event_type.replace(/_/g, " ")} (a bill went unpaid; check the reserve)`);
+        break;
+      case "server_announcement":
+        this.log("fleet", `server ${str("severity") ?? "notice"}: ${str("message") ?? ""}`);
+        break;
+      case "expansion_bonus_paid":
+      case "marque_prize_paid":
+      case "insurance_claim_paid": {
+        const amount = num("amount_pence") ?? num("bonus_pence") ?? num("payout_pence");
+        this.log("fleet", `${e.event_type.replace(/_/g, " ")}${amount ? `: ${cr(amount)}` : ""}`);
+        break;
+      }
+    }
   }
 
   /** Tons other ships are bound for: charter room they will fill, source depth they will buy. */

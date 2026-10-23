@@ -25,6 +25,10 @@ const PRICE_TTL_MS = 3 * 60 * 60 * 1000;
 const SOLD_OUT_MS = 6 * 60 * 1000;
 /** A charter last seen live is recalled for this long (2 game days; real ms at 60×). */
 const RECALL_MS = 2 * 24 * 60 * 1000;
+/** A pirate interception or storm hit destroys this share of every cargo stack. */
+const HIT_LOSS = 0.25;
+/** Assumed cut in interception odds per gun ("cut sharply by cannons"; the formula isn't published). */
+const GUN_DETERRENCE = 0.5;
 
 export interface CharterInfo {
   id: string;
@@ -78,6 +82,8 @@ export class World {
   skewMs = 0;
   charters: CharterInfo[] = [];
   vaults = new Map<BankingRegion, number>();
+  /** Live net piracy per sea zone (bps): base + letters of marque − naval patrols. */
+  piracy = new Map<string, number>();
   private rates = new Map<string, number>();
   private prices = new Map<string, PriceObs>();
   /** Last live copy of each charter seen live, for recall when it drops out of a listing. */
@@ -116,11 +122,13 @@ export class World {
     this.paused = clock.paused;
 
     const asked = Date.now();
-    const [list, rates] = await Promise.all([
+    const [list, rates, zones] = await Promise.all([
       this.client.listContracts({ contract_type: "charter", status: "open", limit: 200 }),
       this.client.rates(),
+      this.client.zones().catch(() => null),
       this.refreshVaults(),
     ]);
+    if (zones) this.piracy = new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps]));
     const fresh = toCharters(list).filter((c) => !this.closed.has(c.id));
     // Ports re-listed live on arrival while this request was in flight keep that newer view.
     const newer = new Set([...this.mergedAt].filter(([, t]) => t > asked).map(([p]) => p));
@@ -255,6 +263,22 @@ export class World {
       const zone = this.catalog.sea_zones.find((z) => z.id === l.to_node);
       return ZONE_RANK[l.edge_class] <= max && (!zone || ZONE_RANK[zone.zone_class] <= max);
     });
+  }
+
+  /**
+   * Expected share of the cargo lost to pirates on a passage. Each leg rolls for the zone it ends
+   * in (a port's own zone for the last leg); the guide's prize-money rule of thumb implies a zone's
+   * net piracy acts as a rate per game day at sea, so longer legs count for more. A hit destroys a
+   * quarter of every stack; guns deter. An estimate for ranking lanes, capped at half the load.
+   */
+  piracyLoss(plan: RoutePlan, guns: number, knots: number): number {
+    const dayMs = 24 * 60 * this.gameMinuteMs;
+    let hits = 0;
+    for (const l of plan.legs) {
+      const bps = this.piracy.get(l.to_node) ?? this.piracy.get(this.port(l.to_node)?.sea_zone_id ?? "");
+      if (bps) hits += Math.min(1, (bps / 10_000) * (this.sailMs(l.distance_nm, knots) / dayMs));
+    }
+    return Math.min(0.5, (hits * HIT_LOSS) / (1 + guns * GUN_DETERRENCE));
   }
 
   // ── Prices ──────────────────────────────────────────────────────────────────

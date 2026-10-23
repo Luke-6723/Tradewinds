@@ -1,11 +1,12 @@
-﻿"use client";
+"use client";
 
 import { useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Empty, ErrorNote, KV, Loading, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { Empty, ErrorNote, KV, Loading, PageHeader, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { FactorPanel, LeasePanel, PortEventsPanel } from "@/components/kibb/fleet-ui-port";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { kibbGet } from "@/lib/kibb/browser";
@@ -27,7 +28,7 @@ function GoodsList({ title, ids }: { title: string; ids: string[] | null | undef
 export default function PortPage() {
   const { id } = useParams<{ id: string }>();
   const { catalog, portName, goodName, shipClassName } = useCatalog();
-  const { data: port, error } = usePoll(() => kibbGet<PortDetail>("/v1/world/port", { port_id: id }), 30_000, [id]);
+  const { data: port, error, reload } = usePoll(() => kibbGet<PortDetail>("/v1/world/port", { port_id: id }), 30_000, [id]);
   const visible = !!port && port.visibility !== "none";
   const { data: book } = usePoll(visible ? () => kibbGet<PortOrderBook>("/v1/market/book", { port_id: id }) : null, 30_000, [id, visible]);
   const { data: contracts } = usePoll(() => kibbGet<ContractListing[]>("/v1/contract/list", { port_id: id, status: "open", limit: 200 }), 60_000, [id]);
@@ -42,35 +43,42 @@ export default function PortPage() {
   const here = (contracts ?? []).filter((c) => c.origin_port_id === id);
 
   return (
-    <div className="space-y-6 pb-8">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <Link href="/ports" className="text-muted-foreground text-xs hover:text-foreground">← Ports</Link>
-          <div className="mt-1 flex items-center gap-2">
-            <h1 className="font-bold text-2xl tracking-tight">{port.name}</h1>
+    <div className="space-y-5 pb-8 sm:space-y-6">
+      <PageHeader
+        back={["/ports", "Ports"]}
+        title={port.name}
+        badges={
+          <>
             {port.is_hub && <Badge variant="info">hub</Badge>}
             {port.has_shipyard && <Badge variant="outline">shipyard</Badge>}
             <Badge variant={visible ? "success" : "secondary"}>{port.visibility}</Badge>
-          </div>
-          <p className="mt-0.5 text-muted-foreground text-sm capitalize">
-            {port.banking_region.replace(/_/g, " ")} · {portName(port.sea_zone_id)} · phase {port.phase}
-          </p>
-        </div>
-        {visible && (
-          <Button variant="outline" render={<Link href={`/market?port=${id}`} />}>
-            Trade here →
-          </Button>
-        )}
-      </div>
+          </>
+        }
+        subtitle={<span className="capitalize">{port.banking_region.replace(/_/g, " ")} · {portName(port.sea_zone_id)} · phase {port.phase}</span>}
+        actions={
+          <>
+            {port.has_shipyard && (
+              <Button variant="outline" render={<Link href="/fleet" />}>
+                Shipyard →
+              </Button>
+            )}
+            {visible && (
+              <Button variant="outline" render={<Link href={`/market?port=${id}`} />}>
+                Trade here →
+              </Button>
+            )}
+          </>
+        }
+      />
 
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid items-start gap-4 lg:grid-cols-3">
         <Panel title="Port">
           <KV
             rows={[
               ["Customs (base)", `${fmtBps(port.customs_bps)} (${fmtBps(port.base_customs_bps)})`],
-              ["Berths", `${port.occupied_berths} / ${port.effective_berths} used`],
+              ["Berths", `${port.occupied_berths} / ${port.effective_berths} used (base ${port.base_berths})`],
               ["Queued for a berth", port.queued_ships],
-              ["Berth dues", `${fmtCr(port.berth_dues_per_day_pence)} / game day`],
+              ["Berth dues", `${fmtCr(port.berth_dues_per_day_pence)} / game day (6 h minimum)`],
               ["Warehouses leased", `${fmtTons(port.total_leased_warehouse)} / ${fmtTons(port.total_warehouse_cap)}`],
               ["Health", fmtBps(port.health_score_bps)],
               ["Player volume (rolling)", `${fmtTons(port.rolling_player_volume_tons)} · ${fmtCr(port.rolling_player_turnover_pence)}`],
@@ -86,7 +94,13 @@ export default function PortPage() {
         </Panel>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid items-start gap-4 lg:grid-cols-3">
+        <FactorPanel port={port} onChange={() => void reload()} />
+        <LeasePanel port={port} onChange={() => void reload()} />
+        <PortEventsPanel portId={id} />
+      </div>
+
+      <div className="grid items-start gap-4 lg:grid-cols-2">
         <Panel title="Your ships here">
           {!ships ? (
             <Loading />
@@ -149,7 +163,7 @@ export default function PortPage() {
       )}
 
       {port.visibility === "quay" && (
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="grid items-start gap-4 lg:grid-cols-2">
           <Panel title="Coffee house gossip">
             {gossip.length === 0 ? (
               <Empty>No news from other ports yet.</Empty>

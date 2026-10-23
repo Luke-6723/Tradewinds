@@ -147,6 +147,11 @@ export function forgetOwner(playerKey: string): void {
   owners.delete(createHash("sha256").update(playerKey).digest("hex"));
 }
 
+/** Forgets every cached ownership answer, so revoked player keys stop working at once. */
+export function forgetAllOwners(): void {
+  owners.clear();
+}
+
 /** Turns an upstream error into a problem+json reply with the same status. */
 export function errorResponse(e: unknown): NextResponse {
   if (e instanceof KibbApiError) {

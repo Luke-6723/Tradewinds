@@ -1,11 +1,46 @@
 "use client";
 
 import type { ReactNode } from "react";
+import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import type { ShipStatus } from "@/lib/kibb/types";
+
+/** Title, one line of context, and the page's own controls (filters, a port picker) on the right. */
+export function PageHeader({
+  title,
+  subtitle,
+  back,
+  badges,
+  actions,
+}: {
+  title: ReactNode;
+  subtitle?: ReactNode;
+  /** `[href, label]` for a "← label" link above the title. */
+  back?: [string, string];
+  badges?: ReactNode;
+  actions?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between md:gap-6">
+      <div className="min-w-0">
+        {back && (
+          <Link href={back[0]} className="text-muted-foreground text-xs hover:text-foreground">
+            ← {back[1]}
+          </Link>
+        )}
+        <div className={cn("flex flex-wrap items-center gap-x-3 gap-y-1", back && "mt-1")}>
+          <h1 className="font-bold text-xl tracking-tight sm:text-2xl">{title}</h1>
+          {badges}
+        </div>
+        {subtitle && <p className="mt-1 max-w-3xl text-muted-foreground text-sm">{subtitle}</p>}
+      </div>
+      {actions && <div className="flex flex-wrap items-center gap-2 [&>*]:min-w-0 max-md:[&>*]:flex-[1_1_9rem]">{actions}</div>}
+    </div>
+  );
+}
 
 /** Card with a small header row (title + optional action) and padded body. */
 export function Panel({
@@ -22,24 +57,42 @@ export function Panel({
   bodyClassName?: string;
 }) {
   return (
-    <Card className={className}>
-      <div className="flex items-center justify-between gap-3 border-b px-5 py-3">
+    <Card className={cn("min-w-0", className)}>
+      <div className="flex min-h-12 flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b px-4 py-2.5 sm:px-5">
         <h2 className="font-medium text-muted-foreground text-sm">{title}</h2>
-        {action}
+        {action && <div className="flex flex-wrap items-center gap-2">{action}</div>}
       </div>
-      <div className={cn("p-5", bodyClassName)}>{children}</div>
+      <div className={cn("p-4 sm:p-5", bodyClassName)}>{children}</div>
     </Card>
+  );
+}
+
+/**
+ * A row of small figures, label above value, in equal cells that wrap 2 → 3 → 6 across.
+ * For summaries inside a panel; StatTile is the standalone card version.
+ */
+export function Metrics({ items, className }: { items: Array<{ label: ReactNode; value: ReactNode; hint?: ReactNode }>; className?: string }) {
+  return (
+    <dl className={cn("grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-3 xl:grid-cols-6", className)}>
+      {items.map((m, i) => (
+        <div key={i} className="bg-card px-3 py-2.5">
+          <dt className="text-muted-foreground text-xs">{m.label}</dt>
+          <dd className="mt-0.5 font-medium tabular-nums">{m.value}</dd>
+          {m.hint && <dd className="text-muted-foreground text-xs">{m.hint}</dd>}
+        </div>
+      ))}
+    </dl>
   );
 }
 
 export function StatTile({ label, value, sub, icon }: { label: string; value: ReactNode; sub?: ReactNode; icon?: ReactNode }) {
   return (
-    <Card className="p-4">
-      <div className="flex items-center justify-between text-muted-foreground text-xs">
+    <Card className="min-w-0 p-3 sm:p-4">
+      <div className="flex items-center justify-between gap-2 text-muted-foreground text-xs">
         <span>{label}</span>
         {icon}
       </div>
-      <div className="mt-1.5 font-semibold text-xl tabular-nums">{value}</div>
+      <div className="mt-1.5 truncate font-semibold text-lg tabular-nums sm:text-xl">{value}</div>
       {sub && <div className="mt-0.5 text-muted-foreground text-xs">{sub}</div>}
     </Card>
   );
@@ -103,11 +156,11 @@ export function NativeSelect({ className, ...props }: React.SelectHTMLAttributes
 /** Two-column key/value list. */
 export function KV({ rows }: { rows: Array<[ReactNode, ReactNode]> }) {
   return (
-    <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-sm">
+    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm sm:gap-x-6">
       {rows.map(([k, v], i) => (
         <div key={i} className="contents">
           <dt className="text-muted-foreground">{k}</dt>
-          <dd className="text-right tabular-nums">{v}</dd>
+          <dd className="min-w-0 text-right tabular-nums [overflow-wrap:anywhere]">{v}</dd>
         </div>
       ))}
     </dl>

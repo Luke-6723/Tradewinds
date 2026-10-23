@@ -58,7 +58,8 @@ async function forward(req: NextRequest, { params }: { params: Promise<{ path: s
       headers,
       body,
       cache: "no-store",
-      signal: AbortSignal.timeout(30_000),
+      // A browser that gives up (a long poll left or paused) ends the upstream call too.
+      signal: AbortSignal.any([req.signal, AbortSignal.timeout(30_000)]),
     });
     const text = await upstream.text();
     if (upstream.status === 401 && key) {

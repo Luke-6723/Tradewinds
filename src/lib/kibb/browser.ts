@@ -24,7 +24,7 @@ function qs(query?: Query): string {
   return parts.length ? `?${parts.join("&")}` : "";
 }
 
-async function call<T>(method: "GET" | "POST", url: string, body?: unknown): Promise<T> {
+async function call<T>(method: "GET" | "POST" | "PATCH", url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
     headers: body !== undefined ? { "content-type": "application/json" } : undefined,
@@ -53,6 +53,7 @@ async function call<T>(method: "GET" | "POST", url: string, body?: unknown): Pro
 export const dash = {
   get: <T>(url: string, query?: Query) => call<T>("GET", `${url}${qs(query)}`),
   post: <T>(url: string, body: unknown = {}) => call<T>("POST", url, body),
+  patch: <T>(url: string, body: unknown = {}) => call<T>("PATCH", url, body),
 };
 
 /** GET a kibb.io API path (e.g. `/v1/fleet/ships`) through the dashboard proxy. */

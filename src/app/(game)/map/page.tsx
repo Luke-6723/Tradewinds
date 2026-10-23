@@ -33,8 +33,13 @@ export default function MapPage() {
   const select = (shipId: string) => setFocus({ shipId, nonce: Date.now() });
 
   return (
-    <div className="flex h-[calc(100vh-8rem)] gap-4">
-      <Card className="relative min-w-0 flex-1 overflow-hidden">
+    <div className="flex flex-col gap-4 lg:h-[calc(100dvh-8rem)] lg:flex-row">
+      {/* Phones: title above the map; the side column carries it on large screens. */}
+      <div className="lg:hidden">
+        <h1 className="font-bold text-xl tracking-tight">Map</h1>
+        <p className="mt-0.5 text-muted-foreground text-sm">Where your ships are, live.</p>
+      </div>
+      <Card className="relative h-[60dvh] min-h-80 min-w-0 overflow-hidden lg:h-auto lg:flex-1">
         {catalog && ships ? (
           <KibbMap
             catalog={catalog}
@@ -53,8 +58,8 @@ export default function MapPage() {
         )}
       </Card>
 
-      <div className="flex w-72 shrink-0 flex-col gap-4 overflow-y-auto">
-        <div>
+      <div className="flex flex-col gap-4 lg:w-72 lg:shrink-0 lg:overflow-y-auto">
+        <div className="hidden lg:block">
           <h1 className="font-bold text-2xl tracking-tight">Map</h1>
           <p className="mt-0.5 text-muted-foreground text-sm">Where your ships are, live.</p>
         </div>

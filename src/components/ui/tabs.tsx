@@ -17,7 +17,7 @@ export function Tabs({ className, ...props }: TabsPrimitive.Root.Props): React.R
 export function TabsList({ className, children, ...props }: TabsPrimitive.List.Props): React.ReactElement {
   return (
     <TabsPrimitive.List
-      className={cn("relative z-0 flex w-fit items-center justify-center gap-x-0.5 rounded-lg bg-muted p-0.5 text-muted-foreground/72", className)}
+      className={cn("relative z-0 flex w-fit max-w-full items-center justify-start gap-x-0.5 overflow-x-auto rounded-lg bg-muted p-0.5 text-muted-foreground/72", className)}
       data-slot="tabs-list"
       {...props}
     >
