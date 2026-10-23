@@ -23,9 +23,14 @@ import type { World } from "./world";
 
 const POLL_MS              = 15_000;
 const MAX_SAIL_SLEEP_MS    = 60_000;
-const IDLE_WAIT_MS         = 3 * 60_000;
-const NO_CASH_WAIT_MS      = 2 * 60_000;
-const STAND_BY_MS          = 5 * 60_000;
+// Idle re-checks are short: events (arrivals, new charters, deliveries paying) wake ships at once,
+// and these are only the fallback when nothing does.
+const IDLE_WAIT_MS         = 30_000;
+const NO_CASH_WAIT_MS      = 30_000;
+/** Between tenders of freight the issuer refused (it has no warehouse space yet). */
+const STAND_BY_MS          = 60_000;
+/** Holding leftovers for a fair bid: NPC buyers re-quote every 6 game hours (6 real min at 60×). */
+const HOLD_WAIT_MS         = 3 * 60_000;
 const ERROR_BACKOFF_MS     = 30_000;
 /** A lane that just failed at its source is skipped for one NPC re-quote (6 game hours at 60×). */
 const LANE_COOLDOWN_MS     = 6 * 60_000;
@@ -1127,7 +1132,7 @@ export class ShipAgent {
     }
     this.activity = `holding ${tons} t ${good}: no fair bid at ${port}`;
     if (r.ship.status === "berthed" && !this.locked(r)) await client.offshore(this.shipId).catch(() => undefined);
-    return IDLE_WAIT_MS;
+    return HOLD_WAIT_MS;
   }
 
   // ── Stores ──────────────────────────────────────────────────────────────────

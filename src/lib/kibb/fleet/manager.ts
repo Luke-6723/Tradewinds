@@ -170,7 +170,7 @@ const BUY_COOLDOWN_MS  = 3 * 60_000;
 const BUY_FAIL_COOLDOWN_MS = 60_000;
 /** A ship calling at a yard re-runs the buyer there at most this often. */
 const YARD_RECHECK_MS  = 45_000;
-const INIT_BACKOFF_MS  = [15_000, 30_000, 60_000, 120_000, 300_000];
+const INIT_BACKOFF_MS  = [5_000, 10_000, 20_000, 40_000, 60_000];
 const LOG_LIMIT        = 400;
 const GUN_PRICE_PENCE  = 15_000;
 /** Spare cash kept in every non-home region for berth dues and stores. */
