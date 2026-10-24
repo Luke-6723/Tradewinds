@@ -35,7 +35,7 @@ import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, zoneDays, type Mar
 import type { ConvoyResult, ConvoyStatus, LetterOfMarque } from "../schema";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
-import type { BankingRegion, RoutePlan, ShipResult } from "../types";
+import type { BankingRegion, BuildQuote, RoutePlan, ShipResult } from "../types";
 import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type ConvoyOutcome, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
 import { openJournal, type Journal } from "./journal";
 import { Advisor, AI_MODES, type AdvisorSnapshot, type AiMode, type AiReport } from "../ai/advisor";
@@ -98,6 +98,11 @@ export interface FleetSettings {
    */
   convoys: boolean;
   /**
+   * Build ships from materials bought on the yard port's own market into a warehouse there
+   * ("bring your own materials"), skipping the yard's 15% turnkey markup, when that is cheaper.
+   */
+  byomBuilds: boolean;
+  /**
    * With no presence at any shipyard, hire a Resident Factor (750 Cr) at the yard nearest the fleet's
    * work when a build there would pay back, build, and dismiss the factor straight after.
    */
@@ -145,6 +150,7 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   underwriteMinEdgeBps: 150,
   useFreight: true,
   convoys: true,
+  byomBuilds: true,
   yardFactor: true,
   holdForRepost: false,
   phaseChestPct: 40,
@@ -182,6 +188,7 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   bool("autoBuy");
   bool("useFreight");
   bool("convoys");
+  bool("byomBuilds");
   bool("marques");
   num("marqueBudgetPence", 0, true);
   bool("underwrite");
@@ -367,6 +374,13 @@ const CONVOY_MAX_WAIT_GAME_H = 6;
 const CONVOY_MIN_MUSTER_GAME_MIN = 60;
 const CONVOY_MIN_EXPOSURE_PENCE = 5_000;
 const CONVOY_MIN_SPEED_RATIO = 0.85;
+/** Own-materials builds: the first bid's cap over the turnkey walk's average per ton, the most a
+ * material may cost in all over the walk, the least a build must save to bother, and how long a
+ * yard builds turnkey after an own-materials attempt there failed. */
+const BYOM_FIRST_BID_MARKUP = 1.1;
+const BYOM_BUDGET_MARKUP = 1.25;
+const BYOM_MIN_SAVING_PENCE = 30_000;
+const BYOM_BLOCK_MS = 30 * 60_000;
 /** A hull's replacement value per ton of hold, until a yard has quoted the class. */
 const HULL_PENCE_PER_TON = 25_000;
 /** Spare cash kept in every non-home region for berth dues and stores. */
@@ -477,7 +491,14 @@ export class FleetManager implements FleetHost {
   private buying = false;
   private readonly lastYardCheck = new Map<string, number>();
   /** A build whose response never arrived: adopted (its purchase record) if the ship shows up. */
-  pendingBuild: { name: string; yard: string; cls: string; price: number; payback: number; lane: string } | null = null;
+  /**
+   * A build whose outcome is unknown, adopted if the ship turns up. `price` is what is still to
+   * book (an own-materials build booked its materials when it bought them), `cost` the whole cost,
+   * `leaseBefore` the warehouse lease to go back to once it is adopted.
+   */
+  pendingBuild: { name: string; yard: string; cls: string; price: number; cost?: number; leaseBefore?: number | null; payback: number; lane: string } | null = null;
+  /** Yards where an own-materials attempt failed lately: build turnkey there until then. */
+  private readonly byomBlockedUntil = new Map<string, number>();
   private cashQueue: Promise<unknown> = Promise.resolve();
   private assignQueue: Promise<unknown> = Promise.resolve();
   private events: Promise<void> | null = null;
@@ -941,13 +962,14 @@ export class FleetManager implements FleetHost {
       if (found) {
         this.pendingBuild = null;
         this.shipSpendPence += pending.price;
+        if (pending.leaseBefore !== undefined && pending.leaseBefore !== null) void this.shrinkLease(pending.yard, pending.leaseBefore);
         this.purchases.push({
           at: new Date().toISOString(),
           shipId: found.ship.id,
           name: pending.name,
           shipClass: pending.cls,
           port: pending.yard,
-          costPence: pending.price,
+          costPence: pending.cost ?? pending.price,
           paybackHours: Math.round(pending.payback * 10) / 10,
           lane: pending.lane,
         });
@@ -1922,6 +1944,90 @@ export class FleetManager implements FleetHost {
     if (p) p.costPence += costPence;
   }
 
+  /**
+   * What an own-materials build would cost here, from a turnkey quote: the labour, plus each
+   * material bought on this port's market at the yard's own walk of its ask ladder (the turnkey
+   * price before the 15% markup) with customs on top. Null when a material can't be supplied.
+   */
+  private byomPrice(q: BuildQuote, yard: string): number | null {
+    if (!q.total_cost_pence || q.materials.some((m) => !m.cost_pence)) return null;
+    const customs = 1 + this.world.customsBps(yard) / 10_000;
+    return Math.round(q.labour_pence + q.materials.reduce((n, m) => n + (m.cost_pence ?? 0), 0) * customs);
+  }
+
+  /** Whether builds at this yard may use own materials now. */
+  private byomOk(yard: string): boolean {
+    return this.settings.byomBuilds && (this.byomBlockedUntil.get(yard) ?? 0) <= Date.now();
+  }
+
+  /**
+   * Buys the materials a build here lacks into our warehouse at the yard (leasing the room first;
+   * we have presence, being able to build here): per material an IOC bid capped a little above
+   * the turnkey walk's average per ton, then one for any shortfall at what is left of a budget a
+   * little over the walk (a steep ladder's top levels cost more than its average). Each fill is
+   * booked to the ship spend and the vault as it is paid. `leaseBefore` is the lease to go back to
+   * after, set only when this grew it.
+   */
+  private async buyMaterials(yard: string, cls: string, q: BuildQuote): Promise<{ ok: boolean; spent: number; why: string; leaseBefore: number | null }> {
+    let spent = 0;
+    let leaseBefore: number | null = null;
+    const region = this.world.region(yard);
+    try {
+      // Unreadable is not empty: a guess here could buy twice or set the lease below what it is.
+      const wh = await this.client.warehouse(yard);
+      const held = (good: string) => {
+        const i = wh.inventory.find((x) => x.commodity_id === good);
+        return i ? Math.max(0, i.quantity - i.locked_quantity) : 0;
+      };
+      const want = q.materials.map((m) => ({ m, qty: Math.max(0, m.quantity - held(m.commodity_id)) })).filter((x) => x.qty > 0);
+      if (want.length === 0) return { ok: true, spent, why: "", leaseBefore };
+      const need = wh.used_tonnage + wh.reserved_tonnage + want.reduce((n, x) => n + x.qty, 0);
+      if (wh.leased_tonnage < need) {
+        await this.client.setLease(yard, need);
+        leaseBefore = wh.leased_tonnage;
+      }
+      for (const { m, qty } of want) {
+        const budget = Math.floor(((m.cost_pence ?? 0) * qty * BYOM_BUDGET_MARKUP) / Math.max(m.quantity, 1));
+        let left = qty;
+        let paid = 0;
+        for (let attempt = 0; attempt < 2 && left > 0; attempt++) {
+          const perTon =
+            attempt === 0 ? Math.ceil(((m.cost_pence ?? 0) / Math.max(m.quantity, 1)) * BYOM_FIRST_BID_MARKUP) : Math.floor((budget - paid) / left);
+          if (perTon <= 0) break;
+          const res = await this.client.placeOrder({ port_id: yard, commodity_id: m.commodity_id, side: "bid", time_in_force: "ioc", price_pence: perTon, quantity: left });
+          const cost = res.total_gross_pence + res.customs_duty_pence;
+          paid += res.total_gross_pence;
+          spent += cost;
+          this.shipSpendPence += cost;
+          this.world.vaults.set(region, this.world.vault(region) - cost);
+          left -= res.filled_quantity;
+        }
+        if (left > 0) return { ok: false, spent, why: `${left} t of ${m.commodity_id} short`, leaseBefore };
+      }
+    } catch (e) {
+      if (this.isFatal(e)) throw e;
+      return { ok: false, spent, why: (e as Error).message, leaseBefore };
+    } finally {
+      if (spent > 0) this.persist(true);
+    }
+    this.log("fleet", `bought the materials for a ${cls} at ${yard} into our warehouse there (${cr(spent)})`);
+    return { ok: true, spent, why: "", leaseBefore };
+  }
+
+  /**
+   * After an own-materials attempt grew the lease here: back down to the lease before it, or to
+   * what the warehouse still holds if that is more.
+   */
+  private async shrinkLease(yard: string, before: number): Promise<void> {
+    try {
+      const wh = await this.client.warehouse(yard);
+      const target = Math.max(before, wh.used_tonnage + wh.reserved_tonnage);
+      if (wh.leased_tonnage > target) await this.client.setLease(yard, target);
+    } catch (e) {
+      if (!this.isFatal(e)) this.log("fleet", `couldn't shrink the warehouse lease at ${yard}: ${(e as Error).message}`);
+    }
+  }
+
   /** The open shipyard nearest the fleet's work, for a factor to build at; null if none. */
   private factorYard(): string | null {
     const { world } = this;
@@ -2096,7 +2202,7 @@ export class FleetManager implements FleetHost {
     }
     if (yards.size === 0 && !factorPriced) return this.setBuyer(`waiting for a ship to call at a shipyard (spare ${cr(spare)} after ${cr(committed)} for loads${chestNote})`);
 
-    type Option = { yard: string; cls: string; hull: number; guns: number; cost: number; payback: number; net: number; lane: Lane; upkeepFloor: number };
+    type Option = { yard: string; cls: string; hull: number; byom: boolean; guns: number; cost: number; payback: number; net: number; lane: Lane; upkeepFloor: number };
     const options: Option[] = [];
     const notes: string[] = [];
     const now = world.now();
@@ -2123,8 +2229,11 @@ export class FleetManager implements FleetHost {
             notes.push(`${cls.id}@${yard}: materials not in stock`);
             continue;
           }
+          // Own materials bought on this yard's market skip the markup: priced at the cheaper way.
+          // (The cache keeps the turnkey price: always on offer, it is what a hull costs to replace.)
+          const own = this.byomOk(yard) ? this.byomPrice(quote, yard) : null;
+          price = own !== null && quote.total_cost_pence - own >= BYOM_MIN_SAVING_PENCE ? own : quote.total_cost_pence;
           this.hullQuotes.set(`${yard}|${cls.id}`, quote.total_cost_pence);
-          price = quote.total_cost_pence;
         }
         // "full" arms new hulls at once; "auto" builds them bare and refits on a pirate-heavy lane.
         const guns = settings.guns === "full" ? cls.max_cannons : 0;
@@ -2191,7 +2300,8 @@ export class FleetManager implements FleetHost {
           notes.push(`${cls.id}@${yard}: its charters can't pay it back in time`);
           continue;
         }
-        options.push({ yard, cls: cls.id, hull, guns, cost, payback: cost / net, net, lane, upkeepFloor });
+        // Priced from a cached quote (factor path) the way is decided at build time.
+        options.push({ yard, cls: cls.id, hull, byom: this.byomOk(yard), guns, cost, payback: cost / net, net, lane, upkeepFloor });
       }
     }
 
@@ -2223,16 +2333,23 @@ export class FleetManager implements FleetHost {
       this.setBuyer(why, true);
       return null;
     };
+    // Materials bought for an own-materials build (on top of the build's own charge, the labour),
+    // and the warehouse lease before buying them grew it (to go back to after, whatever happens).
+    let materialsSpent = 0;
+    let leaseBefore: number | null = null;
     const built = await this.withCash(async () => {
       if (this.stopRequested) return null;
       // The quote may be minutes old by now: price it again and re-check what the fleet needs.
       const q = await this.client.shipyardQuote(pick.yard, pick.cls, "turnkey_cash").catch(() => null);
-      if (!q?.available || !q.total_cost_pence || q.total_cost_pence > pick.hull * 1.05) {
+      const own = q && pick.byom ? this.byomPrice(q, pick.yard) : null;
+      const byom = own !== null && !!q?.total_cost_pence && q.total_cost_pence - own >= BYOM_MIN_SAVING_PENCE;
+      const quoted = byom ? own : (q?.total_cost_pence ?? null);
+      if (!q?.available || !quoted || quoted > pick.hull * 1.05) {
         if (q?.total_cost_pence) this.hullQuotes.set(`${pick.yard}|${pick.cls}`, q.total_cost_pence);
         else this.hullQuotes.delete(`${pick.yard}|${pick.cls}`);
         return failLater(`the price of a ${pick.cls} at ${pick.yard} moved or it can't be built now`);
       }
-      const price = q.total_cost_pence;
+      const price = quoted;
       await world.refreshVaults();
       let committedNow = 0;
       for (const a of this.agents.values()) committedNow += this.committedBy(a);
@@ -2241,8 +2358,23 @@ export class FleetManager implements FleetHost {
       }
       const cash = await this.ensureCash(region, price);
       if (cash < price) return failLater(`could not raise ${cr(price)} in ${region} for a ${pick.cls}`);
+      // Own materials: buy what the warehouse here lacks, then build from it.
+      let mode: "byom" | "turnkey_cash" = "turnkey_cash";
+      if (byom) {
+        const got = await this.buyMaterials(pick.yard, pick.cls, q);
+        materialsSpent = got.spent;
+        leaseBefore = got.leaseBefore;
+        if (!got.ok) {
+          // Nothing bought: build turnkey here for a while. Some bought: the next try here buys only the rest.
+          if (got.spent === 0) this.byomBlockedUntil.set(pick.yard, Date.now() + BYOM_BLOCK_MS);
+          return failLater(
+            `couldn't buy every material for a ${pick.cls} at ${pick.yard} (${got.why})${got.spent > 0 ? `; the ${cr(got.spent)} bought stays in the warehouse there for the next try` : ""}`,
+          );
+        }
+        mode = "byom";
+      }
       try {
-        return await this.client.buildShip(pick.yard, name, pick.cls, "turnkey_cash");
+        return await this.client.buildShip(pick.yard, name, pick.cls, mode);
       } catch (e) {
         if (this.isFatal(e)) throw e;
         if (!isApiError(e) || e.status >= 500 || e.code === "idempotency_request_in_flight") {
@@ -2250,29 +2382,46 @@ export class FleetManager implements FleetHost {
           for (let i = 0; i < 3; i++) {
             const ships = await this.client.ships().catch(() => [] as ShipResult[]);
             const found = ships.find((x) => x.ship.name === name && x.ship.current_port_id === pick.yard);
-            if (found) return { ship_id: found.ship.id, name, port_id: pick.yard, ship_class: pick.cls, build_mode: "turnkey_cash" as const, status: found.ship.status, total_cost_pence: price };
+            if (found) return { ship_id: found.ship.id, name, port_id: pick.yard, ship_class: pick.cls, build_mode: mode, status: found.ship.status, total_cost_pence: mode === "byom" ? q.labour_pence : price };
             await new Promise((r) => setTimeout(r, 5_000));
           }
           // Still unknown: don't build again for a full cooldown; adopt the ship if it turns up.
           this.lastBuy = Date.now();
-          this.pendingBuild = { name, yard: pick.yard, cls: pick.cls, price, payback: pick.payback, lane: pick.lane.key };
+          // The lease goes back once the ship turns up (not before: the build may still need the materials).
+          this.pendingBuild = {
+            name,
+            yard: pick.yard,
+            cls: pick.cls,
+            price: mode === "byom" ? q.labour_pence : price,
+            cost: price,
+            leaseBefore,
+            payback: pick.payback,
+            lane: pick.lane.key,
+          };
+          leaseBefore = null;
           this.persist(true);
           this.setBuyer(`building a ${pick.cls} at ${pick.yard}: outcome unknown (${(e as Error).message}); watching for "${name}"`, true);
           return null;
         }
         // Usually presence lost (the ship sailed) or the price moved past our cash.
-        return failLater(`building a ${pick.cls} at ${pick.yard} failed: ${(e as Error).message}`);
+        if (mode === "byom") this.byomBlockedUntil.set(pick.yard, Date.now() + BYOM_BLOCK_MS);
+        return failLater(
+          `building a ${pick.cls} at ${pick.yard} failed: ${(e as Error).message}${mode === "byom" ? "; its materials stay in the warehouse there" : ""}`,
+        );
       }
     });
+    if (leaseBefore !== null) void this.shrinkLease(pick.yard, leaseBefore);
     if (!built) return;
 
     this.lastBuy = Date.now();
     this.factorFails = 0;
+    // An own-materials build charges only the labour; its materials were booked as they were bought.
+    const spentOnHull = built.total_cost_pence + (built.build_mode === "byom" ? materialsSpent : 0);
     this.shipSpendPence += built.total_cost_pence;
     world.vaults.set(region, world.vault(region) - built.total_cost_pence);
     this.log(
       "fleet",
-      `built ${pick.cls} "${name}" at ${pick.yard} for ${cr(built.total_cost_pence)}: lane ${pick.lane.key}, ~${cr(pick.net)}/h net, pays back in ~${pick.payback.toFixed(1)} h`,
+      `built ${pick.cls} "${name}" at ${pick.yard} for ${cr(spentOnHull)}${built.build_mode === "byom" ? " from our own materials" : ""}: lane ${pick.lane.key}, ~${cr(pick.net)}/h net, pays back in ~${pick.payback.toFixed(1)} h`,
     );
     this.purchases.push({
       at: new Date().toISOString(),
@@ -2280,7 +2429,7 @@ export class FleetManager implements FleetHost {
       name,
       shipClass: pick.cls,
       port: pick.yard,
-      costPence: built.total_cost_pence,
+      costPence: spentOnHull,
       paybackHours: Math.round(pick.payback * 10) / 10,
       lane: pick.lane.key,
     });

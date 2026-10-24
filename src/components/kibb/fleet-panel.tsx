@@ -134,6 +134,10 @@ function SettingsForm({
           Carry freight on empty legs
         </label>
         <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={d.byomBuilds} onChange={(e) => setD({ ...d, byomBuilds: e.target.checked })} />
+          Build ships from materials bought at the yard (skips the 15% markup)
+        </label>
+        <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.convoys} onChange={(e) => setD({ ...d, convoys: e.target.checked })} />
           Sail in convoys with our other ships when it pays
         </label>

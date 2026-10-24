@@ -13,6 +13,7 @@
  *   KIBB_BUY_CLASSES      comma list (default collier,brigantine,fluyt,cutter)
  *   KIBB_FREIGHT=0        don't carry freight on empty legs
  *   KIBB_CONVOYS=0        don't sail in convoys with our other ships
+ *   KIBB_BYOM=0           always build turnkey (not from materials bought at the yard)
  *   KIBB_GUNS             auto (refit each ship to its lane's piracy, default) | full | off
  *   KIBB_BONUS_WEIGHT     % of the expected phase-completion bonus counted in charter pay (default 75)
  *   KIBB_YARD_FACTOR=0    don't hire a factor at a shipyard so the buyer can build there any time
@@ -47,6 +48,7 @@ try {
       buyClasses: env.KIBB_BUY_CLASSES ? env.KIBB_BUY_CLASSES.split(",").map((x) => x.trim()) : undefined,
       useFreight: env.KIBB_FREIGHT ? env.KIBB_FREIGHT !== "0" : undefined,
       convoys: env.KIBB_CONVOYS ? env.KIBB_CONVOYS !== "0" : undefined,
+      byomBuilds: env.KIBB_BYOM ? env.KIBB_BYOM !== "0" : undefined,
       guns: env.KIBB_GUNS ? (env.KIBB_GUNS as FleetSettings["guns"]) : undefined,
       bonusWeightPct: env.KIBB_BONUS_WEIGHT ? Number(env.KIBB_BONUS_WEIGHT) : undefined,
       yardFactor: env.KIBB_YARD_FACTOR ? env.KIBB_YARD_FACTOR !== "0" : undefined,

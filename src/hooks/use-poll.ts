@@ -16,21 +16,35 @@ export function usePoll<T>(
   const [loading, setLoading] = useState(true);
   const loadRef = useRef(load);
   loadRef.current = load;
+  // Answers for old deps (bumped on each change) and answers older than one already shown are dropped.
+  const gen = useRef(0);
+  const seq = useRef(0);
+  const shown = useRef(0);
 
   const reload = useCallback(async () => {
     const fn = loadRef.current;
     if (!fn) return;
+    const g = gen.current;
+    const s = ++seq.current;
+    const current = () => g === gen.current && s > shown.current;
     try {
-      setData(await fn());
+      const d = await fn();
+      if (!current()) return;
+      shown.current = s;
+      setData(d);
       setError(null);
     } catch (e) {
+      if (!current()) return;
+      shown.current = s;
       setError(e as Error);
     } finally {
-      setLoading(false);
+      if (g === gen.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    gen.current++;
+    setError(null);
     if (!loadRef.current) return;
     setLoading(true);
     void reload();
