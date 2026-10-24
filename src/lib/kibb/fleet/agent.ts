@@ -79,6 +79,10 @@ export interface FleetHost {
   freightClaimed(agent: ShipAgent, id: string): boolean;
   /** Another of our ships' hold at this port on this good for a re-post, if any. */
   siblingHold(agent: ShipAgent, port: string, good: string): HoldInfo | undefined;
+  /** A ship about to sail: join or form a convoy with our other ships on the same route, or sail alone. */
+  sailInConvoy(agent: ShipAgent, r: ShipResult, from: string, dest: string, plan: RoutePlan): Promise<ConvoyOutcome>;
+  /** In a convoy still forming here: real ms to wait (and the activity is set), or null to carry on. */
+  convoyWait(agent: ShipAgent, convoyId: string, port: string): Promise<number | null>;
   /** The AI's call on a stalled expansion charter here: hold for its re-post ("wait") or not ("deliver"). */
   stallCall(port: string, good: string): "wait" | "deliver" | undefined;
   /** The fleet's progress changed: save it (`now` for a trip, a load or a delivery). */
@@ -113,6 +117,9 @@ export interface AgentSnapshot {
   ratePerHour: number;
   freight: Array<[string, CarriedFreight]>;
 }
+
+/** A ship about to sail: alone, now in one of our convoys (joined or formed), or a convoy that couldn't be entered. */
+export type ConvoyOutcome = { kind: "alone" } | { kind: "in"; convoyId: string; departsAt: number } | { kind: "failed"; why: string };
 
 /** Cargo held for an expansion charter's re-post. */
 export interface HoldInfo {
@@ -227,6 +234,8 @@ export class ShipAgent {
   private readonly avoid = new Map<string, number>();
   /** Last lane's profit rate, to value this ship's time (pence/hour). */
   private ratePerHour = DEFAULT_RATE_PER_HOUR;
+  /** A stay where joining or forming a convoy failed: sail alone from it. */
+  private noConvoyAt: string | null = null;
   /** Consecutive holds with leftovers at a market that won't pay fairly. */
   private holds = 0;
   private stopRequested = false;
@@ -480,6 +489,27 @@ export class ShipAgent {
     return this.trip;
   }
 
+  /** What this ship's time is worth (pence an hour): its last lane's profit rate. */
+  get rate(): number {
+    return this.ratePerHour;
+  }
+
+  /**
+   * Server time the cargo aboard must arrive by: the soonest charter the lane fills that won't be
+   * re-posted, or the soonest deadline of the sealed freight aboard. Null if nothing is due.
+   */
+  deliverDeadline(): number | null {
+    const { world } = this.host;
+    const dues: number[] = [];
+    for (const [id] of this.lane?.fills ?? []) {
+      const c = world.charters.find((x) => x.id === world.currentId(id));
+      if (c?.expiresAt && !world.renews(c)) dues.push(c.expiresAt);
+    }
+    for (const f of this.freight.values()) if (f.deadline) dues.push(Date.parse(f.deadline));
+    const ok = dues.filter((t) => Number.isFinite(t));
+    return ok.length ? Math.min(...ok) : null;
+  }
+
   /** True while waiting for cash to buy a load. */
   get waitingForCash(): boolean {
     return this.activity.startsWith("waiting for cash");
@@ -652,6 +682,12 @@ export class ShipAgent {
 
     const port = s.current_port_id;
     if (!port) return POLL_MS;
+    // In a convoy still forming here: it sails with the others at its set time. A ship in a convoy
+    // can't dock or sail alone, so there is nothing else to do meanwhile.
+    if (s.convoy_id) {
+      const wait = await this.host.convoyWait(this, s.convoy_id, port);
+      if (wait !== null) return wait;
+    }
     if (!this.stay || this.stay.port !== port) {
       this.stay = { port, key: `${port}@${Date.now()}`, scouted: false, traded: new Set(), boughtHere: new Map(), refused: new Set(), holds: new Map() };
       if (this.resumeAt === port && this.lane) {
@@ -1754,6 +1790,21 @@ export class ShipAgent {
       const wait = Date.parse(r.ship.turnaround_unlocks_at!) - world.now();
       this.activity = `berth lock: leaving for ${dest} in ${secs(wait)}`;
       return wait + 750;
+    }
+
+    // Our other ships bound the same way soon: sail together (pirates board just one ship of a
+    // convoy, and guns are pooled).
+    if (this.noConvoyAt !== stay.key) {
+      const c = await this.host.sailInConvoy(this, r, port, dest, plan);
+      if (c.kind === "failed") {
+        this.log(`convoy to ${dest} not possible (${c.why}): sailing alone`);
+        this.noConvoyAt = stay.key;
+        return 1_000;
+      }
+      if (c.kind === "in") {
+        this.activity = `in convoy to ${dest}, sails in ${secs(c.departsAt - world.now())}`;
+        return 1_500;
+      }
     }
 
     try {

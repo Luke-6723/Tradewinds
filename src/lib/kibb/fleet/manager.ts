@@ -32,11 +32,11 @@
 
 import { KibbClient, KIBB_DEFAULT_URL, isApiError } from "../client";
 import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, zoneDays, type MarqueOption } from "../rivals";
-import type { LetterOfMarque } from "../schema";
+import type { ConvoyResult, ConvoyStatus, LetterOfMarque } from "../schema";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
-import type { BankingRegion, ShipResult } from "../types";
-import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
+import type { BankingRegion, RoutePlan, ShipResult } from "../types";
+import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type ConvoyOutcome, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
 import { openJournal, type Journal } from "./journal";
 import { Advisor, AI_MODES, type AdvisorSnapshot, type AiMode, type AiReport } from "../ai/advisor";
 import { AI_EFFORTS, AI_MODELS, type AiEffort, type AiModel } from "../ai/claude";
@@ -93,6 +93,11 @@ export interface FleetSettings {
   /** Carry Merchant Adventurers freight on legs we sail anyway, when it pays for its berth time. */
   useFreight: boolean;
   /**
+   * Sail in convoys with our other ships bound the same way soon (pirates board just one ship of a
+   * convoy; guns are pooled), when the risk avoided outweighs the wait.
+   */
+  convoys: boolean;
+  /**
    * With no presence at any shipyard, hire a Resident Factor (750 Cr) at the yard nearest the fleet's
    * work when a build there would pay back, build, and dismiss the factor straight after.
    */
@@ -139,6 +144,7 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   underwriteMaxPerPolicyPence: 300_000,
   underwriteMinEdgeBps: 150,
   useFreight: true,
+  convoys: true,
   yardFactor: true,
   holdForRepost: false,
   phaseChestPct: 40,
@@ -175,6 +181,7 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   if (out.bonusWeightPct !== undefined && out.bonusWeightPct > 100) throw new FleetSettingsError("bonusWeightPct must be 0 to 100");
   bool("autoBuy");
   bool("useFreight");
+  bool("convoys");
   bool("marques");
   num("marqueBudgetPence", 0, true);
   bool("underwrite");
@@ -354,6 +361,12 @@ const YARD_RECHECK_MS  = 45_000;
 const INIT_BACKOFF_MS  = [5_000, 10_000, 20_000, 40_000, 60_000];
 const LOG_LIMIT        = 400;
 const GUN_PRICE_PENCE  = 15_000;
+/** Convoys: the longest a ship waits for our others (game hours), the shortest muster the game allows,
+ * the least a passage must risk (pence) to be worth one, and how alike in speed members must be. */
+const CONVOY_MAX_WAIT_GAME_H = 6;
+const CONVOY_MIN_MUSTER_GAME_MIN = 60;
+const CONVOY_MIN_EXPOSURE_PENCE = 5_000;
+const CONVOY_MIN_SPEED_RATIO = 0.85;
 /** A hull's replacement value per ton of hold, until a yard has quoted the class. */
 const HULL_PENCE_PER_TON = 25_000;
 /** Spare cash kept in every non-home region for berth dues and stores. */
@@ -423,6 +436,12 @@ export class FleetManager implements FleetHost {
   /** Saved agents waiting for their ship to be taken command of again. */
   private restoredAgents = new Map<string, AgentSnapshot>();
   private lastPersist = 0;
+  /** Convoys we know of (ours forming, mostly), refreshed at most every 20 s each. */
+  private readonly convoyCache = new Map<
+    string,
+    { from: string; dest: string; departsAt: number; status: ConvoyStatus; organizer: string; members: string[]; classes: string[]; checkedAt: number }
+  >();
+  private convoyQueue: Promise<unknown> = Promise.resolve();
   /** Rival ships and zone traffic from the last rival analysis (for the AI digest). */
   private rivalSummary: DigestInput["rivals"] = { companies: [], zones: [] };
   private lastEscalations: number | null = null;
@@ -1204,6 +1223,18 @@ export class FleetManager implements FleetHost {
       case "ship_entered_port":
         this.world.rivals.addEvent(e.event_type, e.port_id, e.payload, e.timestamp);
         break;
+      case "convoy_departed":
+      case "convoy_arrived":
+      case "convoy_cancelled":
+      case "convoy_disbanded":
+      case "convoy_member_joined":
+      case "convoy_member_detached":
+      case "convoy_member_left_behind": {
+        const id = str("convoy_id");
+        if (id) this.convoyCache.delete(id);
+        for (const a of this.agents.values()) if (!id || a.last?.ship.convoy_id === id) a.nudge();
+        break;
+      }
       case "ship_arrived":
       case "ship_berthed":
       case "ship_evicted":
@@ -1374,6 +1405,179 @@ export class FleetManager implements FleetHost {
       for (const [id, t] of a.lane.fills) if (this.world.currentId(id) === charterId) held += t;
     }
     return Math.max(0, remaining - held);
+  }
+
+  // ── Convoys ─────────────────────────────────────────────────────────────────
+
+  private noteConvoy(r: ConvoyResult): void {
+    const c = r.convoy;
+    this.convoyCache.set(c.id, {
+      from: c.origin_port_id,
+      dest: c.dest_port_id,
+      departsAt: Date.parse(c.departs_at),
+      status: c.status,
+      organizer: c.organizer_company_id,
+      members: r.member_ship_ids,
+      classes: r.members.map((m) => m.ship_class),
+      checkedAt: Date.now(),
+    });
+  }
+
+  async convoyWait(agent: ShipAgent, convoyId: string, port: string): Promise<number | null> {
+    let c = this.convoyCache.get(convoyId);
+    if (!c || Date.now() - c.checkedAt > 20_000) {
+      const list = await this.client.convoys({ convoy_id: convoyId }).catch(() => null);
+      if (list?.[0]) this.noteConvoy(list[0]);
+      c = this.convoyCache.get(convoyId);
+    }
+    if (!c || c.status !== "forming" || c.from !== port) return null;
+    const left = c.departsAt - this.world.now();
+    agent.activity = `in convoy to ${c.dest} with ${c.members.length} ship${c.members.length === 1 ? "" : "s"}, sails in ${Math.max(0, Math.round(left / 1000))}s`;
+    return Math.min(Math.max(left + 2_000, 2_000), 30_000);
+  }
+
+  /**
+   * A ship about to sail `from` -> `dest`: joins one of our convoys forming here for the same port,
+   * or forms one for our other ships bound the same way soon, or sails alone. Decided and done
+   * (offshore, create or join) under one lock, so two ships never both form one for a route.
+   */
+  sailInConvoy(agent: ShipAgent, r: ShipResult, from: string, dest: string, plan: RoutePlan): Promise<ConvoyOutcome> {
+    const run = this.convoyQueue.then(async (): Promise<ConvoyOutcome> => {
+      const decision = await this.convoyDecision(agent, r, from, dest, plan);
+      if (decision.kind === "alone") return decision;
+      try {
+        if (r.ship.status === "berthed") await this.client.offshore(agent.shipId);
+        let convoyId: string;
+        let departsAt: number;
+        if (decision.kind === "join") {
+          const res = await this.client.joinConvoy({ convoy_id: decision.convoyId, ship_id: agent.shipId });
+          if (res.status !== "joined") {
+            await this.client.detachConvoy({ convoy_id: decision.convoyId, ship_id: agent.shipId }).catch(() => undefined);
+            return { kind: "failed", why: `the request is ${res.status}` };
+          }
+          convoyId = decision.convoyId;
+          departsAt = Date.parse(res.departs_at);
+          this.convoyCache.delete(convoyId);
+          this.log(agent.name, `joined our convoy to ${dest} (${decision.ships + 1} ships), sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s`);
+        } else {
+          const res = await this.client.createConvoy({
+            name: `Fleet to ${dest}`,
+            flagship_id: agent.shipId,
+            dest_port_id: dest,
+            depart_in_game_minutes: decision.departInGameMin,
+            admission: "invite_only",
+            visibility: "private",
+          });
+          this.noteConvoy(res);
+          convoyId = res.convoy.id;
+          departsAt = Date.parse(res.convoy.departs_at);
+          this.log(agent.name, `formed a convoy to ${dest} for ${decision.partners} more of our ships, sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s`);
+        }
+        // Seen at once by the next decision (this ship is now in a convoy, not a partner to count).
+        if (agent.last) agent.last = { ...agent.last, ship: { ...agent.last.ship, convoy_id: convoyId, status: "anchored_roadstead" } };
+        return { kind: "in", convoyId, departsAt };
+      } catch (e) {
+        if (this.isFatal(e) || !isApiError(e) || e.status >= 500) throw e;
+        return { kind: "failed", why: e.message };
+      }
+    });
+    this.convoyQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * Whether to sail in convoy. In a convoy of s ships pirates board just one, so each ship's
+   * expected piracy loss (its cargo, and the ship itself) is about 1/s of sailing alone. Joining
+   * (or forming) is worth it when the fall in all our members' losses beats what the wait costs
+   * this ship's time; only with ships of similar speed (a convoy sails at its slowest), only when
+   * the stores cover the slower passage and the wait, and only if the cargo still arrives before
+   * its charters and freight are due.
+   */
+  private async convoyDecision(
+    agent: ShipAgent,
+    r: ShipResult,
+    from: string,
+    dest: string,
+    plan: RoutePlan,
+  ): Promise<{ kind: "alone" } | { kind: "join"; convoyId: string; ships: number } | { kind: "form"; departInGameMin: number; partners: number }> {
+    const alone = { kind: "alone" as const };
+    const w = this.world;
+    if (!this.settings.convoys || this.stopRequested) return alone;
+    const now = w.now();
+    const speed = (cls: string) => (w.shipClass(cls)?.base_speed_centiknots ?? 800) / 100;
+    const ourSpeed = speed(agent.shipClass);
+    const alike = (cls: string) => Math.min(speed(cls), ourSpeed) / Math.max(speed(cls), ourSpeed) >= CONVOY_MIN_SPEED_RATIO;
+    const exposure = (cls: string, guns: number, cargo: number) => {
+      const risk = w.piracyRisk(plan, guns, speed(cls) * 0.8, cargo);
+      return risk.cargoShare * cargo + risk.capture * (this.hullValue(cls) + guns * GUN_PRICE_PENCE);
+    };
+    const cargoOf = (x: ShipResult) => Object.entries(x.cargo_manifest).reduce((n, [g, t]) => n + t * w.basePrice(g), 0);
+    const ours = exposure(agent.shipClass, r.ship.cannons_count, cargoOf(r));
+    const waitCost = (ms: number) => (agent.rate * Math.max(0, ms)) / 3_600_000;
+    const baseLock = 30 * w.gameMinuteMs;
+    const gameDayMs = 24 * 60 * w.gameMinuteMs;
+    // Can this ship sail in a convoy leaving at `departsAt` at `slowest` knots?
+    const fits = (departsAt: number, slowest: number) => {
+      const slow = ourSpeed / Math.max(slowest, 0.1);
+      const stores = plan.safe_provisions_tons * slow + ((departsAt - now) / gameDayMs) * plan.port_provisions_tons_per_day;
+      if (r.stores.provisions_tons < stores) return false;
+      const due = agent.deliverDeadline();
+      const arrive = departsAt + w.sailMs(plan.total_distance_nm, slowest * 0.8) + baseLock;
+      return due === null || arrive <= due;
+    };
+
+    // One of ours already forming here for the same port: join it, or sail alone (never a second).
+    const forming = (await this.client.convoys({ port_id: from, status: "forming", limit: 50 }).catch(() => [] as ConvoyResult[])).filter(
+      (c) => c.convoy.organizer_company_id === w.companyId && c.convoy.dest_port_id === dest,
+    );
+    for (const c of forming) this.noteConvoy(c);
+    const live = forming.map((c) => ({ c, departsAt: Date.parse(c.convoy.departs_at) })).filter(({ departsAt }) => departsAt - now > 10_000);
+    if (live.length) {
+      const pick = live.filter(({ c }) => c.members.every((m) => alike(m.ship_class))).sort((a, b) => a.departsAt - b.departsAt)[0];
+      if (!pick) return alone;
+      const n = Math.max(1, pick.c.members.length);
+      // The members are ours: their cargo is known.
+      const members = pick.c.members.reduce((sum, m) => {
+        const a = this.agents.get(m.ship_id);
+        return sum + (a?.last ? exposure(m.ship_class, m.cannons_count, cargoOf(a.last)) : 0);
+      }, 0);
+      const slowest = Math.min(ourSpeed, ...pick.c.members.map((m) => speed(m.ship_class)));
+      // All members' losses before (ours alone, theirs shared n ways) against after (n + 1 ways).
+      const gain = ours + members / n - (ours + members) / (n + 1);
+      if (gain > waitCost(pick.departsAt - now) && fits(pick.departsAt, slowest)) return { kind: "join", convoyId: pick.c.convoy.id, ships: n };
+      return alone;
+    }
+
+    // Our other ships that will leave the same way soon: at this port with the same lane, or on their way here for it.
+    if (ours < CONVOY_MIN_EXPOSURE_PENCE) return alone;
+    const handling = w.handlingMsPerTon(from);
+    const partners: Array<{ ready: number; exposure: number; speed: number }> = [];
+    for (const a of this.agents.values()) {
+      const pr = a.last;
+      const lane = a.lane;
+      if (a === agent || a.gone || !pr || !lane || lane.source !== from || lane.dest !== dest || pr.ship.convoy_id || !alike(a.shipClass)) continue;
+      const load = a.loaded ? 0 : baseLock + lane.tons * handling;
+      let ready: number;
+      if (pr.ship.status !== "sailing" && pr.ship.current_port_id === from) ready = now + load;
+      else if (pr.ship.status === "sailing" && pr.route_legs.at(-1)?.to_node === from) {
+        const eta = Date.parse(pr.voyage?.estimated_arrival_at ?? pr.ship.leg_arrives_at ?? "");
+        if (!Number.isFinite(eta)) continue;
+        ready = eta + baseLock + load;
+      } else continue;
+      if (ready - now > CONVOY_MAX_WAIT_GAME_H * 60 * w.gameMinuteMs) continue;
+      const value = lane.parts.reduce((n, p) => n + p.tons * w.basePrice(p.good), 0);
+      const e = exposure(a.shipClass, pr.ship.cannons_count, value);
+      // A partner with little at risk may not join on its own account: don't wait for it.
+      if (e < CONVOY_MIN_EXPOSURE_PENCE / 2) continue;
+      partners.push({ ready, exposure: e, speed: speed(a.shipClass) });
+    }
+    if (partners.length === 0) return alone;
+    const k = partners.length;
+    const waitMs = Math.max(CONVOY_MIN_MUSTER_GAME_MIN * w.gameMinuteMs, Math.max(...partners.map((p) => p.ready)) - now + baseLock);
+    const gain = ((ours + partners.reduce((n, p) => n + p.exposure, 0)) * k) / (k + 1);
+    const slowest = Math.min(ourSpeed, ...partners.map((p) => p.speed));
+    if (gain <= waitCost(waitMs) || !fits(now + waitMs, slowest)) return alone;
+    return { kind: "form", departInGameMin: Math.min(3 * 24 * 60, Math.ceil(waitMs / w.gameMinuteMs)), partners: k };
   }
 
   /** Another of our ships' hold at this port on this good for a re-post, if any. */

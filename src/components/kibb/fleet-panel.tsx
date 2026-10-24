@@ -134,6 +134,10 @@ function SettingsForm({
           Carry freight on empty legs
         </label>
         <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={d.convoys} onChange={(e) => setD({ ...d, convoys: e.target.checked })} />
+          Sail in convoys with our other ships when it pays
+        </label>
+        <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.yardFactor} onChange={(e) => setD({ ...d, yardFactor: e.target.checked })} />
           With no ship at a shipyard, hire a factor there for a build (dismissed after)
         </label>
