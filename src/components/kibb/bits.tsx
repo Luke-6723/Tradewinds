@@ -145,7 +145,7 @@ export function NativeSelect({ className, ...props }: React.SelectHTMLAttributes
   return (
     <select
       className={cn(
-        "h-8.5 w-full rounded-lg border border-input bg-background px-2.5 text-base shadow-xs/5 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64 dark:bg-input/32 sm:h-7.5 sm:text-sm",
+        "h-8.5 w-full rounded-lg border border-input bg-background px-2.5 text-base text-foreground shadow-xs/5 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64 dark:bg-popover sm:h-7.5 sm:text-sm",
         className,
       )}
       {...props}
