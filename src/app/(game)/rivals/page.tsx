@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { CrosshairIcon, ShipIcon, SwordsIcon, UsersIcon } from "lucide-react";
+import { CrosshairIcon, ShipIcon, SwordsIcon, TrendingUpIcon, UsersIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,15 +11,23 @@ import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash } from "@/lib/kibb/browser";
-import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtIn } from "@/lib/kibb/format";
+import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { RivalShip, RivalsView } from "@/lib/kibb/rivals";
 
 const LOAD_LABEL = { ballast: "in ballast", part_laden: "part laden", laden: "laden" } as const;
+const SOURCE_LABEL = { quay: "quay", policy: "policy", convoy: "convoy" } as const;
 
 /** `now` and `local` are on the server's clock; `local` turns a server time into a browser one for "in"/"ago" texts. */
 function whereabouts(r: RivalShip, now: number, local: (ts: number) => string, portName: (id: string | null | undefined) => string): string {
   const v = r.voyage;
+  if (v && r.lost) return `lost on passage ${portName(v.from)} → ${portName(v.to)}`;
+  // Not sailed yet: a standing policy (it sails when Lloyd's has covered it), or a forming convoy.
+  if (v && now < v.departAt) {
+    const when = v.departKnown || r.seen.direction === "convoy" ? `, sails ${fmtIn(local(v.departAt))}` : " (insured; sails soon)";
+    return `in ${portName(v.from)}, bound for ${portName(v.to)}${when}`;
+  }
+  if (v && v.arriveKnown) return `at ${portName(v.to)} since ${fmtAgo(local(v.arriveAt))}`;
   if (v && now < v.arriveAt) {
     const pct = Math.round(((now - v.departAt) / Math.max(v.arriveAt - v.departAt, 1)) * 100);
     return `at sea ${portName(v.from)} → ${portName(v.to)}, ~${pct}% (arrives ${fmtIn(local(v.arriveAt))})`;
@@ -27,6 +35,15 @@ function whereabouts(r: RivalShip, now: number, local: (ts: number) => string, p
   if (v) return `probably at ${portName(r.inPort ?? v.to)} (due ${fmtAgo(local(v.arriveAt))})`;
   if (r.inPort) return `at ${portName(r.inPort)} as of ${fmtAgo(local(r.seen.at))}`;
   return "unknown";
+}
+
+/** How a ship was last seen: on the quay (sailed or arrived), insured, or in a public convoy. */
+function seenText(r: RivalShip, portName: (id: string | null | undefined) => string): string {
+  const { port, otherPort, direction } = r.seen;
+  if (direction === "insured") return `insured at ${portName(port)}${otherPort ? ` for ${portName(otherPort)}` : ""}`;
+  if (direction === "convoy") return `in a convoy from ${portName(port)}${otherPort ? ` to ${portName(otherPort)}` : ""}`;
+  const there = direction === "sailed" ? "sailed from" : "arrived at";
+  return `${there} ${portName(port)}${otherPort ? ` ${direction === "sailed" ? "for" : "from"} ${portName(otherPort)}` : ""}`;
 }
 
 function MarqueSettings({ view, onDone }: { view: RivalsView; onDone: () => void }) {
@@ -76,7 +93,7 @@ function MarqueSettings({ view, onDone }: { view: RivalsView; onDone: () => void
 }
 
 export default function RivalsPage() {
-  const { catalog, portName, shipClassName } = useCatalog();
+  const { catalog, portName, shipClassName, goodName } = useCatalog();
   const { data: view, error, reload } = usePoll(() => dash.get<RivalsView>("/api/kibb/rivals"), 30_000);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -98,31 +115,47 @@ export default function RivalsPage() {
   for (const r of view?.rivals ?? []) companies.set(r.company, [...(companies.get(r.company) ?? []), r]);
   const prize = (view?.marques ?? []).reduce((n, m) => n + m.prize_earned_pence, 0);
   const spent = (view?.marques ?? []).reduce((n, m) => n + m.cost_pence, 0);
+  const leader = (view?.profiles ?? []).find((p) => p.earnPerHour !== null && p.rank !== null);
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
       <PageHeader
         title="Rivals"
-        subtitle="Other companies' ships, as seen at the ports where you have a ship or a Resident Factor, and whether a letter of marque on their routes would pay."
+        subtitle="Other companies' ships and voyages: sailings at ports where you have presence, plus public insurance policies, public convoys, expansion deliveries and the leaderboard; and whether a letter of marque on their routes would pay."
       />
       <ErrorNote error={error} />
       {!view ? (
         !error && <Loading />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <StatTile label="Rival ships seen" icon={<ShipIcon className="size-4" />} value={view.rivals.length} sub={`${companies.size} companies`} />
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+            <StatTile
+              label="Rival companies"
+              icon={<ShipIcon className="size-4" />}
+              value={view.profiles.length}
+              sub={`${view.rivals.length} ships known · ${view.coverage.activeCompanies ?? "?"} active in the world`}
+            />
             <StatTile
               label="Watching"
               icon={<UsersIcon className="size-4" />}
               value={`${view.presence.length} port${view.presence.length === 1 ? "" : "s"}`}
-              sub={view.presence.map((p) => portName(p)).join(", ") || "no ship or factor in port"}
+              sub={
+                view.settings.rivalIntel
+                  ? `${view.coverage.policies} policies · ${view.coverage.convoys} convoy ships · ${view.coverage.deliveries} deliveries`
+                  : view.presence.map((p) => portName(p)).join(", ") || "no ship or factor in port"
+              }
             />
             <StatTile
               label="Laden rival passages"
               icon={<CrosshairIcon className="size-4" />}
               value={`${view.traffic.reduce((n, t) => Math.max(n, t.laden), 0).toFixed(1)}`}
               sub="a game day, busiest zone"
+            />
+            <StatTile
+              label="Leader earns"
+              icon={<TrendingUpIcon className="size-4" />}
+              value={leader ? `${fmtCr(leader.earnPerHour)}/h` : "—"}
+              sub={`you: ${view.you?.earnPerHour != null ? `${fmtCr(view.you.earnPerHour)}/h` : "—"}`}
             />
             <StatTile
               label="Auto-marques"
@@ -132,15 +165,83 @@ export default function RivalsPage() {
             />
           </div>
 
+          <Panel title="Rival companies">
+            {view.profiles.length === 0 ? (
+              <Empty>No rival company known yet.</Empty>
+            ) : (
+              <Table head={["Company", "Net worth", "Earns/h", "Ships", "Lanes", "Cargo declared/h", "Feeds", "Losses"]}>
+                {view.profiles.map((p) => (
+                  <tr key={p.company} className="align-top">
+                    <td>
+                      <div className="font-medium">
+                        {p.company}
+                        {!p.linked && <span className="ml-1 text-muted-foreground text-xs">(id only)</span>}
+                      </div>
+                      <div className="text-muted-foreground text-xs">
+                        {[p.homePort ? portName(p.homePort) : null, p.rank !== null ? `rank ${p.rank}` : null].filter(Boolean).join(" · ") || "—"}
+                      </div>
+                    </td>
+                    <td className="whitespace-nowrap tabular-nums">{p.netWorth !== null ? fmtCr(p.netWorth) : "—"}</td>
+                    <td className="whitespace-nowrap tabular-nums">{p.earnPerHour !== null ? fmtCr(p.earnPerHour) : "—"}</td>
+                    <td className="text-xs">
+                      <div className="tabular-nums">{p.ships}</div>
+                      <div className="flex flex-wrap gap-1">
+                        {p.classes.map(([c, n]) => (
+                          <Badge key={c} variant="outline" size="sm">
+                            {shipClassName(c)} ×{n}
+                          </Badge>
+                        ))}
+                      </div>
+                    </td>
+                    <td className="text-xs">
+                      {p.lanes.slice(0, 3).map((l) => (
+                        <div key={`${l.from}>${l.to}`} className="whitespace-nowrap">
+                          {portName(l.from)} → {portName(l.to)} ×{l.voyages} <span className="text-muted-foreground">(laden {l.laden})</span>
+                        </div>
+                      ))}
+                      {p.lanes.length === 0 && "—"}
+                    </td>
+                    <td className="whitespace-nowrap tabular-nums">{p.cargoPerHour !== null ? fmtCr(p.cargoPerHour) : "—"}</td>
+                    <td className="text-xs">
+                      {p.feeds.slice(0, 4).map((f) => (
+                        <div key={`${f.port}|${f.good}`} className="whitespace-nowrap">
+                          {goodName(f.good)} → {portName(f.port)} {fmtTons(f.tons)}
+                        </div>
+                      ))}
+                      {p.feeds.length === 0 && "—"}
+                    </td>
+                    <td className={`tabular-nums ${p.losses > 0 ? "text-destructive-foreground" : ""}`}>{p.losses}</td>
+                  </tr>
+                ))}
+                {view.you && (
+                  <tr className="border-t align-top">
+                    <td className="font-medium">You</td>
+                    <td className="whitespace-nowrap tabular-nums">
+                      {fmtCr(view.you.netWorth)} <span className="text-muted-foreground text-xs">rank {view.you.rank}</span>
+                    </td>
+                    <td className="whitespace-nowrap tabular-nums">{view.you.earnPerHour !== null ? fmtCr(view.you.earnPerHour) : "—"}</td>
+                    <td colSpan={5} />
+                  </tr>
+                )}
+              </Table>
+            )}
+            <p className="mt-3 text-muted-foreground text-xs">
+              Earning is the hourly leaderboard&apos;s net-worth slope (hulls count at build value). Lanes and cargo come from public insurance
+              policies and quay sightings; feeds from the expansion board&apos;s deltas, attributed only when unambiguous. A company seen only by id
+              in policies shows as #abc123 until a sighting ties it to a name.
+              {!view.settings.rivalIntel && " Rival intel is off in the fleet settings: quay sightings only."}
+            </p>
+          </Panel>
+
           <div className="grid items-start gap-4 xl:grid-cols-3">
             <Panel title="Rival ships" className="xl:col-span-2" action={<Link href="/map" className="text-muted-foreground text-xs hover:text-foreground">On the map →</Link>}>
               {view.rivals.length === 0 ? (
                 <Empty>
                   No rival ships seen yet. Ports list the ships that sailed or arrived in the last {view.windowGameHours} game hours, but only
-                  where you have a ship or a factor.
+                  where you have a ship or a factor; public policies and convoys show the rest.
                 </Empty>
               ) : (
-                <Table head={["Ship", "Last seen", "Load", "Probably"]}>
+                <Table head={["Ship", "Seen by", "Last seen", "Cargo", "Probably"]}>
                   {[...companies].flatMap(([company, list]) =>
                     list
                       .sort((a, b) => b.seen.at - a.seen.at)
@@ -152,24 +253,46 @@ export default function RivalsPage() {
                               {company} · {shipClassName(r.shipClass)}
                             </div>
                           </td>
+                          <td>
+                            <div className="flex flex-wrap gap-1">
+                              {r.sources.map((x) => (
+                                <Badge key={x} variant={x === "quay" ? "outline" : "info"} size="sm">
+                                  {SOURCE_LABEL[x]}
+                                </Badge>
+                              ))}
+                            </div>
+                          </td>
                           <td className="text-xs">
-                            {r.seen.direction === "sailed" ? "sailed from" : "arrived at"} {portName(r.seen.port)}
-                            {r.seen.otherPort && ` ${r.seen.direction === "sailed" ? "for" : "from"} ${portName(r.seen.otherPort)}`}
+                            {seenText(r, portName)}
                             <div className="text-muted-foreground">{fmtAgo(local(r.seen.at))}</div>
                           </td>
-                          <td>
-                            <Badge variant={r.loadState === "laden" ? "warning" : "outline"} size="sm">
-                              {LOAD_LABEL[r.loadState]}
-                            </Badge>
+                          <td className="text-xs">
+                            {r.cargo !== null && r.cargo > 0 ? (
+                              <span className="whitespace-nowrap tabular-nums">{fmtCr(r.cargo)} declared</span>
+                            ) : (
+                              <Badge variant={r.loadState === "laden" ? "warning" : "outline"} size="sm">
+                                {r.loadState ? LOAD_LABEL[r.loadState] : "load unknown"}
+                              </Badge>
+                            )}
+                            {r.guns !== null && <div className="text-muted-foreground">{r.guns} guns</div>}
                           </td>
-                          <td className="text-xs">{whereabouts(r, serverNow, local, portName)}</td>
+                          <td className="text-xs">
+                            {r.lost && (
+                              <Badge variant="destructive" size="sm" className="mr-1">
+                                lost
+                              </Badge>
+                            )}
+                            {whereabouts(r, serverNow, local, portName)}
+                          </td>
                         </tr>
                       )),
                   )}
                 </Table>
               )}
               <p className="mt-3 text-muted-foreground text-xs">
-                Positions are estimates: the route to where a ship said it was bound, at its class&apos;s speed. Cargo, guns and timings are never public.
+                Positions are estimates: the route to where a ship said it was bound (or its policy or convoy names), at its class&apos;s speed. A
+                policy declares the cargo insured, never what it is; a ship insured but not yet seen sailing is placed by how long that lane&apos;s
+                policies take to close. Guns are public only in convoys.
               </p>
             </Panel>
 
@@ -201,11 +324,53 @@ export default function RivalsPage() {
             </Panel>
           </div>
 
+          <Panel title="Charters rivals feed">
+            {view.charters.length === 0 ? (
+              <Empty>No expansion charters open.</Empty>
+            ) : (
+              <Table head={["Charter", "Rival tons", "Last rival delivery", "Stalled", "Rivals due before lapse", "Escalates"]}>
+                {view.charters.map((c) => (
+                  <tr key={`${c.port}|${c.good}`} className="align-top">
+                    <td className="font-medium text-sm">
+                      {goodName(c.good)} → {portName(c.port)}
+                    </td>
+                    <td className="text-xs">
+                      {c.rivalTons.map(([company, tons]) => (
+                        <div key={company} className="whitespace-nowrap">
+                          {company} {fmtTons(tons)}
+                        </div>
+                      ))}
+                      {c.rivalTons.length === 0 && "—"}
+                    </td>
+                    <td className="text-muted-foreground text-xs">{c.lastAt !== null ? fmtAgo(local(c.lastAt)) : "—"}</td>
+                    <td>
+                      {c.stalled ? (
+                        <Badge variant="warning" size="sm">
+                          stalled
+                        </Badge>
+                      ) : (
+                        <span className="text-muted-foreground text-xs">being filled</span>
+                      )}
+                    </td>
+                    <td className="tabular-nums">{c.dueBeforeLapse}</td>
+                    <td className="tabular-nums">{c.survival !== null ? `${Math.round(c.survival * 100)}%` : "—"}</td>
+                  </tr>
+                ))}
+              </Table>
+            )}
+            <p className="mt-3 text-muted-foreground text-xs">
+              A stalled posting re-posts richer only if nobody delivers before it lapses. Escalates: the autopilot&apos;s odds that it does if
+              none of our ships delivers first (stalls seen, this charter&apos;s rival record, laden rivals due at the port before then; a
+              likely rival delivery first stops it letting the posting lapse). Rival tons come from the expansion board&apos;s deltas while
+              the autopilot runs.
+            </p>
+          </Panel>
+
           <Panel title="Rival traffic and marques by sea zone">
             {view.verdicts.length === 0 ? (
               <Empty>No rival sailings seen in the last game day.</Empty>
             ) : (
-              <Table head={["Zone", "Piracy now", "Passages", "Laden", "Cargo", "Best marque", "Prize", "Cost", "Our losses", "Verdict"]}>
+              <Table head={["Zone", "Piracy now", "Passages", "Laden", "Cargo", "Next day", "Best marque", "Prize", "Cost", "Our losses", "Verdict"]}>
                 {view.verdicts.map((v) => {
                   const z = view.zones.find((x) => x.sea_zone_id === v.zone);
                   return (
@@ -218,6 +383,7 @@ export default function RivalsPage() {
                       <td className="tabular-nums">{v.passages.toFixed(1)}</td>
                       <td className="tabular-nums">{v.laden.toFixed(1)}</td>
                       <td className="whitespace-nowrap tabular-nums">{fmtCr(v.cargo)}</td>
+                      <td className="tabular-nums">{v.next ? v.next.passages.toFixed(1) : "—"}</td>
                       <td className="tabular-nums">{fmtBps(v.best.bps)}</td>
                       <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.prize)}</td>
                       <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.cost)}</td>
@@ -229,9 +395,11 @@ export default function RivalsPage() {
               </Table>
             )}
             <p className="mt-3 text-muted-foreground text-xs">
-              Per game day. Passages count rival sailings seen in the last {view.windowGameHours} game hours; cargo is estimated from each ship&apos;s
-              class and load and the goods its port of departure makes. Traffic you can&apos;t see (ports without your ships or factors) isn&apos;t counted,
-              so these figures run low. The prize court pays half the seized cargo&apos;s base value times the marques&apos; share of the zone&apos;s piracy.
+              Per game day. Passages count rival sailings seen in the last {view.windowGameHours} game hours, plus the voyages public policies and
+              convoys announce (no presence needed; next day: those not sailed yet); a convoy counts once (pirates board one ship), at its richest
+              member&apos;s cargo. Cargo is the policy&apos;s declared cargo, else estimated from each ship&apos;s class and load and the goods its port
+              of departure makes. Rivals that neither insure nor pass your ports aren&apos;t counted, so these figures run low. The prize court pays
+              half the seized cargo&apos;s base value times the marques&apos; share of the zone&apos;s piracy.
             </p>
           </Panel>
         </>

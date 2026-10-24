@@ -13,12 +13,18 @@
  *   KIBB_BUY_CLASSES      comma list (default collier,brigantine,fluyt,cutter)
  *   KIBB_FREIGHT=0        don't carry freight on empty legs
  *   KIBB_CONVOYS=0        don't sail in convoys with our other ships
+ *   KIBB_RIVAL_INTEL=0    rival intel from quay sightings only (no public policies, convoys or leaderboard)
  *   KIBB_BYOM=0           always build turnkey (not from materials bought at the yard)
  *   KIBB_GUNS             auto (refit each ship to its lane's piracy, default) | full | off
  *   KIBB_BONUS_WEIGHT     % of the expected phase-completion bonus counted in charter pay (default 75)
+ *   KIBB_STORM_WEIGHT     % of expected storm losses counted against a lane (default 100, up to 200; 0 ignores storms)
  *   KIBB_YARD_FACTOR=0    don't hire a factor at a shipyard so the buyer can build there any time
- *   KIBB_HOLD_REPOST=1    hold cargo for a stalled expansion charter's richer re-post
+ *   KIBB_CAPTURE_ESCALATIONS=0  never let a stalled expansion posting lapse for its richer re-post (on by default)
+ *   KIBB_HOLD_REPOST=1    always let a stalled posting lapse in its last 4 game hours, whatever the math says
  *   KIBB_PHASE_CHEST      % of spare cash the buyer keeps back when the tier nears completion (default 40)
+ *   KIBB_RESIZE=0         don't size each load again at its source (and spend as before)
+ *   KIBB_CASH_DUE         % of the cash our ships at sea are due to be paid that loads may count on (default 60; 0: cash in hand only)
+ *   KIBB_WORLD_EVENTS=0   don't plan on world events' prices or on crisis charters not yet listed
  *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY
  *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 2)
  *   KIBB_AI_MODEL         claude-opus-5-5 (default) | claude-sonnet-5-5
@@ -48,12 +54,18 @@ try {
       buyClasses: env.KIBB_BUY_CLASSES ? env.KIBB_BUY_CLASSES.split(",").map((x) => x.trim()) : undefined,
       useFreight: env.KIBB_FREIGHT ? env.KIBB_FREIGHT !== "0" : undefined,
       convoys: env.KIBB_CONVOYS ? env.KIBB_CONVOYS !== "0" : undefined,
+      rivalIntel: env.KIBB_RIVAL_INTEL ? env.KIBB_RIVAL_INTEL !== "0" : undefined,
       byomBuilds: env.KIBB_BYOM ? env.KIBB_BYOM !== "0" : undefined,
       guns: env.KIBB_GUNS ? (env.KIBB_GUNS as FleetSettings["guns"]) : undefined,
       bonusWeightPct: env.KIBB_BONUS_WEIGHT ? Number(env.KIBB_BONUS_WEIGHT) : undefined,
+      stormWeightPct: env.KIBB_STORM_WEIGHT ? Number(env.KIBB_STORM_WEIGHT) : undefined,
       yardFactor: env.KIBB_YARD_FACTOR ? env.KIBB_YARD_FACTOR !== "0" : undefined,
       holdForRepost: env.KIBB_HOLD_REPOST ? env.KIBB_HOLD_REPOST !== "0" : undefined,
+      captureEscalations: env.KIBB_CAPTURE_ESCALATIONS ? env.KIBB_CAPTURE_ESCALATIONS !== "0" : undefined,
       phaseChestPct: env.KIBB_PHASE_CHEST ? Number(env.KIBB_PHASE_CHEST) : undefined,
+      resizeLoads: env.KIBB_RESIZE ? env.KIBB_RESIZE !== "0" : undefined,
+      cashDuePct: env.KIBB_CASH_DUE ? Number(env.KIBB_CASH_DUE) : undefined,
+      actOnEvents: env.KIBB_WORLD_EVENTS ? env.KIBB_WORLD_EVENTS !== "0" : undefined,
       ai: env.KIBB_AI ? (env.KIBB_AI as FleetSettings["ai"]) : undefined,
       aiDailyCapUsd: env.KIBB_AI_DAILY_USD ? Number(env.KIBB_AI_DAILY_USD) : undefined,
       aiTotalCapUsd: env.KIBB_AI_TOTAL_USD ? Number(env.KIBB_AI_TOTAL_USD) : undefined,

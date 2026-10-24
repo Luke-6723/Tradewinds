@@ -250,7 +250,14 @@ export function shipFix(r: ShipResult, now = Date.now()): ShipFix | null {
  * or on the port it was seen in (or bound for, once it should have arrived).
  */
 export function rivalFix(r: RivalShip, now = Date.now()): (ShipFix & { estimated: boolean }) | null {
+  // Sunk or taken: nowhere to show it.
+  if (r.lost) return null;
   const v = r.voyage;
+  // Not sailed yet (a standing policy, a forming convoy): in the port it leaves from.
+  if (v && now < v.departAt) {
+    const at = NODE_COORDS[v.from];
+    return at ? { pos: at, heading: 0, ahead: [], dest: v.to, estimated: true } : null;
+  }
   if (v && now < v.arriveAt) {
     const path: LatLng[] = [];
     for (const [a, b] of v.legs) path.push(...legPath(a, b).slice(path.length ? 1 : 0));

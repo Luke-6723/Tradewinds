@@ -146,14 +146,18 @@ export function refreshFleetKey(companyId: string): Promise<void> {
   });
 }
 
-/** What a running autopilot has seen of rival ships, and its last letter-of-marque report. */
+/**
+ * What an autopilot has seen of rival ships, its last letter-of-marque report, and (running) its
+ * rival intel: snapshot, last analysis, hull quotes.
+ */
 export function fleetRivals(companyId: string) {
   const m = fleets.get(companyId);
   // A stopped autopilot's report would be stale: only a running one's, checked lately, counts.
   const st = m?.state;
   const live = st && (st.status === "running" || st.status === "starting");
   const report = live && st.marques && Date.now() - Date.parse(st.marques.checkedAt) < 12 * 60_000 ? st.marques : null;
-  return { sightings: m?.rivalSightings ?? [], report };
+  const intel = m?.rivalIntel;
+  return { sightings: intel?.sightings ?? [], report, intel: live ? (intel ?? null) : null };
 }
 
 /**

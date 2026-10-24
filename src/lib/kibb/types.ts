@@ -165,7 +165,8 @@ export interface Catalog {
   ports: CatalogPort[];
   commodities: CatalogCommodity[];
   ship_classes: CatalogShipClass[];
-  sea_zones: { id: string; name: string; zone_class: ZoneClass; phase: number }[];
+  /** Catalog hazard odds (bps, 10,000 = 100%); optional here so a missing field falls back. */
+  sea_zones: { id: string; name: string; zone_class: ZoneClass; phase: number; base_storm_bps?: number; base_piracy_bps?: number }[];
 }
 
 export interface GossipReport {
@@ -477,6 +478,10 @@ export interface ContractListing {
   /** True when this is second-hand news; `remaining_quantity` may be out of date. */
   stale: boolean;
   gossip?: { age_seconds: number; heard_at_port_id: string; news_as_of: string } | null;
+  /** When it was posted (a gossiped copy keeps the real posting time). */
+  created_at?: string;
+  /** The raw record (`charter_kind`, `funded_by`, …). */
+  metadata?: Record<string, unknown> | null;
 }
 
 export interface ContractListFilter {

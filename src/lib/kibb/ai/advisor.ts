@@ -324,12 +324,7 @@ export class Advisor {
     return Math.min(BIAS_MAX, Math.max(BIAS_MIN, f));
   }
 
-  /** Stall calls in force, by `port|good`. */
-  stallCalls(): Map<string, "wait" | "deliver"> | undefined {
-    const a = this.inForce();
-    return a && a.stallCalls.length ? new Map(a.stallCalls.map((s) => [s.key, s.call])) : undefined;
-  }
-
+  /** The stall call in force on the expansion charter at this port for this good, if any. */
   stallCall(port: string, good: string): "wait" | "deliver" | undefined {
     return this.inForce()?.stallCalls.find((s) => s.key === `${port}|${good}`)?.call;
   }
@@ -464,9 +459,9 @@ export class Advisor {
 
   /**
    * The parts of the picture worth a fresh answer: the phase and tier (in 10% steps), which
-   * charters are stalled, where each ship is and on what lane, the best lanes, spare cash (by
-   * doubling), the newest notice, the mode, the user's settings it may move, and the advice in
-   * force. Unchanged, a routine call has nothing new to say.
+   * charters are stalled and which the fleet is letting lapse, where each ship is and on what
+   * lane, the best lanes, spare cash (by doubling), the newest notice, the mode, the user's
+   * settings it may move, and the advice in force. Unchanged, a routine call has nothing new to say.
    */
   private fingerprint(d: DigestInput, activeId: string | null): string {
     const u = d.user;
@@ -474,7 +469,14 @@ export class Advisor {
       this.effective,
       [u.bonusWeightPct, u.phaseChestPct, u.minMarginPence, u.holdForRepost],
       d.phase,
-      d.tier ? [Math.floor(d.tier.progressBps / 1_000), d.tier.phaseSoon, d.tier.charters.filter((c) => c.stalled).map((c) => c.id).sort()] : null,
+      d.tier
+        ? [
+            Math.floor(d.tier.progressBps / 1_000),
+            d.tier.phaseSoon,
+            d.tier.charters.filter((c) => c.stalled).map((c) => c.id).sort(),
+            d.tier.stakes.filter((s) => s.camp).map((s) => s.id).sort(),
+          ]
+        : null,
       d.ships.map((s) => [s.state, s.status === "sailing" ? s.dest : s.port, s.lane?.key ?? null]),
       d.topLanes.slice(0, 5).map((l) => l.key),
       Math.floor(Math.log2(Math.max(1, d.cash.spare / 100_000))),

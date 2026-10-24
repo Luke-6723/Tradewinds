@@ -18,10 +18,20 @@
  *
  * Cash: one lock for the whole company, so "raise cash, then spend it" never interleaves between
  * ships. The home region keeps a reserve sized to the fleet's daily upkeep (bills come from it).
+ * A load is planned on the cash spare when its ship reaches the source (cashFlows/cashAt: our other
+ * ships' loads bought first, a share of what our cargo at sea is due to be paid before then), planned
+ * again there just before buying (resizeLane), and never spends what another ship's load counts on.
+ *
+ * Stalls: for each stalled expansion posting the fleet makes one call (stallStakes): let it lapse for
+ * its richer re-post (no ship delivers into it; loads planned into it that land first wait) when the
+ * expected uplift beats what waiting costs, or deliver. A rival's delivery notice ends a camp at once.
  *
  * Events: a long poll on the company's event log wakes a ship's agent the moment something happens
  * to it (arrival, berth from the queue, eviction, hazard) and refreshes the world as soon as a
- * charter is posted, filled or expires, so idle ships re-plan at once. Timers remain the fallback.
+ * charter is posted, filled or expires, so idle ships re-plan at once. Public notices (a policy
+ * listed, a convoy formed, a laden rival sailing) bring the rival check forward. Timers remain the fallback.
+ * World events (shortages, gluts, pirate outbreaks, structural shifts) are read from the public feed
+ * with every world refresh; see World.noteEvents.
  *
  * Progress (each ship's lane and cargo state, sell floors, trips, stats, purchases, the log, the
  * event cursor and the world model's memory) is saved as it changes (journal.ts: MongoDB when
@@ -31,7 +41,7 @@
  */
 
 import { KibbClient, KIBB_DEFAULT_URL, isApiError } from "../client";
-import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, zoneDays, type MarqueOption } from "../rivals";
+import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, rivalProfiles, zoneDays, type MarqueOption, type RivalAnalysis, type RivalDelivery, type ZoneTraffic } from "../rivals";
 import type { ConvoyResult, ConvoyStatus, LetterOfMarque } from "../schema";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
@@ -43,8 +53,8 @@ import { AI_EFFORTS, AI_MODELS, type AiEffort, type AiModel } from "../ai/claude
 import type { DigestInput, DigestShip } from "../ai/digest";
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
-import { rankLanes, type Lane, type Reservations, type ShipSpec } from "./planner";
-import { World, type ExpansionWatch, type WorldSnapshot } from "./world";
+import { HOLD_CAP_GAME_H, HOLD_MAX_GAME_H, rankLanes, REPOST_GRACE_GAME_MIN, type Lane, type Reservations, type ShipSpec, type StallStake } from "./planner";
+import { World, type ExpansionWatch, type StormSummary, type WorldEventsReport, type WorldSnapshot } from "./world";
 
 // ── Settings & state ──────────────────────────────────────────────────────────
 
@@ -73,6 +83,12 @@ export interface FleetSettings {
    */
   bonusWeightPct: number;
   /**
+   * Share (0–200%) of the storm losses the planner expects that counts against a lane: cargo a storm
+   * destroys on the laden passage and the rare sinking. 100 = as learned from our own voyages; 0
+   * ignores storms (stores are still stocked for them).
+   */
+  stormWeightPct: number;
+  /**
    * Sponsor letters of marque automatically where the rival traffic seen makes the prize money beat
    * the cost and our own ships' extra losses by a safety margin. Off by default.
    */
@@ -98,6 +114,12 @@ export interface FleetSettings {
    */
   convoys: boolean;
   /**
+   * Use rival intel beyond quay sightings (public insurance policies, public convoys, expansion
+   * deliveries, the leaderboard) in charter crowding, stall holds and marques. On by default; off
+   * behaves as before (quay sightings only) and stops the extra polling.
+   */
+  rivalIntel: boolean;
+  /**
    * Build ships from materials bought on the yard port's own market into a warehouse there
    * ("bring your own materials"), skipping the yard's 15% turnkey markup, when that is cheaper.
    */
@@ -108,12 +130,25 @@ export interface FleetSettings {
    */
   yardFactor: boolean;
   /**
-   * Hold cargo for a stalled expansion charter (nothing delivered in its posting) that lapses within
-   * a few game hours of arrival, and deliver into its richer re-post. Off by default.
+   * Always let a stalled expansion posting lapse in its last few game hours (4), whatever the math
+   * says: loads landing then wait for the richer re-post. Off by default.
    */
   holdForRepost: boolean;
+  /**
+   * Let a stalled expansion posting (nothing delivered in it) lapse for its richer re-post when the
+   * expected uplift on our tons beats what waiting costs: no ship delivers into it meanwhile (ours
+   * would cancel the escalation too) and runs are timed to land just after the lapse. On by default.
+   */
+  captureEscalations: boolean;
   /** Share (0–90%) of spare cash the buyer leaves alone while the expansion tier is close to completing. */
   phaseChestPct: number;
+  /**
+   * Plan each load again at its source, just before buying, with the cash there is then; never spend
+   * there what our other ships' loads count on (a ship keeps first call on the share of its own load planned on cash in hand). On by default.
+   */
+  resizeLoads: boolean;
+  /** Share (0–90%) of the cash our ships at sea are due to be paid that a load bought after it lands may count on (0: cash in hand only). Needs resizeLoads. */
+  cashDuePct: number;
   /**
    * AI support (Claude as strategist): "off", "shadow" (advises and logs, changes nothing) or "live"
    * (its directives apply within limits). Off by default; needs ANTHROPIC_API_KEY.
@@ -128,6 +163,13 @@ export interface FleetSettings {
   aiEffort: AiEffort;
   /** Minutes between routine calls (halved near a phase turnover); events call sooner. */
   aiIntervalMin: number;
+  /**
+   * Plan on world events: a shortage's dearer bids and a glut's cheaper asks (learned from the shocks
+   * seen, fading by the news' lapse), and a shortage's crisis charter before it is listed (it shows
+   * only on its quay, or as gossip hours later). Pirate outbreaks and structural shifts are always
+   * taken in. On by default.
+   */
+  actOnEvents: boolean;
 }
 
 export type GunPolicy = "auto" | "full" | "off";
@@ -142,6 +184,7 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   buyClasses: ["collier", "brigantine", "fluyt", "cutter"],
   guns: "auto",
   bonusWeightPct: 75,
+  stormWeightPct: 100,
   marques: false,
   marqueBudgetPence: 100_000,
   underwrite: false,
@@ -150,10 +193,15 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   underwriteMinEdgeBps: 150,
   useFreight: true,
   convoys: true,
+  rivalIntel: true,
   byomBuilds: true,
   yardFactor: true,
   holdForRepost: false,
+  captureEscalations: true,
+  actOnEvents: true,
   phaseChestPct: 40,
+  resizeLoads: true,
+  cashDuePct: 60,
   ai: "off",
   aiDailyCapUsd: 2,
   aiTotalCapUsd: 180,
@@ -185,9 +233,12 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   num("maxPaybackHours", 0.1);
   num("bonusWeightPct", 0);
   if (out.bonusWeightPct !== undefined && out.bonusWeightPct > 100) throw new FleetSettingsError("bonusWeightPct must be 0 to 100");
+  num("stormWeightPct", 0);
+  if (out.stormWeightPct !== undefined && out.stormWeightPct > 200) throw new FleetSettingsError("stormWeightPct must be 0 to 200");
   bool("autoBuy");
   bool("useFreight");
   bool("convoys");
+  bool("rivalIntel");
   bool("byomBuilds");
   bool("marques");
   num("marqueBudgetPence", 0, true);
@@ -197,8 +248,13 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   num("underwriteMinEdgeBps", 0, true);
   bool("yardFactor");
   bool("holdForRepost");
+  bool("captureEscalations");
+  bool("actOnEvents");
   num("phaseChestPct", 0);
   if (out.phaseChestPct !== undefined && out.phaseChestPct > 90) throw new FleetSettingsError("phaseChestPct must be 0 to 90");
+  bool("resizeLoads");
+  num("cashDuePct", 0);
+  if (out.cashDuePct !== undefined && out.cashDuePct > 90) throw new FleetSettingsError("cashDuePct must be 0 to 90");
   if (patch.ai !== undefined) {
     if (!AI_MODES.includes(patch.ai)) throw new FleetSettingsError(`ai must be one of ${AI_MODES.join(", ")}`);
     out.ai = patch.ai;
@@ -270,6 +326,12 @@ export interface FleetState {
   expansion: ExpansionReport | null;
   /** Charge on cash a load ties up (per pence per real hour; 0 while cash isn't scarce). */
   capitalRate: number;
+  /** Cash as the planner sees it: spare, committed, due from cargo at sea, and loads re-sized at their source. */
+  cash: CashReport;
+  /** Storm season and what the fleet has learned about storms. */
+  storms: StormSummary | null;
+  /** World events in force, what the planner does with each, and what it has learned from them. */
+  worldEvents: WorldEventsReport;
   /** AI support: mode, spend, the directives in force, recent decisions. */
   ai: AiReport;
   log: FleetLogLine[];
@@ -285,6 +347,41 @@ export interface ExpansionReport {
   /** What a stalled posting's re-post is expected to do to pay and tons. */
   escalation: { pay: number; tons: number };
   charters: ExpansionWatch[];
+  /** The fleet's call on each stalled posting (let it lapse or deliver), with its numbers. */
+  stakes: StallStake[];
+  /** Rival deliveries into this tier's charters seen lately, newest first. */
+  rivalDeliveries: RivalDelivery[];
+  /** Odds each stalled posting (`port|good`) re-posts richer if we don't deliver first (its stake's). */
+  stallOdds: Record<string, number>;
+}
+
+/** A cash movement expected at server time `at`: a load still to buy (out), or cargo at sea paid where it lands (in). */
+interface CashFlow {
+  at: number;
+  pence: number;
+  /** Where an inflow lands (outflows: null). */
+  region: BankingRegion | null;
+}
+
+/** Loads planned again at their source: how often, which way, and the tons moved. */
+export interface ResizeStats {
+  checks: number;
+  grown: number;
+  shrunk: number;
+  /** Another lane loading at the same port won. */
+  switched: number;
+  tonsAdded: number;
+  tonsCut: number;
+  at: string | null;
+}
+
+export interface CashReport {
+  sparePence: number;
+  committedPence: number;
+  /** Cash pay due from our cargo at sea at the share counted (cashDuePct), and when the first lands (server ms). */
+  duePence: number;
+  dueNextAt: number | null;
+  resized: ResizeStats;
 }
 
 export interface MarqueZoneReport {
@@ -293,6 +390,8 @@ export interface MarqueZoneReport {
   passages: number;
   laden: number;
   cargo: number;
+  /** Rival passages already announced for the next game day (rival intel). */
+  next?: ZoneTraffic["next"];
   /** Best marque there (per game day, pence): prize, cost, our own extra losses, profit. */
   best: MarqueOption;
   active: boolean;
@@ -338,6 +437,12 @@ interface FleetSnapshot {
   agents: Record<string, AgentSnapshot>;
   world: WorldSnapshot;
   ai?: AdvisorSnapshot;
+  /** Postings being let lapse (id, `port|good`); absent in older saves. */
+  camping?: Array<[string, string]>;
+  /** Tons each camp shuts out, as seen before it began; absent in older saves. */
+  campShut?: Array<[string, number]>;
+  /** Loads planned again at their source; absent in older saves. */
+  resized?: ResizeStats;
 }
 
 /** How often the progress is saved even when nothing much happened (time use, prices). */
@@ -389,7 +494,7 @@ const REGION_FLOOR_PENCE = 20_000;
 const UPKEEP_DAYS_RESERVED = 1.5;
 /** A refit must improve a load's expected profit by this share to be worth the berth call. */
 const REFIT_MIN_GAIN = 0.02;
-/** How often letters of marque are judged (and presence ports re-read for sightings). */
+/** How often letters of marque are judged (on the last rival analysis). */
 const MARQUE_CHECK_MS = 5 * 60_000;
 /** Marques are bought one game day at a time and judged again before another. */
 const MARQUE_GAME_HOURS = 24;
@@ -401,6 +506,14 @@ const MARQUE_MIN_LADEN = 3;
 const MARQUE_MIN_PENCE = 10_000;
 /** How often the open insurance policies are judged. */
 const UNDERWRITE_CHECK_MS = 60_000;
+/** How often rival intel is gathered (presence ports' sailings, the public policy list, public convoys) and analysed. */
+const RIVAL_CHECK_MS = 2 * 60_000;
+/** A public notice (a policy listed, a convoy formed) brings that forward, never closer together than this. */
+const RIVAL_EVENT_MIN_MS = 20_000;
+/** A laden rival's notice re-runs the analysis alone (no fetch) at most this often. */
+const RIVAL_ANALYSIS_MIN_MS = 10_000;
+/** A rival analysis older than this isn't used by the marque judge or the dashboard. */
+const RIVAL_ANALYSIS_MAX_AGE_MS = 6 * 60_000;
 /** Resident Factor setup fee (its daily salary comes on top). */
 const FACTOR_FEE_PENCE = 75_000;
 /** Spare cash wanted for a hull when no quote has been seen yet, before hiring a factor to price one. */
@@ -418,9 +531,42 @@ const CAPITAL_CHARGE_WEIGHT = 0.5;
 const GUN_PAYBACK_TRIPS = 5;
 /** Whole tons of stores never counted as trimmable room (the voyage always needs some). */
 const STORES_KEPT_TONS = 1;
+/** Calls on stalled expansion postings are worked out at most this often (and afresh after events that move them). */
+const STAKES_TTL_MS = 5_000;
+/** Letting a posting lapse starts once that is worth this many times what waiting costs, and lasts while it is worth that cost. */
+const CAMP_MARGIN = 1.25;
+/** Never let one lapse on longer odds than this (the learned figures are rough). */
+const MIN_ESCALATION_ODDS = 0.2;
+/** ...nor while laden rivals due at its port first leave a stall this little chance (each may deliver its good). */
+const HOLD_MIN_SURVIVAL = 0.4;
+/** Our own flow into a posting let lapse loses this share of its margin to the next-best work meanwhile (a guess). */
+const DEFER_LOSS_SHARE = 0.3;
+/** With no lane of ours into it, a ton's cash margin there is taken as this share of its pay. */
+const DEFER_MARGIN_OF_PAY = 0.15;
+/** The tier must be due to last this many times the wait, or it may complete first (its charters end with it). */
+const TIER_SAFETY = 1.25;
 const FATAL_CODES      = ["account_suspended", "company_frozen"];
 
 const cr = (pence: number) => `${Math.round(pence / 100).toLocaleString("en-GB")} Cr`;
+
+/** "40 t cannons + 20 t timber to sell + 15 t freight": a lane's load, main good first. */
+function loadText(l: Lane): string {
+  return [
+    ...l.parts.map((p) => `${p.tons} t ${p.good}${p.kind === "market" ? " to sell" : ""}`),
+    ...(l.freight.length ? [`${l.freight.reduce((n, f) => n + f.tons, 0)} t freight`] : []),
+  ].join(" + ");
+}
+
+/** A voyage_hazard event read as a storm (a convoy rescue is one that would have sunk the ship), or null. Shape not published. */
+function stormFrom(e: StreamEvent): { hazard: string; zone: string | null; at: number | null; share: number | null; sunk: boolean } | null {
+  const p = (e.payload && typeof e.payload === "object" ? e.payload : {}) as Record<string, unknown>;
+  const name = [p.hazard, p.kind, p.type].find((v): v is string => typeof v === "string");
+  const hazard = (name ?? "hazard").toLowerCase();
+  const rescued = hazard.includes("rescue");
+  if (!hazard.includes("storm") && !rescued) return null;
+  const loss = typeof p.cargo_loss_pct === "number" ? p.cargo_loss_pct / 100 : null;
+  return { hazard, zone: e.sea_zone_id ?? null, at: Date.parse(e.timestamp) || null, share: rescued ? null : loss, sunk: p.sunk === true || rescued };
+}
 
 /** Errors no retry will fix: wrong key, missing scopes, another process running this company. */
 class InitFatal extends Error {}
@@ -459,6 +605,13 @@ export class FleetManager implements FleetHost {
   /** Rival ships and zone traffic from the last rival analysis (for the AI digest). */
   private rivalSummary: DigestInput["rivals"] = { companies: [], zones: [] };
   private lastEscalations: number | null = null;
+  /** The fleet's calls on stalled expansion postings (by `port|good`) and when worked out (local ms; 0: stale). */
+  private stakes = new Map<string, StallStake>();
+  private stakesAt = 0;
+  /** Postings being let lapse (id → `port|good`): the call's hysteresis, saved. */
+  private readonly campState = new Map<string, string>();
+  /** Per stalled posting: tons a camp shuts out, as last seen before it began (stallStakes). */
+  private campShut = new Map<string, number>();
   /** The last hull quote per `yard|class` (pence): prices a build at a yard where we have no presence yet. */
   private readonly hullQuotes = new Map<string, number>();
   /** Factor passes in a row that built nothing: each one backs off longer. */
@@ -475,9 +628,20 @@ export class FleetManager implements FleetHost {
   private lastMarqueCheck = 0;
   private underwriteReport: UnderwriteReport | null = null;
   private lastUnderwriteCheck = 0;
+  private lastRivalCheck = 0;
+  private lastRivalAnalysis = 0;
+  /** A public notice said rival intel changed: gather it again soon; re-analyse soon; judge policies soon. */
+  private rivalsDirty = false;
+  private rivalAnalysisDirty = false;
+  private policiesDirty = false;
+  private nextLeaderboardAt = 0;
+  /** The last rival analysis (local ms it was made). */
+  private rivalAnalysis: (RivalAnalysis & { at: number }) | null = null;
   /** The player's companies (ids), never traded with as rivals. */
   private readonly ourCompanyIds = new Set<string>();
   private retired: AgentStats = { trips: 0, deliveredTons: 0, rewardPence: 0, spentPence: 0, freightPence: 0 };
+  /** Loads planned again at their source (saved). */
+  private resized: ResizeStats = { checks: 0, grown: 0, shrunk: 0, switched: 0, tonsAdded: 0, tonsCut: 0, at: null };
   private shipSpendPence = 0;
   private readonly missingScans = new Map<string, number>();
 
@@ -504,6 +668,8 @@ export class FleetManager implements FleetHost {
   private events: Promise<void> | null = null;
   private eventsAbort: AbortController | null = null;
   private eventCursor: string | undefined;
+  /** The one-off read of the 7-day log for storms is under way (bootstrapStorms). */
+  private stormBootstrapping = false;
   /** An event said charters or the phase changed: refresh the world soon, then wake idle ships. */
   private worldDirty = false;
 
@@ -514,6 +680,9 @@ export class FleetManager implements FleetHost {
     this.client = new KibbClient({ baseUrl: cfg.baseUrl ?? KIBB_DEFAULT_URL, apiKey: cfg.apiKey });
     this.world = new World(this.client);
     this.ownSettings = cfg.settings;
+    this.world.rivalIntel = cfg.settings.rivalIntel;
+    this.world.planOnEvents = cfg.settings.actOnEvents;
+    this.world.onNote = (msg) => this.log("world", msg);
     const self = this;
     this.advisor = new Advisor({
       get world() {
@@ -525,8 +694,9 @@ export class FleetManager implements FleetHost {
       log: (msg) => self.log("fleet", msg),
       persist: (now) => self.persist(now),
       directivesChanged: () => {
-        // New limits or biases: ships idling for want of a lane look again.
+        // New limits or biases: ships idling for want of a lane look again; stall calls may flip.
         for (const a of self.agents.values()) if (a.idle) a.nudge();
+        self.reviewStalls();
       },
       companyId: () => self.world.companyId,
     });
@@ -567,6 +737,9 @@ export class FleetManager implements FleetHost {
       ai: this.advisor.report(),
       expansion: this.expansionReport(),
       capitalRate: this.capitalRate(),
+      cash: this.cashReport(),
+      storms: this.world.stormSummary(),
+      worldEvents: this.world.eventsReport(),
       log: [...this.logLines],
     };
   }
@@ -574,6 +747,7 @@ export class FleetManager implements FleetHost {
   private expansionReport(): ExpansionReport | null {
     const w = this.world;
     if (w.tierTargetPhase === null) return null;
+    const stakes = [...this.stallStakes().values()];
     return {
       targetPhase: w.tierTargetPhase,
       progressBps: w.tierProgressBps,
@@ -581,6 +755,9 @@ export class FleetManager implements FleetHost {
       phaseSoon: this.phaseSoon() && this.settings.autoBuy && this.settings.phaseChestPct > 0 && this.agents.size < this.settings.maxShips,
       escalation: { ...w.escalation },
       charters: [...w.expansionWatch.values()].sort((a, b) => Number(b.stalled) - Number(a.stalled) || b.rate - a.rate),
+      stakes,
+      rivalDeliveries: w.rivals.deliveriesSeen(w.tierTargetPhase),
+      stallOdds: Object.fromEntries(stakes.map((s) => [s.key, s.p])),
     };
   }
 
@@ -604,11 +781,18 @@ export class FleetManager implements FleetHost {
     const prev = this.ownSettings;
     this.ownSettings = v;
     if (prev) this.advisor.settingsChanged(prev, v);
+    this.world.rivalIntel = this.settings.rivalIntel;
+    this.world.planOnEvents = this.settings.actOnEvents;
+    // Off: expected crisis charters go now, not at the next refresh.
+    if (!this.world.planOnEvents) this.world.charters = this.world.charters.filter((c) => !c.provisional);
+    this.stakesAt = 0;
   }
 
-  /** The AI's stall call on an expansion charter at this port for this good, if any. */
-  stallCall(port: string, good: string): "wait" | "deliver" | undefined {
-    return this.advisor.stallCall(port, good);
+  /** The fleet's call on the stalled expansion posting this charter now stands for, if any. */
+  stallStake(charterId: string): StallStake | undefined {
+    const id = this.world.currentId(charterId);
+    for (const st of this.stallStakes().values()) if (st.id === id) return st;
+    return undefined;
   }
 
   /** From the dashboard: ask the AI now, or clear its directives. */
@@ -652,12 +836,23 @@ export class FleetManager implements FleetHost {
       gameMinuteMs: w.gameMinuteMs,
       phase: w.unlockedPhase,
       tier: x
-        ? { targetPhase: x.targetPhase, progressBps: x.progressBps, etaMs: x.etaMs, phaseSoon: x.phaseSoon, stallSurvives: w.stallSurvives, escalation: x.escalation, charters: x.charters }
+        ? {
+            targetPhase: x.targetPhase,
+            progressBps: x.progressBps,
+            etaMs: x.etaMs,
+            phaseSoon: x.phaseSoon,
+            stallSurvives: w.stallSurvives,
+            escalation: x.escalation,
+            charters: x.charters,
+            stakes: x.stakes,
+            // Company names never go to the AI.
+            rivalDeliveries: x.rivalDeliveries.map((d) => ({ at: d.at, port: d.port, good: d.good, tons: d.tons })),
+          }
         : null,
       ships,
       maxShips: this.ownSettings.maxShips,
       buyer: this.buyer,
-      cash: { vaults: [...w.vaults], homeRegion: this.homeRegion, spare: this.spareCash(), committed, capitalRate: this.capitalRate() },
+      cash: { vaults: [...w.vaults], homeRegion: this.homeRegion, spare: this.spareCash(), committed, capitalRate: this.capitalRate(), due: this.cashReport().duePence },
       user: this.ownSettings,
       active: this.advisor.overrides(),
       topLanes: this.topLanes,
@@ -665,6 +860,7 @@ export class FleetManager implements FleetHost {
       piracy: [...w.piracy].filter(([, b]) => b > 0).sort((a, b) => b[1] - a[1]),
       rivals: this.rivalSummary,
       bidHaircutPerDay: w.bidHaircutPerDay,
+      storms: w.stormSummary(),
     };
   }
 
@@ -763,6 +959,9 @@ export class FleetManager implements FleetHost {
       agents,
       world: this.world.snapshot(),
       ai: this.advisor.snapshot(),
+      camping: [...this.campState],
+      campShut: [...this.campShut],
+      resized: { ...this.resized },
     };
   }
 
@@ -780,6 +979,10 @@ export class FleetManager implements FleetHost {
     this.pendingBuild = s.pendingBuild ?? null;
     this.restoredAgents = new Map(Object.entries(s.agents ?? {}));
     this.advisor.restore(s.ai);
+    if (s.resized) this.resized = { ...this.resized, ...s.resized };
+    // A camp under way before the restart carries on without the entry margin.
+    for (const [id, key] of s.camping ?? []) this.campState.set(id, key);
+    for (const [id, tons] of s.campShut ?? []) if (Number.isFinite(tons)) this.campShut.set(id, tons);
   }
 
   fatal(msg: string): void {
@@ -894,10 +1097,12 @@ export class FleetManager implements FleetHost {
     // Every company of this player: their ships aren't rivals and their policies aren't ours to write.
     this.ourCompanyIds.add(profile.company.id);
     this.world.rivals.ours.add(profile.company.name);
+    this.world.rivals.ourIds.add(profile.company.id);
     const player = await this.client.playerProfile().catch(() => null);
     for (const c of player?.companies ?? []) {
       this.ourCompanyIds.add(c.id);
       this.world.rivals.ours.add(c.name);
+      this.world.rivals.ourIds.add(c.id);
     }
     this.log(
       "fleet",
@@ -909,6 +1114,18 @@ export class FleetManager implements FleetHost {
     if (this.tempFactors.size > 0) await this.dismissTempFactors();
     this.lastWorld = Date.now();
     await this.scanShips();
+    // After the scan: the replay needs our ships' classes. The live feed takes over from the cursor.
+    if (!this.world.stormBootstrapped && !this.stormBootstrapping) {
+      const cursor = this.eventCursor;
+      this.stormBootstrapping = true;
+      void this.bootstrapStorms(cursor)
+        .catch((e) => {
+          if (!this.isFatal(e)) this.log("fleet", `storm history not read (${(e as Error).message}); learning from new voyages only`);
+        })
+        .finally(() => {
+          this.stormBootstrapping = false;
+        });
+    }
   }
 
   /** World refresh, new/lost ships, lane overview, purchases. */
@@ -927,6 +1144,8 @@ export class FleetManager implements FleetHost {
       // New charters: ships idling for want of a lane look again now, not in minutes.
       if (dirty) for (const a of this.agents.values()) if (a.idle) a.nudge();
       await this.refreshTopLanes();
+      // Stalls start, break and lapse with the listing: the fleet's calls on them follow.
+      this.reviewStalls();
       // A stalled posting re-posted richer: worth the AI's look.
       const esc = this.world.escalationsSeen;
       if (this.lastEscalations !== null && esc > this.lastEscalations) this.advisor.trigger("a stalled expansion charter re-posted richer");
@@ -936,6 +1155,20 @@ export class FleetManager implements FleetHost {
     if (now - this.lastScan > SHIP_SCAN_MS) await this.scanShips();
     if (now - this.lastPersist > PERSIST_MS) this.persist();
     if (now - this.lastBuyCheck > BUY_CHECK_MS) await this.runBuyer(null);
+    this.world.rivalIntel = this.settings.rivalIntel;
+    if (now - this.lastRivalCheck > RIVAL_CHECK_MS || (this.rivalsDirty && now - this.lastRivalCheck > RIVAL_EVENT_MIN_MS)) {
+      this.lastRivalCheck = now;
+      this.rivalsDirty = false;
+      this.rivalAnalysisDirty = false;
+      await this.runRivals().catch((e) => {
+        if (this.isFatal(e)) throw e;
+        this.log("fleet", `rival check failed: ${(e as Error).message}`);
+      });
+    } else if (this.rivalAnalysisDirty && Date.now() - this.lastRivalAnalysis > RIVAL_ANALYSIS_MIN_MS) {
+      // A laden rival's notice: no fetch (routes are cached), so charter crowding and stall odds see it within seconds.
+      this.rivalAnalysisDirty = false;
+      await this.analyseRivalsNow().catch(() => undefined);
+    }
     if (now - this.lastMarqueCheck > MARQUE_CHECK_MS) {
       this.lastMarqueCheck = now;
       await this.runMarques().catch((e) => {
@@ -943,8 +1176,9 @@ export class FleetManager implements FleetHost {
         this.log("fleet", `marque check failed: ${(e as Error).message}`);
       });
     }
-    if (now - this.lastUnderwriteCheck > UNDERWRITE_CHECK_MS) {
+    if (now - this.lastUnderwriteCheck > UNDERWRITE_CHECK_MS || (this.policiesDirty && now - this.lastUnderwriteCheck > RIVAL_EVENT_MIN_MS)) {
       this.lastUnderwriteCheck = now;
+      this.policiesDirty = false;
       await this.runUnderwriting().catch((e) => {
         if (this.isFatal(e)) throw e;
         this.log("fleet", `underwriting check failed: ${(e as Error).message}`);
@@ -1078,15 +1312,19 @@ export class FleetManager implements FleetHost {
 
   /** `except`: the ship being planned for, whose own pending load isn't someone else's claim on cash. */
   private planOptions(cash: number | null, except?: ShipAgent) {
+    // A ship's own load may count on cash due before it buys; never a hull the buyer prices (no `except`).
+    const flows = except && this.settings.resizeLoads && this.settings.cashDuePct > 0 ? this.cashFlows(except) : null;
+    const spare = flows ? this.spareCash() : 0;
     return {
       minMargin: this.settings.minMarginPence,
       freight: this.settings.useFreight,
       bonusWeight: this.settings.bonusWeightPct / 100,
+      stormWeight: this.settings.stormWeightPct / 100,
       cash,
       capitalRate: this.capitalRate(except),
-      holdForRepost: this.settings.holdForRepost,
       bias: this.advisor.hasBias() ? (l: Lane) => this.advisor.bias(l) : undefined,
-      stallCalls: this.advisor.stallCalls(),
+      stalls: this.stallStakes(),
+      cashAt: flows ? (at: number, source: string) => this.cashAt(flows, at, this.world.region(source), spare) : undefined,
     };
   }
 
@@ -1112,9 +1350,27 @@ export class FleetManager implements FleetHost {
     return Math.max(0, this.spareCash() - committed);
   }
 
-  /** Cash a ship's lane still has to spend: goods not yet bought, collateral for lots not yet taken. */
+  /**
+   * Cash a ship's lane still has to spend: goods not yet bought (at landed cost, less the storm share:
+   * that is lost cargo, not cash), collateral for lots not yet taken. The piracy and fee markup left
+   * in landed cost (about 1-5% over the cash) is kept on purpose: a buffer for walking up the ask ladder.
+   */
   private committedBy(a: ShipAgent): number {
-    return a.partsToBuy().reduce((n, p) => n + p.tons * p.costPerTon, 0) + a.freightToTake().reduce((n, f) => n + f.collateral, 0);
+    const kept = 1 - (a.lane?.stormBps ?? 0) / 10_000;
+    return a.partsToBuy().reduce((n, p) => n + p.tons * p.costPerTon * kept, 0) + a.freightToTake().reduce((n, f) => n + f.collateral, 0);
+  }
+
+  /**
+   * A ship's first call at its source, ahead of our other ships' loads: what its plan still has to buy,
+   * but never beyond the plan's cash less what this stay has already put into it (a part dearer than
+   * planned isn't refilled from the others' cash), and never the share it counted on cash due.
+   */
+  private ownCall(a: ShipAgent): number {
+    const lane = a.lane;
+    if (!lane) return 0;
+    const kept = 1 - (lane.stormBps ?? 0) / 10_000;
+    const planned = lane.parts.reduce((n, p) => n + p.tons * p.costPerTon * kept, 0) + lane.freight.reduce((n, f) => n + f.collateral, 0);
+    return Math.max(0, Math.min(this.committedBy(a), planned - a.spentOnLane()) - (lane.dueCounted ?? 0));
   }
 
   cashArrived(): void {
@@ -1146,8 +1402,10 @@ export class FleetManager implements FleetHost {
     const room = (g: number) => r.effective_hold_capacity_tons + 2 * (now - g) - agent.sealedTons();
     const roomBound = lane.tons >= room(now) - 0.5;
     const tonsAt = (g: number) => Math.max(0, roomBound ? room(g) : Math.min(lane.tons, room(g)));
-    // Landed cost without the piracy markup the planner priced in for the current guns.
-    const landed = lane.costPerTon * (1 - lane.piracyBps / 10_000);
+    // Landed cost without the piracy markup the planner priced in for the current guns. Storms take
+    // their share whatever the guns: off what arrives, not off the guns' case.
+    const stormKept = 1 - (lane.stormBps ?? 0) / 10_000;
+    const landed = lane.costPerTon * (1 - lane.piracyBps / 10_000) * stormKept;
     const payPerTon = lane.pay + (lane.bonus ?? 0);
     // Cargo pirates take (richer loads draw more raids), and the chance they take the ship itself,
     // at its value with the guns it would carry: guns cut both.
@@ -1160,7 +1418,7 @@ export class FleetManager implements FleetHost {
         : 0;
     const profit = (g: number) => {
       const risk = this.world.piracyRisk(plan, g, knots, tonsAt(g) * lootPerTon);
-      return tonsAt(g) * (payPerTon * (1 - risk.cargoShare) - landed) - risk.capture * (hull + g * GUN_PRICE_PENCE);
+      return tonsAt(g) * (payPerTon * (1 - risk.cargoShare) * stormKept - landed) - risk.capture * (hull + g * GUN_PRICE_PENCE);
     };
 
     // Hysteresis, so a ship moving between quiet and pirate water doesn't buy and land guns on
@@ -1244,6 +1502,17 @@ export class FleetManager implements FleetHost {
       case "ship_sailed":
       case "ship_entered_port":
         this.world.rivals.addEvent(e.event_type, e.port_id, e.payload, e.timestamp);
+        // A laden rival under way or just in: charter crowding and stall odds take it in within seconds.
+        if (p.load_state !== "ballast") this.rivalAnalysisDirty = true;
+        break;
+      case "insurance_policy_listed":
+        // Public: a ship somewhere is about to sail (rival intel), and a fresh policy to judge.
+        this.policiesDirty = true;
+        this.wake?.();
+        break;
+      case "convoy_formed":
+        // Public unless private: a convoy's schedule, hulls and guns.
+        this.rivalsDirty = true;
         break;
       case "convoy_departed":
       case "convoy_arrived":
@@ -1273,8 +1542,27 @@ export class FleetManager implements FleetHost {
         const captured = hazard.includes("captur") || p.captured === true;
         this.log(agent?.name ?? "fleet", `${hazard} at sea${captured ? ": CAPTURED by pirates" : p.sunk ? ": SUNK" : loss ? `: lost ${loss}% of cargo` : ""}`);
         if (agent && (hazard.includes("pira") || hazard.includes("raid") || captured)) this.world.notePirateRaid(loss !== undefined ? loss / 100 : null, captured);
+        // Storms, learned per season and hull against the exposure our voyages logged (agent.noteVoyage).
+        const storm = agent && !captured ? stormFrom(e) : null;
+        if (agent && storm) {
+          const r = agent.last;
+          const zone = storm.zone ?? r?.route_legs[r.ship.current_leg_idx]?.to_node ?? null;
+          this.world.noteStorm(zone, this.world.shipClass(agent.shipClass)?.hull_category ?? "coastal", storm.at ?? this.world.now(), storm.share, storm.sunk);
+        }
         if ((p.sunk || captured) && agent) this.advisor.trigger("a ship was lost");
         agent?.nudge();
+        break;
+      }
+      case "convoy_rescue": {
+        // A storm that would have sunk the ship (consorts saved it): counts as a sinking storm. Sent to
+        // every party, so only the rescued ship counts (the payload's shape isn't published).
+        const id = str("rescued_ship_id", "ship_id");
+        const saved = id ? this.agents.get(id) : undefined;
+        if (saved) {
+          this.log(saved.name, "rescued by convoy consorts from a storm that would have sunk her");
+          this.world.noteStorm(e.sea_zone_id ?? null, this.world.shipClass(saved.shipClass)?.hull_category ?? "coastal", Date.parse(e.timestamp) || this.world.now(), null, true);
+        }
+        saved?.nudge();
         break;
       }
       case "ship_captured": {
@@ -1294,6 +1582,15 @@ export class FleetManager implements FleetHost {
         break;
       case "charter_delivered":
       case "charter_expired": {
+        // A public charter's notice may name who delivered (its shape isn't documented): a rival's goes in its profile.
+        if (e.event_type === "charter_delivered" && e.port_id) {
+          const who = str("deliverer_company_name", "delivered_by", "company_name");
+          const tons = num("delivered_quantity") ?? num("quantity_delivered") ?? num("quantity") ?? num("tons");
+          const good = str("commodity_id");
+          const cid = str("contract_id", "charter_id");
+          const phase = cid && this.world.renews({ id: cid }) ? (this.world.tierTargetPhase ?? 0) : 0;
+          if (who && tons && good) this.world.rivals.addDelivery({ company: who, port: e.port_id, good, tons, at: Date.parse(e.timestamp) || this.world.now(), phase });
+        }
         // Filled or lapsed: drop it now. A partial delivery (ours or a rival's) shows in the next
         // listing; adjusting `remaining` here could count our own delivery twice.
         const id = str("contract_id", "charter_id");
@@ -1307,6 +1604,22 @@ export class FleetManager implements FleetHost {
         else if (!id || remaining === undefined) {
           this.worldDirty = true;
           this.wake?.();
+        }
+        // Someone else delivered into a posting we watch for a stall: it's over (any delivery cancels
+        // the escalation). Look again now; ships holding for it deliver at once.
+        if (id && e.event_type === "charter_delivered") {
+          const co = str("deliverer_company_name", "delivered_by", "company_name", "company");
+          const coId = str("deliverer_company_id", "company_id");
+          const { rivals } = this.world;
+          const ours =
+            co !== undefined && rivals.ours.size ? rivals.ours.has(co)
+            : coId !== undefined && this.ourCompanyIds.size ? this.ourCompanyIds.has(coId) || rivals.ourIds.has(coId)
+            : undefined;
+          const ended = this.world.noteCharterDelivered(id, ours);
+          if (ended) {
+            this.log("fleet", `a rival delivered into the stalled ${ended.good} charter at ${ended.port}: no richer re-post this time`);
+            this.reviewStalls();
+          }
         }
         break;
       }
@@ -1348,6 +1661,84 @@ export class FleetManager implements FleetHost {
   }
 
   /**
+   * First start with storm pricing: learn from our own 7-day event log rather than the prior alone,
+   * with departures as exposure (routed for the ship's class) and storms met on those voyages as hits
+   * (a guessed payload that matches nothing leaves the prior alone), up to the saved event
+   * cursor or now (the live feed handles what follows; event ids are time-ordered). Applied only once
+   * both replays are read, so a stop part-way leaves nothing to count twice. Once; best effort.
+   */
+  private async bootstrapStorms(cursor: string | undefined): Promise<void> {
+    const w = this.world;
+    const until = w.now();
+    const replay = async (type: string, each: (e: StreamEvent) => Promise<void> | void): Promise<boolean> => {
+      let after = "0";
+      for (let page = 0; page < 40; page++) {
+        if (this.stopRequested) return false;
+        const batch = await this.client.events({ after_id: after, event_type: type, limit: 500, timeout_ms: 0 });
+        for (const e of batch) {
+          if ((cursor && e.id > cursor) || Date.parse(e.timestamp) > until) return true;
+          await each(e);
+          if (e.id === cursor) return true;
+        }
+        if (batch.length < 500) return true;
+        after = batch.at(-1)!.id;
+      }
+      return true;
+    };
+    const field = (e: StreamEvent, k: string) => {
+      const v = (e.payload && typeof e.payload === "object" ? (e.payload as Record<string, unknown>) : {})[k];
+      return typeof v === "string" ? v : undefined;
+    };
+    const exposures: Array<() => void> = [];
+    // Each matched departure's time at sea, per ship: a storm counts only inside one, so hits and
+    // exposure come from the same voyages (a convoy leg or payload we can't read drops out of both).
+    const voyages = new Map<string, Array<[number, number]>>();
+    const storms: Array<() => void> = [];
+    let unmatched = 0;
+    const names = new Map<string, number>();
+    const departed = await replay("ship_departed", async (e) => {
+      const id = field(e, "ship_id") ?? "";
+      const cls = this.agents.get(id)?.shipClass;
+      const from = e.port_id ?? field(e, "origin_port_id");
+      const to = field(e, "dest_port_id");
+      if (!cls || !from || !to || from === to) return;
+      const plan = await w.route(from, to, cls).catch(() => null);
+      if (!plan) return;
+      const c = w.shipClass(cls);
+      const speed = Math.round((c?.base_speed_centiknots ?? 800) * 0.9);
+      const at = Date.parse(e.timestamp) || w.now();
+      exposures.push(() => w.noteStormExposure(plan.legs.map((l) => ({ ...l, speed_centiknots: speed })), c?.hull_category ?? "coastal", at));
+      const list = voyages.get(id) ?? [];
+      // Slack for laden or convoy pace and roadstead waits.
+      list.push([at, at + w.sailMs(plan.total_distance_nm, speed / 100) * 1.5 + 60 * w.gameMinuteMs]);
+      voyages.set(id, list);
+    });
+    const hazards =
+      departed &&
+      (await replay("voyage_hazard", (e) => {
+        const name = field(e, "hazard") ?? field(e, "kind") ?? "?";
+        names.set(name, (names.get(name) ?? 0) + 1);
+        const id = field(e, "ship_id") ?? field(e, "carrier_ship_id") ?? "";
+        const cls = this.agents.get(id)?.shipClass;
+        const s = stormFrom(e);
+        const t = s?.at;
+        if (cls && s && t != null && voyages.get(id)?.some(([a, b]) => t >= a && t <= b)) storms.push(() => w.noteStorm(s.zone, w.shipClass(cls)?.hull_category ?? "coastal", t, s.share, s.sunk));
+        else if (s) unmatched++;
+      }));
+    if (!hazards || this.stopRequested || w.stormBootstrapped) return;
+    for (const f of [...exposures, ...storms]) f();
+    w.stormBootstrapped = true;
+    const sum = w.stormSummary();
+    this.log(
+      "fleet",
+      `storms: read ${exposures.length} voyages from the 7-day log, ${sum?.seen ?? storms.length} storms against ${sum?.expected ?? "?"} expected` +
+        `${unmatched ? ` (${unmatched} storms not matched to a departure, left out)` : ""}; ` +
+        `hazards seen: ${[...names].map(([k, n]) => `${k} ×${n}`).join(", ") || "none"}`,
+    );
+    this.persist();
+  }
+
+  /**
    * What other ships are bound for: charter room they will fill, source depth they will buy, buyers
    * at a port they will sell to, and freight lots they mean to take.
    */
@@ -1365,13 +1756,214 @@ export class FleetManager implements FleetHost {
       for (const [id, t] of lane.fills) {
         const cur = this.world.currentId(id);
         add(charterTons, cur, t);
-        if (!lane.holdMs && lane.deliverAt) charterLandsAt.set(cur, Math.min(charterLandsAt.get(cur) ?? Infinity, lane.deliverAt));
+        // A camped posting's loads wait for the lapse whatever was planned: they don't end its stall.
+        if (!lane.holdMs && lane.deliverAt && !this.stallStake(cur)?.camp) charterLandsAt.set(cur, Math.min(charterLandsAt.get(cur) ?? Infinity, lane.deliverAt));
       }
       for (const p of a.partsToBuy()) add(sourceTons, `${lane.source}|${p.good}`, p.tons);
       for (const p of lane.parts) if (p.kind === "market") add(sellTons, `${lane.dest}|${p.good}`, p.tons);
       for (const f of a.freightToTake()) freightIds.add(f.id);
     }
     return { charterTons, sourceTons, sellTons, freightIds, charterLandsAt };
+  }
+
+  /**
+   * The fleet's call on each stalled expansion posting: let it lapse (no ship delivers into it;
+   * loads landing first wait for the re-post) or deliver into it. A lapse is worth the re-post's
+   * extra pay on the tons we expect to deliver into it (our recent flow there over a posting, and
+   * loads already bound for it that can wait for it) times the chance it really escalates; waiting
+   * costs the hold time of loaded ships landing first or already holding (their earning rate and the
+   * cash they tie up), their tons the smaller re-post can't take, and part of the margin on our own
+   * flow there until the lapse and on loads it shuts out (landing more than HOLD_CAP early). AI
+   * "deliver", the tier possibly completing first, our loads (into any of its postings) completing
+   * it, or a laden rival likely to deliver first veto it; otherwise
+   * "always hold" and AI "wait" force it near the lapse. Our own delivery would cancel the
+   * escalation too (as the feed shows: a posting is stalled while nothing is delivered in it).
+   */
+  private stallStakes(): Map<string, StallStake> {
+    if (Date.now() - this.stakesAt < STAKES_TTL_MS) return this.stakes;
+    const w = this.world;
+    const s = this.settings;
+    const now = w.now();
+    const gm = w.gameMinuteMs;
+    const capRate = this.capitalRate();
+    const out = new Map<string, StallStake>();
+    const shutOut = new Map<string, number>();
+    for (const [key, x] of w.expansionWatch) {
+      if (!x.stalled || x.expiresAt === null || x.expiresAt <= now || !w.renews({ id: x.id })) continue;
+      const until = x.expiresAt + REPOST_GRACE_GAME_MIN * gm;
+      const hoursLeft = (x.expiresAt - now) / 3_600_000;
+      const into = (fills: Lane["fills"]) => fills.reduce((n, [id, tons]) => n + (w.currentId(id) === x.id ? tons : 0), 0);
+      // A camp gives a load landing more than this before the lapse no room (planner terms()).
+      const capMs = HOLD_CAP_GAME_H * 60 * gm;
+      let before = 0;
+      let holdable = 0;
+      let loadedBefore = 0;
+      let blocked = 0;
+      let others = 0;
+      let after = 0;
+      let holdCost = 0;
+      let longest = 0;
+      let margin = 0;
+      let marginTons = 0;
+      for (const a of this.agents.values()) {
+        const lane = a.lane;
+        if (!lane || a.gone) continue;
+        // A ship already holding for it waits from now, whenever its plan had it landing.
+        const held = a.holdAt(x.port, x.good);
+        const lands = held && w.currentId(held.id) === x.id ? now : lane.deliverAt - lane.holdMs;
+        // Our loads into the tier's other postings landing first (not ones being let lapse) count towards completing it.
+        if (lands < x.expiresAt) {
+          for (const [id, tons] of lane.fills) {
+            const cur = w.currentId(id);
+            if (cur !== x.id && w.renews({ id: cur }) && !this.campState.has(cur)) others += tons;
+          }
+        }
+        const t = into(lane.fills);
+        if (t <= 0) continue;
+        const part = lane.parts.find((p) => p.fills.some(([id]) => w.currentId(id) === x.id));
+        if (part) {
+          margin += (part.pay - part.costPerTon) * t;
+          marginTons += t;
+        }
+        if (lands >= x.expiresAt) {
+          after += t;
+          continue;
+        }
+        before += t;
+        // One not yet loaded can plan otherwise: within HOLD_CAP of the lapse it may wait for the re-post;
+        // earlier, a camp re-plans it away (its margin here lost), so it never reaches the re-post.
+        if (!a.loaded) {
+          if (x.expiresAt - lands > capMs) blocked += t;
+          else holdable += t;
+          continue;
+        }
+        // Loaded cargo has nowhere better to go: it waits.
+        holdable += t;
+        loadedBefore += t;
+        const holdMs = until - Math.max(now, lands);
+        longest = Math.max(longest, holdMs);
+        holdCost += (holdMs / 3_600_000) * (a.rate + capRate * (lane.capital ?? 0) * (t / Math.max(lane.tons, 1)));
+      }
+      const tierLeft = w.tierEtaMs === null ? Infinity : w.tierEtaMs - (until - now);
+      const flow = w.ownRate(key);
+      const top = this.topLanes.find((l) => into(l.fills) > 0);
+      const topTons = top ? into(top.fills) : 0;
+      // The best lane into it landing more than HOLD_CAP early is shut out by a camp: a cost, not re-post tons.
+      const topBlocked = top && top.deliverAt - top.holdMs < x.expiresAt - capMs ? topTons : 0;
+      const repostTons = Math.floor(x.remaining * w.escalation.tons);
+      const tonsAfter = Math.min(repostTons, Math.max((flow * Math.min(w.postingWindowMs(key), tierLeft)) / 3_600_000, after, topTons - topBlocked));
+      const call = this.advisor.stallCall(x.port, x.good);
+      const p = call === "deliver" ? 0 : w.escalationOdds(x, now);
+      const uplift = Math.round((w.escalation.pay - 1) * x.rate);
+      // The re-post takes no more than its own tons, held loads included (never loads a camp plans away).
+      const value = Math.round(p * uplift * Math.min(repostTons, tonsAfter + holdable));
+      const perTon = marginTons > 0 ? margin / marginTons : top ? top.margin - top.bonus : DEFER_MARGIN_OF_PAY * x.rate;
+      // Tons a camp shuts out. Once camped those lanes are re-planned and no longer show, so the figure
+      // from before it began stands while loads could still land that early.
+      const shutNow = blocked + topBlocked;
+      // Camping already, or the last pass's call (the lane re-planning in between drops the top lane
+      // before the camp is recorded).
+      const prev = this.stakes.get(key);
+      const wasCamp = this.campState.has(x.id) || (prev?.id === x.id && prev.camp);
+      const shut = wasCamp && x.expiresAt - now > capMs ? Math.max(shutNow, this.campShut.get(x.id) ?? 0) : shutNow;
+      shutOut.set(x.id, shut);
+      // Loaded tons the smaller re-post can't take are sold off instead of paid this posting's rate.
+      const salvage = Math.min(x.rate, w.price(x.port, x.good)?.bid ?? w.basePrice(x.good));
+      const spill = Math.max(0, Math.min(loadedBefore, x.remaining) - repostTons);
+      const cost = Math.round(holdCost + p * spill * (x.rate - salvage) + (flow * hoursLeft + shut) * DEFER_LOSS_SHARE * Math.max(0, perTon));
+      // Vetoes first: "always hold" and AI "wait" never camp past them.
+      const veto =
+        call === "deliver" ? "AI call: deliver"
+        : w.tierEtaMs !== null && w.tierEtaMs < (until - now) * TIER_SAFETY ? "the tier may complete before the lapse"
+        : before + others > 0 && before + others >= w.expansionTonsLeft ? "our loads would complete the tier"
+        : w.rivalKeep(x) < HOLD_MIN_SURVIVAL ? "a laden rival due before the lapse will likely deliver"
+        : null;
+      const forced = !veto && (call === "wait" || s.holdForRepost);
+      let camp = false;
+      let why: string;
+      if (veto) why = veto;
+      else if (forced && x.expiresAt - now <= HOLD_MAX_GAME_H * 60 * gm) {
+        camp = true;
+        why = call === "wait" ? "AI call: wait" : "always hold (setting)";
+      } else if (!s.captureEscalations) why = "escalation capture is off";
+      else if (longest > capMs) why = "a loaded ship would wait too long";
+      else if (p < MIN_ESCALATION_ODDS) why = `escalates only ~${Math.round(p * 100)}%`;
+      else if (value > 0 && value >= (wasCamp ? 1 : CAMP_MARGIN) * cost) {
+        camp = true;
+        why = "the re-post adds more than waiting costs";
+      } else why = value > 0 ? "waiting costs more than the re-post adds" : "no tons of ours for it";
+      out.set(key, {
+        key,
+        id: x.id,
+        port: x.port,
+        good: x.good,
+        expiresAt: x.expiresAt,
+        p,
+        rivalPerDay: w.rivalBreakRate(key) * 24,
+        uplift,
+        tonsBefore: before,
+        tonsAfter: Math.round(tonsAfter),
+        value,
+        cost,
+        camp,
+        forced,
+        why,
+      });
+    }
+    this.stakes = out;
+    this.campShut = shutOut;
+    this.stakesAt = Date.now();
+    return out;
+  }
+
+  /**
+   * After a refresh, a rival analysis or an event that moves a stall: logs each posting the fleet
+   * starts or stops letting lapse. Starting, lanes into it that would land first and have bought
+   * nothing yet (ships still sailing to their source) are planned again with the wait counted (at
+   * once, or at the source when loads are re-sized there); stopping, ships holding for it deliver now.
+   */
+  private reviewStalls(): void {
+    this.stakesAt = 0;
+    const stakes = this.stallStakes();
+    const w = this.world;
+    const live = new Set<string>();
+    const nudgeHolders = (key: string) => {
+      const [port, good] = key.split("|");
+      for (const a of this.agents.values()) if (a.holdAt(port, good)) a.nudge();
+    };
+    for (const st of stakes.values()) {
+      live.add(st.id);
+      if (st.camp === this.campState.has(st.id)) continue;
+      if (st.camp) {
+        this.campState.set(st.id, st.key);
+        this.log(
+          "fleet",
+          `letting the ${st.good} charter at ${st.port} lapse for its richer re-post in ${Math.round((st.expiresAt - w.now()) / 60_000)} min (${st.why}): ` +
+            `~${Math.round(st.p * 100)}% it escalates, worth ~${cr(st.value)} against ~${cr(st.cost)} waiting`,
+        );
+        // Loads re-sized at their source re-plan with this camp counted.
+        if (!this.settings.resizeLoads) {
+          for (const a of this.agents.values()) {
+            const lane = a.lane;
+            if (!lane || a.loaded || a.last?.ship.status !== "sailing" || a.partsToBuy().length < lane.parts.length || a.freightToTake().length < lane.freight.length) continue;
+            if (lane.deliverAt - lane.holdMs < st.expiresAt && lane.fills.some(([id]) => w.currentId(id) === st.id)) {
+              this.releaseLane(a);
+              a.nudge();
+            }
+          }
+        }
+      } else {
+        this.campState.delete(st.id);
+        this.log("fleet", `delivering into the ${st.good} charter at ${st.port} again (${st.why})`);
+        nudgeHolders(st.key);
+      }
+    }
+    // Camps on postings no longer stalled (a delivery, the lapse) end: holders deliver or wait out the re-post.
+    for (const [id, key] of [...this.campState]) {
+      if (live.has(id)) continue;
+      this.campState.delete(id);
+      nudgeHolders(key);
+    }
   }
 
   /** One planning pass at a time, so each ship sees the others' fresh reservations. */
@@ -1395,18 +1987,20 @@ export class FleetManager implements FleetHost {
       lanes = await rankLanes(this.world, armed, from, this.reservations(agent), this.planOptions(cash, agent));
       best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
     }
+    // What it counted on beyond the cash in hand: cash due, which must land before it is spent.
+    if (best) best = { ...best, dueCounted: Math.max(0, Math.round(best.capital - cash)) };
     agent.setLane(best);
+    // Its tons before or after a stalled posting's lapse move the fleet's call on it.
+    this.stakesAt = 0;
     if (best) agent.noteLane(best);
     if (best && best.key !== prev?.key) {
-      const load = [
-        ...best.parts.map((p) => `${p.tons} t ${p.good}${p.kind === "market" ? " to sell" : ""}`),
-        ...(best.freight.length ? [`${best.freight.reduce((n, f) => n + f.tons, 0)} t freight`] : []),
-      ].join(" + ");
       this.log(
         agent.name,
-        `lane: ${load} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t` +
+        `lane: ${loadText(best)} ${best.source} → ${best.dest}, margin ~${cr(best.margin)}/t` +
           `${best.bonus > 0 ? ` incl. ~${cr(best.bonus)}/t phase bonus` : ""}${best.askKnown ? "" : " (ask estimated)"}, ~${cr(best.profitPerHour)}/h` +
           `${best.holdMs > 0 ? `, holding ~${Math.round(best.holdMs / 1000)}s at ${best.dest} for a stalled charter's re-post` : ""}` +
+          `${best.speculative ? ", for a crisis charter expected from a shortage (not listed yet)" : ""}` +
+          `${best.capital > cash ? `, counting on ~${cr(best.capital - cash)} of cash due before it loads` : ""}` +
           `${best.next ? `; then ${best.next}` : ""}`,
       );
     } else if (!best && prev) {
@@ -1415,8 +2009,84 @@ export class FleetManager implements FleetHost {
     return best;
   }
 
+  /**
+   * At a lane's source, before any of it is bought: the load planned again from here with the vaults
+   * read afresh, the book just scouted, today's reservations and the cash this load may use now
+   * (cashAt, and at least its own plan's first call, ownCall). The same lane re-sized if it still
+   * ranks among lanes loading here, else the best of those (the passage here is sailed). Null keeps
+   * the lane as planned; buying then stops at loadBudget, and a load that counted on cash due waits for
+   * it rather than sail under the planner's minimum (ShipAgent.buyPart).
+   */
+  resizeLane(agent: ShipAgent, port: string, r: ShipResult): Promise<Lane | null> {
+    const run = this.assignQueue.then(() => this.resizeLaneNow(agent, port, r));
+    this.assignQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async resizeLaneNow(agent: ShipAgent, port: string, r: ShipResult): Promise<Lane | null> {
+    const prev = agent.lane;
+    if (!this.settings.resizeLoads || !prev || prev.source !== port || agent.loaded) return null;
+    await this.world.refreshVaults().catch(() => undefined);
+    const cash = this.loadCash(agent);
+    const spare = this.cashAt(this.cashFlows(agent), this.world.now(), this.world.region(port));
+    // First call on what its own plan still has to buy from cash in hand (that share respected the others
+    // when it was planned); cash due it counted on, and growth, must leave the others' loads alone.
+    const floor = Math.min(this.ownCall(agent), this.spareCash());
+    const base = this.planOptions(Math.max(cash, floor), agent);
+    const opts = { ...base, onlySource: port, cashAt: (at: number, src: string) => Math.max(floor, base.cashAt ? base.cashAt(at, src) : cash) };
+    let lanes: Lane[];
+    try {
+      lanes = await rankLanes(this.world, this.specFor(agent, r), port, this.reservations(agent), opts);
+    } catch (e) {
+      this.log(agent.name, `planning the load again at ${port} failed (${(e as Error).message}); buying it as planned`);
+      return null;
+    }
+    // Released or replaced meanwhile: nothing to re-size.
+    if (agent.lane !== prev) return null;
+    const s = this.resized;
+    s.checks++;
+    const room = Math.max(floor, spare);
+    const here = lanes.filter((l) => l.source === port && !agent.isAvoided(l.key));
+    const pick = here.find((l) => l.key === prev.key) ?? here[0];
+    if (!pick) {
+      this.log(
+        agent.name,
+        `nothing loading at ${port} pays with ${cr(room)} spare for it now; buying what that covers of ${loadText(prev)}` +
+          `${(prev.dueCounted ?? 0) > 0 ? " if it makes a load worth the leg, else waiting for the cash due it counted on" : ""}`,
+      );
+      return null;
+    }
+    const before = this.committedBy(agent);
+    const lane = agent.adoptResized({ ...pick, resizedFrom: prev.resizedFrom ?? prev.tons, dueCounted: Math.max(0, Math.round(pick.capital - Math.max(cash, floor))) });
+    // Its tons before or after a stalled posting's lapse move the fleet's call on it.
+    this.stakesAt = 0;
+    const d = lane.tons - prev.tons;
+    if (d > 0) {
+      s.grown++;
+      s.tonsAdded += d;
+    } else if (d < 0) {
+      s.shrunk++;
+      s.tonsCut -= d;
+    }
+    const switched = lane.key !== prev.key;
+    if (switched) s.switched++;
+    if (switched || d !== 0) {
+      s.at = new Date().toISOString();
+      this.log(
+        agent.name,
+        `${switched ? "re-planned" : "re-sized"} at ${port} with ${cr(room)} spare for it now: ${loadText(prev)} → ${loadText(lane)}` +
+          `${switched ? ` to ${lane.dest}` : ""} (${d >= 0 ? "+" : ""}${d} t), ~${cr(lane.profitPerHour)}/h`,
+      );
+      this.persist();
+    }
+    // Less cash tied up than planned: ships waiting for some may have it now.
+    if (this.committedBy(agent) < before) this.cashArrived();
+    return lane;
+  }
+
   releaseLane(agent: ShipAgent): void {
     agent.setLane(null);
+    this.stakesAt = 0;
   }
 
   /** Room in a charter this ship may deliver into: what other ships already carrying cargo for it leave. */
@@ -1650,9 +2320,10 @@ export class FleetManager implements FleetHost {
     return run;
   }
 
-  async ensureCash(region: BankingRegion, amount: number): Promise<number> {
+  /** Cash spendable in a region after its floor, remitted from other regions if short. `fresh`: the vaults were just read. */
+  async ensureCash(region: BankingRegion, amount: number, fresh = false): Promise<number> {
     const w = this.world;
-    await w.refreshVaults();
+    if (!fresh) await w.refreshVaults();
     let have = w.vault(region) - this.floorIn(region);
     if (have >= amount || !this.canRemit) return Math.max(0, have);
 
@@ -1684,6 +2355,93 @@ export class FleetManager implements FleetHost {
     let n = 0;
     for (const [r, v] of this.world.vaults) n += Math.max(0, v - this.floorIn(r));
     return n;
+  }
+
+  /** When a ship whose lane is still to buy will buy it: on reaching its source if sailing there, else now (the most careful). */
+  private buyTime(a: ShipAgent, now: number): number {
+    const r = a.last;
+    if (!r || !a.lane || r.ship.status !== "sailing" || r.route_legs.at(-1)?.to_node !== a.lane.source) return now;
+    const eta = Date.parse(r.voyage?.estimated_arrival_at ?? r.ship.leg_arrives_at ?? "");
+    return Number.isFinite(eta) ? Math.max(now, eta) : now;
+  }
+
+  /**
+   * The fleet's cash movements from now on, in time order: what each other ship's load still has to
+   * spend, when it buys; and (at cashDuePct) what our cargo at sea is due to be paid where it lands,
+   * less any shortfall under that region's floor (refilled first). Nothing due counts as in hand.
+   */
+  private cashFlows(except?: ShipAgent): CashFlow[] {
+    const w = this.world;
+    const now = w.now();
+    const flows: CashFlow[] = [];
+    for (const a of this.agents.values()) {
+      const out = a === except ? 0 : this.committedBy(a);
+      if (out > 0) flows.push({ at: this.buyTime(a, now), pence: -out, region: null });
+    }
+    const share = this.settings.resizeLoads ? this.settings.cashDuePct / 100 : 0;
+    if (share > 0) {
+      const due = [...this.agents.values()]
+        .filter((a) => a !== except && !a.gone)
+        .map((a) => a.proceedsAboard())
+        .filter((p): p is NonNullable<typeof p> => p !== null)
+        .sort((x, y) => x.at - y.at);
+      const short = new Map<BankingRegion, number>();
+      for (const p of due) {
+        const region = w.region(p.dest);
+        const gap = short.get(region) ?? Math.max(0, this.floorIn(region) - w.vault(region));
+        const pence = Math.round(p.pence * share);
+        short.set(region, Math.max(0, gap - pence));
+        // Never "now": at the buy only cash in hand counts.
+        if (pence > gap) flows.push({ at: Math.max(p.at, now + 1), pence: pence - gap, region });
+      }
+    }
+    return flows.sort((x, y) => x.at - y.at);
+  }
+
+  /**
+   * Cash a load bought at `at` in `region` may use: the least the fleet's spare cash falls to from then
+   * on, after our other ships' loads and with cash due (less the fee to bring it to `region`). A ship
+   * never counts on cash another's load needs first. With nothing due this equals loadCash().
+   */
+  private cashAt(flows: CashFlow[], at: number, region: BankingRegion | null, spare = this.spareCash()): number {
+    let bal = spare;
+    let low: number | null = null;
+    for (const f of flows) {
+      if (low === null && f.at > at) low = bal;
+      const fee = f.pence > 0 && f.region && region && f.region !== region ? this.world.remitBps(f.region, region) / 10_000 : 0;
+      bal += f.pence * (1 - fee);
+      if (low !== null) low = Math.min(low, bal);
+    }
+    return Math.max(0, Math.floor(low ?? bal));
+  }
+
+  /**
+   * Cash this ship may put into its load now in `region` (topped up from other regions): at most
+   * `amount`, and never what our other ships' loads count on unless cash due lands before they buy;
+   * but always its own plan's share planned on cash in hand, while that cash is there (ownCall: that
+   * share respected the others when it was planned). Call holding the cash lock. Re-sizing off: as before.
+   */
+  async loadBudget(agent: ShipAgent, region: BankingRegion, amount: number): Promise<number> {
+    if (!this.settings.resizeLoads) return this.ensureCash(region, amount);
+    await this.world.refreshVaults();
+    const spare = this.spareCash();
+    // First call on its own plan's cash in hand (ownCall); beyond that never what our other ships' loads count on.
+    const budget = Math.max(this.cashAt(this.cashFlows(agent), this.world.now(), region, spare), Math.min(this.ownCall(agent), spare));
+    if (budget <= 0) return 0;
+    return Math.min(budget, await this.ensureCash(region, Math.min(amount, budget), true));
+  }
+
+  private cashReport(): CashReport {
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    const due = this.cashFlows().filter((f) => f.pence > 0);
+    return {
+      sparePence: this.spareCash(),
+      committedPence: Math.round(committed),
+      duePence: Math.round(due.reduce((n, f) => n + f.pence, 0)),
+      dueNextAt: due[0]?.at ?? null,
+      resized: { ...this.resized },
+    };
   }
 
   // ── Letters of marque ───────────────────────────────────────────────────────
@@ -1721,11 +2479,19 @@ export class FleetManager implements FleetHost {
   }
 
   /**
-   * Re-reads the ports where we have presence for rival sailings, judges a marque in every zone
-   * rival traffic crosses, and (when enabled, within the budget) sponsors the most profitable one
-   * that clears the safety margin, for one game day.
+   * Rival intel, every couple of minutes (sooner after a public notice): what is gathered, then the
+   * analysis.
    */
-  private async runMarques(): Promise<void> {
+  private async runRivals(): Promise<void> {
+    await this.gatherRivals();
+    await this.analyseRivalsNow();
+  }
+
+  /**
+   * Sailings at the ports where we have presence and, with `rivalIntel`, the public policy list
+   * (closed policies say when a ship arrived or sank), public convoys and the hourly leaderboard.
+   */
+  private async gatherRivals(): Promise<void> {
     const { world, client, settings } = this;
     const ports = new Set<string>();
     for (const a of this.agents.values()) {
@@ -1733,45 +2499,93 @@ export class FleetManager implements FleetHost {
       if (s && s.status !== "sailing" && s.current_port_id) ports.add(s.current_port_id);
     }
     for (const p of await client.factors().catch(() => [] as string[])) ports.add(p);
-    await Promise.all(
-      [...ports].map(async (p) => {
-        const detail = await client.port(p).catch(() => null);
-        if (detail) world.observeGossip(detail);
-      }),
-    );
+    const intel = settings.rivalIntel;
+    const [details, policies, forming, sailing, board] = await Promise.all([
+      Promise.all([...ports].map((p) => client.port(p).catch(() => null))),
+      intel ? client.policies({ limit: 200 }).catch(() => null) : null,
+      intel ? client.convoys({ status: "forming", limit: 50 }).catch(() => null) : null,
+      intel ? client.convoys({ status: "sailing", limit: 50 }).catch(() => null) : null,
+      intel && Date.now() >= this.nextLeaderboardAt ? client.leaderboard().catch(() => null) : null,
+    ]);
+    for (const d of details) if (d) world.observeGossip(d);
+    if (policies) world.rivals.addPolicies(policies);
+    for (const list of [forming, sailing]) if (list) world.rivals.addConvoys(list);
+    if (board) {
+      world.rivals.observeLeaderboard(board);
+      // Recomputed hourly: look again just after the next refresh (server time to ours), not sooner than 5 min.
+      const next = Date.parse(board.next_refresh_at ?? "");
+      this.nextLeaderboardAt = Math.max(Date.now() + 5 * 60_000, Number.isFinite(next) ? next - world.skewMs + 30_000 : Date.now() + 3_600_000);
+    }
+  }
+
+  /**
+   * Where every rival ship probably is, who lands where before our ships (charter crowding, stall
+   * odds), and rival traffic per sea zone (marques), from what was gathered. No fetch but routes
+   * (cached), so it can run again within seconds of a laden rival's notice.
+   */
+  private async analyseRivalsNow(): Promise<void> {
+    const { world } = this;
     const now = world.now();
     world.rivals.prune(now, world.gameMinuteMs);
-
-    const [zones, ours] = await Promise.all([client.zones(), this.recentMarques(now)]);
-    const spent = ours.filter((m) => now - Date.parse(m.created_at) < 24 * 3_600_000).reduce((n, m) => n + m.cost_pence, 0);
-    const prize = ours.reduce((n, m) => n + m.prize_earned_pence, 0);
-    const active = new Set(ours.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
-    const { ships: rivalShips, zones: traffic } = await analyseRivals(world.rivals.all(), {
+    const analysis = await analyseRivals(world.rivals, {
       catalog: world.catalog,
       route: (f, t, c) => world.route(f, t, c).catch(() => null),
       now,
       gameMinuteMs: world.gameMinuteMs,
-      piracy: new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps])),
+      piracy: world.piracy,
+      intel: this.settings.rivalIntel,
+      quotes: this.knownQuotes(),
     });
-    // Laden rivals still at sea, by the port they're bound for: the planner discounts public
-    // charters there; and a summary for the AI digest (companies aliased, never named).
-    const arrivals = new Map<string, number[]>();
-    const byCompany = new Map<string, { ships: number; laden: number; sailing: number }>();
-    for (const r of rivalShips) {
-      const c = byCompany.get(r.company) ?? { ships: 0, laden: 0, sailing: 0 };
-      c.ships++;
-      if (r.loadState !== "ballast") c.laden++;
-      if (r.voyage && r.voyage.arriveAt > now) {
-        c.sailing++;
-        if (r.loadState !== "ballast") arrivals.set(r.voyage.to, [...(arrivals.get(r.voyage.to) ?? []), r.voyage.arriveAt]);
-      }
-      byCompany.set(r.company, c);
-    }
-    world.rivalArrivals = arrivals;
+    world.rivalLandings = new Map(analysis.landings);
+    this.rivalAnalysis = { ...analysis, at: Date.now() };
+    this.lastRivalAnalysis = Date.now();
+    // For the AI digest: companies aliased there, never named; rivals seen first.
+    const profiles = rivalProfiles(world.rivals, analysis, now)
+      .filter((p) => p.ships > 0 || p.earnPerHour !== null)
+      .sort((a, b) => b.ships - a.ships || (b.netWorth ?? 0) - (a.netWorth ?? 0));
     this.rivalSummary = {
-      companies: [...byCompany.values()].sort((a, b) => b.ships - a.ships),
-      zones: traffic.map((t) => ({ zone: t.zone, passages: t.passages, laden: t.laden })),
+      companies: profiles.map((p) => {
+        const ships = analysis.ships.filter((s) => s.company === p.company);
+        return {
+          ships: p.ships,
+          laden: ships.filter((s) => s.loadState !== null && s.loadState !== "ballast").length,
+          sailing: ships.filter((s) => s.voyage && s.voyage.departAt <= now && s.voyage.arriveAt > now).length,
+          earnPerHour: p.earnPerHour,
+          lanes: p.lanes.slice(0, 3).map((l) => `${l.from}>${l.to} x${l.voyages} (${l.laden} laden)`),
+          feeds: p.feeds.slice(0, 4).map((f) => `${f.port}/${f.good} ${Math.round(f.tons)}t`),
+        };
+      }),
+      zones: analysis.zones.map((t) => ({ zone: t.zone, passages: t.passages, laden: t.laden })),
     };
+    // Rivals landing where a posting is stalled move its odds: the fleet's calls follow within seconds.
+    this.reviewStalls();
+  }
+
+  /** Cheapest quote seen per hull class (what the game values a hull at). */
+  private knownQuotes(): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const [k, v] of this.hullQuotes) {
+      const cls = k.slice(k.indexOf("|") + 1);
+      out.set(cls, Math.min(out.get(cls) ?? Infinity, v));
+    }
+    return out;
+  }
+
+  /**
+   * Judges a marque in every zone rival traffic crosses (the last rival analysis), and (when enabled,
+   * within the budget) sponsors the most profitable one that clears the safety margin, for one game day.
+   */
+  private async runMarques(): Promise<void> {
+    const { world, client, settings } = this;
+    if (!this.rivalAnalysis || Date.now() - this.rivalAnalysis.at > RIVAL_ANALYSIS_MAX_AGE_MS) await this.runRivals();
+    const analysis = this.rivalAnalysis;
+    if (!analysis) return;
+    const now = world.now();
+    const [zones, ours] = await Promise.all([client.zones(), this.recentMarques(now)]);
+    const spent = ours.filter((m) => now - Date.parse(m.created_at) < 24 * 3_600_000).reduce((n, m) => n + m.cost_pence, 0);
+    const prize = ours.reduce((n, m) => n + m.prize_earned_pence, 0);
+    const active = new Set(ours.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
+    const traffic = analysis.zones;
     const own = await this.ownExposure();
 
     // Marques are sized to what the budget has left (a game day of it), not refused for being big.
@@ -1783,17 +2597,21 @@ export class FleetManager implements FleetHost {
     for (const t of traffic) {
       const z = zones.find((x) => x.sea_zone_id === t.zone);
       if (!z || z.phase > world.unlockedPhase) continue;
-      const best = bestMarque(z, t.exposure, own.get(t.zone) ?? 0, Math.max(50, maxBps));
+      // What a marque bought now covers: the next game day. Sailings already announced there (rival intel)
+      // stand in for it when they exceed the last day's.
+      const exposure = settings.rivalIntel ? Math.max(t.exposure, t.next.exposure) : t.exposure;
+      const laden = settings.rivalIntel ? Math.max(t.laden, t.next.laden) : t.laden;
+      const best = bestMarque(z, exposure, own.get(t.zone) ?? 0, Math.max(50, maxBps));
       const verdict = active.has(t.zone)
         ? "our marque is in force"
         : best.bps === 0
           ? "the zone's marques are at their cap"
-          : t.laden < MARQUE_MIN_LADEN
-            ? `too little laden traffic seen (${t.laden.toFixed(1)} a game day; needs ${MARQUE_MIN_LADEN})`
+          : laden < MARQUE_MIN_LADEN
+            ? `too little laden traffic seen (${laden.toFixed(1)} a game day; needs ${MARQUE_MIN_LADEN})`
             : best.profit <= 0 || best.prize < MARQUE_SAFETY * (best.cost + best.ownLoss)
               ? `doesn't pay: prize ~${cr(best.prize)} vs cost ${cr(best.cost)} + our losses ${cr(best.ownLoss)} a game day`
               : "pays";
-      rows.push({ zone: t.zone, passages: t.passages, laden: t.laden, cargo: Math.round(t.cargo), best, active: active.has(t.zone), verdict });
+      rows.push({ zone: t.zone, passages: t.passages, laden, cargo: Math.round(t.cargo), next: t.next, best, active: active.has(t.zone), verdict });
     }
     rows.sort((a, b) => b.best.profit - a.best.profit);
 
@@ -1873,6 +2691,11 @@ export class FleetManager implements FleetHost {
       client.vaults(),
     ]);
     const locked = vaults.vaults.filter((v) => v.account_type === "escrow").reduce((n, v) => n + Math.max(0, v.balance_pence), 0);
+    // The same lists are the public record of other companies' voyages: rival intel at no extra call.
+    if (settings.rivalIntel) {
+      world.rivals.addPolicies([...open, ...active]);
+      this.rivalAnalysisDirty = true;
+    }
     const rows = judgePolicies([...open, ...active], {
       ours: this.ourCompanyIds,
       now: world.now(),
@@ -1882,6 +2705,9 @@ export class FleetManager implements FleetHost {
       maxPerPolicyPence: settings.underwriteMaxPerPolicyPence,
       minEdgeBps: settings.underwriteMinEdgeBps,
       held: new Set(held.map((p) => p.id)),
+      record: settings.rivalIntel
+        ? (p) => world.rivals.policyRecord(p.insured_company_id, p.origin_port_id, p.dest_port_id, p.insured_value_pence > p.hull_value_pence)
+        : undefined,
     });
 
     const toWrite = rows.filter((r) => r.verdict === "write");
@@ -1930,9 +2756,16 @@ export class FleetManager implements FleetHost {
     };
   }
 
-  /** Sightings and the last marque report, for the dashboard. */
-  get rivalSightings() {
-    return this.world.rivals.all();
+  /** Rival intel and the last analysis (null once it is old), for the dashboard. */
+  get rivalIntel() {
+    const fresh = this.rivalAnalysis && Date.now() - this.rivalAnalysis.at < RIVAL_ANALYSIS_MAX_AGE_MS ? this.rivalAnalysis : null;
+    return {
+      sightings: this.world.rivals.all(),
+      snapshot: this.world.rivals.snapshot(),
+      analysis: fresh,
+      quotes: [...this.knownQuotes()],
+      activeCompanies: this.world.activeCompanies,
+    };
   }
 
   // ── Buying ships ────────────────────────────────────────────────────────────
@@ -2151,7 +2984,8 @@ export class FleetManager implements FleetHost {
     if ([...this.agents.values()].some((a) => a.waitingForCash)) return this.setBuyer("a ship is waiting for cash to load: not buying");
 
     await world.refreshVaults();
-    // Cash the existing fleet still needs for loads it is bound to buy comes first.
+    // Cash the existing fleet still needs for loads it is bound to buy comes first (loads sized on
+    // cash due included: cash due never funds a hull).
     let committed = 0;
     for (const a of this.agents.values()) committed += this.committedBy(a);
     const loose = this.spareCash() - committed;
@@ -2249,8 +3083,9 @@ export class FleetManager implements FleetHost {
           continue;
         }
         // Planned with the cash left after building it, so the load it is credited with is one it can buy.
-        // Without the AI's lane bias: it may only hold the buyer, never talk it into a ship.
-        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), { ...this.planOptions(afterBuy), bias: undefined }))[0];
+        // Without the AI's lane bias: it may only hold the buyer, never talk it into a ship. Nor is one
+        // built for a crisis charter only expected from the news, in its own leg or the onward one.
+        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), { ...this.planOptions(afterBuy), bias: undefined, noSpeculativeOnward: true })).find((l) => !l.speculative);
         if (!lane) {
           notes.push(`${cls.id}@${yard}: no paying lane it could afford`);
           continue;

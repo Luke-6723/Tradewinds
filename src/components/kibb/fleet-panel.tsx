@@ -13,7 +13,7 @@ import type { AiMode, AiReport } from "@/lib/kibb/ai/advisor";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash } from "@/lib/kibb/browser";
-import { fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
+import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
 import type { FleetSettings, GunPolicy } from "@/lib/kibb/fleet/manager";
@@ -107,6 +107,29 @@ function SettingsForm({
           onChange={(e) => setD({ ...d, bonusWeightPct: Math.min(100, Math.max(0, Number(e.target.value))) })}
         />
       </div>
+      <div className="space-y-1">
+        <Label>Storm losses counted (%)</Label>
+        <Input
+          type="number"
+          min={0}
+          max={200}
+          step={10}
+          value={d.stormWeightPct}
+          onChange={(e) => setD({ ...d, stormWeightPct: Math.min(200, Math.max(0, Number(e.target.value))) })}
+        />
+      </div>
+      <div className="space-y-1">
+        <Label>Cash due from cargo at sea counted (%)</Label>
+        <Input
+          type="number"
+          min={0}
+          max={90}
+          step={10}
+          disabled={!d.resizeLoads}
+          value={d.cashDuePct}
+          onChange={(e) => setD({ ...d, cashDuePct: Math.min(90, Math.max(0, Number(e.target.value))) })}
+        />
+      </div>
       <div className="col-span-full space-y-1.5">
         <Label>Classes the buyer may build</Label>
         <div className="grid gap-x-4 gap-y-1.5 text-sm sm:grid-cols-2 xl:grid-cols-4">
@@ -142,8 +165,20 @@ function SettingsForm({
           Sail in convoys with our other ships when it pays
         </label>
         <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={d.rivalIntel} onChange={(e) => setD({ ...d, rivalIntel: e.target.checked })} />
+          Use rival intel (public policies, convoys, expansion deliveries) in charter races, stall holds and marques
+        </label>
+        <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.yardFactor} onChange={(e) => setD({ ...d, yardFactor: e.target.checked })} />
           With no ship at a shipyard, hire a factor there for a build (dismissed after)
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={d.actOnEvents} onChange={(e) => setD({ ...d, actOnEvents: e.target.checked })} />
+          Plan on world events (shortage bids, glut asks, crisis charters before their gossip)
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={d.resizeLoads} onChange={(e) => setD({ ...d, resizeLoads: e.target.checked })} />
+          Size each load again at its source with the cash there is then
         </label>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -202,17 +237,24 @@ function SettingsForm({
               onChange={(e) => setD({ ...d, phaseChestPct: Math.min(90, Math.max(0, Number(e.target.value))) })}
             />
           </div>
-          <label className="flex items-center gap-1.5 text-sm sm:col-span-2">
-            <input type="checkbox" checked={d.holdForRepost} onChange={(e) => setD({ ...d, holdForRepost: e.target.checked })} />
-            Hold cargo for a stalled expansion charter&apos;s richer re-post (off by default)
-          </label>
+          <div className="space-y-1 sm:col-span-2">
+            <label className="flex items-center gap-1.5 text-sm">
+              <input type="checkbox" checked={d.captureEscalations} onChange={(e) => setD({ ...d, captureEscalations: e.target.checked })} />
+              Let stalled expansion charters lapse for their richer re-post when that pays (on by default)
+            </label>
+            <label className="flex items-center gap-1.5 text-sm">
+              <input type="checkbox" checked={d.holdForRepost} onChange={(e) => setD({ ...d, holdForRepost: e.target.checked })} />
+              Always do so in a posting&apos;s last 4 game hours, whatever the math says (off by default)
+            </label>
+          </div>
         </div>
         <p className="text-muted-foreground text-xs">
-          Expansion charters re-post when they lapse; one nobody delivered to comes back at higher pay on fewer tons. Lanes already count
-          that for loads landing after the lapse. Holding goes further: a load landing up to 4 game hours before a stalled posting lapses
-          waits for the re-post instead of delivering at today&apos;s rate (if anyone delivers meanwhile, it delivers at once). Once the
-          tier is 90% done or due within 2 hours, and for an hour after it turns over, the buyer leaves the kept-back share of spare cash
-          for the next tier&apos;s charters.
+          A posting nobody delivers to re-posts at about 25% more pay on 75% of the tons, and the higher pay stays for later postings; any
+          delivery cancels that, ours too (assumed: the feed counts a posting stalled only while nothing is delivered in it). For each
+          stalled posting the fleet weighs the extra pay on the tons it expects to deliver there, times the chance it escalates (from
+          stalls seen, rival deliveries there, laden rivals inbound), against what waiting costs. While it lets one lapse, no ship delivers into it, the tons a load plans into it that land early wait in the roadstead, and ships take other work until a
+          run lands just after the lapse; if a rival delivers, holders deliver at once. Once the tier is 90% done or due within 2 hours,
+          and for an hour after it turns over, the buyer leaves the kept-back share of spare cash for the next tier&apos;s charters.
         </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -237,7 +279,12 @@ function SettingsForm({
       <p className="col-span-full text-muted-foreground text-xs">
         Each gun takes 2 t of hold. Auto refits a ship at shipyard calls when it pays: in quiet Channel and North Sea water that means none.
         Expansion charters also earn a share of the phase-completion bonus when the tier fills; the percentage is how much of that
-        expected share counts when choosing lanes and buy prices.
+        expected share counts when choosing lanes and buy prices. Storm losses: the cargo storms are expected to destroy on each lane
+        (learned from our own voyages; storm season, game months 11-2, roughly doubles it) counts at this percentage; 0 ignores storms.
+        Stores are stocked for extra hits either way. A ship sailing to its source is planned on the cash spare when it gets there: cash in
+        hand, less what our other ships&apos; loads spend first, plus the cash-due share of what our ships at sea are due to be paid before
+        then (less the remittance fee). At the source the load is planned again with the cash there is then; a ship there keeps first
+        call on the share of its own load planned on cash in hand, and waits for cash due rather than sail a sliver of a load that counted on it.
       </p>
       <div className="col-span-full flex justify-end gap-2">
         <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
@@ -336,6 +383,19 @@ export function FleetPanel() {
               {" · "}cash is scarce: loads charged {(st.capitalRate * 100).toFixed(2)}%/h of the money they tie up
             </span>
           )}
+          {st?.cash && st.cash.duePence > 0 && (
+            <span title="Cash pay due from our cargo at sea, at the share counted; loads bought after it lands may count on it">
+              {" · "}
+              {fmtCr(st.cash.duePence)} due from cargo at sea
+            </span>
+          )}
+          {st?.cash && st.cash.resized.grown + st.cash.resized.shrunk + st.cash.resized.switched > 0 && (
+            <span title="Loads planned again at their source with the cash there was then">
+              {" · "}re-sized at source: {st.cash.resized.grown} up (+{fmtTons(st.cash.resized.tonsAdded)}),{" "}
+              {st.cash.resized.shrunk} down (−{fmtTons(st.cash.resized.tonsCut)})
+              {st.cash.resized.switched ? `, ${st.cash.resized.switched} swapped` : ""}
+            </span>
+          )}
         </p>
 
         <ErrorNote error={actionError ?? st?.error ?? null} />
@@ -421,6 +481,11 @@ export function FleetPanel() {
                         <div className="text-muted-foreground">
                           ~{fmtCr(a.lane.margin)}/t · ~{fmtCr(a.lane.profitPerHour)}/h
                         </div>
+                        {a.lane.resizedFrom !== undefined && a.lane.resizedFrom !== a.lane.tons && (
+                          <div className="text-muted-foreground">
+                            re-sized at source: {fmtTons(a.lane.resizedFrom)} → {fmtTons(a.lane.tons)}
+                          </div>
+                        )}
                       </>
                     ) : (
                       <span className="text-muted-foreground">—</span>
@@ -438,6 +503,8 @@ export function FleetPanel() {
         {agents.length > 0 && <Efficiency agents={agents} startedAt={st?.progressSince ?? st?.startedAt ?? null} stoppedAt={st?.stoppedAt ?? null} />}
 
         {st?.expansion && <ExpansionWatchView x={st.expansion} />}
+
+        {st?.worldEvents && <WorldEventsView w={st.worldEvents} />}
 
         {st?.underwriting && (
           <details className="text-sm">
@@ -487,11 +554,12 @@ export function FleetPanel() {
             {st && st.topLanes.length > 0 && (
               <div className="space-y-1.5">
                 <div className="text-muted-foreground text-xs">Best lanes right now (planner&apos;s view)</div>
-                <Table head={["Lane", "Load", "Margin", "Piracy", "Est. /h"]}>
+                <Table head={["Lane", "Load", "Margin", "Piracy", "Storms", "Est. /h"]}>
                   {st.topLanes.map((l) => (
                     <tr key={l.key} className="align-top">
                       <td className="text-xs">
                         <div className="font-medium text-sm">{loadText(l)}</div>
+                        {l.speculative && <Badge variant="info" size="sm" className="mr-1">crisis charter expected</Badge>}
                         {portName(l.source)} → {portName(l.dest)}
                         {l.next && <div className="text-muted-foreground">then {l.next}</div>}
                       </td>
@@ -503,11 +571,23 @@ export function FleetPanel() {
                       <td className="text-muted-foreground tabular-nums" title="Expected share of the load lost to pirates, priced into the margin">
                         {fmtBps(l.piracyBps ?? 0)}
                       </td>
+                      <td className="text-muted-foreground tabular-nums" title="Expected share of the load storms destroy on the laden passage, priced into the margin">
+                        {fmtBps(l.stormBps ?? 0)}
+                      </td>
                       <td className="whitespace-nowrap tabular-nums">{fmtCr(l.profitPerHour)}</td>
                     </tr>
                   ))}
                 </Table>
               </div>
+            )}
+
+            {st?.storms && (
+              <p className="text-muted-foreground text-xs">
+                {st.storms.season ? "Storm season (game months 11-2)" : "Calm season"}
+                {st.storms.turnsAt && <>; storm season {st.storms.season ? "ends" : "starts"} {fmtIn(st.storms.turnsAt)}</>}. Storm odds per game day at sea:{" "}
+                {st.storms.perDay.calm.toFixed(2)}× each zone&apos;s storm rate ({st.storms.perDay.storm.toFixed(2)}× in storm season), learned from {st.storms.seen} storm
+                {st.storms.seen === 1 ? "" : "s"} met against {st.storms.expected} expected; a hit destroys {Math.round(st.storms.take * 100)}% of every stack.
+              </p>
             )}
 
             {st && st.purchases.length > 0 && (
@@ -604,7 +684,15 @@ function Efficiency({
                   <div className="font-medium text-sm">{t.ship}</div>
                   {laneLabel(t.lane)} · {t.hours} h
                 </td>
-                <td className="tabular-nums">{fmtTons(t.tons)}</td>
+                <td className="tabular-nums">
+                  {fmtTons(t.tons)}
+                  {t.resizedTons ? (
+                    <div className="text-muted-foreground text-xs">
+                      {t.resizedTons > 0 ? "+" : ""}
+                      {t.resizedTons} t at source
+                    </div>
+                  ) : null}
+                </td>
                 <td className="whitespace-nowrap tabular-nums">{fmtCr(t.estPerHour)}</td>
                 <td className={`whitespace-nowrap tabular-nums ${t.actualPerHour < t.estPerHour * 0.7 ? "text-destructive" : ""}`}>
                   {fmtCr(t.actualPerHour)}
@@ -633,30 +721,111 @@ function ExpansionWatchView({ x }: { x: NonNullable<NonNullable<FleetView["state
       {x.charters.length === 0 ? (
         <Empty>No open expansion charters.</Empty>
       ) : (
-        <Table head={["Charter", "Pay now", "Tons left", "Lapses", "If it re-posts stalled", "State"]} className="mt-2">
-          {x.charters.map((c) => (
-            <tr key={`${c.port}|${c.good}`} className="align-top">
+        <Table head={["Charter", "Pay now", "Tons left", "Lapses", "If it re-posts stalled", "State", "Fleet's call"]} className="mt-2">
+          {x.charters.map((c) => {
+            const st = x.stakes.find((s) => s.key === `${c.port}|${c.good}`);
+            return (
+              <tr key={`${c.port}|${c.good}`} className="align-top">
+                <td className="text-xs">
+                  <div className="font-medium text-sm">
+                    {goodName(c.good)} → {portName(c.port)}
+                  </div>
+                  {c.beyondCoastal && <Badge variant="warning" size="sm">beyond coastal water</Badge>}
+                  {c.escalations > 0 && <span className="ml-1 text-muted-foreground">re-posted ×{c.escalations}</span>}
+                </td>
+                <td className="tabular-nums">{fmtCr(c.rate)}/t</td>
+                <td className="tabular-nums">{fmtTons(c.remaining)}</td>
+                <td className="whitespace-nowrap text-xs">{c.expiresAt ? fmtIn(new Date(c.expiresAt).toISOString()) : "—"}</td>
+                <td className="whitespace-nowrap tabular-nums text-xs">
+                  {fmtCr(Math.round(c.rate * x.escalation.pay))}/t on {fmtTons(Math.floor(c.remaining * x.escalation.tons))}
+                </td>
+                <td className="text-xs">
+                  {c.stalled ? <Badge variant="warning" size="sm">stalled</Badge> : <span className="text-muted-foreground">being filled</span>}
+                </td>
+                <td className="text-xs">
+                  {st ? (
+                    <>
+                      {st.camp ? <Badge variant="info" size="sm">letting it lapse</Badge> : <span className="text-muted-foreground">delivering</span>}
+                      <div className="text-muted-foreground">
+                        ~{Math.round(st.p * 100)}% it escalates · worth ~{fmtCr(st.value)} vs ~{fmtCr(st.cost)} waiting
+                      </div>
+                      <div className="text-muted-foreground">{st.why}</div>
+                    </>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </Table>
+      )}
+      {x.rivalDeliveries.length > 0 && (
+        <div className="mt-2 text-xs">
+          <div className="font-medium">Rival deliveries seen this tier</div>
+          <ul className="text-muted-foreground">
+            {x.rivalDeliveries.slice(0, 8).map((r) => (
+              <li key={`${r.at}|${r.port}|${r.good}`}>
+                {fmtAgo(new Date(r.at).toISOString())}: {r.company ?? "a rival"}, {fmtTons(r.tons)} {goodName(r.good)} → {portName(r.port)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Stalled: nothing delivered in this posting yet. If that lasts until it lapses, it re-posts at about {Math.round((x.escalation.pay - 1) * 100)}% more
+        pay on {Math.round(x.escalation.tons * 100)}% of the tons (learned from escalations seen). Lanes landing after the lapse count that. The
+        fleet&apos;s call: let it lapse when the expected extra pay beats waiting (the odds count stalls seen, rival deliveries there and laden
+        rivals due first); rival deliveries come from the public contributor board.
+      </p>
+    </details>
+  );
+}
+
+/** World events in force, what the planner makes of each, and what it has learned from them. */
+function WorldEventsView({ w }: { w: NonNullable<FleetView["state"]>["worldEvents"] }) {
+  const { catalog, portName, goodName } = useCatalog();
+  const zoneName = (id: string | null) => (id ? (catalog?.sea_zones.find((z) => z.id === id)?.name ?? id) : "—");
+  const learned = (f: { ratio: number; n: number }) => `${f.ratio.toFixed(2)}×${f.n ? ` (${f.n} seen)` : " (guess)"}`;
+  const lapse = (ms: number) => {
+    const iso = new Date(ms).toISOString();
+    return ms > Date.now() ? fmtIn(iso) : `lapsed ${fmtAgo(iso)}`;
+  };
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        World events: {w.rows.length} in force{w.enabled ? "" : " · not planned on (setting off)"} · shortage bids {learned(w.shortageBid)} base · glut asks{" "}
+        {learned(w.glutAsk)} · crisis pay {learned(w.crisisPay)}, found {Math.round(w.crisisFound.rate * 100)}%
+        {w.crisisFound.n ? ` (${w.crisisFound.n} looked for)` : " (guess)"}
+      </summary>
+      {w.rows.length === 0 ? (
+        <Empty>No world events in force.</Empty>
+      ) : (
+        <Table head={["Event", "Where", "What the planner does", "News lapses"]} className="mt-2">
+          {w.rows.map((e) => (
+            <tr key={e.id} className="align-top" title={e.title}>
               <td className="text-xs">
-                <div className="font-medium text-sm">
-                  {goodName(c.good)} → {portName(c.port)}
-                </div>
-                {c.beyondCoastal && <Badge variant="warning" size="sm">beyond coastal water</Badge>}
-                {c.escalations > 0 && <span className="ml-1 text-muted-foreground">re-posted ×{c.escalations}</span>}
+                <div className="font-medium text-sm">{e.type.replace(/_/g, " ")}</div>
+                {e.good && goodName(e.good)}
               </td>
-              <td className="tabular-nums">{fmtCr(c.rate)}/t</td>
-              <td className="tabular-nums">{fmtTons(c.remaining)}</td>
-              <td className="whitespace-nowrap text-xs">{c.expiresAt ? fmtIn(new Date(c.expiresAt).toISOString()) : "—"}</td>
-              <td className="whitespace-nowrap tabular-nums text-xs">
-                {fmtCr(Math.round(c.rate * x.escalation.pay))}/t on {fmtTons(Math.floor(c.remaining * x.escalation.tons))}
+              <td className="text-xs">{e.port ? portName(e.port) : zoneName(e.zone)}</td>
+              <td className="text-xs">
+                {e.crisis && (
+                  <Badge variant={e.crisis === "found" ? "success" : e.crisis === "expected" ? "info" : "outline"} size="sm" className="mr-1">
+                    crisis {e.crisis}
+                  </Badge>
+                )}
+                {e.effect}
               </td>
-              <td className="text-xs">{c.stalled ? <Badge variant="warning" size="sm">stalled</Badge> : <span className="text-muted-foreground">being filled</span>}</td>
+              <td className="whitespace-nowrap text-xs">{lapse(e.expiresAt)}</td>
             </tr>
           ))}
         </Table>
       )}
       <p className="mt-2 text-muted-foreground text-xs">
-        Stalled: nothing delivered in this posting yet. If that lasts until it lapses, it re-posts at about {Math.round((x.escalation.pay - 1) * 100)}% more
-        pay on {Math.round(x.escalation.tons * 100)}% of the tons (learned from escalations seen). Lanes landing after the lapse count that.
+        Events say what happened where, never by how much. A shortage&apos;s bid and a glut&apos;s ask are learned from the books our ships read
+        while one is on, and fade to nothing by the news&apos; lapse. A shortage&apos;s crisis charter is listed only on its quay or as gossip
+        later: until then lanes count it as expected, at most one load at a time. Trips on it show estimate against actual under Recent trips.
       </p>
     </details>
   );

@@ -8,9 +8,9 @@
  * zones as catalog ids, and free-text notices only as the fields the Haiku screen extracted.
  */
 
-import type { ExpansionWatch, CharterInfo } from "../fleet/world";
+import type { ExpansionWatch, CharterInfo, StormSummary } from "../fleet/world";
 import type { FleetSettings } from "../fleet/manager";
-import type { Lane } from "../fleet/planner";
+import type { Lane, StallStake } from "../fleet/planner";
 import type { TripRecord } from "../fleet/agent";
 import type { Catalog } from "../types";
 import type { ScreenedEvent } from "./screen";
@@ -45,12 +45,13 @@ const RULES = `You are the strategist for a fleet autopilot in Tradewinds, a mul
 - Hulls are rated coastal, regional or oceanic; a ship can only sail water its hull is rated for. Some charters lie beyond coastal water.
 - Cash sits in regional vaults; moving it costs fees. Upkeep is billed daily from the home region. Ships cost a lot; buying them early compounds income (the leading rival grew to about 20 ships by reinvesting charter pay).
 - Piracy per sea zone (letters of marque raise it, naval patrols lower it, corsair outbreaks are strong and long). Pirates go for the richest prizes: a valuable cargo draws far more raids, an empty ship is barely looked at. A raid takes a varying share of the cargo, and sometimes the ship itself, cargo and all; guns make both much rarer. The planner already prices this per lane (cargo at risk, and the hull at risk of capture) and refits guns to it.
+- Storms: each leg rolls for the sea zone it ends in, at the zone's storm odds; worse for a hull below the zone's class (never sailed) and in storm season (game months 11 to 2, about 2 real days in every 6). A hit destroys a quarter of every cargo stack and of the stores. The planner already prices storms per lane (learned from our own voyages) and stocks stores for extra hits, so long Baltic and North Sea legs rank lower in storm season by themselves.
 - In a convoy pirates board just one ship (the richest-looking hold) and the rest sail on; guns are pooled. The autopilot forms convoys of its own ships bound the same way soon when the risk avoided outweighs the wait.
 
 ## What the autopilot already does well (don't redo it)
-- Ranks every lane (charter, market and freight legs, mixed loads, the onward leg) by profit per real hour from live and remembered prices, costs, fees, piracy, the phase-bonus share and re-post terms. Reserves charter room, source stock and buyers across our own ships. Sizes loads to spare cash, and when cash is scarce charges each load for the cash it ties up.
-- Buys ships when one pays back within the user's limit; keeps a share of cash back near a phase turnover; discounts public charters where laden rival ships are seen heading first.
-- Holds cargo for a stalled posting's re-post only if the user turned that on (or you call it for a specific charter).
+- Ranks every lane (charter, market and freight legs, mixed loads, the onward leg) by profit per real hour from live and remembered prices, costs, fees, piracy, storms, the phase-bonus share and re-post terms. Reserves charter room, source stock and buyers across our own ships. Sizes loads to spare cash plus cash due before they are bought, and sizes each again at its source; when cash is scarce it charges each load for the cash it ties up.
+- Buys ships when one pays back within the user's limit; keeps a share of cash back near a phase turnover; discounts charters by what rivals due there first are likely to deliver (their declared cargo or past deliveries), and laden rival ships of unknown cargo seen heading there.
+- Decides per stalled posting whether to let it lapse (no ship delivers into it, since our own delivery cancels the escalation too; loads land or wait for just after the lapse; holders deliver the moment a rival does) from its escalation odds (learned stall fates, rival deliveries per charter, laden rivals inbound) against the waiting cost. The digest shows each call.
 
 ## What you decide
 Your levers are coarse on purpose. Use them for what the code can't see: the shape of the race, the phase turnover, which stalled charters to contest, whether to grow the fleet or keep cash, what world events mean, and where the planner's estimates have been wrong (each ship's recent trips show estimate against actual).
@@ -58,9 +59,9 @@ Your levers are coarse on purpose. Use them for what the code can't see: the sha
   - bonusWeightPct: how much of the expected phase-completion bonus counts when choosing lanes (50-100).
   - phaseChestPct: share of spare cash the ship buyer leaves alone while the tier is close to completing (0-70).
   - minMarginPence: the least profit per ton a lane must clear (between half and twice the user's value). Lower it when ships sit idle for want of a lane; raise it when thin lanes keep disappointing.
-  - holdForRepost: whether ships may hold cargo for any stalled posting's re-post.
+  - holdForRepost: let every stalled posting lapse in its last 4 game hours whatever the math says.
 - laneBias: up to 12 entries, each a factor from 0.5 to 1.5 on the rank of lanes matching: a destination port (dest), a source port (source), a good (good), a charter alias (charter: lanes filling it), or a lane alias (lane). Factors multiply. A bias only reorders lanes that already pass every check and earn something.
-- stallCalls: up to 10, for expansion charters only (by charter alias): "wait" lets ships hold for that charter's re-post when it is stalled and lapses soon after they land (even if holding is off), "deliver" treats it as not stalled (deliver now, don't count on a re-post).
+- stallCalls: up to 10, for expansion charters only (by charter alias): "wait" lets that stalled posting lapse in its last 4 game hours whatever the math says (ships hold for its re-post rather than deliver), "deliver" treats it as not stalled (deliver now, don't count on a re-post).
 - buy: "hold" stops the ship buyer for the horizon (keep cash, e.g. for a phase turnover); "auto" leaves it to its own rules.
 - horizonMin: how long this advice should last (15-180). Shorter when things move fast.
 - posture: one word for your overall stance.
@@ -203,24 +204,30 @@ export interface DigestInput {
     stallSurvives: number;
     escalation: { pay: number; tons: number };
     charters: ExpansionWatch[];
+    /** The fleet's call on each stalled posting (let it lapse or deliver), with its numbers. */
+    stakes: StallStake[];
+    /** Rival deliveries into the tier's charters seen lately (no company). */
+    rivalDeliveries: Array<{ at: number; port: string; good: string; tons: number }>;
   } | null;
   ships: DigestShip[];
   maxShips: number;
   buyer: string;
-  cash: { vaults: Array<[string, number]>; homeRegion: string | null; spare: number; committed: number; capitalRate: number };
+  /** `due`: cash pay due from our cargo at sea, at the share loads may count on. */
+  cash: { vaults: Array<[string, number]>; homeRegion: string | null; spare: number; committed: number; capitalRate: number; due: number };
   user: FleetSettings;
   active: Partial<FleetSettings> | null;
   topLanes: Lane[];
   charters: CharterInfo[];
   piracy: Array<[string, number]>;
   rivals: {
-    /** Ships seen per rival company (largest first). */
-    companies: Array<{ ships: number; laden: number; sailing: number }>;
+    /** Per rival company (most ships known first): ships, earning rate, top lanes and the charters it delivers to (catalog ids). */
+    companies: Array<{ ships: number; laden: number; sailing: number; earnPerHour?: number | null; lanes?: string[]; feeds?: string[] }>;
     zones: Array<{ zone: string; passages: number; laden: number }>;
   };
   events: ScreenedEvent[];
   decisions: DigestDecision[];
   bidHaircutPerDay: number;
+  storms: StormSummary | null;
 }
 
 export interface Aliases {
@@ -278,9 +285,13 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
     );
     for (const w of t.charters) {
       const c = d.charters.find((x) => x.id === w.id) ?? ({ id: w.id, port: w.port, good: w.good, payPerTon: w.rate, remaining: w.remaining, expiresAt: w.expiresAt, stale: false, isPublic: true, title: "", newsAt: null } as CharterInfo);
+      const st = t.stakes.find((s) => s.key === `${w.port}|${w.good}`);
+      const rv = t.rivalDeliveries.filter((x) => x.port === w.port && x.good === w.good);
       out.push(
         `- ${aliasCharter(c)} ${w.good} -> ${w.port}: ${cr(w.rate)}/t, ${w.remaining}t left, ${w.expiresAt ? `lapses in ${gameH(w.expiresAt - d.now)}` : "no lapse"}` +
-          `${w.stalled ? ", STALLED" : ""}${w.escalations ? `, re-posted x${w.escalations}` : ""}${w.beyondCoastal ? ", beyond coastal water" : ""}`,
+          `${w.stalled ? ", STALLED" : ""}${w.escalations ? `, re-posted x${w.escalations}` : ""}${w.beyondCoastal ? ", beyond coastal water" : ""}` +
+          `${st ? `; fleet ${st.camp ? "LETTING IT LAPSE" : "delivering"} (escalates ~${Math.round(st.p * 100)}%, lapse worth ~${cr(st.value)} vs waiting ~${cr(st.cost)}: ${st.why})` : ""}` +
+          `${rv.length ? `; rivals delivered ${rv.length}x (${Math.round(rv.reduce((n, x) => n + x.tons, 0))} t) lately` : ""}`,
       );
     }
   }
@@ -305,6 +316,7 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
     `## Cash`,
     `vaults: ${d.cash.vaults.map(([r, v]) => `${r}${r === d.cash.homeRegion ? " (home)" : ""} ${cr(v)}`).join(", ")}`,
     `spare after reserves ${cr(d.cash.spare)}, committed to loads being bought ${cr(d.cash.committed)}` +
+      `${d.cash.due > 0 ? `, due from our cargo at sea ~${cr(d.cash.due)} (loads bought after it lands may count on it)` : ""}` +
       `${d.cash.capitalRate > 0 ? `; cash is scarce (loads charged ${(d.cash.capitalRate * 100).toFixed(2)}%/h of the cash they tie up)` : ""}`,
   );
 
@@ -328,14 +340,19 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
   for (const c of d.charters.slice(0, 20)) {
     out.push(
       `- ${aliasCharter(c)} ${c.good} -> ${c.port}: ${cr(c.payPerTon)}/t, ${c.remaining}t` +
-        `${c.expiresAt ? `, lapses in ${gameH(c.expiresAt - d.now)}` : ""}${c.isPublic ? ", public" : ""}${c.stale ? ", gossip (may be filled)" : ""}`,
+        `${c.expiresAt ? `, lapses in ${gameH(c.expiresAt - d.now)}` : ""}${c.isPublic ? ", public" : ""}${c.provisional ? ", expected from a shortage's news, not listed yet" : c.stale ? ", gossip (may be filled)" : ""}`,
     );
   }
 
   // Piracy, rivals
   if (d.piracy.length) out.push(`## Piracy (net bps by zone)`, d.piracy.map(([z, b]) => `${z} ${b}`).join(", "));
   out.push(`## Rivals seen (aliased)`);
-  d.rivals.companies.slice(0, 8).forEach((r, i) => out.push(`- R${i + 1}: ${r.ships} ships seen, ${r.laden} laden, ${r.sailing} at sea`));
+  d.rivals.companies.slice(0, 8).forEach((r, i) =>
+    out.push(
+      `- R${i + 1}: ${r.ships} ships known, ${r.laden} laden, ${r.sailing} at sea` +
+        `${r.earnPerHour != null ? `, earns ~${cr(r.earnPerHour)}/h` : ""}${r.lanes?.length ? `; lanes ${r.lanes.join(", ")}` : ""}${r.feeds?.length ? `; delivers ${r.feeds.join(", ")}` : ""}`,
+    ),
+  );
   if (d.rivals.zones.length) out.push(`traffic by zone: ${d.rivals.zones.slice(0, 10).map((z) => `${z.zone} ${z.passages} passages (${z.laden.toFixed(1)} laden)`).join("; ")}`);
 
   // Events
@@ -352,5 +369,12 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
     for (const x of d.decisions.slice(-5)) out.push(`- ${x.at}: ${x.posture}, ${x.applied}; ${x.outcome}`);
   }
   out.push(`## Planner calibration`, `remembered bids are marked down ${(d.bidHaircutPerDay * 100).toFixed(1)}% per game day of age (learned)`);
+  if (d.storms) {
+    const s = d.storms;
+    out.push(
+      `storms: ${s.season ? "storm season now" : "calm season"}${s.turnsAt ? `, turns in ${gameH(Date.parse(s.turnsAt) - d.now)}` : ""}; a leg's storm odds are ` +
+        `${s.perDay.calm.toFixed(2)}x (calm) / ${s.perDay.storm.toFixed(2)}x (storm season) its zone's storm bps per game day at sea, learned from ${s.seen} storms over ${s.expected} expected`,
+    );
+  }
   return { text: out.join("\n"), aliases };
 }

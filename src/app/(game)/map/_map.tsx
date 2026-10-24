@@ -11,7 +11,7 @@ import L from "leaflet";
 import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import { NODE_COORDS, legPath, rivalFix, seaLanes, shipFix, type LatLng, type ShipFix } from "@/lib/kibb/geo";
-import { fmtAgo, fmtBps, fmtIn, fmtTons } from "@/lib/kibb/format";
+import { fmtAgo, fmtBps, fmtCr, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type { RivalShip } from "@/lib/kibb/rivals";
 import type { Catalog, SeaZoneStatus, ShipResult, ShipStatus } from "@/lib/kibb/types";
 
@@ -275,7 +275,8 @@ export default function KibbMap({
       {rivals.map((r) => {
         const fix = rivalFix(r, now + serverOffsetMs);
         if (!fix) return null;
-        const atSea = !!r.voyage && now + serverOffsetMs < r.voyage.arriveAt;
+        const t = now + serverOffsetMs;
+        const atSea = !!r.voyage && t >= r.voyage.departAt && t < r.voyage.arriveAt;
         return (
           <Marker key={`rival-${r.key}`} position={fix.pos} icon={rivalIcon(atSea, fix.heading)} zIndexOffset={500}>
             <Tooltip direction="top">
@@ -285,15 +286,21 @@ export default function KibbMap({
               <div className="space-y-1 text-xs">
                 <div className="font-semibold text-sm">{r.ship}</div>
                 <div>
-                  {r.company} · {shipClassName(r.shipClass)} · {r.loadState.replace("_", " ")}
+                  {r.company} · {shipClassName(r.shipClass)} · {r.cargo ? `${fmtCr(r.cargo)} declared` : (r.loadState?.replace("_", " ") ?? "load unknown")}
                 </div>
                 <div>
-                  {r.seen.direction === "sailed" ? "Sailed from" : "Arrived at"} {portName(r.seen.port)}
-                  {r.seen.otherPort ? ` ${r.seen.direction === "sailed" ? "for" : "from"} ${portName(r.seen.otherPort)}` : ""},{" "}
+                  {{ sailed: "Sailed from", arrived: "Arrived at", insured: "Insured at", convoy: "In a convoy from" }[r.seen.direction]} {portName(r.seen.port)}
+                  {r.seen.otherPort ? ` ${r.seen.direction === "arrived" ? "from" : r.seen.direction === "convoy" ? "to" : "for"} ${portName(r.seen.otherPort)}` : ""},{" "}
                   {fmtAgo(new Date(r.seen.at - serverOffsetMs).toISOString())}
                 </div>
                 <div className="text-muted-foreground">
-                  {atSea ? `Estimated position; due ${fmtIn(new Date(r.voyage!.arriveAt - serverOffsetMs).toISOString())}` : fix.estimated ? "Probably in port" : "Last seen here"}
+                  {atSea
+                    ? `Estimated position; due ${fmtIn(new Date(r.voyage!.arriveAt - serverOffsetMs).toISOString())}`
+                    : r.voyage && t < r.voyage.departAt
+                      ? `In port; sails ${fmtIn(new Date(r.voyage.departAt - serverOffsetMs).toISOString())}`
+                      : fix.estimated
+                        ? "Probably in port"
+                        : "Last seen here"}
                 </div>
               </div>
             </Popup>

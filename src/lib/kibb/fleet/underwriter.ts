@@ -31,6 +31,8 @@ export interface UnderwriteRules {
   minEdgeBps: number;
   /** Every policy any of our companies has a slice of, whatever its status: their cover is ours, not Lloyd's. */
   held: Set<string>;
+  /** The insured's public record on this lane and cover (rival intel), if known. */
+  record?: (p: InsurancePolicy) => { closed: number; losses: number } | undefined;
 }
 
 export interface UnderwriteRow {
@@ -58,6 +60,8 @@ const LLOYDS_REVIEW_GAME_HOURS = 4;
 /** Smallest slice the game accepts, and its step. */
 const MIN_SLICE = 500;
 const SLICE_STEP = 100;
+/** Closed policies needed before an insured's own record on a lane counts. */
+const RECORD_MIN = 8;
 
 const coverOf = (p: InsurancePolicy): "hull" | "cargo" => (p.insured_value_pence <= p.hull_value_pence ? "hull" : "cargo");
 
@@ -93,12 +97,16 @@ export function judgePolicies(policies: InsurancePolicy[], rules: UnderwriteRule
 
     const ageGameHours = (rules.now - Date.parse(p.created_at)) / (60 * rules.gameMinuteMs);
     const uncovered = Math.floor((10_000 - p.covered_bps) / SLICE_STEP) * SLICE_STEP;
+    // Sinkings alone are a lower bound on the insured's loss rate (partial losses never show): this only refuses.
+    const rec = edge !== null && edge >= rules.minEdgeBps ? rules.record?.(p) : undefined;
     if (rules.ours.has(p.insured_company_id)) row.verdict = "our own company";
     else if (rules.held.has(p.id)) row.verdict = "we hold a slice";
     else if (ageGameHours > MAX_AGE_GAME_HOURS) row.verdict = "too old: the ship has probably sailed";
     else if (edge === null)
       row.verdict = ageGameHours > LLOYDS_REVIEW_GAME_HOURS ? "Lloyd's reviewed it and declined" : "waiting for Lloyd's review";
     else if (edge < rules.minEdgeBps) row.verdict = `edge ${Math.round(edge)} bps under the ${rules.minEdgeBps} bps minimum`;
+    else if (rec && rec.closed >= RECORD_MIN && (rec.losses / rec.closed) * 10_000 > lossBound!)
+      row.verdict = `the insured sank ${rec.losses} of ${rec.closed} on this lane: worse than Lloyd's bound`;
     else if (uncovered < MIN_SLICE) row.verdict = "fully covered";
     else {
       // The biggest slice the per-policy cap and the remaining budget allow, in 100 bps steps.

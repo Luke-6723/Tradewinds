@@ -17,22 +17,33 @@
  * Costs per ton: the ask (with the impact of what we and our other ships buy there), customs at S,
  * the fee to bring the money from D's region back to S's, and the share of the load pirates are
  * expected to take on the way (more for a richer load: pirates go for the richest prizes). The
- * chance of pirates taking the ship itself is charged to the leg at the hull's value. Charters count a weighted share of the phase-completion bonus, but
- * their cash pay must cover the cost by itself. Loads are capped by hold room and spare cash.
+ * chance of pirates taking the ship itself is charged to the leg at the hull's value. Storms are
+ * charged the same way: the share of the load they are expected to destroy on the laden passage
+ * (each zone's storm odds per day at sea, worse in storm season, learned from our own voyages), and
+ * the rare sinking at the hull's value. Charters count a weighted share of the phase-completion bonus, but
+ * their cash pay must cover the cost by itself. Loads are capped by hold room and by the cash spare
+ * when the ship reaches the source: what our other ships' loads leave by then, counting cash due
+ * from our cargo at sea that lands first.
  *
  * Expansion charters are re-posted when they lapse, so their expiry doesn't end them: a load landing
  * after it is valued at the re-post's terms (richer, on fewer tons, when the posting looks stalled).
- * With holding allowed, a load landing shortly before a stalled posting lapses may wait for it.
+ * While the fleet lets a stalled posting lapse (manager.ts stallStakes), nothing of ours is delivered
+ * into it first: a load landing before the lapse waits for the re-post, its wait counted in the lane's
+ * time, so ships take other work until a run lands near the lapse.
  *
  * Lanes are ranked by profit per real hour over the leg plus the best leg visible from D, so a lane
  * that ends where a paid return cargo waits beats one ending in a dead end. With nothing paying from
  * D, an empty sail back to S stands in for what comes next. When cash is what limits the fleet, the
  * money a load ties up is charged at the fleet's own return on cash, so thin-margin loads that lock
  * up a lot of it rank lower.
+ *
+ * World events move prices: a shortage's bid and a glut's ask are expected from the shocks seen so
+ * far, fading by the news' lapse, and a shortage's crisis charter (listed only on its quay or as
+ * gossip later) is planned on before it is listed, at the share found when looked for.
  */
 
 import type { RoutePlan, ZoneClass } from "../types";
-import { BID_HAIRCUT_BASE, type CharterInfo, type World } from "./world";
+import { BID_HAIRCUT_BASE, PROVISIONAL_PREFIX, type CharterInfo, type World } from "./world";
 
 export interface ShipSpec {
   shipClass: string;
@@ -65,7 +76,7 @@ export interface Part {
   cashPay: number;
   estAsk: number;
   askKnown: boolean;
-  /** Landed cost per ton: ask + customs + remittance fee + expected piracy loss. */
+  /** Landed cost per ton: ask + customs + remittance fee + expected piracy and storm losses. */
   costPerTon: number;
   /** Per ton delivered: pay + bonus − cost. */
   margin: number;
@@ -104,6 +115,8 @@ export interface Lane {
   margin: number;
   /** Expected share of the load lost to pirates on the laden passage (bps). */
   piracyBps: number;
+  /** Expected share of the load storms destroy on the laden passage (bps), sinkings included; read as `?? 0` (restored lanes lack it). */
+  stormBps: number;
   /** Whether the main good's ask is a price seen (rather than an estimate). */
   askKnown: boolean;
   /** Expected cash profit of this leg (the phase bonus is paid later and isn't in it). */
@@ -121,6 +134,12 @@ export interface Lane {
   profitPerHour: number;
   /** What the planner expects to do after this leg, for the log. */
   next: string | null;
+  /** Tons first planned, once the load was planned again at its source with the cash there was then. */
+  resizedFrom?: number;
+  /** Of `capital`, what the plan counted on cash due rather than cash in hand (absent: none). That part never has first call at the source. */
+  dueCounted?: number;
+  /** It fills a crisis charter expected from a shortage's news, not listed yet. */
+  speculative?: boolean;
 }
 
 /** Tons other ships are bound to deliver, buy or sell, and freight lots they mean to take. */
@@ -136,6 +155,35 @@ export interface Reservations {
   charterLandsAt?: Map<string, number>;
 }
 
+/**
+ * The fleet's call on one stalled expansion posting (manager.ts): let it lapse for its richer
+ * re-post ("camp": nothing of ours goes into it before then) or deliver into it, with the numbers.
+ */
+export interface StallStake {
+  /** `port|good`, the posting and its lapse (server ms). */
+  key: string;
+  id: string;
+  port: string;
+  good: string;
+  expiresAt: number;
+  /** Chance it re-posts richer if none of our ships delivers first (0 on an AI "deliver" call). */
+  p: number;
+  /** Rival first deliveries into its stalled postings per game day (its record, pooled). */
+  rivalPerDay: number;
+  /** Extra pay per ton on the re-post (pence). */
+  uplift: number;
+  /** Our tons landing before the lapse, and those expected into the re-post. */
+  tonsBefore: number;
+  tonsAfter: number;
+  /** Expected gain of letting it lapse, and what waiting costs (pence). */
+  value: number;
+  cost: number;
+  camp: boolean;
+  /** "Always hold" or an AI "wait": camped in its last HOLD_MAX_GAME_H whatever the math says. */
+  forced: boolean;
+  why: string;
+}
+
 export interface PlanOptions {
   /** Minimum profit per ton (pence) after every cost. */
   minMargin: number;
@@ -143,19 +191,28 @@ export interface PlanOptions {
   freight: boolean;
   /** 0–1: how much of the expected phase-completion bonus to count. */
   bonusWeight: number;
+  /** 0–2: how much of the expected storm losses to count (1 = as learned, 0 = ignore storms). */
+  stormWeight?: number;
   /** Pence the fleet can spend on this load, or null for no limit. */
   cash: number | null;
+  /**
+   * Pence the fleet can spend on a load bought at `source` at server time `at`, counting cash due by
+   * then (FleetManager.cashAt). Used for this ship's own legs in place of `cash`; onward legs keep `cash`.
+   */
+  cashAt?: (at: number, source: string) => number;
+  /** Only legs loading at this port: a load planned again at its source (FleetManager.resizeLane). */
+  onlySource?: string;
   /** Charge per pence of cash a load ties up, per real hour (0 while cash isn't scarce). */
   capitalRate?: number;
-  /** Wait at the destination for a stalled expansion charter's richer re-post when it lapses soon after arrival. */
-  holdForRepost?: boolean;
   /**
    * A multiplier on a lane's rank (the AI advisor's lane bias). It only reorders lanes that already
    * passed every check and earn something; it never makes a lane eligible.
    */
   bias?: (lane: Lane) => number;
-  /** Per expansion charter (`port|good`): wait for a stalled posting's re-post, or deliver now (AI stall calls). */
-  stallCalls?: Map<string, "wait" | "deliver">;
+  /** The fleet's call on each stalled expansion posting, by `port|good` (AI stall calls and settings folded in). */
+  stalls?: Map<string, StallStake>;
+  /** Leave crisis charters expected from the news out of onward legs (the buyer). */
+  noSpeculativeOnward?: boolean;
 }
 
 /** Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). */
@@ -174,6 +231,8 @@ const EXPIRY_SLACK_MS = 10 * 60_000;
 const LEG_OVERHEAD_MS = 60_000;
 /** Smallest amount of one good worth a separate purchase. */
 const MIN_PART_TONS = 3;
+/** Smallest load (goods and freight, tons) worth a leg for a ship with this much room; the buyer keeps to it too. */
+export const minLoadTons = (cap: number) => Math.min(10, cap * 0.5);
 /** Bids seen longer ago than this (game hours) aren't planned on. */
 const MARKET_MAX_AGE_GAME_H = 72;
 // A remembered bid is marked down by World's BID_HAIRCUT_BASE, plus its learned rate per game day of age.
@@ -183,10 +242,16 @@ const GOSSIP_TRUST_PER_DAY = 0.15;
 const GOSSIP_TRUST_MIN = 0.15;
 /** A ton's worth at a gossiped charter's port if the charter is gone and no bid is known there. */
 const SALVAGE_OF_BASE = 0.6;
-/** Each laden rival seen bound for a public charter's port before we land takes this share of its room (to at most 60%). */
+/**
+ * Each laden rival whose cargo is unknown, due at a public charter's port (or an expected crisis
+ * charter's, from public news) before we land, takes this share of its room; known cargo takes its
+ * likely tons (to at most 60% in all).
+ */
 const RIVAL_CROWD_SHARE = 0.15;
-/** Longest wait (game hours) for a stalled posting to lapse and re-post richer. */
+/** "Always hold" and AI "wait" calls camp a stalled posting this close to its lapse (game hours). */
 export const HOLD_MAX_GAME_H = 4;
+/** Backstop on any hold the math allows (game hours; 4 real hours at 60x): data going stale shouldn't idle a ship longer. */
+export const HOLD_CAP_GAME_H = 240;
 /** Allowance (game minutes) for the re-post to appear after the lapse. */
 export const REPOST_GRACE_GAME_MIN = 30;
 
@@ -218,22 +283,32 @@ const rate = (profit: number, ms: number) => (profit * 3_600_000) / Math.max(ms,
 
 // ── Prices ────────────────────────────────────────────────────────────────────
 
-/** The bid a sale at `port` can count on: a live book as seen, older news marked down; null if too old. */
-function expectedBid(ctx: Ctx, port: string, good: string): number | null {
-  const obs = ctx.world.price(port, good);
-  if (!obs?.bid) return null;
-  const age = Math.max(0, ctx.now - obs.at);
-  if (age > MARKET_MAX_AGE_GAME_H * 60 * ctx.world.gameMinuteMs) return null;
-  const fresh = obs.live && age < 60 * ctx.world.gameMinuteMs;
-  const haircut = fresh ? 0 : BID_HAIRCUT_BASE + ctx.world.bidHaircutPerDay * (age / ctx.gameDayMs);
-  return obs.bid * Math.max(0, 1 - haircut);
+/**
+ * The bid a sale at `port` can count on when the load lands at `at`: a live book as seen, older news
+ * marked down, a shock's share easing as it fades; a shortage's expected spike when no book since it
+ * began shows the real one. Null with nothing to go on (or only a bid from before an import slump).
+ */
+function expectedBid(ctx: Ctx, port: string, good: string, at = ctx.now): number | null {
+  const { world } = ctx;
+  const obs = world.price(port, good);
+  let bid: number | null = null;
+  const age = obs ? Math.max(0, ctx.now - obs.at) : Infinity;
+  if (obs?.bid && age <= MARKET_MAX_AGE_GAME_H * 60 * world.gameMinuteMs && !world.shiftedSince(port, good, "import_slump", obs.at)) {
+    const fresh = obs.live && age < 60 * world.gameMinuteMs;
+    const haircut = fresh ? 0 : BID_HAIRCUT_BASE + world.bidHaircutPerDay * (age / ctx.gameDayMs);
+    bid = world.easeShock(port, good, "demand_shortage", obs.bid, obs.at, at) * Math.max(0, 1 - haircut);
+  }
+  const spike = world.shortageBid(port, good, at, obs?.at ?? null);
+  return spike !== null ? Math.max(bid ?? 0, spike) : bid;
 }
 
-/** 1 for a live charter; for gossip, the chance it is still open. */
+/** 1 for a live charter; for gossip, the chance it is still open (one expected from the news: at most the share found). */
 function trust(ctx: Ctx, c: CharterInfo): number {
   if (!c.stale) return 1;
   const ageDays = c.newsAt ? Math.max(0, ctx.now - c.newsAt) / ctx.gameDayMs : 2;
-  return Math.max(GOSSIP_TRUST_MIN, Math.min(GOSSIP_TRUST_MAX, GOSSIP_TRUST_MAX - GOSSIP_TRUST_PER_DAY * ageDays));
+  const t = Math.max(GOSSIP_TRUST_MIN, Math.min(GOSSIP_TRUST_MAX, GOSSIP_TRUST_MAX - GOSSIP_TRUST_PER_DAY * ageDays));
+  // Expected from a shortage's news: also no more than the share of crisis charters found so far.
+  return c.trustCap !== undefined ? Math.max(GOSSIP_TRUST_MIN, Math.min(t, c.trustCap)) : t;
 }
 
 /** What a charter pays and takes for a load landing at `arriveAt`, and how long to hold it. */
@@ -246,27 +321,33 @@ interface Terms {
 /**
  * An expansion charter re-posts when it lapses: at the same rate, or (if nothing was delivered in
  * the posting) at a higher rate on fewer tons. A load landing after the lapse gets the re-post's
- * terms, weighted by the chance the stall lasts; one landing shortly before it may wait for it.
+ * terms, weighted by the chance it escalates; one landing before it waits for it while the fleet
+ * lets the posting lapse.
  */
 function terms(ctx: Ctx, c: CharterInfo, arriveAt: number): Terms {
   const plain = { pay: c.payPerTon, remaining: c.remaining, holdUntil: null };
   const w = c.expiresAt === null || !renewing(ctx, c) ? undefined : ctx.world.stallWatch(c);
   if (!w || c.expiresAt === null) return plain;
   const esc = ctx.world.escalation;
-  // One of our own ships delivering before the lapse ends the stall; so does an AI call to deliver.
+  // The fleet's call on this posting. A pre-lapse delivery of ours (planned, not held) ends the
+  // stall; camped postings never have one (reservations leave them out).
+  const stake = ctx.opts.stalls?.get(`${c.port}|${c.good}`);
+  const mine = stake?.id === c.id ? stake : undefined;
   const ours = ctx.res.charterLandsAt?.get(c.id);
-  const call = ctx.opts.stallCalls?.get(`${c.port}|${c.good}`);
-  const stalled = w.stalled && call !== "deliver" && !(ours !== undefined && ours < c.expiresAt);
-  // How often stalls seen lapse did re-post richer (learned).
-  const p = stalled ? ctx.world.stallSurvives : 0;
+  const stalled = w.stalled && !(ours !== undefined && ours < c.expiresAt);
+  // The chance it re-posts richer: learned stall fates, rival record, rivals inbound (an AI "deliver" call: none).
+  const p = !stalled ? 0 : mine ? mine.p : ctx.world.escalationOdds(w, ctx.now);
   const reposted = {
     pay: Math.round(c.payPerTon * (1 + (esc.pay - 1) * p)),
     remaining: Math.floor(c.remaining * (1 - (1 - esc.tons) * p)),
   };
   if (arriveAt > c.expiresAt) return { ...reposted, holdUntil: null };
-  const holdMax = HOLD_MAX_GAME_H * 60 * ctx.world.gameMinuteMs;
-  if ((ctx.opts.holdForRepost || call === "wait") && stalled && c.expiresAt - arriveAt <= holdMax) {
-    return { ...reposted, holdUntil: c.expiresAt + REPOST_GRACE_GAME_MIN * ctx.world.gameMinuteMs };
+  const gm = ctx.world.gameMinuteMs;
+  const early = c.expiresAt - arriveAt;
+  if (mine && stalled && (mine.camp || (mine.forced && early <= HOLD_MAX_GAME_H * 60 * gm))) {
+    // Nothing of ours goes in before the lapse: a load landing far too early can't use it.
+    if (early > HOLD_CAP_GAME_H * 60 * gm) return { ...plain, remaining: 0 };
+    return { ...reposted, holdUntil: c.expiresAt + REPOST_GRACE_GAME_MIN * gm };
   }
   return plain;
 }
@@ -283,11 +364,11 @@ function renewing(ctx: Ctx, c: CharterInfo): boolean {
   return world.tierEtaMs === null || ctx.now + world.tierEtaMs > lapse;
 }
 
-/** Expected cash per ton for a charter: its pay if open, else what the goods fetch at its port. */
-function charterCash(ctx: Ctx, c: CharterInfo, pay = c.payPerTon): number {
+/** Expected cash per ton for a charter landing at `at`: its pay if open, else what the goods fetch at its port. */
+function charterCash(ctx: Ctx, c: CharterInfo, pay = c.payPerTon, at = ctx.now): number {
   const t = trust(ctx, c);
   if (t >= 1) return pay;
-  const salvage = expectedBid(ctx, c.port, c.good) ?? ctx.world.basePrice(c.good) * SALVAGE_OF_BASE;
+  const salvage = expectedBid(ctx, c.port, c.good, at) ?? ctx.world.basePrice(c.good) * SALVAGE_OF_BASE;
   return t * pay + (1 - t) * Math.min(salvage, pay);
 }
 
@@ -306,39 +387,59 @@ interface PartArgs {
   cash: number;
   /** Share of the cargo expected lost to pirates on the passage. */
   piracy: number;
+  /** Share of the cargo expected destroyed by storms on the passage (sinkings included). */
+  storm: number;
   /** Server time the load can be delivered by (charters closing sooner are skipped). */
   deliverBy: number;
   /** Expected server time of delivery: landing plus the base lock (without the safety slack in deliverBy). */
   arriveAt: number;
   /** Phase-bonus tons still unclaimed in this lane (read only: taking a part claims them). */
   bonusTons: number;
+  /** Expected server time of buying at the source (its base lock cleared). */
+  buyAt: number;
 }
 
 /** Landed cost per ton delivered at `ask`, and the cash it takes at the source per ton bought. */
 function costs(ctx: Ctx, a: PartArgs, ask: number) {
   const customs = 1 + ctx.world.customsBps(a.source) / 10_000;
   const fee = 1 + ctx.world.remitBps(ctx.world.region(a.dest), ctx.world.region(a.source)) / 10_000;
-  return { landed: (ask * customs * fee) / (1 - a.piracy), cash: ask * customs };
+  return { landed: (ask * customs * fee) / ((1 - a.piracy) * (1 - a.storm)), cash: ask * customs };
 }
 
 function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | null {
   const { world, res, opts } = ctx;
-  const est = world.estAsk(a.source, a.good);
+  const est = world.estAsk(a.source, a.good, a.buyAt);
   if (!est || a.room < MIN_PART_TONS) return null;
   const reserved = res.sourceTons.get(`${a.source}|${a.good}`) ?? 0;
   // Re-posted charters outlive their expiry; the rest must still be open when the load lands.
   const usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
   const t = new Map(usable.map((c) => [c.id, terms(ctx, c, a.arriveAt)]));
-  const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay);
+  const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay, a.arriveAt);
   const value = (c: CharterInfo) => cashOf(c) + charterBonus(ctx, c);
   usable.sort((x, y) => value(y) - value(x));
 
   const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + a.room / 2))).cash, 1));
   const cap = Math.min(a.room, cashTons);
-  // Public charters can be raced: laden rivals seen bound for the port before we land take some of the room.
-  const crowd = (c: CharterInfo) => (c.isPublic ? Math.max(0.4, 1 - RIVAL_CROWD_SHARE * world.rivalsLanding(c.port, a.arriveAt)) : 1);
-  const roomOf = (c: CharterInfo) =>
-    Math.max(0, Math.floor((t.get(c.id)!.remaining - (res.charterTons.get(c.id) ?? 0)) * trust(ctx, c) * crowd(c)));
+  // Rivals due at the port before we land: what they likely deliver of this good goes to the best-paying
+  // charters first, counted once across them; laden ones of unknown cargo take a share of each public
+  // charter's room, and of a crisis charter expected from public news (it can be raced too).
+  const rivals = world.rivalLanding(a.dest, a.good, a.arriveAt);
+  const rivalTake = new Map<string, number>();
+  let rivalLeft = rivals.tons;
+  for (const c of usable) {
+    const take = Math.min(rivalLeft, Math.max(0, t.get(c.id)!.remaining));
+    if (take <= 0) break;
+    rivalTake.set(c.id, take);
+    rivalLeft -= take;
+  }
+  // Never below 40% of the room: arrival estimates are rough.
+  const roomOf = (c: CharterInfo) => {
+    // An expected crisis charter isn't listed yet: one ship's load on it at a time.
+    if (c.provisional && (res.charterTons.get(c.id) ?? 0) > 0) return 0;
+    const room = (t.get(c.id)!.remaining - (res.charterTons.get(c.id) ?? 0)) * trust(ctx, c);
+    const share = c.isPublic || c.provisional ? 1 - RIVAL_CROWD_SHARE * rivals.unknown : 1;
+    return Math.max(0, Math.floor(Math.max(room * 0.4, room * share - (rivalTake.get(c.id) ?? 0))));
+  };
   const avail = Math.min(cap, usable.reduce((n, c) => n + roomOf(c), 0));
   const fullCost = costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + avail / 2))).landed;
 
@@ -395,8 +496,8 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
 
 function marketPart(ctx: Ctx, a: PartArgs): Part | null {
   const { world, res, opts } = ctx;
-  const bid = expectedBid(ctx, a.dest, a.good);
-  const est = world.estAsk(a.source, a.good);
+  const bid = expectedBid(ctx, a.dest, a.good, a.arriveAt);
+  const est = world.estAsk(a.source, a.good, a.buyAt);
   if (!bid || !est || a.room < MIN_PART_TONS) return null;
   // Cheap test before any sizing: the best case must clear the margin.
   if (bid - costs(ctx, a, est.ask).landed < opts.minMargin) return null;
@@ -490,12 +591,20 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   // Delivered once the destination's base lock clears.
   const arriveAt = landsAt + ctx.baseLockMs;
   const deliverBy = arriveAt + EXPIRY_SLACK_MS;
+  // Bought once the source's base lock clears.
+  const buyAt = ctx.now + deadMs + ctx.baseLockMs;
+  // Storms don't care what's aboard: the share of the load expected destroyed on the laden passage
+  // (judged in the season it sails in), and the chance of sinking; the empty sail there can sink it too.
+  const sailsAt = buyAt + ship.cap * world.handlingMsPerTon(source);
+  const storm = world.stormRisk(out, ship.hull, ship.knots * 0.8, sailsAt, opts.stormWeight ?? 1);
+  const deadSink = dead ? world.stormRisk(dead, ship.hull, ship.knots, ctx.now, opts.stormWeight ?? 1).sink : 0;
   let bonusTons = ctx.bonusTons;
   let room = ship.cap;
-  let cash = opts.cash ?? Number.MAX_SAFE_INTEGER;
+  // Bought once at the source: cash due by then may count (onward legs: cash in hand only).
+  let cash = !cheap && opts.cashAt ? opts.cashAt(buyAt, source) : (opts.cash ?? Number.MAX_SAFE_INTEGER);
   const parts: Part[] = [];
   let freight: FreightPick[] = [];
-  const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, deliverBy, arriveAt, bonusTons });
+  const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, storm: storm.cargoShare, deliverBy, arriveAt, buyAt, bonusTons });
   const charterAt = (good: string) => ctx.charters.get(`${dest}|${good}`) ?? [];
   const take = (p: Part) => {
     parts.push(p);
@@ -551,7 +660,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const goodsTons = parts.reduce((n, p) => n + p.tons, 0);
   const freightTons = freight.reduce((n, f) => n + f.tons, 0);
   const tons = goodsTons + freightTons;
-  if (tons < Math.min(10, ship.cap * 0.5)) return null;
+  if (tons < minLoadTons(ship.cap)) return null;
 
   const fill = tons / Math.max(ship.cap, 1);
   const marketTons = parts.filter((p) => p.kind === "market").reduce((n, p) => n + p.tons, 0);
@@ -569,14 +678,16 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   // of losing the ship itself, at what it would cost to replace.
   const lootValue = parts.reduce((n, p) => n + p.tons * world.basePrice(p.good), 0) + freight.reduce((n, f) => n + 3 * f.collateral, 0);
   const risk = world.piracyRisk(out, ship.guns, ship.knots * 0.8, lootValue);
-  const kept = 1 - risk.cargoShare;
+  const kept = (1 - risk.cargoShare) * (1 - storm.cargoShare);
   const captureCost = risk.capture * (ship.hullValue ?? 0);
+  // A storm sinking loses the hull (its cargo is already in the storm share).
+  const sinkCost = (storm.sink + deadSink) * (ship.hullValue ?? 0);
   const freightReward = freight.reduce((n, f) => n + f.reward, 0);
   // Per ton bought: what arrives earns its pay (and bonus); the cash paid at the source is the
-  // landed cost without the first guess's piracy markup.
-  const paid = (p: Part) => p.costPerTon * (1 - piracy);
-  const profit = parts.reduce((n, p) => n + p.tons * (kept * (p.pay + p.bonus) - paid(p)), 0) + freightReward - captureCost;
-  const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * p.pay - paid(p)), 0) + freightReward - captureCost;
+  // landed cost without the first guess's piracy and storm markups.
+  const paid = (p: Part) => p.costPerTon * (1 - piracy) * (1 - storm.cargoShare);
+  const profit = parts.reduce((n, p) => n + p.tons * (kept * (p.pay + p.bonus) - paid(p)), 0) + freightReward - captureCost - sinkCost;
+  const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * p.pay - paid(p)), 0) + freightReward - captureCost - sinkCost;
   // Pirates taking the ship can make a load not worth carrying at all.
   if (profit <= 0) return null;
   const main = parts[0];
@@ -606,6 +717,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       costPerTon: Math.round(costPerTon),
       margin: Math.round(pay + bonusAvg - costPerTon),
       piracyBps: Math.round(piracy * 10_000),
+      stormBps: Math.round(storm.cargoShare * 10_000),
       askKnown: main?.askKnown ?? true,
       cashProfit: Math.round(cashProfit),
       capital: Math.round(capital),
@@ -615,6 +727,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       loopMs: ms,
       profitPerHour: Math.round(rate(profit, ms)),
       next: null,
+      speculative: parts.some((p) => p.fills.some(([id]) => id.startsWith(PROVISIONAL_PREFIX))) || undefined,
     },
   };
 }
@@ -632,32 +745,37 @@ function legsFrom(ctx: Ctx, from: string, cheap: boolean): Promise<Leg[]> {
 
 async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Leg[]> {
   const { world } = ctx;
+  // Re-sizing at a source: only legs loading there (onward legs from elsewhere are unaffected).
+  const only = cheap ? undefined : ctx.opts.onlySource;
   const jobs: Array<Promise<Leg | null>> = [];
 
   // Charters (live and gossip) at each port, by good, from every port selling the good.
   for (const [k, charters] of ctx.charters) {
     const [dest, good] = k.split("|");
     for (const source of world.sellersOf(good)) {
-      if (source !== dest) jobs.push(buildLeg(ctx, from, source, dest, { kind: "charter", good, charters }, cheap));
+      if (source !== dest && (!only || source === only)) jobs.push(buildLeg(ctx, from, source, dest, { kind: "charter", good, charters }, cheap));
     }
   }
 
-  // Markets: for each good, the best few buyers (by bid) against the cheapest few sellers.
+  // Markets: for each good, the best few buyers (by bid) against the cheapest few sellers, plus ports
+  // in a shortage or glut of it (tried on top of the best few, never in place of one: the shock may
+  // fade before a ship gets there).
   for (const c of world.catalog.commodities) {
-    const buyers = world.catalog.ports
+    const bids = world.catalog.ports
       .filter((p) => world.isOpen(p.id) && world.trades(p.id, c.id))
       .map((p) => ({ port: p.id, bid: expectedBid(ctx, p.id, c.id) }))
       .filter((b): b is { port: string; bid: number } => b.bid !== null)
-      .sort((a, b) => b.bid - a.bid)
-      .slice(0, MARKET_TOP);
+      .sort((a, b) => b.bid - a.bid);
+    const buyers = [...bids.slice(0, MARKET_TOP), ...bids.slice(MARKET_TOP).filter((b) => world.shortageAt(b.port, c.id))];
     if (buyers.length === 0) continue;
-    const sellers = world
+    const offers = world
       .sellersOf(c.id)
+      .filter((port) => !only || port === only)
       .map((port) => ({ port, ask: world.estAsk(port, c.id) }))
       .filter((x): x is { port: string; ask: { ask: number; known: boolean } } => x.ask !== null)
       .map((x) => ({ port: x.port, cost: x.ask.ask * (1 + world.customsBps(x.port) / 10_000) }))
-      .sort((a, b) => a.cost - b.cost)
-      .slice(0, MARKET_TOP);
+      .sort((a, b) => a.cost - b.cost);
+    const sellers = [...offers.slice(0, MARKET_TOP), ...offers.slice(MARKET_TOP).filter((s) => world.glutAt(s.port, c.id))];
     for (const s of sellers) {
       for (const b of buyers) {
         // Skip pairs that can't clear the margin even before the costs that need a route.
@@ -749,7 +867,7 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     let ms = leg.ms + (back ? world.sailMs(back.total_distance_nm, ship.knots) : leg.ms);
     let next: string | null = null;
     if (i < ONWARD_TOP) {
-      const onward = (await legsFrom(ctx, leg.lane.dest, true)).find((l) => l.profit > 0 && !overlaps(leg.lane, l.lane));
+      const onward = (await legsFrom(ctx, leg.lane.dest, true)).find((l) => l.profit > 0 && !overlaps(leg.lane, l.lane) && !(opts.noSpeculativeOnward && l.lane.speculative));
       if (onward && rate(leg.profit + onward.profit, leg.ms + onward.ms) > rate(profit, ms)) {
         profit = leg.profit + onward.profit;
         ms = leg.ms + onward.ms;
@@ -800,6 +918,7 @@ export function cargoLane(good: string, source: string, dest: string, charterId:
     costPerTon: 0,
     margin: 0,
     piracyBps: 0,
+    stormBps: 0,
     askKnown: false,
     cashProfit: 0,
     capital: 0,
