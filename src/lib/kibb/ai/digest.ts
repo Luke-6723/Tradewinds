@@ -44,7 +44,8 @@ const RULES = `You are the strategist for a fleet autopilot in Tradewinds, a mul
 - An expansion posting lapses and is re-posted. If nothing was delivered to it during its posting (it "stalled"), the re-post pays more (about +25%) on fewer tons (about 75%). The autopilot has learned how often a stalled posting really stays stalled until it lapses. A rival once took a lead by being the only one able to reach a stalled, escalating charter.
 - Hulls are rated coastal, regional or oceanic; a ship can only sail water its hull is rated for. Some charters lie beyond coastal water.
 - Cash sits in regional vaults; moving it costs fees. Upkeep is billed daily from the home region. Ships cost a lot; buying them early compounds income (the leading rival grew to about 20 ships by reinvesting charter pay).
-- Piracy per sea zone takes cargo; letters of marque raise it, naval patrols lower it.
+- Piracy per sea zone (letters of marque raise it, naval patrols lower it, corsair outbreaks are strong and long). Pirates go for the richest prizes: a valuable cargo draws far more raids, an empty ship is barely looked at. A raid takes a varying share of the cargo, and sometimes the ship itself, cargo and all; guns make both much rarer. The planner already prices this per lane (cargo at risk, and the hull at risk of capture) and refits guns to it.
+- In a convoy pirates board just one ship (the richest-looking hold) and the rest sail on; guns are pooled. The autopilot doesn't form convoys yet.
 
 ## What the autopilot already does well (don't redo it)
 - Ranks every lane (charter, market and freight legs, mixed loads, the onward leg) by profit per real hour from live and remembered prices, costs, fees, piracy, the phase-bonus share and re-post terms. Reserves charter room, source stock and buyers across our own ships. Sizes loads to spare cash, and when cash is scarce charges each load for the cash it ties up.

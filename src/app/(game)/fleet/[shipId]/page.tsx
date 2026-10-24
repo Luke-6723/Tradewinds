@@ -37,6 +37,16 @@ function DepartForm({
   const [picked, setPicked] = useState<string | null>(null);
   const dest = picked ?? policy?.dest_port_id ?? "";
   const voids = !!policy && !!dest && dest !== policy.dest_port_id;
+  // Cargo loaded since the policy was written voids it at departure. The game values cargo at the
+  // higher of base price and the local mid, so cargo worth more than declared even at base prices
+  // means more was loaded.
+  const declared = policy ? Math.max(0, policy.insured_value_pence - policy.hull_value_pence) : 0;
+  const aboardAtBase = Object.entries(r.cargo_manifest).reduce(
+    (n, [g, t]) => n + t * (catalog?.commodities.find((c) => c.id === g)?.base_price_pence ?? 0),
+    0,
+  );
+  // Hull-only cover declares no cargo on purpose: nothing to compare.
+  const overDeclared = !!policy && policy.insured_value_pence > policy.hull_value_pence && aboardAtBase > declared * 1.02 + 100;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DepartResult | null>(null);
@@ -83,6 +93,11 @@ function DepartForm({
         </NativeSelect>
       </div>
       {voids && policy && <ErrorNote error={`Sailing here voids the ${policy.status} policy to ${portName(policy.dest_port_id)}: no claim would ever be paid.`} />}
+      {!voids && overDeclared && policy && (
+        <ErrorNote
+          error={`The cargo aboard looks worth more (${fmtCr(aboardAtBase)} at base prices) than the ${fmtCr(declared)} declared on the policy. If it was loaded after insuring, the policy is void when the ship sails.`}
+        />
+      )}
       {policy && !voids && dest && policy.covered_bps < 10_000 && (
         <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
           {policy.covered_bps === 0

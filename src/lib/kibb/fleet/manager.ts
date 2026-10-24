@@ -354,6 +354,8 @@ const YARD_RECHECK_MS  = 45_000;
 const INIT_BACKOFF_MS  = [5_000, 10_000, 20_000, 40_000, 60_000];
 const LOG_LIMIT        = 400;
 const GUN_PRICE_PENCE  = 15_000;
+/** A hull's replacement value per ton of hold, until a yard has quoted the class. */
+const HULL_PENCE_PER_TON = 25_000;
 /** Spare cash kept in every non-home region for berth dues and stores. */
 const REGION_FLOOR_PENCE = 20_000;
 /** The home reserve covers at least this many game days of fleet upkeep. */
@@ -996,10 +998,21 @@ export class FleetManager implements FleetHost {
 
   // ── Lanes ───────────────────────────────────────────────────────────────────
 
+  /**
+   * What a hull of this class costs to replace (pence): the cheapest quote seen for it at any yard,
+   * else a rough figure from its hold. Used to price the chance of pirates taking the ship.
+   */
+  private hullValue(shipClass: string): number {
+    const seen = [...this.hullQuotes].filter(([k]) => k.endsWith(`|${shipClass}`)).map(([, v]) => v);
+    if (seen.length) return Math.min(...seen);
+    return (this.world.shipClass(shipClass)?.hold_capacity_tons ?? 40) * HULL_PENCE_PER_TON;
+  }
+
   /** Hull, speed and cargo room for one of our ships. */
   private specFor(agent: ShipAgent, r: ShipResult): ShipSpec {
     const cls = this.world.shipClass(agent.shipClass);
     return {
+      hullValue: this.hullValue(agent.shipClass) + r.ship.cannons_count * GUN_PRICE_PENCE,
       shipClass: agent.shipClass,
       hull: cls?.hull_category ?? "coastal",
       knots: (cls?.base_speed_centiknots ?? 800) / 100,
@@ -1013,6 +1026,7 @@ export class FleetManager implements FleetHost {
   private specForClass(shipClass: string, guns: number): ShipSpec {
     const cls = this.world.shipClass(shipClass);
     return {
+      hullValue: this.hullValue(shipClass) + guns * GUN_PRICE_PENCE,
       shipClass,
       hull: cls?.hull_category ?? "coastal",
       knots: (cls?.base_speed_centiknots ?? 800) / 100,
@@ -1094,7 +1108,19 @@ export class FleetManager implements FleetHost {
     // Landed cost without the piracy markup the planner priced in for the current guns.
     const landed = lane.costPerTon * (1 - lane.piracyBps / 10_000);
     const payPerTon = lane.pay + (lane.bonus ?? 0);
-    const profit = (g: number) => tonsAt(g) * (payPerTon * (1 - this.world.piracyLoss(plan, g, knots)) - landed);
+    // Cargo pirates take (richer loads draw more raids), and the chance they take the ship itself,
+    // at its value with the guns it would carry: guns cut both.
+    const hull = this.hullValue(agent.shipClass);
+    // Valued as the planner values it: the goods at base price, freight at ~3x its collateral.
+    const goodsTons = lane.parts.reduce((n, p) => n + p.tons, 0);
+    const lootPerTon =
+      lane.tons > 0
+        ? (lane.parts.reduce((n, p) => n + p.tons * this.world.basePrice(p.good), 0) + lane.freight.reduce((n, f) => n + 3 * f.collateral, 0)) / Math.max(goodsTons + lane.freight.reduce((n, f) => n + f.tons, 0), 1)
+        : 0;
+    const profit = (g: number) => {
+      const risk = this.world.piracyRisk(plan, g, knots, tonsAt(g) * lootPerTon);
+      return tonsAt(g) * (payPerTon * (1 - risk.cargoShare) - landed) - risk.capture * (hull + g * GUN_PRICE_PENCE);
+    };
 
     // Hysteresis, so a ship moving between quiet and pirate water doesn't buy and land guns on
     // alternate calls: mounting must repay twice its price (it may be landed again), landing must
@@ -1189,8 +1215,21 @@ export class FleetManager implements FleetHost {
         break;
       case "voyage_hazard": {
         const loss = num("cargo_loss_pct");
-        this.log(agent?.name ?? "fleet", `${str("hazard") ?? "hazard"} at sea${p.sunk ? ": SUNK" : loss ? `: lost ${loss}% of cargo` : ""}`);
-        if (p.sunk && agent) this.advisor.trigger("a ship was lost");
+        const hazard = (str("hazard", "kind", "type") ?? "hazard").toLowerCase();
+        // Since the October patch pirates may take the ship itself (the event's shape isn't published).
+        const captured = hazard.includes("captur") || p.captured === true;
+        this.log(agent?.name ?? "fleet", `${hazard} at sea${captured ? ": CAPTURED by pirates" : p.sunk ? ": SUNK" : loss ? `: lost ${loss}% of cargo` : ""}`);
+        if (agent && (hazard.includes("pira") || hazard.includes("raid") || captured)) this.world.notePirateRaid(loss !== undefined ? loss / 100 : null, captured);
+        if ((p.sunk || captured) && agent) this.advisor.trigger("a ship was lost");
+        agent?.nudge();
+        break;
+      }
+      case "ship_captured": {
+        this.log(agent?.name ?? "fleet", "CAPTURED by pirates: ship and cargo lost");
+        if (agent) {
+          this.world.notePirateRaid(null, true);
+          this.advisor.trigger("a ship was lost");
+        }
         agent?.nudge();
         break;
       }
@@ -1292,8 +1331,17 @@ export class FleetManager implements FleetHost {
   private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult): Promise<Lane | null> {
     const prev = agent.lane;
     const cash = this.loadCash(agent);
-    const lanes = await rankLanes(this.world, this.specFor(agent, r), from, this.reservations(agent), this.planOptions(cash, agent));
-    const best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
+    const spec = this.specFor(agent, r);
+    let lanes = await rankLanes(this.world, spec, from, this.reservations(agent), this.planOptions(cash, agent));
+    let best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
+    // Nothing pays unarmed (pirates would likely take the ship), but this is a yard: plan as if
+    // fully armed; the refit here then sizes the guns to the lane and the load is planned again.
+    const max = this.world.shipClass(agent.shipClass)?.max_cannons ?? 0;
+    if (!best && this.settings.guns === "auto" && r.ship.status !== "sailing" && this.world.port(from)?.has_shipyard && spec.guns < max) {
+      const armed: ShipSpec = { ...spec, guns: max, cap: Math.max(0, spec.cap - 2 * (max - spec.guns)), hullValue: (spec.hullValue ?? 0) + (max - spec.guns) * GUN_PRICE_PENCE };
+      lanes = await rankLanes(this.world, armed, from, this.reservations(agent), this.planOptions(cash, agent));
+      best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
+    }
     agent.setLane(best);
     if (best) agent.noteLane(best);
     if (best && best.key !== prev?.key) {

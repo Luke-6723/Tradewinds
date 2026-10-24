@@ -635,6 +635,8 @@ export class ShipAgent {
     const s = r.ship;
 
     if (s.status === "sunk") return this.leaveFleet("has sunk");
+    // Taken by pirates (a status the October patch may have added).
+    if ((s.status as string) === "captured") return this.leaveFleet("was captured by pirates");
     if (!this.freightSynced) await this.syncFreight();
     if (this.checkRestored && this.freightSynced) this.checkRestoredLane(r);
     for (const good of [...this.minSale.keys()]) if (this.ownTons(r, good) <= 0) this.minSale.delete(good);

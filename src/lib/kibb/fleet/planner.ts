@@ -16,7 +16,8 @@
  *
  * Costs per ton: the ask (with the impact of what we and our other ships buy there), customs at S,
  * the fee to bring the money from D's region back to S's, and the share of the load pirates are
- * expected to take on the way. Charters count a weighted share of the phase-completion bonus, but
+ * expected to take on the way (more for a richer load: pirates go for the richest prizes). The
+ * chance of pirates taking the ship itself is charged to the leg at the hull's value. Charters count a weighted share of the phase-completion bonus, but
  * their cash pay must cover the cost by itself. Loads are capped by hold room and spare cash.
  *
  * Expansion charters are re-posted when they lapse, so their expiry doesn't end them: a load landing
@@ -41,6 +42,8 @@ export interface ShipSpec {
   /** Cargo room once guns, stores and sealed freight are aboard. */
   cap: number;
   guns: number;
+  /** What losing the ship to pirates would cost (pence): its rebuild value and guns. */
+  hullValue?: number;
 }
 
 export type LaneKind = "charter" | "market" | "freight";
@@ -474,7 +477,14 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   }
   if (!world.routeRated(out, ship.hull) || (dead && !world.routeRated(dead, ship.hull))) return null;
 
-  const piracy = world.piracyLoss(out, ship.guns, ship.knots * 0.8);
+  // Pirates go for the richest prizes. To price the goods, a first guess: the hold full of the main
+  // good at its base price (freight: the lots here at about three times their collateral). The
+  // load actually chosen is re-judged below.
+  const guessValue =
+    primary.kind === "freight"
+      ? world.freight.filter((f) => f.origin === source && f.dest === dest && !ctx.res.freightIds.has(f.id)).reduce((n, f) => n + 3 * f.collateral, 0)
+      : ship.cap * world.basePrice(primary.good);
+  const piracy = world.piracyRisk(out, ship.guns, ship.knots * 0.8, guessValue).cargoShare;
   const deadMs = dead ? world.sailMs(dead.total_distance_nm, ship.knots) : 0;
   const landsAt = ctx.now + deadMs + ctx.baseLockMs + ship.cap * world.handlingMsPerTon(source) + world.sailMs(out.total_distance_nm, ship.knots * 0.8);
   // Delivered once the destination's base lock clears.
@@ -555,10 +565,20 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const holdMs = holdUntil === null ? 0 : Math.max(0, holdUntil - landAt);
   const ms = deadMs + loadMs + ladenMs + holdMs + unloadMs + LEG_OVERHEAD_MS;
 
-  const kept = 1 - piracy;
+  // The load as chosen, as the pirates see it: its share lost (captures included) and the chance
+  // of losing the ship itself, at what it would cost to replace.
+  const lootValue = parts.reduce((n, p) => n + p.tons * world.basePrice(p.good), 0) + freight.reduce((n, f) => n + 3 * f.collateral, 0);
+  const risk = world.piracyRisk(out, ship.guns, ship.knots * 0.8, lootValue);
+  const kept = 1 - risk.cargoShare;
+  const captureCost = risk.capture * (ship.hullValue ?? 0);
   const freightReward = freight.reduce((n, f) => n + f.reward, 0);
-  const profit = parts.reduce((n, p) => n + p.tons * kept * p.margin, 0) + freightReward;
-  const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * (p.pay - p.costPerTon)), 0) + freightReward;
+  // Per ton bought: what arrives earns its pay (and bonus); the cash paid at the source is the
+  // landed cost without the first guess's piracy markup.
+  const paid = (p: Part) => p.costPerTon * (1 - piracy);
+  const profit = parts.reduce((n, p) => n + p.tons * (kept * (p.pay + p.bonus) - paid(p)), 0) + freightReward - captureCost;
+  const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * p.pay - paid(p)), 0) + freightReward - captureCost;
+  // Pirates taking the ship can make a load not worth carrying at all.
+  if (profit <= 0) return null;
   const main = parts[0];
   const good = main?.good ?? freight[0]?.good ?? "";
   const kind: LaneKind = primary.kind;

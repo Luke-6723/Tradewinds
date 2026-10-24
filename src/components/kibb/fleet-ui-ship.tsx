@@ -582,7 +582,7 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
             <div className="font-medium text-xs">Insure the next voyage</div>
             <PortSelect value={dest} onChange={setDest} placeholder="Bound for…" maxPhase={clock?.unlocked_phase} filter={(id) => id !== port} />
             <div className="grid gap-2 sm:grid-cols-2">
-              <Field label="Sum insured (Cr)">
+              <Field label="Sum insured (Cr): hull plus all the cargo aboard">
                 <Input type="number" min={0.01} step={0.01} value={valueCr} onChange={(e) => setValueCr(e.target.value)} />
               </Field>
               <Field label="Premium (bps)">
@@ -590,6 +590,9 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
               </Field>
             </div>
             {premium !== "" && !bpsOk && <ErrorNote error="The premium must be a whole number of bps from 10 to 3,000." />}
+            <p className="text-muted-foreground text-xs">
+              Load everything first: cargo loaded after the policy is written voids it when the ship sails. A capture by pirates pays out as a total loss.
+            </p>
             {dest && <LaneGuide floors={floors} hullOnly={hullOnly} premiumBps={bps} />}
             {cap && <InsurableCap cap={cap} valueCr={valueCr} onUseMax={setValueCr} />}
             <p className="text-muted-foreground text-xs">

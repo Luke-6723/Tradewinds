@@ -206,7 +206,7 @@ function CreatePolicy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
         <PortSelect value={dest} onChange={setDest} placeholder="Choose a port…" maxPhase={maxPhase} filter={(p) => p !== from} />
       </Field>
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Sum insured (Cr)">
+        <Field label="Sum insured (Cr): hull plus all the cargo aboard">
           <Input type="number" min={0.01} step={0.01} value={valueCr} onChange={(e) => setValueCr(e.target.value)} />
         </Field>
         <Field label="Premium (bps)">
@@ -721,7 +721,9 @@ export default function InsurancePage() {
             <ul className="list-disc space-y-1.5 pl-4 text-muted-foreground text-xs">
               <li>One policy per voyage, written in port or the roadstead. It binds at departure and is void (no claim ever) if the ship sails anywhere but the insured port.</li>
               <li>Sum insured ≤ hull rebuild quote + 150 Cr a gun + cargo aboard. Stores are not insurable. Cannons can&apos;t be removed while insured.</li>
-              <li>A sinking pays the full cover; a storm or pirate loss pays the lost share, capped at 25% of declared cargo (hull-only cover pays only on a sinking); a convoy rescue caps at 60%.</li>
+              <li>Declare your whole cargo: underwriters price pirate risk on the cargo declared, and cargo loaded after the policy is written voids it when the ship sails.</li>
+              <li>A sinking, or a capture by pirates, pays the full cover; a storm or pirate raid pays the lost share, capped at 25% of declared cargo (hull-only cover pays only on a total loss); a convoy rescue caps at 60%.</li>
+              <li>Pirates go for the richest prizes and sometimes take the ship itself (guns make that much rarer), so rich or dangerous runs cost more to insure.</li>
               <li>Arrival closes it settled safe: collateral goes back to underwriters and unwritten premium to you. Insure each leg anew. A mutiny pays nothing.</li>
               <li>Lloyd&apos;s writes only policies open about a game hour, every couple of game hours, if the premium ≥ 1.25 × its expected loss + 25 bps; it locks at most 10% of its funds on one policy and 20% per sea zone.</li>
               <li>A policy can&apos;t be withdrawn: one priced below what Lloyd&apos;s accepts on the lane just waits, and blocks a new one until the ship sails or it lapses.</li>

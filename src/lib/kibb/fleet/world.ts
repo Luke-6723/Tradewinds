@@ -27,8 +27,20 @@ const PRICE_TTL_MS = 3 * 60 * 60 * 1000;
 const SOLD_OUT_MS = 6 * 60 * 1000;
 /** A charter last seen live is recalled for this long (2 game days; real ms at 60×). */
 const RECALL_MS = 2 * 24 * 60 * 1000;
-/** A pirate interception or storm hit destroys this share of every cargo stack. */
-const HIT_LOSS = 0.25;
+/**
+ * Piracy since the October patch (formulas not published, so these are estimates the fleet refines
+ * from its own raids): pirates go for the richest prizes, take a varying share of the cargo, and
+ * sometimes the ship itself. A raid's take starts at this guess and is learned from our raids.
+ */
+const RAID_TAKE_PRIOR = 0.3;
+const RAID_TAKE_PRIOR_N = 5;
+/** Attention: a cargo worth this (pence) draws the zone's raw piracy; richer more, cheaper less, empty almost none. */
+const ATTENTION_REF_PENCE = 1_000_000;
+const ATTENTION_MIN = 0.1;
+const ATTENTION_MAX = 3;
+/** Chance a raid takes the ship (cargo and all), unarmed; each gun cuts it sharply. */
+const CAPTURE_PER_RAID = 0.15;
+const CAPTURE_GUN_CUT = 0.6;
 /** Assumed cut in interception odds per gun ("cut sharply by cannons"; the formula isn't published). */
 const GUN_DETERRENCE = 0.5;
 /**
@@ -75,6 +87,8 @@ export interface WorldSnapshot {
   /** Learned figures (calibrators): stalled postings seen lapse and whether they escalated; bid drift samples. */
   stallFates?: { escalated: number; not: number };
   bidSamples?: Array<[ageDays: number, ratio: number]>;
+  raidTakes?: number[];
+  captures?: number;
 }
 
 /** Ids of closed charters kept in a snapshot (the newest). */
@@ -236,6 +250,9 @@ export class World {
   escalation = { pay: ESCALATION_PAY, tons: ESCALATION_TONS };
   /** Stalled postings seen lapse, and whether they re-posted richer. */
   private stallFates = { escalated: 0, not: 0 };
+  /** Our own pirate raids: shares of cargo taken (captures aside), and captures seen. */
+  private raidTakes: number[] = [];
+  captures = 0;
   /** A remembered bid against the next live one at the same port: (age in game days, live/remembered). */
   private bidSamples: Array<[number, number]> = [];
   /** bidHaircutPerDay, recomputed when a sample comes in (read thousands of times per plan). */
@@ -294,6 +311,8 @@ export class World {
       sightings: this.rivals.all(),
       stallFates: { ...this.stallFates },
       bidSamples: [...this.bidSamples],
+      raidTakes: [...this.raidTakes],
+      captures: this.captures,
     };
   }
 
@@ -312,6 +331,8 @@ export class World {
     for (const x of s.sightings ?? []) this.rivals.add(x);
     if (s.stallFates) this.stallFates = { ...s.stallFates };
     if (s.bidSamples) this.bidSamples = s.bidSamples.slice(-BID_SAMPLES_MAX);
+    if (s.raidTakes) this.raidTakes = s.raidTakes.slice(-100);
+    this.captures = s.captures ?? 0;
     this.updateBidHaircut();
   }
 
@@ -722,19 +743,53 @@ export class World {
   }
 
   /**
-   * Expected share of the cargo lost to pirates on a passage. Each leg rolls for the zone it ends
-   * in (a port's own zone for the last leg); the guide's prize-money rule of thumb implies a zone's
-   * net piracy acts as a rate per game day at sea, so longer legs count for more. A hit destroys a
-   * quarter of every stack; guns deter. An estimate for ranking lanes, capped at half the load.
+   * What pirates are expected to cost a passage carrying `cargoValue` (pence). Each leg rolls for
+   * the zone it ends in (a port's own zone for the last leg), at the zone's net piracy as a rate per
+   * game day at sea, so longer legs count for more. Pirates go for the richest prizes, so the rate
+   * scales with the cargo's value (an empty ship is barely looked at); guns deter. A raid takes a
+   * share of the cargo (learned from our raids), and now and then the ship itself, cargo and all
+   * (rarer with guns). Returns the expected share of the cargo lost (captures included) and the
+   * chance of losing the ship. Estimates for ranking lanes and refits.
    */
-  piracyLoss(plan: RoutePlan, guns: number, knots: number): number {
+  piracyRisk(plan: RoutePlan, guns: number, knots: number, cargoValue: number): { cargoShare: number; capture: number } {
     const dayMs = 24 * 60 * this.gameMinuteMs;
-    let hits = 0;
+    let rate = 0;
     for (const l of plan.legs) {
       const bps = this.piracy.get(l.to_node) ?? this.piracy.get(this.port(l.to_node)?.sea_zone_id ?? "");
-      if (bps) hits += Math.min(1, (bps / 10_000) * (this.sailMs(l.distance_nm, knots) / dayMs));
+      if (bps) rate += Math.min(1, (bps / 10_000) * (this.sailMs(l.distance_nm, knots) / dayMs));
     }
-    return Math.min(0.5, (hits * HIT_LOSS) / (1 + guns * GUN_DETERRENCE));
+    if (rate <= 0) return { cargoShare: 0, capture: 0 };
+    const attention = cargoValue <= 0 ? ATTENTION_MIN : Math.min(ATTENTION_MAX, Math.max(ATTENTION_MIN, Math.sqrt(cargoValue / ATTENTION_REF_PENCE)));
+    const raids = Math.min(1, (rate * attention) / (1 + guns * GUN_DETERRENCE));
+    const capturePerRaid = CAPTURE_PER_RAID / (1 + guns * CAPTURE_GUN_CUT);
+    const take = this.raidTake;
+    return {
+      cargoShare: Math.min(0.6, raids * (capturePerRaid + (1 - capturePerRaid) * take)),
+      capture: Math.min(0.5, raids * capturePerRaid),
+    };
+  }
+
+  /** The expected share of the cargo lost to pirates on a passage (captures included); see piracyRisk. */
+  piracyLoss(plan: RoutePlan, guns: number, knots: number, cargoValue: number): number {
+    return this.piracyRisk(plan, guns, knots, cargoValue).cargoShare;
+  }
+
+  /** Share of the cargo a raid takes, learned from our own raids (30% until some are seen). */
+  get raidTake(): number {
+    const n = this.raidTakes.length;
+    const sum = this.raidTakes.reduce((a, b) => a + b, 0);
+    return Math.min(0.9, Math.max(0.05, (sum + RAID_TAKE_PRIOR * RAID_TAKE_PRIOR_N) / (n + RAID_TAKE_PRIOR_N)));
+  }
+
+  /** One of our ships was raided: the share of its cargo taken, or captured outright. */
+  notePirateRaid(share: number | null, captured: boolean): void {
+    if (captured) {
+      this.captures++;
+      return;
+    }
+    if (share === null || !Number.isFinite(share) || share <= 0 || share > 1) return;
+    this.raidTakes.push(share);
+    if (this.raidTakes.length > 100) this.raidTakes.shift();
   }
 
   // ── Prices ──────────────────────────────────────────────────────────────────
