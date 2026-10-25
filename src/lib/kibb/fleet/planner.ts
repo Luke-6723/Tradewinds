@@ -40,6 +40,9 @@
  * World events move prices: a shortage's bid and a glut's ask are expected from the shocks seen so
  * far, fading by the news' lapse, and a shortage's crisis charter (listed only on its quay or as
  * gossip later) is planned on before it is listed, at the share found when looked for.
+ *
+ * The AI's bans (ports, sea zones, goods, charters, public charters rivals are due at first) keep lanes
+ * touching them out of every plan, onward legs included; its bias only reorders lanes that pass.
  */
 
 import type { RoutePlan, ZoneClass } from "../types";
@@ -140,6 +143,21 @@ export interface Lane {
   dueCounted?: number;
   /** It fills a crisis charter expected from a shortage's news, not listed yet. */
   speculative?: boolean;
+  /** Sea zones the laden passage's hazards roll for (absent on lanes saved before it was kept). */
+  zones?: string[];
+}
+
+/** The AI's hard bans for its horizon (ai/directives.ts): no planned load touches them. */
+export interface Bans {
+  /** No loading, delivering or selling there. */
+  ports: Set<string>;
+  /** No passage through them, laden or empty. */
+  zones: Set<string>;
+  goods: Set<string>;
+  /** Postings (the ids that now stand for them). */
+  charters: Set<string>;
+  /** No public charter where rivals are due before we land. */
+  contested: boolean;
 }
 
 /** Tons other ships are bound to deliver, buy or sell, and freight lots they mean to take. */
@@ -202,6 +220,8 @@ export interface PlanOptions {
   cashAt?: (at: number, source: string) => number;
   /** Only legs loading at this port: a load planned again at its source (FleetManager.resizeLane). */
   onlySource?: string;
+  /** Only legs delivering at this port: a ship insured for that voyage (its policy is void anywhere else). */
+  onlyDest?: string;
   /** Charge per pence of cash a load ties up, per real hour (0 while cash isn't scarce). */
   capitalRate?: number;
   /**
@@ -213,6 +233,8 @@ export interface PlanOptions {
   stalls?: Map<string, StallStake>;
   /** Leave crisis charters expected from the news out of onward legs (the buyer). */
   noSpeculativeOnward?: boolean;
+  /** The AI's bans in force: lanes touching them aren't planned (onward legs included). */
+  bans?: Bans;
 }
 
 /** Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). */
@@ -412,7 +434,7 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   if (!est || a.room < MIN_PART_TONS) return null;
   const reserved = res.sourceTons.get(`${a.source}|${a.good}`) ?? 0;
   // Re-posted charters outlive their expiry; the rest must still be open when the load lands.
-  const usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
+  let usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
   const t = new Map(usable.map((c) => [c.id, terms(ctx, c, a.arriveAt)]));
   const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay, a.arriveAt);
   const value = (c: CharterInfo) => cashOf(c) + charterBonus(ctx, c);
@@ -424,6 +446,8 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   // charters first, counted once across them; laden ones of unknown cargo take a share of each public
   // charter's room, and of a crisis charter expected from public news (it can be raced too).
   const rivals = world.rivalLanding(a.dest, a.good, a.arriveAt);
+  // The AI's "contested" ban: no public charter (nor one expected from public news) rivals are due at first.
+  if (opts.bans?.contested && (rivals.tons > 0 || rivals.unknown > 0)) usable = usable.filter((c) => !c.isPublic && !c.provisional);
   const rivalTake = new Map<string, number>();
   let rivalLeft = rivals.tons;
   for (const c of usable) {
@@ -577,6 +601,10 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
     return null;
   }
   if (!world.routeRated(out, ship.hull) || (dead && !world.routeRated(dead, ship.hull))) return null;
+  // Zones the laden passage rolls for (kept on the lane), and the AI's zone bans on it and on the empty sail there.
+  const zones = [...new Set(out.legs.map((l) => world.hazardZone(l.to_node)?.id).filter((z): z is string => !!z))];
+  const banZ = opts.bans?.zones;
+  if (banZ?.size && (zones.some((z) => banZ.has(z)) || dead?.legs.some((l) => banZ.has(world.hazardZone(l.to_node)?.id ?? "")))) return null;
 
   // Pirates go for the richest prizes. To price the goods, a first guess: the hold full of the main
   // good at its base price (freight: the lots here at about three times their collateral). The
@@ -638,7 +666,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
     const done = new Set(parts.map((p) => p.good));
     const options: Part[] = [];
     for (const good of world.goodsAt(source)) {
-      if (done.has(good) || !wanted.has(good)) continue;
+      if (done.has(good) || !wanted.has(good) || opts.bans?.goods.has(good)) continue;
       const c = charterPart(ctx, args(good), charterAt(good));
       const m = marketPart(ctx, args(good));
       const pick = c && m ? (c.margin >= m.margin ? c : m) : (c ?? m);
@@ -673,6 +701,11 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const holdUntil = parts.reduce<number | null>((m, p) => (p.holdUntil === null ? m : Math.max(m ?? 0, p.holdUntil)), null);
   const holdMs = holdUntil === null ? 0 : Math.max(0, holdUntil - landAt);
   const ms = deadMs + loadMs + ladenMs + holdMs + unloadMs + LEG_OVERHEAD_MS;
+  // Season end (guide 3.11): a leg must be delivered before it (charters and freight pay nothing after, cargo counts at base).
+  if (!world.beforeSeasonEnd(ctx.now + ms - LEG_OVERHEAD_MS)) return null;
+  // Berth dues (guide 3.3): the stay loading at the source (its minimum already paid when the ship is there)
+  // and the one at the destination (a ship berths on arrival; a hold for a re-post waits in the roadstead).
+  const dues = world.berthDuesFor(source, loadMs, from !== source) + world.berthDuesFor(dest, unloadMs);
 
   // The load as chosen, as the pirates see it: its share lost (captures included) and the chance
   // of losing the ship itself, at what it would cost to replace.
@@ -682,19 +715,24 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const captureCost = risk.capture * (ship.hullValue ?? 0);
   // A storm sinking loses the hull (its cargo is already in the storm share).
   const sinkCost = (storm.sink + deadSink) * (ship.hullValue ?? 0);
-  const freightReward = freight.reduce((n, f) => n + f.reward, 0);
+  // Sealed freight goes down with the ship on the laden passage (a sinking or a capture): its reward
+  // unearned and its collateral forfeit (guide 3.6).
+  const shipLost = Math.min(1, risk.capture + storm.sink);
+  const freightPay = freight.reduce((n, f) => n + f.reward, 0);
+  const freightReward = freight.reduce((n, f) => n + f.reward * (1 - shipLost) - f.collateral * shipLost, 0);
   // Per ton bought: what arrives earns its pay (and bonus); the cash paid at the source is the
   // landed cost without the first guess's piracy and storm markups.
   const paid = (p: Part) => p.costPerTon * (1 - piracy) * (1 - storm.cargoShare);
-  const profit = parts.reduce((n, p) => n + p.tons * (kept * (p.pay + p.bonus) - paid(p)), 0) + freightReward - captureCost - sinkCost;
-  const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * p.pay - paid(p)), 0) + freightReward - captureCost - sinkCost;
+  const profit = parts.reduce((n, p) => n + p.tons * (kept * (p.pay + p.bonus) - paid(p)), 0) + freightReward - captureCost - sinkCost - dues;
+  const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * p.pay - paid(p)), 0) + freightReward - captureCost - sinkCost - dues;
   // Pirates taking the ship can make a load not worth carrying at all.
   if (profit <= 0) return null;
   const main = parts[0];
   const good = main?.good ?? freight[0]?.good ?? "";
   const kind: LaneKind = primary.kind;
   const sum = (f: (p: Part) => number) => parts.reduce((n, p) => n + f(p) * p.tons, 0);
-  const pay = (sum((p) => p.pay) + freightReward) / tons;
+  // Pay as listed, like the goods' (the risk is in the profit).
+  const pay = (sum((p) => p.pay) + freightPay) / tons;
   const bonusAvg = sum((p) => p.bonus) / tons;
   const costPerTon = sum((p) => p.costPerTon) / tons;
   const capital = parts.reduce((n, p) => n + costs(ctx, args(p.good), p.estAsk).cash * p.tons, 0) + freight.reduce((n, f) => n + f.collateral, 0);
@@ -728,6 +766,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       profitPerHour: Math.round(rate(profit, ms)),
       next: null,
       speculative: parts.some((p) => p.fills.some(([id]) => id.startsWith(PROVISIONAL_PREFIX))) || undefined,
+      zones,
     },
   };
 }
@@ -747,13 +786,19 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   const { world } = ctx;
   // Re-sizing at a source: only legs loading there (onward legs from elsewhere are unaffected).
   const only = cheap ? undefined : ctx.opts.onlySource;
+  // Insured for one voyage: only legs ending at its port (onward legs from there are free).
+  const onlyDest = cheap ? undefined : ctx.opts.onlyDest;
+  // The AI's bans (charters at banned ports, of banned goods or banned themselves are already out of ctx.charters).
+  const bans = ctx.opts.bans;
+  const portOk = (p: string) => !bans?.ports.has(p);
   const jobs: Array<Promise<Leg | null>> = [];
 
   // Charters (live and gossip) at each port, by good, from every port selling the good.
   for (const [k, charters] of ctx.charters) {
     const [dest, good] = k.split("|");
+    if (onlyDest && dest !== onlyDest) continue;
     for (const source of world.sellersOf(good)) {
-      if (source !== dest && (!only || source === only)) jobs.push(buildLeg(ctx, from, source, dest, { kind: "charter", good, charters }, cheap));
+      if (source !== dest && (!only || source === only) && portOk(source)) jobs.push(buildLeg(ctx, from, source, dest, { kind: "charter", good, charters }, cheap));
     }
   }
 
@@ -761,8 +806,10 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   // in a shortage or glut of it (tried on top of the best few, never in place of one: the shock may
   // fade before a ship gets there).
   for (const c of world.catalog.commodities) {
+    if (bans?.goods.has(c.id)) continue;
     const bids = world.catalog.ports
-      .filter((p) => world.isOpen(p.id) && world.trades(p.id, c.id))
+      .filter((p) => world.isOpen(p.id) && world.trades(p.id, c.id) && portOk(p.id))
+      .filter((p) => !onlyDest || p.id === onlyDest)
       .map((p) => ({ port: p.id, bid: expectedBid(ctx, p.id, c.id) }))
       .filter((b): b is { port: string; bid: number } => b.bid !== null)
       .sort((a, b) => b.bid - a.bid);
@@ -770,7 +817,7 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
     if (buyers.length === 0) continue;
     const offers = world
       .sellersOf(c.id)
-      .filter((port) => !only || port === only)
+      .filter((port) => (!only || port === only) && portOk(port))
       .map((port) => ({ port, ask: world.estAsk(port, c.id) }))
       .filter((x): x is { port: string; ask: { ask: number; known: boolean } } => x.ask !== null)
       .map((x) => ({ port: x.port, cost: x.ask.ask * (1 + world.customsBps(x.port) / 10_000) }))
@@ -786,9 +833,9 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   }
 
   // Freight listed here, by destination.
-  if (ctx.opts.freight) {
+  if (ctx.opts.freight && portOk(from)) {
     for (const dest of new Set(world.freight.filter((f) => f.origin === from).map((f) => f.dest))) {
-      if (dest !== from && world.isOpen(dest)) jobs.push(buildLeg(ctx, from, from, dest, { kind: "freight" }, cheap));
+      if (dest !== from && world.isOpen(dest) && portOk(dest) && (!onlyDest || dest === onlyDest) && (!only || from === only)) jobs.push(buildLeg(ctx, from, from, dest, { kind: "freight" }, cheap));
     }
   }
 
@@ -839,8 +886,10 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     if (!set) ctx.wanted.set(port, (set = new Set()));
     set.add(good);
   };
+  const bans = opts.bans;
   for (const c of world.charters) {
     if (!world.isOpen(c.port) || c.remaining <= 0 || (c.stale && trust(ctx, c) <= GOSSIP_TRUST_MIN)) continue;
+    if (bans && (bans.ports.has(c.port) || bans.goods.has(c.good) || bans.charters.has(world.currentId(c.id)))) continue;
     const k = `${c.port}|${c.good}`;
     ctx.charters.set(k, [...(ctx.charters.get(k) ?? []), c]);
     want(c.port, c.good);

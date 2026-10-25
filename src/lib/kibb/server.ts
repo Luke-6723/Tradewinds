@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { type NextRequest, NextResponse } from "next/server";
 import { KibbClient, KibbApiError, KIBB_DEFAULT_URL } from "./client";
 import { COOKIE_COMPANY_ID, COOKIE_PLAYER_KEY } from "./cookies";
-import { getCompanyKey, keyIsUsable, saveCompanyKey, type StoredCompanyKey } from "./store";
+import { getCompanyKey, keyIsUsable, listCompanyKeys, saveCompanyKey, type StoredCompanyKey } from "./store";
 import type { ApiKeyScope } from "./types";
 
 export const KIBB_URL = process.env.KIBB_API_URL ?? KIBB_DEFAULT_URL;
@@ -28,6 +28,11 @@ const COMPANY_KEY_SCOPES: ApiKeyScope[] = [
 
 /** Reuse a stored company key with at least this much life left, instead of minting a new one. */
 const REUSE_MIN_LIFE_MS = 24 * 60 * 60 * 1000;
+/** A stored key with less life than this is renewed (best effort) while its owner is signed in; looked at this often per company. */
+const RENEW_WITHIN_MS = 7 * 24 * 60 * 60 * 1000;
+const RENEW_CHECK_MS = 10 * 60_000;
+/** A renewal is only worth it when the player key outlives the stored key by this much (a sub-key can't outlive it). */
+const RENEW_MIN_GAIN_MS = 24 * 60 * 60 * 1000;
 
 export function kibb(apiKey?: string): KibbClient {
   return new KibbClient({ baseUrl: KIBB_URL, apiKey });
@@ -51,13 +56,14 @@ export function cookieOptions(req: NextRequest, maxAgeS: number) {
   };
 }
 
-/** Returns the stored company key, minting one with the player key if none has a day of life left. */
+/** Returns the stored company key, minting one with the player key if none has `minLifeMs` of life left (a day by default). */
 export async function ensureCompanyKey(
   playerKey: string,
   company: { id: string; name: string },
+  minLifeMs = REUSE_MIN_LIFE_MS,
 ): Promise<StoredCompanyKey> {
   const stored = await getCompanyKey(company.id);
-  if (stored && keyIsUsable(stored, REUSE_MIN_LIFE_MS)) {
+  if (stored && keyIsUsable(stored, minLifeMs)) {
     // Reuse it only if the game still accepts it (it may have been revoked).
     try {
       await kibb(stored.apiKey).whoami();
@@ -88,14 +94,34 @@ export async function ensureCompanyKey(
     savedAt: new Date().toISOString(),
   };
   await saveCompanyKey(key);
-  // A running autopilot still holds the old key: restart it on the new one.
+  // A running autopilot still holds the old key: it switches to the new one (a failed one restarts on it).
   void import("./fleet-registry").then((m) => m.refreshFleetKey(company.id)).catch(() => undefined);
   return key;
 }
 
 // Which companies each signed-in player owns, cached briefly (keyed by a hash of the player key).
-const g = globalThis as { __kibbOwners?: Map<string, { ids: Set<string>; at: number }> };
+const g = globalThis as { __kibbOwners?: Map<string, { ids: Set<string>; at: number }>; __kibbRenewChecked?: Map<string, number> };
 const owners = (g.__kibbOwners ??= new Map());
+const renewChecked = (g.__kibbRenewChecked ??= new Map<string, number>());
+
+/**
+ * Best effort, from the dashboard's fleet poll: mints a fresh company key once the stored one has under 7 days
+ * left (or has run out), with the signed-in owner's player key (the cookie), at most every 10 min per company.
+ * Skipped when the player key wouldn't outlive the stored key by a day: then the panel says to sign in again.
+ * The running autopilot takes the new key without a restart (ensureCompanyKey → refreshFleetKey).
+ */
+export async function renewCompanyKeyIfDue(req: NextRequest, companyId: string): Promise<void> {
+  const playerKey = req.cookies.get(COOKIE_PLAYER_KEY)?.value;
+  if (!playerKey || Date.now() - (renewChecked.get(companyId) ?? 0) < RENEW_CHECK_MS) return;
+  renewChecked.set(companyId, Date.now());
+  const stored = (await listCompanyKeys()).find((k) => k.companyId === companyId);
+  const ends = stored?.expiresAt ? Date.parse(stored.expiresAt) : NaN;
+  if (!stored || !Number.isFinite(ends) || ends - Date.now() > RENEW_WITHIN_MS) return;
+  const who = await kibb(playerKey).whoami();
+  const playerEnds = who.expires_at ? Date.parse(who.expires_at) : Infinity;
+  if (!(playerEnds - ends >= RENEW_MIN_GAIN_MS)) return;
+  await ensureCompanyKey(playerKey, { id: companyId, name: stored.companyName }, RENEW_WITHIN_MS);
+}
 const OWNER_TTL_MS = 5 * 60_000;
 
 /** The game couldn't be asked who owns what (network, 5xx, rate limit): answer 503, don't sign out. */

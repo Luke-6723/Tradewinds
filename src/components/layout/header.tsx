@@ -34,6 +34,10 @@ export function Header({ onMenu }: { onMenu: () => void }) {
   }
 
   const autopilotOn = status === "running" || status === "starting";
+  // The company key running out stops the autopilot: flagged in its last 3 days. A stopped manager's reading may
+  // predate a renewal: the stored key's then.
+  const keyExpiresAt = (autopilotOn ? runner?.state?.keyExpiresAt : null) ?? runner?.keyExpiresAt ?? null;
+  const keyDays = keyExpiresAt ? (Date.parse(keyExpiresAt) - Date.now()) / 86_400_000 : null;
 
   return (
     <header className="flex h-14 shrink-0 items-center gap-2 border-b bg-card px-3 sm:gap-3 sm:px-6">
@@ -76,6 +80,21 @@ export function Header({ onMenu }: { onMenu: () => void }) {
             <BotIcon className="size-3" />
             <span className="hidden sm:inline">Autopilot</span> {autopilotOn ? "on" : status === "failed" ? "failed" : "off"}
           </Badge>
+        )}
+        {autopilotOn && runner?.state?.paused && (
+          <Badge variant="warning" title="The operators paused the world: ships wait until it resumes">
+            World paused
+          </Badge>
+        )}
+        {runner?.state?.announcement && (
+          <Link href="/events" title={`Critical notice from the operators: ${runner.state.announcement.message}`}>
+            <Badge variant="error">Server notice</Badge>
+          </Link>
+        )}
+        {keyDays !== null && keyDays < 3 && (
+          <Link href="/companies" title={`The company key expires ${keyExpiresAt}: sign in again and select the company to renew it`}>
+            <Badge variant="warning">key {keyDays <= 0 ? "expired" : keyDays >= 1 ? `${Math.floor(keyDays)}d` : `${Math.max(1, Math.floor(keyDays * 24))}h`}</Badge>
+          </Link>
         )}
         {cash !== undefined && <span className="font-mono text-muted-foreground text-xs sm:text-sm">{fmtCr(cash)}</span>}
         <button

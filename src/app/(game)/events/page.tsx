@@ -73,10 +73,30 @@ async function pollEvents(query: Record<string, string>, signal: AbortSignal): P
       if (p.code === "not_signed_in") window.location.href = "/login";
       else if (p.code === "no_company_key") window.location.href = "/companies";
     }
-    throw new DashboardApiError(res.status, p.code, p.detail ?? (typeof data === "string" && data ? data : res.statusText));
+    // A rate limit (or the proxy's cap on live feeds) says when to come back.
+    const retryAfterS = Number(res.headers.get("retry-after"));
+    throw Object.assign(new DashboardApiError(res.status, p.code, p.detail ?? (typeof data === "string" && data ? data : res.statusText)), {
+      retryAfterMs: retryAfterS > 0 ? retryAfterS * 1_000 : undefined,
+    });
   }
   return (data as S.StreamEvent[]) ?? [];
 }
+
+/** Resolves once the tab is visible again (or the feed stops): a hidden tab doesn't hold one of the company's long polls. */
+const untilVisible = (signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    if (!document.hidden || signal.aborted) return resolve();
+    const done = () => {
+      document.removeEventListener("visibilitychange", seen);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const seen = () => {
+      if (!document.hidden) done();
+    };
+    document.addEventListener("visibilitychange", seen);
+    signal.addEventListener("abort", done);
+  });
 
 type Payload = Record<string, unknown>;
 
@@ -193,6 +213,13 @@ function LiveFeed() {
       let backoff = 2_000;
       setState("connecting");
       while (!ctl.signal.aborted) {
+        if (document.hidden) {
+          // The cursor is kept: nothing is missed, the log holds 7 days.
+          setState("paused");
+          await untilVisible(ctl.signal);
+          if (ctl.signal.aborted) return;
+          setState("connecting");
+        }
         try {
           const q: Record<string, string> = { timeout_ms: "25000", limit: "200" };
           if (cursor.current) q.after_id = cursor.current;
@@ -207,7 +234,7 @@ function LiveFeed() {
           }
         } catch (e) {
           if (ctl.signal.aborted) return;
-          const err = e as DashboardApiError;
+          const err = e as DashboardApiError & { retryAfterMs?: number };
           if (err.status === 410 || err.code === "events_expired") {
             // The cursor fell out of the 7-day log: carry on from now.
             cursor.current = undefined;
@@ -218,7 +245,7 @@ function LiveFeed() {
           setLastError(err.message);
           // Without a cursor the next poll only sees events from then on.
           if (!cursor.current) setMissed(true);
-          await sleep(backoff, ctl.signal);
+          await sleep(Math.max(backoff, err.retryAfterMs ?? 0), ctl.signal);
           backoff = Math.min(backoff * 2, 30_000);
         }
       }

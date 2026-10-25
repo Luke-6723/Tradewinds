@@ -318,6 +318,7 @@ export interface Ship {
   cannons_count: number;
   convoy_id?: string | null;
   stores_provisions_units: number;
+  created_at?: string;
 }
 
 export interface LegEstimate {
@@ -384,6 +385,8 @@ export interface DockActionResult {
   queue_position?: number | null;
   turnaround_unlocks_at?: string | null;
   berth_dues_pence?: number | null;
+  /** The port's berth dues a game day at its occupancy when this call berthed the ship (only when it did). */
+  berth_dues_per_day_pence?: number | null;
 }
 
 export interface StoresTransferResult {

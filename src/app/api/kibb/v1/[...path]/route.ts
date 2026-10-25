@@ -10,6 +10,12 @@ export const dynamic = "force-dynamic";
 const BLOCKED_WRITES = [/^auth\//, /^player\//, /^company\/create$/, /^company\/declare-bankruptcy$/];
 // Upstream says our stored company key is no good: send the user to re-select the company.
 const DEAD_KEY_CODES = ["revoked_api_key", "invalid_api_key", "expired_api_key"];
+// Passed back to the browser: a replayed write, and the rate limits it may want to honour.
+const FORWARD_HEADERS = ["retry-after", "idempotency-replayed", "x-ratelimit-bucket", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"];
+/** Browser long polls on the event log held open at once per company (each tab is one; the autopilot shares the key's stream bucket). */
+const MAX_BROWSER_POLLS = 2;
+const g = globalThis as { __kibbBrowserPolls?: Map<string, number> };
+const polls = (g.__kibbBrowserPolls ??= new Map<string, number>());
 
 /**
  * Forwards `/api/kibb/v1/*` to the kibb.io API with the active company's stored key, for a
@@ -49,7 +55,22 @@ async function forward(req: NextRequest, { params }: { params: Promise<{ path: s
   if (isWrite) {
     body = await req.text();
     headers["content-type"] = "application/json";
+    // The browser's own key (writeFetch) is kept for retries of the same action; a fresh one otherwise.
     headers["idempotency-key"] = req.headers.get("idempotency-key") ?? randomUUID();
+  }
+
+  // An event long poll (SSE, or a stream read that waits: timeout_ms absent means 5 s) holds a slot until it ends.
+  const wait = req.nextUrl.searchParams.get("timeout_ms");
+  const longPoll = !!companyId && (path === "event/sse" || (path === "event/stream" && (wait === null || Number(wait) > 0)));
+  if (longPoll) {
+    const open = polls.get(companyId!) ?? 0;
+    if (open >= MAX_BROWSER_POLLS) {
+      return NextResponse.json(
+        { status: 429, code: "too_many_streams", detail: `At most ${MAX_BROWSER_POLLS} live event feeds per company from the dashboard; close another tab` },
+        { status: 429, headers: { "retry-after": "30" } },
+      );
+    }
+    polls.set(companyId!, open + 1);
   }
 
   try {
@@ -79,11 +100,25 @@ async function forward(req: NextRequest, { params }: { params: Promise<{ path: s
     }
     const out = new NextResponse(text, { status: upstream.status });
     out.headers.set("content-type", upstream.headers.get("content-type") ?? "application/json");
-    const retryAfter = upstream.headers.get("retry-after");
-    if (retryAfter) out.headers.set("retry-after", retryAfter);
+    for (const h of FORWARD_HEADERS) {
+      const v = upstream.headers.get(h);
+      if (v) out.headers.set(h, v);
+    }
     return out;
   } catch (e) {
-    return NextResponse.json({ status: 502, code: "upstream_unreachable", detail: (e as Error).message }, { status: 502 });
+    const err = e as Error & { cause?: { name?: string } };
+    if (err.name === "TimeoutError" || err.cause?.name === "TimeoutError") {
+      // No answer in time: a write may still have gone through. Retrying sends the same key, so it replays.
+      const detail = isWrite ? "The game didn't answer in time; it may have gone through, and retrying reuses the same key" : "The game didn't answer in time";
+      return NextResponse.json({ status: 504, code: "upstream_timeout", detail }, { status: 504 });
+    }
+    return NextResponse.json({ status: 502, code: "upstream_unreachable", detail: err.message }, { status: 502 });
+  } finally {
+    if (longPoll) {
+      const left = (polls.get(companyId!) ?? 1) - 1;
+      if (left > 0) polls.set(companyId!, left);
+      else polls.delete(companyId!);
+    }
   }
 }
 

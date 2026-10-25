@@ -359,7 +359,8 @@ export default function RivalsPage() {
               </Table>
             )}
             <p className="mt-3 text-muted-foreground text-xs">
-              A stalled posting re-posts richer only if nobody delivers before it lapses. Escalates: the autopilot&apos;s odds that it does if
+              A stalled posting (under a tenth of its expected pace) re-posts richer only if no other company delivers before it lapses (and,
+              until re-posts show otherwise, none of ours). Escalates: the autopilot&apos;s odds that it does if
               none of our ships delivers first (stalls seen, this charter&apos;s rival record, laden rivals due at the port before then; a
               likely rival delivery first stops it letting the posting lapse). Rival tons come from the expansion board&apos;s deltas while
               the autopilot runs.

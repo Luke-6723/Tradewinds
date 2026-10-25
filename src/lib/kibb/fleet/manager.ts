@@ -23,8 +23,9 @@
  * again there just before buying (resizeLane), and never spends what another ship's load counts on.
  *
  * Stalls: for each stalled expansion posting the fleet makes one call (stallStakes): let it lapse for
- * its richer re-post (no ship delivers into it; loads planned into it that land first wait) when the
- * expected uplift beats what waiting costs, or deliver. A rival's delivery notice ends a camp at once.
+ * its richer re-post (no ship delivers into it, beyond what fits under the pace line once re-posts showed
+ * that safe; loads planned into it that land first wait) when the expected uplift beats what waiting
+ * costs, or deliver. A rival's (or our other company's) delivery notice ends a camp at once.
  *
  * Events: a long poll on the company's event log wakes a ship's agent the moment something happens
  * to it (arrival, berth from the queue, eviction, hazard) and refreshes the world as soon as a
@@ -33,6 +34,12 @@
  * World events (shortages, gluts, pirate outbreaks, structural shifts) are read from the public feed
  * with every world refresh; see World.noteEvents.
  *
+ * AI (ai/advisor.ts, live only): its setting overrides sit on the user's under hard floors wherever
+ * settings are read (ai/directives.ts enforceFloors); its bans go into every plan; its ship orders act
+ * through lane assignment and the ship's own decisions; a build order runs the buyer once with every
+ * check; its marques and patrols are issued within the marque budget (runAiNaval). What can't be done
+ * is reported back to it as a status code, and logged.
+ *
  * Progress (each ship's lane and cargo state, sell floors, trips, stats, purchases, the log, the
  * event cursor and the world model's memory) is saved as it changes (journal.ts: MongoDB when
  * MONGODB_URI is set, plus a local file) and picked up again on start, so a restart resumes work.
@@ -40,21 +47,22 @@
  * Runs in-process in the Next.js server (fleet-registry.ts) or from the CLI (workers/kibb-fleet.ts).
  */
 
-import { KibbClient, KIBB_DEFAULT_URL, isApiError } from "../client";
-import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, rivalProfiles, zoneDays, type MarqueOption, type RivalAnalysis, type RivalDelivery, type ZoneTraffic } from "../rivals";
-import type { ConvoyResult, ConvoyStatus, LetterOfMarque } from "../schema";
+import { fatalText, KibbClient, KIBB_DEFAULT_URL, isApiError, isFatalApiError, outcomeUnknown } from "../client";
+import { analyseRivals, bestMarque, MARQUE_PENCE_PER_BPS_DAY, rivalProfiles, ZONE_MARQUE_CAP, zoneDays, type MarqueOption, type RivalAnalysis, type RivalDelivery, type ZoneTraffic } from "../rivals";
+import type { ConvoyResult, ConvoyStatus, LedgerEntry, LetterOfMarque, NavalPatrol, SeaZonePiracyResult } from "../schema";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
 import type { StreamEvent } from "../schema";
-import type { BankingRegion, BuildQuote, RoutePlan, ShipResult } from "../types";
-import { ShipAgent, type AgentSnapshot, type AgentState, type AgentStats, type ConvoyOutcome, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
+import type { BankingRegion, BuildQuote, CatalogShipClass, RoutePlan, ShipResult } from "../types";
+import { ShipAgent, STORES_BUFFER_DAYS, type AgentSnapshot, type AgentState, type AgentStats, type ConvoyOutcome, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
 import { openJournal, type Journal } from "./journal";
 import { Advisor, AI_MODES, type AdvisorSnapshot, type AiMode, type AiReport } from "../ai/advisor";
 import { AI_EFFORTS, AI_MODELS, type AiEffort, type AiModel } from "../ai/claude";
-import type { DigestInput, DigestShip } from "../ai/digest";
+import type { DigestInput, DigestShip, DigestYard, DigestZone } from "../ai/digest";
+import { enforceFloors, laneBanned, navalCost, NAVAL_TERM_MIN_H, type NavalOrder, type OrderCode, type OrderStatus, type ShipOrder, type ValidateCtx } from "../ai/directives";
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
 import { HOLD_CAP_GAME_H, HOLD_MAX_GAME_H, rankLanes, REPOST_GRACE_GAME_MIN, type Lane, type Reservations, type ShipSpec, type StallStake } from "./planner";
-import { World, type ExpansionWatch, type StormSummary, type WorldEventsReport, type WorldSnapshot } from "./world";
+import { OWN_TRICKLE_CONFIRM, SEASON_ENDGAME_MS, World, type ExpansionWatch, type StormSummary, type TrickleSample, type WorldEventsReport, type WorldSnapshot } from "./world";
 
 // ── Settings & state ──────────────────────────────────────────────────────────
 
@@ -135,9 +143,10 @@ export interface FleetSettings {
    */
   holdForRepost: boolean;
   /**
-   * Let a stalled expansion posting (nothing delivered in it) lapse for its richer re-post when the
-   * expected uplift on our tons beats what waiting costs: no ship delivers into it meanwhile (ours
-   * would cancel the escalation too) and runs are timed to land just after the lapse. On by default.
+   * Let a stalled expansion posting (under a tenth of its expected pace) lapse for its richer re-post when
+   * the expected uplift on our tons beats what waiting costs: no ship delivers into it meanwhile (ours are
+   * taken to cancel the escalation too, until re-posts show they don't; then only what keeps it under the
+   * line) and runs are timed to land just after the lapse. On by default.
    */
   captureEscalations: boolean;
   /** Share (0–90%) of spare cash the buyer leaves alone while the expansion tier is close to completing. */
@@ -334,6 +343,17 @@ export interface FleetState {
   worldEvents: WorldEventsReport;
   /** AI support: mode, spend, the directives in force, recent decisions. */
   ai: AiReport;
+  /**
+   * The season's announced end (guide 3.11; null: not announced), the real ms left before it (the slack
+   * taken off), and the mode: endgame (no new hulls), final (the last hours).
+   */
+  season: { endsAt: string | null; leftMs: number | null; mode: "normal" | "endgame" | "final" };
+  /** When the company key expires (whoami; null: never, or not read yet). */
+  keyExpiresAt: string | null;
+  /** The operators paused the world: ships wait, nothing is bought or sold. */
+  paused: boolean;
+  /** The operators' last critical announcement (server_announcement), for a day: a dashboard banner. */
+  announcement: { at: string; message: string } | null;
   log: FleetLogLine[];
 }
 
@@ -353,6 +373,11 @@ export interface ExpansionReport {
   rivalDeliveries: RivalDelivery[];
   /** Odds each stalled posting (`port|good`) re-posts richer if we don't deliver first (its stake's). */
   stallOdds: Record<string, number>;
+  /**
+   * Our own small deliveries into stalled postings: allowed under the pace line (after `needed` re-posts in a
+   * row escalated after only ours), the record so far, and its last samples.
+   */
+  trickle: { allowed: boolean; confirmed: number; needed: number; refuted: number; samples: TrickleSample[] };
 }
 
 /** A cash movement expected at server time `at`: a load still to buy (out), or cargo at sea paid where it lands (in). */
@@ -382,6 +407,14 @@ export interface CashReport {
   duePence: number;
   dueNextAt: number | null;
   resized: ResizeStats;
+  /**
+   * The daily bills (pence a game day): fleet upkeep (the formula, or what the ledger shows was charged if
+   * more) and warehouse rent per region (from the ledger), the home floor they set, and when the ledger was
+   * last read (server ms; null: not yet).
+   */
+  bills: { upkeepPerDay: number; rent: Array<[BankingRegion, number]>; homeFloor: number; measuredAt: number | null };
+  /** Auto-remit for bills (company settings, guide 3.9) as last read (only read, never changed); null: not read. */
+  autoRemit: { on: boolean; reservePence: number } | null;
 }
 
 export interface MarqueZoneReport {
@@ -413,8 +446,10 @@ export interface MarqueReport {
   checkedAt: string;
   enabled: boolean;
   budgetPence: number;
-  /** Spent on our marques created in the last 24 real hours. */
+  /** Spent on our marques and patrols (the AI's) created in the last 24 real hours: one budget for both. */
   spentPence: number;
+  /** Of which patrols (absent in older reports). */
+  patrolSpentPence?: number;
   /** Prize money our marques have earned (all listed). */
   prizePence: number;
   zones: MarqueZoneReport[];
@@ -443,6 +478,14 @@ interface FleetSnapshot {
   campShut?: Array<[string, number]>;
   /** Loads planned again at their source; absent in older saves. */
   resized?: ResizeStats;
+  /** The daily bills as the ledger showed them (pence a game day; `at` server ms); absent: not measured yet. */
+  bills?: { rent: Array<[BankingRegion, number]>; upkeep: number; at: number };
+  /** Older saves only (the autopilot once set the auto-remit reserve): ignored, never written now. */
+  autoRemitSet?: { at: string; pence: number };
+  /** The last critical server announcement (`at` server ms); absent: none. */
+  announcement?: { at: number; message: string };
+  /** The key-expiry warnings already given (KEY_WARN_MS marks) for the key expiring at `expiresAt`; absent in older saves. */
+  keyWarned?: { expiresAt: number; marks: number[] };
 }
 
 /** How often the progress is saved even when nothing much happened (time use, prices). */
@@ -473,6 +516,21 @@ const YARD_RECHECK_MS  = 45_000;
 const INIT_BACKOFF_MS  = [5_000, 10_000, 20_000, 40_000, 60_000];
 const LOG_LIMIT        = 400;
 const GUN_PRICE_PENCE  = 15_000;
+/** The company key's expiry is warned of once as it comes within each of these (real ms). */
+const KEY_WARN_MS = [7 * 24 * 3_600_000, 24 * 3_600_000, 3_600_000];
+/** While the world is paused, the clock is read this often and nothing else is done. */
+const PAUSE_CHECK_MS = 30_000;
+/** A critical server announcement stays on the dashboard this long (server ms), at most this many characters of it. */
+const ANNOUNCEMENT_SHOW_MS = 24 * 3_600_000;
+const ANNOUNCEMENT_MAX_CHARS = 500;
+/** Resident Factors a company may keep (guide 3.9): no hire for a build past it. */
+const MAX_FACTORS = 12;
+/** A new hull's stores (tons of hold) as first guessed when planning its lane; that lane's real figure then counts. */
+const FIRST_STORES_GUESS_TONS = 2;
+/** A build whose outcome was unknown: watched for this long (server ms) before it counts as not built; a ship
+ * created this long before the attempt can't be it. */
+const PENDING_BUILD_MS = 10 * 60_000;
+const PENDING_BUILD_SLACK_MS = 5 * 60_000;
 /** Convoys: the longest a ship waits for our others (game hours), the shortest muster the game allows,
  * the least a passage must risk (pence) to be worth one, and how alike in speed members must be. */
 const CONVOY_MAX_WAIT_GAME_H = 6;
@@ -490,10 +548,24 @@ const BYOM_BLOCK_MS = 30 * 60_000;
 const HULL_PENCE_PER_TON = 25_000;
 /** Spare cash kept in every non-home region for berth dues and stores. */
 const REGION_FLOOR_PENCE = 20_000;
-/** The home reserve covers at least this many game days of fleet upkeep. */
+/** The home reserve covers at least this many game days of fleet upkeep (and each region of its warehouse rent). */
 const UPKEEP_DAYS_RESERVED = 1.5;
+/** How often the ledger is read for what the daily bills really charge; how far back, in pages of 200. */
+const BILLS_CHECK_MS = 10 * 60_000;
+const BILLS_LOOKBACK_GAME_DAYS = 2;
+const BILLS_LEDGER_PAGES = 5;
+/** Ledger entries this close together are one billing pass. */
+const BILLING_CLUSTER_MS = 60_000;
+/** Ledger reasons of the daily bills (not published: the ones seen are logged once), and one-offs that name them. */
+const RENT_REASON = /(?:^|[_\s-])(?:rent|lease)|warehouse/i;
+const UPKEEP_REASON = /upkeep|sprawl|factor|salar/i;
+const ONE_OFF_REASON = /hire|setup|refund|release|bailiff|seiz|distress|sale|remit/i;
 /** A refit must improve a load's expected profit by this share to be worth the berth call. */
 const REFIT_MIN_GAIN = 0.02;
+/** AI marques and patrols still to issue are looked at this often (one waiting for cash is tried again then). */
+const AI_NAVAL_RETRY_MS = 15_000;
+/** One whose call had no answer: if not among ours this long after it was sent, it wasn't issued (never sent again). */
+const AI_NAVAL_SETTLE_MS = 2 * 60_000;
 /** How often letters of marque are judged (on the last rival analysis). */
 const MARQUE_CHECK_MS = 5 * 60_000;
 /** Marques are bought one game day at a time and judged again before another. */
@@ -545,7 +617,6 @@ const DEFER_LOSS_SHARE = 0.3;
 const DEFER_MARGIN_OF_PAY = 0.15;
 /** The tier must be due to last this many times the wait, or it may complete first (its charters end with it). */
 const TIER_SAFETY = 1.25;
-const FATAL_CODES      = ["account_suspended", "company_frozen"];
 
 const cr = (pence: number) => `${Math.round(pence / 100).toLocaleString("en-GB")} Cr`;
 
@@ -591,23 +662,29 @@ export class FleetManager implements FleetHost {
   private stoppedAt: string | null = null;
   private homeRegion: BankingRegion | null = null;
   private homePort: string | null = null;
+  /** This company's name (a stall is only ours to keep when this company delivered: a sibling's counts as another's). */
+  private companyName: string | null = null;
   private journal: Journal<FleetSnapshot> | null = null;
   private progressSince: string | null = null;
   /** Saved agents waiting for their ship to be taken command of again. */
   private restoredAgents = new Map<string, AgentSnapshot>();
   private lastPersist = 0;
-  /** Convoys we know of (ours forming, mostly), refreshed at most every 20 s each. */
+  /** Convoys we know of (ours forming, mostly), refreshed at most every 20 s each; `memberClasses`: joined members'. */
   private readonly convoyCache = new Map<
     string,
-    { from: string; dest: string; departsAt: number; status: ConvoyStatus; organizer: string; members: string[]; classes: string[]; checkedAt: number }
+    { from: string; dest: string; departsAt: number; status: ConvoyStatus; organizer: string; members: string[]; memberClasses: string[]; checkedAt: number }
   >();
   private convoyQueue: Promise<unknown> = Promise.resolve();
+  /** One-off log lines already written (logOnceFor), so a waiting ship doesn't repeat them. */
+  private readonly loggedOnce = new Set<string>();
   /** Rival ships and zone traffic from the last rival analysis (for the AI digest). */
   private rivalSummary: DigestInput["rivals"] = { companies: [], zones: [] };
   private lastEscalations: number | null = null;
   /** The fleet's calls on stalled expansion postings (by `port|good`) and when worked out (local ms; 0: stale). */
   private stakes = new Map<string, StallStake>();
   private stakesAt = 0;
+  /** Whether our own deliveries under the pace line are allowed into postings let lapse, as last seen (World.ownTrickleOk). */
+  private trickleOk = false;
   /** Postings being let lapse (id → `port|good`): the call's hysteresis, saved. */
   private readonly campState = new Map<string, string>();
   /** Per stalled posting: tons a camp shuts out, as last seen before it began (stallStakes). */
@@ -618,8 +695,28 @@ export class FleetManager implements FleetHost {
   private factorFails = 0;
   /** Factors the buyer hired for a build and hasn't dismissed yet (never the user's own). */
   private readonly tempFactors = new Set<string>();
+  /** Resident Factors the company has (the user's too: all are billed), as last listed. */
+  private factorCount = 0;
+  /** The daily bills as the ledger last showed them (learnBills; saved). */
+  private bills: { rent: Map<BankingRegion, number>; upkeep: number; at: number | null } = { rent: new Map(), upkeep: 0, at: null };
+  private lastBillsCheck = 0;
+  private billReasonsLogged = false;
+  /** Auto-remit for bills as last read (re-read with the bills; never changed by the autopilot); an unreadable read said once. */
+  private autoRemit: CashReport["autoRemit"] = null;
+  private autoRemitUnreadSaid = false;
   private factorBlockedUntil = 0;
   private canRemit = true;
+  /** The key may build ships (`infra_manage`): the AI can't switch the buyer on without it. */
+  private canBuild = true;
+  /** AI marques and patrols: being worked on, last looked at (local ms). */
+  private navalBusy = false;
+  private lastNavalTry = 0;
+  /** For the AI digest: the zones as last read, our ships' exposure per zone, our marques and patrols, factor ports, the buyer's best options. */
+  private zoneStatus: { at: number; zones: SeaZonePiracyResult[] } | null = null;
+  private ownExposureSeen = new Map<string, number>();
+  private ownNaval: { at: number; marques: LetterOfMarque[]; patrols: NavalPatrol[] } | null = null;
+  private factorPorts: string[] = [];
+  private buyerOptions: DigestInput["buyerOptions"] = [];
   private logLines: FleetLogLine[] = [];
   private purchases: PurchaseRecord[] = [];
   private topLanes: Lane[] = [];
@@ -648,6 +745,14 @@ export class FleetManager implements FleetHost {
   private stopRequested = false;
   private wake: (() => void) | null = null;
   private loop: Promise<void> | null = null;
+  /** When the company key expires (server ms; null: never, or not read yet), and the KEY_WARN_MS marks already warned of. */
+  private keyExpiresAt: number | null = null;
+  private readonly keyWarned = new Set<number>();
+  /** The operators paused the world (the clock, or a `503 world_paused`): ships wait, housekeeping only reads the clock. */
+  paused = false;
+  private lastPauseCheck = 0;
+  /** The operators' last critical announcement (server ms; saved): the dashboard's banner for a day. */
+  private announcement: { at: number; message: string } | null = null;
   private lastWorld = 0;
   private lastScan = 0;
   private lastBuyCheck = 0;
@@ -660,7 +765,7 @@ export class FleetManager implements FleetHost {
    * book (an own-materials build booked its materials when it bought them), `cost` the whole cost,
    * `leaseBefore` the warehouse lease to go back to once it is adopted.
    */
-  pendingBuild: { name: string; yard: string; cls: string; price: number; cost?: number; leaseBefore?: number | null; payback: number; lane: string } | null = null;
+  pendingBuild: { name: string; yard: string; cls: string; price: number; cost?: number; leaseBefore?: number | null; payback: number; lane: string; at?: number } | null = null;
   /** Yards where an own-materials attempt failed lately: build turnkey there until then. */
   private readonly byomBlockedUntil = new Map<string, number>();
   private cashQueue: Promise<unknown> = Promise.resolve();
@@ -690,12 +795,19 @@ export class FleetManager implements FleetHost {
       },
       userSettings: () => self.ownSettings,
       digestInput: () => self.digestInput(),
-      idleShare: () => (self.agents.size ? [...self.agents.values()].filter((a) => a.idle).length / self.agents.size : 0),
+      limits: () => self.limits(),
+      // Held by an AI order counts as idle: the tripwire sees a fleet its orders keep from work.
+      idleShare: () => (self.agents.size ? [...self.agents.values()].filter((a) => a.idle || a.held).length / self.agents.size : 0),
       log: (msg) => self.log("fleet", msg),
       persist: (now) => self.persist(now),
       directivesChanged: () => {
-        // New limits or biases: ships idling for want of a lane look again; stall calls may flip.
-        for (const a of self.agents.values()) if (a.idle) a.nudge();
+        // New settings, bans, biases or orders: world flags follow, vetoed lanes are dropped, ships idling or
+        // held look again, a build or naval order is looked at within a pass, and stall calls may flip.
+        self.syncWorldFlags();
+        self.applyShipDirectives();
+        self.lastBuyCheck = 0;
+        self.lastNavalTry = 0;
+        for (const a of self.agents.values()) if (a.idle || a.held) a.nudge();
         self.reviewStalls();
       },
       companyId: () => self.world.companyId,
@@ -740,6 +852,17 @@ export class FleetManager implements FleetHost {
       cash: this.cashReport(),
       storms: this.world.stormSummary(),
       worldEvents: this.world.eventsReport(),
+      season: {
+        endsAt: this.world.seasonEndsAt !== null ? new Date(this.world.seasonEndsAt).toISOString() : null,
+        leftMs: this.world.seasonEndsAt !== null ? Math.max(0, Math.round(this.world.seasonLeftMs())) : null,
+        mode: this.world.seasonMode(),
+      },
+      keyExpiresAt: this.keyExpiresAt !== null ? new Date(this.keyExpiresAt).toISOString() : null,
+      paused: this.paused,
+      announcement:
+        this.announcement && this.world.now() - this.announcement.at < ANNOUNCEMENT_SHOW_MS
+          ? { at: new Date(this.announcement.at).toISOString(), message: this.announcement.message }
+          : null,
       log: [...this.logLines],
     };
   }
@@ -758,6 +881,10 @@ export class FleetManager implements FleetHost {
       stakes,
       rivalDeliveries: w.rivals.deliveriesSeen(w.tierTargetPhase),
       stallOdds: Object.fromEntries(stakes.map((s) => [s.key, s.p])),
+      trickle: (() => {
+        const t = w.trickleRecord();
+        return { allowed: w.ownTrickleOk, confirmed: t.confirmed, needed: OWN_TRICKLE_CONFIRM, refuted: t.refuted, samples: t.samples.slice(-5) };
+      })(),
     };
   }
 
@@ -770,10 +897,14 @@ export class FleetManager implements FleetHost {
     return w.tierProgressBps >= PHASE_SOON_BPS || (w.tierEtaMs !== null && w.tierEtaMs < PHASE_SOON_MS);
   }
 
-  /** The settings in force: the user's, with the AI's overrides while they last. */
+  /**
+   * The settings in force: the user's, with the AI's overrides while they last, under the hard floors wherever
+   * read (directives.ts enforceFloors: its own settings the user's, ceilings the user's, the reserve only raised,
+   * no ship buying without the key's scope).
+   */
   get settings(): FleetSettings {
     const o = this.advisor?.overrides();
-    return o ? { ...this.ownSettings, ...o } : this.ownSettings;
+    return o || !this.canBuild ? enforceFloors(this.ownSettings, { ...this.ownSettings, ...o }, { canBuild: this.canBuild }) : this.ownSettings;
   }
 
   /** The user's settings changed (dashboard, CLI): applied live. */
@@ -781,11 +912,17 @@ export class FleetManager implements FleetHost {
     const prev = this.ownSettings;
     this.ownSettings = v;
     if (prev) this.advisor.settingsChanged(prev, v);
-    this.world.rivalIntel = this.settings.rivalIntel;
-    this.world.planOnEvents = this.settings.actOnEvents;
-    // Off: expected crisis charters go now, not at the next refresh.
-    if (!this.world.planOnEvents) this.world.charters = this.world.charters.filter((c) => !c.provisional);
+    this.syncWorldFlags();
     this.stakesAt = 0;
+  }
+
+  /** The world's own copies of settings in force (the user's, or the AI's overrides), after either changes. */
+  private syncWorldFlags(): void {
+    const s = this.settings;
+    this.world.rivalIntel = s.rivalIntel;
+    this.world.planOnEvents = s.actOnEvents;
+    // Off: expected crisis charters go now, not at the next refresh.
+    if (!this.world.planOnEvents && this.world.charters.some((c) => c.provisional)) this.world.charters = this.world.charters.filter((c) => !c.provisional);
   }
 
   /** The fleet's call on the stalled expansion posting this charter now stands for, if any. */
@@ -801,8 +938,41 @@ export class FleetManager implements FleetHost {
     this.persist(true);
   }
 
-  /** What the AI strategist reads (digest.ts): the fleet, cash, lanes, charters, the tier, rivals. */
-  private digestInput(): Omit<DigestInput, "events" | "decisions"> {
+  /** What an AI answer is validated against (directives.ts validateAnswer). */
+  private limits(): ValidateCtx {
+    const w = this.world;
+    const zoneBps = new Map((this.zoneStatus?.zones ?? []).map((z) => [z.sea_zone_id, { marque: z.marque_piracy_bps, patrol: z.patrol_suppression_bps }]));
+    return {
+      user: this.ownSettings,
+      canBuild: this.canBuild,
+      catalog: w.catalog,
+      unlockedPhase: w.unlockedPhase,
+      isOpen: (p) => w.isOpen(p),
+      currentId: (id) => w.currentId(id),
+      renews: (c) => w.renews(c),
+      hazardZone: (n) => w.hazardZone(n),
+      fleet: [...this.agents.values()].map((a) => ({ id: a.shipId, hull: w.shipClass(a.shipClass)?.hull_category ?? "coastal", gone: a.gone })),
+      // Not read yet: the whole budget counts as spent, so no naval order passes it.
+      navalSpent24h: this.navalSpent() ?? this.ownSettings.marqueBudgetPence,
+      zoneBps,
+      gameMinuteMs: w.gameMinuteMs,
+    };
+  }
+
+  /**
+   * Our marques and patrols created in the last 24 real hours (pence), as last read, and the AI's sent then with
+   * no answer and not found among them yet (they may have been paid for); null before a read.
+   */
+  private navalSpent(): number | null {
+    const n = this.ownNaval;
+    if (!n) return null;
+    const now = this.world.now();
+    const listed = [...n.marques, ...n.patrols].filter((x) => now - Date.parse(x.created_at) < 24 * 3_600_000).reduce((s, x) => s + x.cost_pence, 0);
+    return listed + this.advisor.unknownNavalPence(now - 24 * 3_600_000);
+  }
+
+  /** What the AI strategist reads (digest.ts): the fleet, cash, lanes, charters, the tier, zones, yards, rivals. */
+  private digestInput(): Omit<DigestInput, "events" | "decisions" | "inForce"> {
     const w = this.world;
     const now = w.now();
     let committed = 0;
@@ -812,12 +982,14 @@ export class FleetManager implements FleetHost {
       .map((a) => {
         const r = a.last!;
         const s = r.ship;
+        const cls = w.shipClass(a.shipClass);
         const eta = Date.parse(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at ?? "");
         const state =
-          s.status === "sailing" ? "sailing" : a.idle ? "idle" : a.waitingForCash ? "waiting_cash" : a.activity.startsWith("holding") ? "holding" : "working";
+          s.status === "sailing" ? "sailing" : a.idle ? "idle" : a.held ? "held" : a.waitingForCash ? "waiting_cash" : a.activity.startsWith("holding") ? "holding" : "working";
         return {
           id: a.shipId,
           cls: a.shipClass,
+          hull: cls?.hull_category ?? "coastal",
           status: s.status,
           port: s.current_port_id ?? null,
           dest: s.status === "sailing" ? (r.route_legs.at(-1)?.to_node ?? null) : null,
@@ -825,12 +997,20 @@ export class FleetManager implements FleetHost {
           state,
           cargoTons: r.cargo_used_tons,
           hold: r.effective_hold_capacity_tons,
+          guns: s.cannons_count,
+          maxGuns: cls?.max_cannons ?? 0,
+          stores: r.stores.provisions_tons,
+          loadCash: this.loadCash(a),
           lane: a.lane,
           trips: a.state.trips,
         };
       });
     const x = this.expansionReport();
     const value = (c: (typeof w.charters)[number]) => c.payPerTon * c.remaining;
+    const charters = w.charters.filter((c) => c.remaining > 0 && w.isOpen(c.port)).sort((a, b) => value(b) - value(a));
+    // "Contested": rivals due at the charter's port before it lapses (or within half a game day).
+    const charterRivals = new Map(charters.slice(0, 20).map((c) => [c.id, w.rivalLanding(c.port, c.good, c.expiresAt ?? now + 12 * 60 * w.gameMinuteMs)]));
+    const home = this.homeRegion;
     return {
       now,
       gameMinuteMs: w.gameMinuteMs,
@@ -847,6 +1027,7 @@ export class FleetManager implements FleetHost {
             stakes: x.stakes,
             // Company names never go to the AI.
             rivalDeliveries: x.rivalDeliveries.map((d) => ({ at: d.at, port: d.port, good: d.good, tons: d.tons })),
+            trickle: { allowed: x.trickle.allowed, confirmed: x.trickle.confirmed, needed: x.trickle.needed, refuted: x.trickle.refuted },
           }
         : null,
       ships,
@@ -854,14 +1035,81 @@ export class FleetManager implements FleetHost {
       buyer: this.buyer,
       cash: { vaults: [...w.vaults], homeRegion: this.homeRegion, spare: this.spareCash(), committed, capitalRate: this.capitalRate(), due: this.cashReport().duePence },
       user: this.ownSettings,
-      active: this.advisor.overrides(),
+      canBuild: this.canBuild,
       topLanes: this.topLanes,
-      charters: w.charters.filter((c) => c.remaining > 0 && w.isOpen(c.port)).sort((a, b) => value(b) - value(a)),
-      piracy: [...w.piracy].filter(([, b]) => b > 0).sort((a, b) => b[1] - a[1]),
+      charters,
+      charterRivals,
+      zones: this.digestZones(now),
+      yards: this.digestYards(),
+      buyerOptions: this.buyerOptions,
+      paybackLimit: this.settings.maxPaybackHours,
+      budgets: {
+        navalSpent24h: this.navalSpent(),
+        navalBudget: this.ownSettings.marqueBudgetPence,
+        underwriteLocked: this.underwriteReport?.lockedPence ?? null,
+        underwriteBudget: this.ownSettings.underwriteBudgetPence,
+        fleet: [...this.agents.values()].filter((a) => !a.gone).length,
+        homeFloor: home ? this.floorIn(home) : this.homeFloor(),
+        reserve: this.settings.reservePence,
+        billsFloor: Math.ceil(UPKEEP_DAYS_RESERVED * this.upkeepPerDay()),
+      },
       rivals: this.rivalSummary,
       bidHaircutPerDay: w.bidHaircutPerDay,
       storms: w.stormSummary(),
     };
+  }
+
+  /**
+   * Sea zones for the digest (at most 8): ours in force first, then by what is at stake there (our exposure and
+   * the rival cargo crossing), then by piracy. The split comes from the last zones read (marques, AI naval orders).
+   */
+  private digestZones(now: number): DigestZone[] {
+    const w = this.world;
+    const read = new Map((this.zoneStatus?.zones ?? []).map((z) => [z.sea_zone_id, z]));
+    const fresh = this.rivalAnalysis && Date.now() - this.rivalAnalysis.at < RIVAL_ANALYSIS_MAX_AGE_MS ? this.rivalAnalysis : null;
+    const traffic = new Map((fresh?.zones ?? []).map((t) => [t.zone, t]));
+    const ours = (zone: string) => [
+      ...(this.ownNaval?.marques ?? []).filter((m) => m.sea_zone_id === zone && Date.parse(m.expires_at) > now && m.cost_pence > 0).map((m) => ({ kind: "marque" as const, bps: m.added_piracy_bps, leftMs: Date.parse(m.expires_at) - now })),
+      ...(this.ownNaval?.patrols ?? []).filter((p) => p.sea_zone_id === zone && Date.parse(p.expires_at) > now).map((p) => ({ kind: "patrol" as const, bps: p.suppressed_piracy_bps, leftMs: Date.parse(p.expires_at) - now })),
+    ];
+    const out: DigestZone[] = [];
+    for (const z of w.catalog.sea_zones) {
+      if (z.phase > w.unlockedPhase) continue;
+      const r = read.get(z.id);
+      const t = traffic.get(z.id);
+      const net = r?.net_piracy_bps ?? w.piracy.get(z.id) ?? 0;
+      const own = this.ownExposureSeen.get(z.id) ?? 0;
+      const mine = ours(z.id);
+      if (net <= 0 && !t && own <= 0 && mine.length === 0) continue;
+      out.push({
+        zone: z.id,
+        net,
+        split: r ? { base: r.base_piracy_bps, marque: r.marque_piracy_bps, patrol: r.patrol_suppression_bps } : null,
+        rivals: t ? { passages: t.passages, laden: t.laden, cargo: t.cargo } : null,
+        ownExposure: Math.round(own),
+        ours: mine,
+      });
+    }
+    const stake = (z: DigestZone) => z.ownExposure + (z.rivals?.cargo ?? 0);
+    return out.sort((a, b) => b.ours.length - a.ours.length || stake(b) - stake(a) || b.net - a.net).slice(0, 8);
+  }
+
+  /** Shipyards for the digest (at most 6): where we have presence first, then those quoted; each with its last quotes. */
+  private digestYards(): DigestYard[] {
+    const w = this.world;
+    const out: DigestYard[] = [];
+    for (const p of w.catalog.ports) {
+      if (!p.has_shipyard || !w.isOpen(p.id)) continue;
+      const ships = [...this.agents.values()].filter((a) => !a.gone && a.last && a.last.ship.status !== "sailing" && a.last.ship.current_port_id === p.id).map((a) => a.shipId);
+      const factor = this.factorPorts.includes(p.id);
+      const quotes = w.catalog.ship_classes
+        .filter((c) => c.phase <= w.unlockedPhase && this.hullQuotes.has(`${p.id}|${c.id}`))
+        .map((c): [string, number] => [c.id, this.hullQuotes.get(`${p.id}|${c.id}`)!])
+        .sort((a, b) => a[1] - b[1])
+        .slice(0, 4);
+      if (ships.length || factor || quotes.length) out.push({ port: p.id, ships, factor, quotes });
+    }
+    return out.sort((a, b) => Number(b.ships.length > 0 || b.factor) - Number(a.ships.length > 0 || a.factor) || b.quotes.length - a.quotes.length).slice(0, 6);
   }
 
   start(): void {
@@ -962,6 +1210,9 @@ export class FleetManager implements FleetHost {
       camping: [...this.campState],
       campShut: [...this.campShut],
       resized: { ...this.resized },
+      bills: this.bills.at !== null ? { rent: [...this.bills.rent], upkeep: this.bills.upkeep, at: this.bills.at } : undefined,
+      announcement: this.announcement ?? undefined,
+      keyWarned: this.keyExpiresAt !== null && this.keyWarned.size ? { expiresAt: this.keyExpiresAt, marks: [...this.keyWarned] } : undefined,
     };
   }
 
@@ -983,6 +1234,21 @@ export class FleetManager implements FleetHost {
     // A camp under way before the restart carries on without the entry margin.
     for (const [id, key] of s.camping ?? []) this.campState.set(id, key);
     for (const [id, tons] of s.campShut ?? []) if (Number.isFinite(tons)) this.campShut.set(id, tons);
+    if (s.bills) {
+      this.bills = {
+        rent: new Map((s.bills.rent ?? []).filter(([, p]) => Number.isFinite(p) && p > 0)),
+        upkeep: Number.isFinite(s.bills.upkeep) ? s.bills.upkeep : 0,
+        at: s.bills.at ?? null,
+      };
+    }
+    // An older save's autoRemitSet is ignored: the company settings are never changed now (checkAutoRemit).
+    const an = s.announcement;
+    if (an && Number.isFinite(an.at) && typeof an.message === "string") this.announcement = { at: an.at, message: an.message.slice(0, ANNOUNCEMENT_MAX_CHARS) };
+    // Warnings already given for this same key (whoami read it before the restore) aren't given again after a restart.
+    const kw = s.keyWarned;
+    if (kw && this.keyExpiresAt !== null && kw.expiresAt === this.keyExpiresAt && Array.isArray(kw.marks)) {
+      for (const m of kw.marks) if (KEY_WARN_MS.includes(m)) this.keyWarned.add(m);
+    }
   }
 
   fatal(msg: string): void {
@@ -1006,6 +1272,64 @@ export class FleetManager implements FleetHost {
       });
   }
 
+  /** The key's expiry as whoami gives it; a new key starts its warnings afresh. */
+  private noteKey(expiresAt: string | null | undefined): void {
+    const at = expiresAt ? Date.parse(expiresAt) : NaN;
+    this.keyExpiresAt = Number.isFinite(at) ? at : null;
+    this.keyWarned.clear();
+  }
+
+  /** Once at each KEY_WARN_MS mark (a key found already inside a mark says only the tightest): it would stop the loop. */
+  private warnKeyExpiry(): void {
+    if (this.keyExpiresAt === null) return;
+    const left = this.keyExpiresAt - this.world.now();
+    const mark = KEY_WARN_MS.filter((m) => left <= m).at(-1);
+    if (mark === undefined || this.keyWarned.has(mark)) return;
+    for (const m of KEY_WARN_MS) if (m >= mark) this.keyWarned.add(m);
+    const span = left <= 0 ? "now" : left >= 2 * 86_400_000 ? `in ${Math.round(left / 86_400_000)} days` : left >= 2 * 3_600_000 ? `in ${Math.round(left / 3_600_000)} h` : `in ${Math.max(1, Math.round(left / 60_000))} min`;
+    this.log(
+      "fleet",
+      `WARNING: the company key expires ${span} (${new Date(this.keyExpiresAt).toISOString()}); the autopilot stops then. ` +
+        "Dashboard: it is renewed while you are signed in (sign in again and select the company if this repeats). " +
+        "CLI: mint a new KIBB_API_KEY with ttl_seconds (or create-key with handle and passphrase, which never expires) and restart.",
+    );
+  }
+
+  /**
+   * A renewed key for this company (the dashboard minted it before the old one ran out): every call uses it from
+   * now on, without a restart. Checked first: one that isn't bound to this company is refused (throws).
+   */
+  async useApiKey(key: string): Promise<void> {
+    const who = await new KibbClient({ baseUrl: this.client.baseUrl, apiKey: key }).whoami();
+    if (!who.company_id || (this.world.companyId && who.company_id !== this.world.companyId)) throw new Error("the new key isn't bound to this company");
+    this.client.setApiKey(key);
+    this.noteKey(who.expires_at);
+    this.log("fleet", `now on a renewed company key${who.expires_at ? ` (expires ${who.expires_at})` : " (no expiry)"}`);
+  }
+
+  /** A call was refused with `503 world_paused`: wait on the clock from now on (housekeeping reads it every 30 s). */
+  notePaused(): void {
+    if (this.paused) return;
+    this.world.paused = true;
+    this.syncPause();
+  }
+
+  /** Follows the world's pause flag, logged once each way. On resume the world is read again at once and every ship looks again. */
+  private syncPause(): void {
+    const p = this.world.paused;
+    if (p === this.paused) return;
+    this.paused = p;
+    if (p) {
+      this.lastPauseCheck = Date.now();
+      this.log("fleet", "the operators paused the world: game time stands still and only reads are served; ships wait and nothing is bought, sold or sailed until it resumes");
+      return;
+    }
+    this.log("fleet", "the world resumed: reading it again and waking every ship");
+    this.lastWorld = 0;
+    for (const a of this.agents.values()) a.nudge();
+    this.wake?.();
+  }
+
   private sleep(ms: number): Promise<void> {
     if (this.stopRequested) return Promise.resolve();
     return new Promise((resolve) => {
@@ -1021,7 +1345,7 @@ export class FleetManager implements FleetHost {
   }
 
   private isFatal(e: unknown): boolean {
-    return e instanceof InitFatal || (isApiError(e) && (e.status === 401 || FATAL_CODES.includes(e.code ?? "")));
+    return e instanceof InitFatal || isFatalApiError(e);
   }
 
   private async run(): Promise<void> {
@@ -1031,7 +1355,7 @@ export class FleetManager implements FleetHost {
         await this.init();
         break;
       } catch (e) {
-        if (this.isFatal(e)) return this.fatal((e as Error).message);
+        if (this.isFatal(e)) return this.fatal(fatalText(e));
         const wait = INIT_BACKOFF_MS[Math.min(attempt, INIT_BACKOFF_MS.length - 1)];
         this.log("fleet", `start-up failed (${(e as Error).message}); retrying in ${Math.round(wait / 1000)}s`);
         await this.sleep(wait);
@@ -1047,8 +1371,10 @@ export class FleetManager implements FleetHost {
       try {
         await this.housekeeping();
       } catch (e) {
-        if (this.isFatal(e)) return this.fatal((e as Error).message);
-        this.log("fleet", `housekeeping failed: ${(e as Error).message}`);
+        if (this.isFatal(e)) return this.fatal(fatalText(e));
+        // Paused: said once (syncPause), not as a failure every pass.
+        if (isApiError(e, "world_paused")) this.notePaused();
+        else this.log("fleet", `housekeeping failed: ${(e as Error).message}`);
       }
       await this.sleep(LOOP_MS);
     }
@@ -1057,22 +1383,33 @@ export class FleetManager implements FleetHost {
   private async init(): Promise<void> {
     const who = await this.client.whoami();
     if (!who.company_id) throw new InitFatal("the API key is player-level; a company-bound key is needed");
+    this.noteKey(who.expires_at);
     const missing = ["read", "fleet_navigate", "fleet_cargo", "market_spot", "market_derivatives"].filter(
       (s) => !who.scopes.includes(s as never),
     );
     if (missing.length) throw new InitFatal(`key is missing scopes: ${missing.join(", ")}`);
-    if (this.settings.autoBuy && !who.scopes.includes("infra_manage")) {
-      this.log("fleet", "key lacks infra_manage: automatic ship buying is off");
-      this.settings = { ...this.ownSettings, autoBuy: false };
-    }
+    this.canBuild = who.scopes.includes("infra_manage");
+    // The user's own setting (the settings getter already forces autoBuy off without the scope, and leaves theirs as it is).
+    if (this.ownSettings.autoBuy && !this.canBuild) this.log("fleet", "key lacks infra_manage: automatic ship buying is off");
     this.canRemit = who.scopes.includes("treasury_remit");
     if (!this.canRemit) this.log("fleet", "key lacks treasury_remit: cash stays in the region it lands in");
 
+    let leaseNote: string | undefined;
     if (this.leaseDir && !this.lease) {
-      const got = await acquireLease(this.leaseDir, who.company_id, () => this.fatal("another process took over this company's autopilot lease"));
+      const got = await acquireLease(
+        this.leaseDir,
+        who.company_id,
+        () => {
+          // The new holder owns the saved progress now (the database copy is shared): ours isn't written over it.
+          this.journal = null;
+          this.fatal("another process took over this company's autopilot lease");
+        },
+        (msg) => this.log("fleet", msg),
+      );
       // Held: retried with backoff by run(), so a crashed holder's lease is taken once it goes stale.
       if ("heldBy" in got) throw new Error(`this company's autopilot is already running (${got.heldBy})`);
       this.lease = got.lease;
+      leaseNote = got.note;
     }
 
     // Pick up the progress saved before a restart (first start of this manager only).
@@ -1088,16 +1425,27 @@ export class FleetManager implements FleetHost {
         if (saved.world) this.world.restore(saved.world);
       }
     }
+    // After the restore (which brings back the saved log): the database lease couldn't be had at start.
+    if (leaseNote) this.log("fleet", leaseNote);
     this.progressSince ??= new Date().toISOString();
     await this.world.init();
     const profile = await this.client.companyProfile();
     this.homeRegion = this.world.region(profile.company.home_port_id);
     this.homePort = profile.company.home_port_id;
+    this.companyName = profile.company.name;
     this.world.companyId = profile.company.id;
+    this.trickleOk = this.world.ownTrickleOk;
     // Every company of this player: their ships aren't rivals and their policies aren't ours to write.
     this.ourCompanyIds.add(profile.company.id);
     this.world.rivals.ours.add(profile.company.name);
     this.world.rivals.ourIds.add(profile.company.id);
+    this.world.rivals.self = profile.company.name;
+    // Every factor is billed daily, the user's own included (upkeepPerDay).
+    const factors = await this.client.factors().catch((e) => {
+      if (this.isFatal(e)) throw e;
+      return null;
+    });
+    if (factors) this.factorCount = factors.length;
     const player = await this.client.playerProfile().catch(() => null);
     for (const c of player?.companies ?? []) {
       this.ourCompanyIds.add(c.id);
@@ -1110,9 +1458,13 @@ export class FleetManager implements FleetHost {
         `${this.world.charters.length} open charters, auto-buy ${this.settings.autoBuy ? "on" : "off"}` +
         `${saved ? `; resumed progress saved for ${this.restoredAgents.size} ship${this.restoredAgents.size === 1 ? "" : "s"}` : ""}`,
     );
+    // Read again with the bills; only a fatal error comes out of it.
+    await this.checkAutoRemit();
     // A factor hired for a build before the restart is dismissed now, not left drawing salary.
     if (this.tempFactors.size > 0) await this.dismissTempFactors();
     this.lastWorld = Date.now();
+    // Started while paused: ships wait from their first tick.
+    this.syncPause();
     await this.scanShips();
     // After the scan: the replay needs our ships' classes. The live feed takes over from the cursor.
     if (!this.world.stormBootstrapped && !this.stormBootstrapping) {
@@ -1131,6 +1483,16 @@ export class FleetManager implements FleetHost {
   /** World refresh, new/lost ships, lane overview, purchases. */
   private async housekeeping(): Promise<void> {
     const now = Date.now();
+    this.warnKeyExpiry();
+    // Paused by the operators (guide 4.2: only reads are served, nothing sails or bills): the clock alone is read
+    // every PAUSE_CHECK_MS, and nothing is written (buyer, marques, underwriting, remits) until it resumes.
+    if (this.paused) {
+      if (now - this.lastPauseCheck < PAUSE_CHECK_MS) return;
+      this.lastPauseCheck = now;
+      await this.world.readClock();
+      this.syncPause();
+      if (this.paused) return;
+    }
     if (now - this.lastWorld > WORLD_REFRESH_MS || (this.worldDirty && now - this.lastWorld > EVENT_REFRESH_MS)) {
       const dirty = this.worldDirty;
       this.worldDirty = false;
@@ -1141,8 +1503,17 @@ export class FleetManager implements FleetHost {
         throw e;
       }
       this.lastWorld = now;
+      this.syncPause();
+      if (this.paused) return;
       // New charters: ships idling for want of a lane look again now, not in minutes.
       if (dirty) for (const a of this.agents.values()) if (a.idle) a.nudge();
+      // A re-post just showed whether our own small deliveries cancel the escalation: the calls change, and
+      // holders may deliver under the line now (or must stop).
+      if (this.world.ownTrickleOk !== this.trickleOk) {
+        this.trickleOk = this.world.ownTrickleOk;
+        this.stakesAt = 0;
+        for (const a of this.agents.values()) if (a.activity.startsWith("holding")) a.nudge();
+      }
       await this.refreshTopLanes();
       // Stalls start, break and lapse with the listing: the fleet's calls on them follow.
       this.reviewStalls();
@@ -1152,10 +1523,28 @@ export class FleetManager implements FleetHost {
       this.lastEscalations = esc;
     }
     this.advisor.tick();
+    // The AI's marques and patrols don't wait for the marque check (paused: housekeeping never gets here).
+    if (!this.navalBusy && now - this.lastNavalTry > AI_NAVAL_RETRY_MS && this.advisor.pendingNaval().length) {
+      this.lastNavalTry = now;
+      await this.runAiNaval().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.log("fleet", `AI marques and patrols: ${(e as Error).message}`);
+      });
+    }
     if (now - this.lastScan > SHIP_SCAN_MS) await this.scanShips();
     if (now - this.lastPersist > PERSIST_MS) this.persist();
+    // Before the buyer: the floors it leaves alone count the bills as charged.
+    if (now - this.lastBillsCheck > BILLS_CHECK_MS) {
+      this.lastBillsCheck = now;
+      await this.learnBills().catch((e) => {
+        if (this.isFatal(e)) throw e;
+        this.log("fleet", `reading the daily bills from the ledger failed: ${(e as Error).message}`);
+      });
+      await this.keepHomeFloor();
+    }
     if (now - this.lastBuyCheck > BUY_CHECK_MS) await this.runBuyer(null);
-    this.world.rivalIntel = this.settings.rivalIntel;
+    // An AI override may have lapsed in between.
+    this.syncWorldFlags();
     if (now - this.lastRivalCheck > RIVAL_CHECK_MS || (this.rivalsDirty && now - this.lastRivalCheck > RIVAL_EVENT_MIN_MS)) {
       this.lastRivalCheck = now;
       this.rivalsDirty = false;
@@ -1192,7 +1581,22 @@ export class FleetManager implements FleetHost {
     const listed = new Set(ships.map((r) => r.ship.id));
     const pending = this.pendingBuild;
     if (pending) {
-      const found = ships.find((x) => x.ship.name === pending.name && x.ship.ship_class === pending.cls && !this.agents.has(x.ship.id));
+      // Older saves carry no stamp: the watch starts now.
+      pending.at ??= this.world.now();
+      const at = pending.at;
+      // Only a ship created about when the build was tried (a later ship of the same name and class isn't it).
+      const madeThen = (x: ShipResult) => {
+        const made = Date.parse(x.ship.created_at ?? "");
+        return !Number.isFinite(made) || made >= at - PENDING_BUILD_SLACK_MS;
+      };
+      const found = ships.find((x) => x.ship.name === pending.name && x.ship.ship_class === pending.cls && !this.agents.has(x.ship.id) && madeThen(x));
+      if (!found && this.world.now() - at > PENDING_BUILD_MS) {
+        // Not in the fleet long after: it wasn't built. The lease grown for its materials goes back (what is stored stays).
+        this.pendingBuild = null;
+        if (pending.leaseBefore !== undefined && pending.leaseBefore !== null) void this.shrinkLease(pending.yard, pending.leaseBefore);
+        this.log("fleet", `the ${pending.cls} "${pending.name}" wasn't built (not in the fleet ${Math.round(PENDING_BUILD_MS / 60_000)} min after the attempt): the buyer may build again`);
+        this.persist(true);
+      }
       if (found) {
         this.pendingBuild = null;
         this.shipSpendPence += pending.price;
@@ -1208,6 +1612,8 @@ export class FleetManager implements FleetHost {
           lane: pending.lane,
         });
         this.log("fleet", `the ${pending.cls} "${pending.name}" was built after all`);
+        const order = this.advisor.buildOrder();
+        if (order?.cls === pending.cls && order.yard === pending.yard) this.noteBuild("done", undefined, undefined, found.ship.id);
       }
     }
     for (const r of ships) {
@@ -1297,17 +1703,37 @@ export class FleetManager implements FleetHost {
     };
   }
 
-  /** Hull, speed and cargo room for a class not yet built. */
-  private specForClass(shipClass: string, guns: number): ShipSpec {
+  /** Hull, speed and cargo room for a class not yet built: 2 t of hold a gun, and whole tons for `stores`. */
+  private specForClass(shipClass: string, guns: number, stores: number): ShipSpec {
     const cls = this.world.shipClass(shipClass);
     return {
       hullValue: this.hullValue(shipClass) + guns * GUN_PRICE_PENCE,
       shipClass,
       hull: cls?.hull_category ?? "coastal",
       knots: (cls?.base_speed_centiknots ?? 800) / 100,
-      cap: Math.max(0, (cls?.hold_capacity_tons ?? 40) - 2 * guns - 2),
+      cap: Math.max(0, (cls?.hold_capacity_tons ?? 40) - 2 * guns - Math.ceil(stores)),
       guns,
     };
+  }
+
+  /**
+   * Stores (tons) a new hull of `cls` carries on its first lane, as a ship stocks them at the source (ShipAgent.storesTarget:
+   * there and back at the safe figures, or the hits the laden passage could plausibly take if more, plus STORES_BUFFER_DAYS
+   * of eating in port). They take hold room (guide 3.3). Null: the passage can't be routed.
+   */
+  private async firstStores(cls: CatalogShipClass, guns: number, lane: Lane): Promise<number | null> {
+    const w = this.world;
+    const [out, back] = await Promise.all([
+      w.route(lane.source, lane.dest, cls.id).catch(() => null),
+      w.route(lane.dest, lane.source, cls.id).catch(() => null),
+    ]);
+    if (!out) return null;
+    const safe = (from: string, to: string, p: RoutePlan) => Math.max(p.safe_provisions_tons, w.safeFloor(from, to, cls.id));
+    const cargo = lane.parts.reduce((n, p) => n + p.tons * w.basePrice(p.good), 0);
+    const hits = w.storesFor(out, cls.hull_category, guns, (cls.base_speed_centiknots / 100) * 0.8, cargo, w.now());
+    const legs = safe(lane.source, lane.dest, out) + (back ? safe(lane.dest, lane.source, back) : 0);
+    const need = Math.max(legs, Number.isFinite(hits) ? hits : 0) + STORES_BUFFER_DAYS * out.port_provisions_tons_per_day;
+    return Number.isFinite(need) ? need : null;
   }
 
   /** `except`: the ship being planned for, whose own pending load isn't someone else's claim on cash. */
@@ -1323,6 +1749,8 @@ export class FleetManager implements FleetHost {
       cash,
       capitalRate: this.capitalRate(except),
       bias: this.advisor.hasBias() ? (l: Lane) => this.advisor.bias(l) : undefined,
+      // Everywhere (the buyer and the top lanes too, which drop only the bias): restrictions, never a reason to buy.
+      bans: this.advisor.bans() ?? undefined,
       stalls: this.stallStakes(),
       cashAt: flows ? (at: number, source: string) => this.cashAt(flows, at, this.world.region(source), spare) : undefined,
     };
@@ -1476,7 +1904,9 @@ export class FleetManager implements FleetHost {
           this.worldDirty = true;
           continue;
         }
-        if (isApiError(e) && (e.status === 401 || e.status === 403)) {
+        // A dead key or a frozen company stops everything, not just the feed.
+        if (isFatalApiError(e)) return this.fatal(fatalText(e));
+        if (isApiError(e) && e.status === 403) {
           this.log("fleet", `event feed stopped (${e.message}); running on timers`);
           return;
         }
@@ -1506,10 +1936,22 @@ export class FleetManager implements FleetHost {
         if (p.load_state !== "ballast") this.rivalAnalysisDirty = true;
         break;
       case "insurance_policy_listed":
+      case "insurance_underwritten":
+      case "insurance_cover_reduced":
+      case "insurance_policy_closed": {
         // Public: a ship somewhere is about to sail (rival intel), and a fresh policy to judge.
-        this.policiesDirty = true;
-        this.wake?.();
+        if (e.event_type === "insurance_policy_listed") {
+          this.policiesDirty = true;
+          this.wake?.();
+        }
+        // A policy on one of our ships (the user's: the autopilot never buys one) changed: read it again at
+        // the ship's next decision. A notice naming no ship may be about any of ours.
+        const insured = str("insured_company_id");
+        if (insured !== undefined && !this.ourCompanyIds.has(insured)) break;
+        if (agent) agent.forgetPolicy();
+        else if (!str("ship_id")) for (const a of this.agents.values()) a.forgetPolicy();
         break;
+      }
       case "convoy_formed":
         // Public unless private: a convoy's schedule, hulls and guns.
         this.rivalsDirty = true;
@@ -1575,11 +2017,23 @@ export class FleetManager implements FleetHost {
         break;
       }
       case "ship_mutinied":
-      case "ship_provisions_exhausted":
-        this.log(agent?.name ?? "fleet", e.event_type === "ship_mutinied" ? "the crew mutinied: ship lost" : "stores ran out at sea");
-        if (e.event_type === "ship_mutinied" && agent) this.advisor.trigger("a ship was lost");
+      case "ship_provisions_exhausted": {
+        const mutiny = e.event_type === "ship_mutinied";
+        this.log(agent?.name ?? "fleet", mutiny ? "the crew mutinied: ship lost" : "stores ran out at sea");
+        // The stores reckoning fell short (golden rule 1: a starving crew loses cargo, then may mutiny): this ship keeps a day
+        // more in hand from now on; after a mutiny, with that ship gone, every other ship does.
+        if (agent && !mutiny) {
+          const days = agent.raiseStoresBias(true);
+          if (days !== null) this.log(agent.name, `keeping ${days} game days of stores in hand from now on`);
+        }
+        if (agent && mutiny) {
+          for (const a of this.agents.values()) if (a !== agent && !a.gone) a.raiseStoresBias(false);
+          this.log("fleet", "after the mutiny every ship keeps a game day more of stores in hand");
+          this.advisor.trigger("a ship was lost");
+        }
         agent?.nudge();
         break;
+      }
       case "charter_delivered":
       case "charter_expired": {
         // A public charter's notice may name who delivered (its shape isn't documented): a rival's goes in its profile.
@@ -1611,13 +2065,18 @@ export class FleetManager implements FleetHost {
           const co = str("deliverer_company_name", "delivered_by", "company_name", "company");
           const coId = str("deliverer_company_id", "company_id");
           const { rivals } = this.world;
-          const ours =
-            co !== undefined && rivals.ours.size ? rivals.ours.has(co)
-            : coId !== undefined && this.ourCompanyIds.size ? this.ourCompanyIds.has(coId) || rivals.ourIds.has(coId)
+          // For a stall only this company's deliveries are ours: the server sees a sibling company's as another's.
+          const self =
+            co !== undefined && this.companyName !== null ? co === this.companyName
+            : coId !== undefined && this.world.companyId !== null ? coId === this.world.companyId
             : undefined;
-          const ended = this.world.noteCharterDelivered(id, ours);
+          const sibling = !self && ((co !== undefined && rivals.ours.has(co)) || (coId !== undefined && (this.ourCompanyIds.has(coId) || rivals.ourIds.has(coId))));
+          const ended = this.world.noteCharterDelivered(id, self, Date.parse(e.timestamp) || undefined);
           if (ended) {
-            this.log("fleet", `a rival delivered into the stalled ${ended.good} charter at ${ended.port}: no richer re-post this time`);
+            this.log(
+              "fleet",
+              `${sibling ? `our other company${co ? ` ${co}` : ""} delivered (the server counts it as another company's)` : "a rival delivered"} into the stalled ${ended.good} charter at ${ended.port}: no richer re-post this time`,
+            );
             this.reviewStalls();
           }
         }
@@ -1638,10 +2097,17 @@ export class FleetManager implements FleetHost {
       case "crown_bailiff_upkeep_seizure":
         this.log("fleet", `BAILIFF: ${e.event_type.replace(/_/g, " ")} (a bill went unpaid; check the reserve)`);
         break;
-      case "server_announcement":
+      case "server_announcement": {
+        const at = Date.parse(e.timestamp) || this.world.now();
         this.log("fleet", `server ${str("severity") ?? "notice"}: ${str("message") ?? ""}`);
-        this.advisor.noteEvent("server_announcement", str("message") ?? "", Date.parse(e.timestamp) || this.world.now());
+        this.advisor.noteEvent("server_announcement", str("message") ?? "", at);
+        // A critical one (maintenance, a pause, the season's end) is a banner on the dashboard for a while; the latest wins.
+        if (str("severity") === "critical" && (this.announcement === null || at >= this.announcement.at)) {
+          this.announcement = { at, message: (str("message") ?? "").slice(0, ANNOUNCEMENT_MAX_CHARS) };
+          this.persist();
+        }
         break;
+      }
       case "expansion_bonus_paid":
       case "marque_prize_paid": {
         const amount = num("amount_pence") ?? num("bonus_pence") ?? num("payout_pence") ?? num("prize_pence");
@@ -1776,8 +2242,9 @@ export class FleetManager implements FleetHost {
    * flow there until the lapse and on loads it shuts out (landing more than HOLD_CAP early). AI
    * "deliver", the tier possibly completing first, our loads (into any of its postings) completing
    * it, or a laden rival likely to deliver first veto it; otherwise
-   * "always hold" and AI "wait" force it near the lapse. Our own delivery would cancel the
-   * escalation too (as the feed shows: a posting is stalled while nothing is delivered in it).
+   * "always hold" and AI "wait" force it near the lapse. Our own delivery is taken to cancel the
+   * escalation too until re-posts show it doesn't (World.judge); after that ships may deliver into
+   * it what fits under the pace line (ShipAgent.campShut). The season ending first vetoes it as well.
    */
   private stallStakes(): Map<string, StallStake> {
     if (Date.now() - this.stakesAt < STAKES_TTL_MS) return this.stakes;
@@ -1874,6 +2341,7 @@ export class FleetManager implements FleetHost {
       // Vetoes first: "always hold" and AI "wait" never camp past them.
       const veto =
         call === "deliver" ? "AI call: deliver"
+        : !w.beforeSeasonEnd(until) ? "the season ends before the re-post"
         : w.tierEtaMs !== null && w.tierEtaMs < (until - now) * TIER_SAFETY ? "the tier may complete before the lapse"
         : before + others > 0 && before + others >= w.expansionTonsLeft ? "our loads would complete the tier"
         : w.rivalKeep(x) < HOLD_MIN_SURVIVAL ? "a laden rival due before the lapse will likely deliver"
@@ -1966,27 +2434,49 @@ export class FleetManager implements FleetHost {
     }
   }
 
-  /** One planning pass at a time, so each ship sees the others' fresh reservations. */
-  assignLane(agent: ShipAgent, from: string, r: ShipResult): Promise<Lane | null> {
-    const run = this.assignQueue.then(() => this.assignLaneNow(agent, from, r));
+  /** One planning pass at a time, so each ship sees the others' fresh reservations. `pin`: an insured voyage's limits. */
+  assignLane(agent: ShipAgent, from: string, r: ShipResult, pin?: { onlySource?: string; onlyDest?: string }): Promise<Lane | null> {
+    const run = this.assignQueue.then(() => this.assignLaneNow(agent, from, r, pin));
     this.assignQueue = run.catch(() => undefined);
     return run;
   }
 
-  private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult): Promise<Lane | null> {
+  private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult, pin: { onlySource?: string; onlyDest?: string } = {}): Promise<Lane | null> {
     const prev = agent.lane;
     const cash = this.loadCash(agent);
     const spec = this.specFor(agent, r);
-    let lanes = await rankLanes(this.world, spec, from, this.reservations(agent), this.planOptions(cash, agent));
-    let best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
+    const w = this.world;
+    // The AI's order for this ship, never over an insured voyage's limits (its policy decides first).
+    const order = pin.onlySource || pin.onlyDest ? undefined : this.advisor.shipOrder(agent.shipId);
+    if (order?.order === "port" && order.ref === from) this.noteOrder(agent, order, "done");
+    // A port order plans only loads from that port (none paying: the ship sails there empty, ShipAgent.atPort).
+    const portOrder = order?.order === "port" && order.ref !== from ? order.ref : undefined;
+    const opts = { ...this.planOptions(cash, agent), ...pin, ...(portOrder ? { onlySource: portOrder } : {}) };
+    const pick = (lanes: Lane[]) => lanes.find((l) => !agent.isAvoided(l.key) && (!portOrder || l.source === portOrder)) ?? null;
+    let lanes = await rankLanes(w, spec, from, this.reservations(agent), opts);
+    let best = pick(lanes);
     // Nothing pays unarmed (pirates would likely take the ship), but this is a yard: plan as if
     // fully armed; the refit here then sizes the guns to the lane and the load is planned again.
-    const max = this.world.shipClass(agent.shipClass)?.max_cannons ?? 0;
-    if (!best && this.settings.guns === "auto" && r.ship.status !== "sailing" && this.world.port(from)?.has_shipyard && spec.guns < max) {
+    const max = w.shipClass(agent.shipClass)?.max_cannons ?? 0;
+    if (!best && this.settings.guns === "auto" && r.ship.status !== "sailing" && w.port(from)?.has_shipyard && spec.guns < max) {
       const armed: ShipSpec = { ...spec, guns: max, cap: Math.max(0, spec.cap - 2 * (max - spec.guns)), hullValue: (spec.hullValue ?? 0) + (max - spec.guns) * GUN_PRICE_PENCE };
-      lanes = await rankLanes(this.world, armed, from, this.reservations(agent), this.planOptions(cash, agent));
-      best = lanes.find((l) => !agent.isAvoided(l.key)) ?? null;
+      lanes = await rankLanes(w, armed, from, this.reservations(agent), opts);
+      best = pick(lanes);
     }
+    // A lane or charter order: the best lane that is it and passes every check (and still earns after the
+    // charge on the cash it ties up), else the best as usual: an order never idles a ship.
+    if (order && (order.order === "lane" || order.order === "charter")) {
+      const charge = opts.capitalRate ?? 0;
+      const pinned = lanes.find(
+        (l) =>
+          !agent.isAvoided(l.key) &&
+          l.profitPerHour - charge * l.capital > 0 &&
+          (order.order === "lane" ? l.key === order.ref : l.fills.some(([id]) => w.currentId(id) === w.currentId(order.ref))),
+      );
+      if (pinned) best = pinned;
+      this.noteOrder(agent, order, pinned ? "active" : "unmet", pinned ? undefined : "no_passing_lane");
+    } else if (order?.order === "release") this.noteOrder(agent, order, "done");
+    else if (portOrder && best) this.noteOrder(agent, order!, "active");
     // What it counted on beyond the cash in hand: cash due, which must land before it is spent.
     if (best) best = { ...best, dueCounted: Math.max(0, Math.round(best.capital - cash)) };
     agent.setLane(best);
@@ -2017,13 +2507,13 @@ export class FleetManager implements FleetHost {
    * the lane as planned; buying then stops at loadBudget, and a load that counted on cash due waits for
    * it rather than sail under the planner's minimum (ShipAgent.buyPart).
    */
-  resizeLane(agent: ShipAgent, port: string, r: ShipResult): Promise<Lane | null> {
-    const run = this.assignQueue.then(() => this.resizeLaneNow(agent, port, r));
+  resizeLane(agent: ShipAgent, port: string, r: ShipResult, onlyDest?: string): Promise<Lane | null> {
+    const run = this.assignQueue.then(() => this.resizeLaneNow(agent, port, r, onlyDest));
     this.assignQueue = run.catch(() => undefined);
     return run;
   }
 
-  private async resizeLaneNow(agent: ShipAgent, port: string, r: ShipResult): Promise<Lane | null> {
+  private async resizeLaneNow(agent: ShipAgent, port: string, r: ShipResult, onlyDest?: string): Promise<Lane | null> {
     const prev = agent.lane;
     if (!this.settings.resizeLoads || !prev || prev.source !== port || agent.loaded) return null;
     await this.world.refreshVaults().catch(() => undefined);
@@ -2033,7 +2523,7 @@ export class FleetManager implements FleetHost {
     // when it was planned); cash due it counted on, and growth, must leave the others' loads alone.
     const floor = Math.min(this.ownCall(agent), this.spareCash());
     const base = this.planOptions(Math.max(cash, floor), agent);
-    const opts = { ...base, onlySource: port, cashAt: (at: number, src: string) => Math.max(floor, base.cashAt ? base.cashAt(at, src) : cash) };
+    const opts = { ...base, onlySource: port, onlyDest, cashAt: (at: number, src: string) => Math.max(floor, base.cashAt ? base.cashAt(at, src) : cash) };
     let lanes: Lane[];
     try {
       lanes = await rankLanes(this.world, this.specFor(agent, r), port, this.reservations(agent), opts);
@@ -2089,6 +2579,85 @@ export class FleetManager implements FleetHost {
     this.stakesAt = 0;
   }
 
+  // ── AI orders to ships ──────────────────────────────────────────────────────
+
+  /** The AI's order in force for this ship (live only), unless done or refused. */
+  shipOrder(agent: ShipAgent): ShipOrder | undefined {
+    return this.advisor.shipOrder(agent.shipId);
+  }
+
+  /** What became of this order for this ship (from the ship itself; nothing if a newer answer replaced it meanwhile). */
+  orderOutcome(agent: ShipAgent, order: ShipOrder, status: OrderStatus, code?: OrderCode, note?: string): void {
+    this.noteOrder(agent, order, status, code, note);
+  }
+
+  /** Records an order's outcome while it is still the one in force, logged once per change (the CLI's view of it). */
+  private noteOrder(agent: ShipAgent, o: ShipOrder, status: OrderStatus, code?: OrderCode, note?: string): void {
+    if (this.advisor.noteOrder(o, status, code, note)) {
+      this.log(agent.name, `AI order ${o.order}${o.label ? ` ${o.label}` : ""}: ${status}${code ? ` (${code.replace(/_/g, " ")})` : ""}${note ? `: ${note}` : ""}`);
+    }
+  }
+
+  /**
+   * Whether the AI wants this planned lane (nothing of it bought yet) dropped: it touches a ban, or an order
+   * still to be acted on wants something else (a lane, charter or port order not yet planned, a hold, a release).
+   */
+  laneVetoed(agent: ShipAgent, lane: Lane): boolean {
+    const bans = this.advisor.bans();
+    if (bans && laneBanned(lane, bans, (id) => this.world.currentId(id))) return true;
+    const o = this.advisor.shipOrder(agent.shipId);
+    if (!o) return false;
+    if (o.order === "hold") return true;
+    if (o.status !== "pending") return false;
+    if (o.order === "release") return true;
+    if (o.order === "port") return lane.source !== o.ref;
+    if (o.order === "lane") return lane.key !== o.ref;
+    return !lane.fills.some(([id]) => this.world.currentId(id) === this.world.currentId(o.ref));
+  }
+
+  /** Whether the AI's bans keep a ship from making for this port (or from this passage), or from this charter. */
+  offLimits(port: string, plan?: RoutePlan, charterId?: string): boolean {
+    const b = this.advisor.bans();
+    if (!b) return false;
+    const zone = (n: string) => this.world.hazardZone(n)?.id ?? "";
+    return (
+      b.ports.has(port) ||
+      b.zones.has(zone(port)) ||
+      (!!charterId && b.charters.has(this.world.currentId(charterId))) ||
+      !!plan?.legs.some((l) => b.zones.has(zone(l.to_node)))
+    );
+  }
+
+  /**
+   * New directives: a sailing ship's planned lane that nothing has been bought for and that the AI vetoes is
+   * dropped (it plans again on arrival; it can't be recalled); release orders are carried out or refused. Ships
+   * in port see to it themselves at their next decision (never mid-load).
+   */
+  private applyShipDirectives(): void {
+    for (const a of this.agents.values()) {
+      if (a.gone || !a.last) continue;
+      const lane = a.lane;
+      const o = this.advisor.shipOrder(a.shipId);
+      const sailing = a.last.ship.status === "sailing";
+      const untouched = !!lane && !a.loaded && a.partsToBuy().length === lane.parts.length && a.freightToTake().length === lane.freight.length;
+      if (o?.order === "release" && o.status === "pending") {
+        if (!lane) this.noteOrder(a, o, "done");
+        else if (!untouched) this.noteOrder(a, o, "refused", "cargo_aboard");
+        else if (sailing) {
+          this.releaseLane(a);
+          this.noteOrder(a, o, "done");
+        }
+        a.nudge();
+        continue;
+      }
+      if (sailing && lane && untouched && this.laneVetoed(a, lane)) {
+        this.log(a.name, `dropping the planned lane ${lane.key}: the AI's directives rule it out (planning again on arrival)`);
+        this.releaseLane(a);
+      }
+      if (o) a.nudge();
+    }
+  }
+
   /** Room in a charter this ship may deliver into: what other ships already carrying cargo for it leave. */
   charterRoomFor(agent: ShipAgent, charterId: string, remaining: number): number {
     let held = 0;
@@ -2110,22 +2679,144 @@ export class FleetManager implements FleetHost {
       status: c.status,
       organizer: c.organizer_company_id,
       members: r.member_ship_ids,
-      classes: r.members.map((m) => m.ship_class),
+      // The pace is the slowest joined member's (pending requests don't sail).
+      memberClasses: r.members.filter((m) => m.status === "joined").map((m) => m.ship_class),
       checkedAt: Date.now(),
     });
   }
 
-  async convoyWait(agent: ShipAgent, convoyId: string, port: string): Promise<number | null> {
+  /** A class's speed in knots (unknown: about a hoy's). */
+  private knots(shipClass: string): number {
+    return (this.world.shipClass(shipClass)?.base_speed_centiknots ?? 800) / 100;
+  }
+
+  /**
+   * Stores one of our ships needs to sail with a convoy leaving at `departsAt` at `slowest` knots: its passage
+   * as it would sail alone (ShipAgent.passageStores, never under the safe figure) stretched to the convoy's
+   * pace, plus eating in port until it sails. `bare`: with no hit margin (fed to port if nothing strikes).
+   * The one measure joining, forming and waiting all use, so a ship never joins only to leave again.
+   */
+  private convoyStores(a: ShipAgent, plan: RoutePlan, departsAt: number, slowest: number): { need: number; bare: number } {
+    const slow = Math.max(1, this.knots(a.shipClass) / Math.max(slowest, 0.1));
+    const wait = (Math.max(0, departsAt - this.world.now()) / (24 * 60 * this.world.gameMinuteMs)) * plan.port_provisions_tons_per_day;
+    return { need: a.passageStores(plan) * slow + wait, bare: plan.expected_provisions_tons * slow + wait };
+  }
+
+  /**
+   * Whether a policy on one of the convoy's members (for its port) may have been priced with the consorts
+   * (guide 3.4: they must then all sail with it, or it is void). Lloyd's doesn't say, so any counts.
+   */
+  private async consortPriced(c: { dest: string; members: string[] }): Promise<boolean> {
+    for (const id of c.members) {
+      const a = this.agents.get(id);
+      const p = a ? await a.insuredPolicy() : null;
+      // Unknown (the read failed): it may be.
+      if (p === undefined || (p && p.dest_port_id === c.dest)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * In one of our convoys at `port`: waits for it to sail, re-checking every pass that this ship's stores
+   * still cover the convoy's pace and the wait (a slower ship may have joined; the crew eats in port; convoy
+   * departures aren't checked, guide 2). Short: provisions carried as cargo go into the stores; else it
+   * leaves the convoy to top up and join again or sail alone, unless that would void a policy priced on
+   * the consorts while the bare need is still covered. Never null while the convoy can't be read, isn't
+   * listed or isn't forming here (only once it is over): a ship in a convoy can't dock or sail alone.
+   */
+  async convoyWait(agent: ShipAgent, r: ShipResult, convoyId: string, port: string): Promise<number | null> {
     let c = this.convoyCache.get(convoyId);
     if (!c || Date.now() - c.checkedAt > 20_000) {
-      const list = await this.client.convoys({ convoy_id: convoyId }).catch(() => null);
-      if (list?.[0]) this.noteConvoy(list[0]);
+      const list = await this.client.convoys({ convoy_id: convoyId }).catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (!list) {
+        agent.activity = "in a convoy (couldn't read it); waiting";
+        return 15_000;
+      }
+      if (list[0]) this.noteConvoy(list[0]);
+      else this.convoyCache.delete(convoyId);
       c = this.convoyCache.get(convoyId);
     }
-    if (!c || c.status !== "forming" || c.from !== port) return null;
-    const left = c.departsAt - this.world.now();
-    agent.activity = `in convoy to ${c.dest} with ${c.members.length} ship${c.members.length === 1 ? "" : "s"}, sails in ${Math.max(0, Math.round(left / 1000))}s`;
-    return Math.min(Math.max(left + 2_000, 2_000), 30_000);
+    // Over (completed, cancelled): the ship is free. Not listed, or not forming here, while she is still in it: she
+    // can't dock or sail alone, so she waits (a depart now would only be refused).
+    if (c && (c.status === "completed" || c.status === "cancelled")) return null;
+    if (!c || c.status !== "forming" || c.from !== port) {
+      agent.activity = `in a convoy that isn't forming at ${port}; waiting`;
+      return 15_000;
+    }
+    const w = this.world;
+    const left = c.departsAt - w.now();
+    const n = c.members.length;
+    const dest = c.dest;
+    const waiting = () => {
+      agent.activity = `in convoy to ${dest} with ${n} ship${n === 1 ? "" : "s"}, sails in ${Math.max(0, Math.round(left / 1000))}s`;
+      return Math.min(Math.max(left + 2_000, 2_000), 30_000);
+    };
+    // A policy the user bought since for another port is void if she sails with this convoy (rule 8): she leaves it,
+    // and atPort makes for the policy's port. Unknown (a failed read): read again next pass.
+    const policy = await agent.insuredPolicy();
+    if (policy && policy.dest_port_id !== c.dest && policy.dest_port_id !== port) {
+      try {
+        await this.client.detachConvoy({ convoy_id: convoyId, ship_id: agent.shipId });
+      } catch (e) {
+        if (this.isFatal(e) || !isApiError(e) || e.status >= 500) throw e;
+        this.logOnceFor(`${agent.shipId}|insured|${convoyId}`, agent.name, `couldn't leave the convoy to ${c.dest} for the policy's ${policy.dest_port_id} (${e.message}); trying again`);
+        agent.activity = `in convoy to ${c.dest}, insured for ${policy.dest_port_id}: couldn't leave it`;
+        return 15_000;
+      }
+      this.convoyCache.delete(convoyId);
+      this.log(agent.name, `left the convoy to ${c.dest}: the policy on this ship is for a voyage to ${policy.dest_port_id}`);
+      return 1_000;
+    }
+    const plan = await w.route(c.from, c.dest, agent.shipClass).catch(() => null);
+    if (!plan) return waiting();
+    const slowest = Math.min(this.knots(agent.shipClass), ...c.memberClasses.map((k) => this.knots(k)));
+    const { need, bare } = this.convoyStores(agent, plan, c.departsAt, slowest);
+    const have = r.stores.provisions_tons;
+    // A hair under what it joined on (the storm odds of a later sailing) isn't worth leaving over: `need` keeps its hit margin.
+    if (have >= need * 0.99) return waiting();
+
+    // Short: our own provisions cargo first (whole tons; the stores take it from the hold).
+    const own = Math.min(agent.ownTons(r, "provisions"), Math.ceil(need - have));
+    if (own > 0) {
+      try {
+        await this.client.provision(agent.shipId, own, "cargo");
+        this.log(agent.name, `moved ${own} t of provisions cargo into the stores: the convoy to ${c.dest} sails at ${slowest.toFixed(1)} kn`);
+        return 1_000;
+      } catch (e) {
+        if (this.isFatal(e) || !isApiError(e) || e.status >= 500) throw e;
+      }
+    }
+    if (have >= bare && (await this.consortPriced(c))) {
+      agent.activity = `in convoy to ${c.dest}, stores ${have.toFixed(2)} t under the ${need.toFixed(2)} t its pace wants: staying, a policy counts on the consorts`;
+      this.logOnceFor(`${agent.shipId}|consorts|${convoyId}`, agent.name, `stores ${have.toFixed(2)} t, short of the ${need.toFixed(2)} t the convoy to ${c.dest} wants (${bare.toFixed(2)} t bare): staying with it, a policy may count on the consorts`);
+      return waiting();
+    }
+    try {
+      await this.client.detachConvoy({ convoy_id: convoyId, ship_id: agent.shipId });
+    } catch (e) {
+      if (this.isFatal(e) || !isApiError(e) || e.status >= 500) throw e;
+      this.logOnceFor(`${agent.shipId}|detach|${convoyId}`, agent.name, `couldn't leave the convoy to ${c.dest} short of stores (${e.message}); trying again`);
+      agent.activity = `in convoy to ${c.dest}, short of stores: couldn't leave it`;
+      return 15_000;
+    }
+    this.convoyCache.delete(convoyId);
+    const topUp = agent.convoyTopUp(need);
+    this.log(
+      agent.name,
+      `left the convoy to ${c.dest}: stores ${have.toFixed(2)} t, short of the ${need.toFixed(2)} t its ${slowest.toFixed(1)} kn pace needs; ${topUp ? "topping up, then joining again" : "sailing alone"}`,
+    );
+    return 1_000;
+  }
+
+  /** Logs once per `key` (a ship waiting on the same thing says it once). */
+  private logOnceFor(key: string, source: string, msg: string): void {
+    if (this.loggedOnce.has(key)) return;
+    this.loggedOnce.add(key);
+    if (this.loggedOnce.size > 200) this.loggedOnce.delete(this.loggedOnce.values().next().value!);
+    this.log(source, msg);
   }
 
   /**
@@ -2138,7 +2829,7 @@ export class FleetManager implements FleetHost {
       const decision = await this.convoyDecision(agent, r, from, dest, plan);
       if (decision.kind === "alone") return decision;
       try {
-        if (r.ship.status === "berthed") await this.client.offshore(agent.shipId);
+        if (r.ship.status === "berthed") agent.noteDues(from, (await this.client.offshore(agent.shipId)).berth_dues_pence);
         let convoyId: string;
         let departsAt: number;
         if (decision.kind === "join") {
@@ -2180,10 +2871,10 @@ export class FleetManager implements FleetHost {
   /**
    * Whether to sail in convoy. In a convoy of s ships pirates board just one, so each ship's
    * expected piracy loss (its cargo, and the ship itself) is about 1/s of sailing alone. Joining
-   * (or forming) is worth it when the fall in all our members' losses beats what the wait costs
-   * this ship's time; only with ships of similar speed (a convoy sails at its slowest), only when
-   * the stores cover the slower passage and the wait, and only if the cargo still arrives before
-   * its charters and freight are due.
+   * (or forming) is worth it when the fall in all our members' losses, less the extra storm loss
+   * of the slower (and later) passage, beats what the wait costs this ship's time; only with ships
+   * of similar speed (a convoy sails at its slowest), only when the stores cover the slower passage
+   * and the wait, and only if the cargo still arrives before its charters and freight are due.
    */
   private async convoyDecision(
     agent: ShipAgent,
@@ -2205,23 +2896,36 @@ export class FleetManager implements FleetHost {
     };
     const cargoOf = (x: ShipResult) => Object.entries(x.cargo_manifest).reduce((n, [g, t]) => n + t * w.basePrice(g), 0);
     const ours = exposure(agent.shipClass, r.ship.cannons_count, cargoOf(r));
+    // Each ship still rolls its own storms (guide 3.7), longer at sea at the convoy's slower pace: what a passage's
+    // storms are expected to cost a ship (its cargo's share, and its hull if it sinks), at the user's storm weight.
+    const stormWeight = this.settings.stormWeightPct / 100;
+    const storms = (cls: string, guns: number, cargo: number, knots: number, sailsAt: number) => {
+      const s = w.stormRisk(plan, w.shipClass(cls)?.hull_category ?? "coastal", knots * 0.8, sailsAt, stormWeight);
+      return s.cargoShare * cargo + s.sink * (this.hullValue(cls) + guns * GUN_PRICE_PENCE);
+    };
+    // A convoy's extra storm loss for one ship over how it would sail otherwise; never counted as a gain.
+    const slower = (cls: string, guns: number, cargo: number, convoy: { knots: number; at: number }, otherwise: { knots: number; at: number }) =>
+      Math.max(0, storms(cls, guns, cargo, convoy.knots, convoy.at) - storms(cls, guns, cargo, otherwise.knots, otherwise.at));
     const waitCost = (ms: number) => (agent.rate * Math.max(0, ms)) / 3_600_000;
     const baseLock = 30 * w.gameMinuteMs;
-    const gameDayMs = 24 * 60 * w.gameMinuteMs;
-    // Can this ship sail in a convoy leaving at `departsAt` at `slowest` knots?
+    // Can this ship sail in a convoy leaving at `departsAt` at `slowest` knots? (The stores as convoyWait judges them.)
     const fits = (departsAt: number, slowest: number) => {
-      const slow = ourSpeed / Math.max(slowest, 0.1);
-      const stores = plan.safe_provisions_tons * slow + ((departsAt - now) / gameDayMs) * plan.port_provisions_tons_per_day;
-      if (r.stores.provisions_tons < stores) return false;
+      if (r.stores.provisions_tons < this.convoyStores(agent, plan, departsAt, slowest).need) return false;
       const due = agent.deliverDeadline();
       const arrive = departsAt + w.sailMs(plan.total_distance_nm, slowest * 0.8) + baseLock;
+      // Charters and freight pay nothing after the season ends (guide 3.11): the muster and the slower pace mustn't push it past.
+      if (!w.beforeSeasonEnd(arrive)) return false;
       return due === null || arrive <= due;
     };
 
-    // One of ours already forming here for the same port: join it, or sail alone (never a second).
-    const forming = (await this.client.convoys({ port_id: from, status: "forming", limit: 50 }).catch(() => [] as ConvoyResult[])).filter(
-      (c) => c.convoy.organizer_company_id === w.companyId && c.convoy.dest_port_id === dest,
-    );
+    // One of ours already forming here for the same port: join it, or sail alone (never a second). Unread, or
+    // not read to the end, ours may be among the missing: sail alone rather than form another.
+    const listed = await this.client.convoyPages({ port_id: from, status: "forming" }).catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!listed?.complete) return alone;
+    const forming = listed.items.filter((c) => c.convoy.organizer_company_id === w.companyId && c.convoy.dest_port_id === dest);
     for (const c of forming) this.noteConvoy(c);
     const live = forming.map((c) => ({ c, departsAt: Date.parse(c.convoy.departs_at) })).filter(({ departsAt }) => departsAt - now > 10_000);
     if (live.length) {
@@ -2233,17 +2937,36 @@ export class FleetManager implements FleetHost {
         const a = this.agents.get(m.ship_id);
         return sum + (a?.last ? exposure(m.ship_class, m.cannons_count, cargoOf(a.last)) : 0);
       }, 0);
-      const slowest = Math.min(ourSpeed, ...pick.c.members.map((m) => speed(m.ship_class)));
-      // All members' losses before (ours alone, theirs shared n ways) against after (n + 1 ways).
-      const gain = ours + members / n - (ours + members) / (n + 1);
-      if (gain > waitCost(pick.departsAt - now) && fits(pick.departsAt, slowest)) return { kind: "join", convoyId: pick.c.convoy.id, ships: n };
-      return alone;
+      const pace = Math.min(...pick.c.members.map((m) => speed(m.ship_class)));
+      const slowest = Math.min(ourSpeed, pace);
+      // All members' losses before (ours alone, theirs shared n ways) against after (n + 1 ways), less the storms
+      // of the slower passage: ours (later and slower than alone now), and the members' when we slow them.
+      const convoy = { knots: slowest, at: pick.departsAt };
+      let stormCost = slower(agent.shipClass, r.ship.cannons_count, cargoOf(r), convoy, { knots: ourSpeed, at: now });
+      if (slowest < pace) {
+        for (const m of pick.c.members) {
+          const a = this.agents.get(m.ship_id);
+          if (a?.last) stormCost += slower(m.ship_class, m.cannons_count, cargoOf(a.last), convoy, { knots: pace, at: pick.departsAt });
+        }
+      }
+      const gain = ours + members / n - (ours + members) / (n + 1) - stormCost;
+      if (!(gain > waitCost(pick.departsAt - now) && fits(pick.departsAt, slowest))) return alone;
+      // A slower ship slows everyone: each of ours already in it must still have the stores for the new pace.
+      if (slowest < pace) {
+        for (const m of pick.c.members) {
+          const a = this.agents.get(m.ship_id);
+          if (!a?.last) continue;
+          const mp = await w.route(from, dest, m.ship_class).catch(() => null);
+          if (!mp || a.last.stores.provisions_tons < this.convoyStores(a, mp, pick.departsAt, slowest).need) return alone;
+        }
+      }
+      return { kind: "join", convoyId: pick.c.convoy.id, ships: n };
     }
 
     // Our other ships that will leave the same way soon: at this port with the same lane, or on their way here for it.
     if (ours < CONVOY_MIN_EXPOSURE_PENCE) return alone;
     const handling = w.handlingMsPerTon(from);
-    const partners: Array<{ ready: number; exposure: number; speed: number }> = [];
+    const partners: Array<{ ready: number; exposure: number; speed: number; cls: string; guns: number; value: number }> = [];
     for (const a of this.agents.values()) {
       const pr = a.last;
       const lane = a.lane;
@@ -2261,13 +2984,18 @@ export class FleetManager implements FleetHost {
       const e = exposure(a.shipClass, pr.ship.cannons_count, value);
       // A partner with little at risk may not join on its own account: don't wait for it.
       if (e < CONVOY_MIN_EXPOSURE_PENCE / 2) continue;
-      partners.push({ ready, exposure: e, speed: speed(a.shipClass) });
+      partners.push({ ready, exposure: e, speed: speed(a.shipClass), cls: a.shipClass, guns: pr.ship.cannons_count, value });
     }
     if (partners.length === 0) return alone;
     const k = partners.length;
     const waitMs = Math.max(CONVOY_MIN_MUSTER_GAME_MIN * w.gameMinuteMs, Math.max(...partners.map((p) => p.ready)) - now + baseLock);
-    const gain = ((ours + partners.reduce((n, p) => n + p.exposure, 0)) * k) / (k + 1);
     const slowest = Math.min(ourSpeed, ...partners.map((p) => p.speed));
+    // Less the storms of the slower, later passage: ours against alone now, each partner's against alone when ready.
+    const convoy = { knots: slowest, at: now + waitMs };
+    const stormCost =
+      slower(agent.shipClass, r.ship.cannons_count, cargoOf(r), convoy, { knots: ourSpeed, at: now }) +
+      partners.reduce((n, p) => n + slower(p.cls, p.guns, p.value, convoy, { knots: p.speed, at: p.ready }), 0);
+    const gain = ((ours + partners.reduce((n, p) => n + p.exposure, 0)) * k) / (k + 1) - stormCost;
     if (gain <= waitCost(waitMs) || !fits(now + waitMs, slowest)) return alone;
     return { kind: "form", departInGameMin: Math.min(3 * 24 * 60, Math.ceil(waitMs / w.gameMinuteMs)), partners: k };
   }
@@ -2292,6 +3020,8 @@ export class FleetManager implements FleetHost {
   private fleetTons(oceanic: boolean): number {
     let t = 0;
     for (const a of this.agents.values()) {
+      // Sunk or seized but not retired yet (the next scan): no longer billed.
+      if (a.gone) continue;
       const cls = this.world.shipClass(a.shipClass);
       if (!cls || (cls.hull_category === "oceanic") !== oceanic) continue;
       t += cls.hold_capacity_tons;
@@ -2301,9 +3031,12 @@ export class FleetManager implements FleetHost {
 
   /** Daily fleet upkeep (pence per game day), optionally with an extra hull. */
   private upkeepPerDay(extra?: { tons: number; oceanic: boolean }): number {
-    const coastal = this.fleetTons(false) + (extra && !extra.oceanic ? extra.tons : 0);
-    const oceanic = this.fleetTons(true) + (extra?.oceanic ? extra.tons : 0);
-    return this.world.sprawlPerDay(coastal) + 100 * oceanic;
+    const w = this.world;
+    const bill = (coastal: number, oceanic: number) => w.sprawlPerDay(coastal) + w.factorUpkeepPerDay(this.factorCount) + 100 * oceanic;
+    const now = bill(this.fleetTons(false), this.fleetTons(true));
+    const withExtra = bill(this.fleetTons(false) + (extra && !extra.oceanic ? extra.tons : 0), this.fleetTons(true) + (extra?.oceanic ? extra.tons : 0));
+    // The formula (guide 3.9), or what the last billing passes charged if more, plus the extra hull.
+    return Math.max(withExtra, this.bills.upkeep + withExtra - now);
   }
 
   private homeFloor(extra?: { tons: number; oceanic: boolean }): number {
@@ -2311,7 +3044,135 @@ export class FleetManager implements FleetHost {
   }
 
   private floorIn(region: BankingRegion): number {
-    return region === this.homeRegion ? this.homeFloor() : REGION_FLOOR_PENCE;
+    // Each region also keeps its own warehouses' rent (billed from the port's region).
+    const rent = Math.ceil(UPKEEP_DAYS_RESERVED * (this.bills.rent.get(region) ?? 0));
+    return (region === this.homeRegion ? this.homeFloor() : REGION_FLOOR_PENCE) + rent;
+  }
+
+  /**
+   * What the daily bills really charge (guide 3.9: warehouse rent per port from its region, sprawl and
+   * factors from home), learned from the ledger since the rates aren't published. A billing pass is a
+   * cluster of bill debits from our vaults; per region (upkeep: all regions, a short home is swept) the
+   * larger of the last two passes counts. The reason strings aren't published either: those seen are
+   * logged once, so the patterns can be checked. Nothing measured: the formula alone, as before.
+   */
+  private async learnBills(): Promise<void> {
+    const w = this.world;
+    // The user may have changed them on the company page since.
+    await this.checkAutoRemit();
+    if (w.vaultAccounts.size === 0) await w.refreshVaults();
+    const now = w.now();
+    const since = now - BILLS_LOOKBACK_GAME_DAYS * 24 * 60 * w.gameMinuteMs;
+    const entries: LedgerEntry[] = [];
+    let cursor: string | undefined;
+    let complete = false;
+    for (let page = 0; page < BILLS_LEDGER_PAGES; page++) {
+      const batch = await this.client.ledger({ cursor, limit: 200 });
+      entries.push(...batch);
+      if (batch.length < 200) {
+        complete = true;
+        break;
+      }
+      if (Date.parse(batch[batch.length - 1].created_at) < since) break;
+      cursor = batch[batch.length - 1].id;
+    }
+    // Read far enough back for a whole game day's billing, or to the start of the ledger.
+    const oldest = Math.min(...entries.map((e) => Date.parse(e.created_at)).filter((t) => Number.isFinite(t)), now);
+    const covered = complete || oldest <= now - 24 * 60 * w.gameMinuteMs;
+
+    const bills: Array<{ at: number; region: BankingRegion; pence: number; kind: "rent" | "upkeep" }> = [];
+    const reasons = new Map<string, string>();
+    for (const e of entries) {
+      const at = Date.parse(e.created_at);
+      // Out of one of our vaults to someone else (the debit side, as the treasury page reads it).
+      const region = w.vaultAccounts.get(e.debit_account_id);
+      if (!region || w.vaultAccounts.has(e.credit_account_id) || !(at >= since)) continue;
+      const kind = ONE_OFF_REASON.test(e.reason) ? null : RENT_REASON.test(e.reason) ? "rent" : UPKEEP_REASON.test(e.reason) ? "upkeep" : null;
+      if (!reasons.has(e.reason)) reasons.set(e.reason, kind ?? "-");
+      if (kind && e.amount_pence > 0) bills.push({ at, region, pence: e.amount_pence, kind });
+    }
+    if (!this.billReasonsLogged && reasons.size > 0) {
+      this.billReasonsLogged = true;
+      this.log("fleet", `ledger reasons seen (taken as a daily bill: rent/upkeep): ${[...reasons].map(([r, k]) => `${r}${k === "-" ? "" : ` (${k})`}`).join(", ")}`);
+    }
+
+    // Billing passes: entries within a minute of the one before.
+    const passes: Array<typeof bills> = [];
+    for (const b of bills.sort((x, y) => x.at - y.at)) {
+      const last = passes.at(-1);
+      if (last && b.at - last[last.length - 1].at <= BILLING_CLUSTER_MS) last.push(b);
+      else passes.push([b]);
+    }
+    const lastTwo = (pick: (b: (typeof bills)[number]) => boolean) => {
+      const sums = passes.map((p) => p.filter(pick).reduce((n, b) => n + b.pence, 0)).filter((n) => n > 0);
+      return sums.length ? Math.max(...sums.slice(-2)) : 0;
+    };
+    const rent = new Map<BankingRegion, number>();
+    for (const region of new Set(bills.filter((b) => b.kind === "rent").map((b) => b.region))) rent.set(region, lastTwo((b) => b.kind === "rent" && b.region === region));
+    const upkeep = lastTwo((b) => b.kind === "upkeep");
+    // Not back a whole game day (a busy ledger): what this read found, the rest as measured before.
+    if (!covered) {
+      for (const [r, p] of this.bills.rent) if (!rent.has(r)) rent.set(r, p);
+    }
+    const prev = this.bills;
+    this.bills = { rent, upkeep: covered || upkeep > 0 ? upkeep : prev.upkeep, at: now };
+    const total = (b: typeof prev) => b.upkeep + [...b.rent.values()].reduce((n, p) => n + p, 0);
+    if (prev.at === null || Math.abs(total(this.bills) - total(prev)) >= Math.max(1_000, 0.1 * total(prev))) {
+      const rents = [...rent].filter(([, p]) => p > 0).map(([r, p]) => `${r} ${cr(p)}`);
+      this.log("fleet", `daily bills from the ledger: upkeep ${cr(this.bills.upkeep)}${rents.length ? `, rent ${rents.join(", ")}` : ", no rent"}; home keeps ${cr(this.homeRegion ? this.floorIn(this.homeRegion) : this.homeFloor())}`);
+    }
+    this.persist();
+  }
+
+  /**
+   * Auto-remit (guide 3.9) tops a bill its region can't cover up from our other regions, never below its reserve and
+   * all-or-nothing. Only read and reported, never changed: a reserve at the floor ensureCash drains donors to would
+   * leave a covered bill unpaid (the bailiff seizes ships for unpaid upkeep). Home is kept at its floor from the
+   * others instead (keepHomeFloor). Said when it changes; only a fatal error comes out.
+   */
+  private async checkAutoRemit(): Promise<void> {
+    const s = await this.client.companySettings().catch((e) => {
+      if (this.isFatal(e)) throw e;
+      return null;
+    });
+    if (!s) {
+      if (this.autoRemit === null && !this.autoRemitUnreadSaid) {
+        this.autoRemitUnreadSaid = true;
+        this.log("fleet", "company settings unreadable: auto-remit for bills unknown (looking again with the bills)");
+      }
+      return;
+    }
+    const prev = this.autoRemit;
+    this.autoRemit = { on: s.auto_remit_for_bills, reservePence: s.auto_remit_min_reserve_pence };
+    if (prev && prev.on === this.autoRemit.on && prev.reservePence === this.autoRemit.reservePence) return;
+    if (!s.auto_remit_for_bills) {
+      return void this.log(
+        "fleet",
+        "auto-remit for bills is off: a region that can't cover its own bill meets the bailiff. The autopilot keeps every region's floor (home topped up from the others); switching it on (company page) also covers a short bill from the other regions",
+      );
+    }
+    this.log(
+      "fleet",
+      `auto-remit for bills is on: a short bill is topped up from the other regions${s.auto_remit_min_reserve_pence > 0 ? `, keeping ${cr(s.auto_remit_min_reserve_pence)} in each (all-or-nothing: a bill the regions can't cover above that isn't topped up at all)` : ""}`,
+    );
+  }
+
+  /**
+   * Upkeep is billed from home every game day (guide 3.9) and nothing else refills it: home is topped up to its
+   * floor from the other regions' spare (ensureCash with nothing to spend remits just the shortfall). Never while
+   * paused or stopping, never dipping into a floor (not essential), under the cash lock so no stores purchase
+   * is mid-way.
+   */
+  private async keepHomeFloor(): Promise<void> {
+    const home = this.homeRegion;
+    if (!home || !this.canRemit) return;
+    await this.withCash(async () => {
+      if (this.paused || this.stopRequested) return;
+      await this.ensureCash(home, 0);
+    }).catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      this.log("fleet", `topping ${home} up to its floor failed: ${(e as Error).message}`);
+    });
   }
 
   withCash<T>(fn: () => Promise<T>): Promise<T> {
@@ -2320,40 +3181,63 @@ export class FleetManager implements FleetHost {
     return run;
   }
 
-  /** Cash spendable in a region after its floor, remitted from other regions if short. `fresh`: the vaults were just read. */
-  async ensureCash(region: BankingRegion, amount: number, fresh = false): Promise<number> {
+  /**
+   * Cash spendable in a region after its floor, remitted from other regions if short. `fresh`: the vaults
+   * were just read. `essential` (stores to sail safely): when still short, it may dip into the floor.
+   */
+  async ensureCash(region: BankingRegion, amount: number, opts: { fresh?: boolean; essential?: boolean } = {}): Promise<number> {
     const w = this.world;
-    if (!fresh) await w.refreshVaults();
+    if (!opts.fresh) await w.refreshVaults();
     let have = w.vault(region) - this.floorIn(region);
-    if (have >= amount || !this.canRemit) return Math.max(0, have);
-
-    // Pull the shortfall from the cheapest corridor first, paying the ACH fee.
-    const donors = [...w.vaults.entries()]
-      .filter(([r]) => r !== region)
-      .map(([r, v]) => ({ r, spare: v - this.floorIn(r) }))
-      .filter((d) => d.spare > 0)
-      .sort((a, b) => w.remitBps(a.r, region) - w.remitBps(b.r, region) || b.spare - a.spare);
-    for (const d of donors) {
-      const fee = w.remitBps(d.r, region) / 10_000;
-      const gross = Math.min(d.spare, Math.max(Math.ceil((amount - have) / (1 - fee)) + 100, 1_000));
-      if (gross <= 0) continue;
-      try {
-        const res = await this.client.remit(d.r, region, gross);
-        this.log("fleet", `moved ${cr(res.net_credited_pence)} ${d.r} → ${region} (fee ${cr(res.fee_pence)})`);
-        await w.refreshVaults();
+    if (have < amount && this.canRemit) {
+      // Pull the shortfall from the cheapest corridor first, paying the ACH fee. Each donor's spare is worked
+      // out from the vaults as read after the remit before it.
+      const asked = new Set<BankingRegion>();
+      for (;;) {
+        const d = [...w.vaults.entries()]
+          .filter(([r]) => r !== region && !asked.has(r))
+          .map(([r, v]) => ({ r, spare: v - this.floorIn(r) }))
+          .filter((x) => x.spare > 0)
+          .sort((a, b) => w.remitBps(a.r, region) - w.remitBps(b.r, region) || b.spare - a.spare)[0];
+        if (!d) break;
+        asked.add(d.r);
+        const fee = w.remitBps(d.r, region) / 10_000;
+        const gross = Math.min(d.spare, Math.max(Math.ceil((amount - have) / (1 - fee)) + 100, 1_000));
+        if (gross <= 0) continue;
+        let failed: unknown = null;
+        try {
+          const res = await this.client.remit(d.r, region, gross);
+          this.log("fleet", `moved ${cr(res.net_credited_pence)} ${d.r} → ${region} (fee ${cr(res.fee_pence)})`);
+          // Booked at once, in case the read below fails.
+          w.vaults.set(d.r, w.vault(d.r) - res.gross_amount_pence);
+          w.vaults.set(region, w.vault(region) + res.net_credited_pence);
+        } catch (e) {
+          if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+          this.log("fleet", `remit ${d.r} → ${region} failed: ${(e as Error).message}`);
+          failed = e;
+        }
+        await w.refreshVaults().catch((e) => {
+          if (this.isFatal(e)) throw e;
+        });
         have = w.vault(region) - this.floorIn(region);
         if (have >= amount) break;
-      } catch (e) {
-        if (this.isFatal(e)) throw e;
-        this.log("fleet", `remit ${d.r} → ${region} failed: ${(e as Error).message}`);
+        // It may have gone through: don't stack another remit on it; the caller asks again next tick.
+        if (failed !== null && outcomeUnknown(failed)) break;
       }
+    }
+    if (have < amount && opts.essential) {
+      // Stores to sail safely are what the floor is kept for: they may use it, down to a day's upkeep at
+      // home and a day's warehouse rent anywhere.
+      const keep = (region === this.homeRegion ? Math.min(this.homeFloor(), Math.ceil(this.upkeepPerDay())) : 0) + Math.ceil(this.bills.rent.get(region) ?? 0);
+      return Math.max(0, w.vault(region) - keep);
     }
     return Math.max(0, have);
   }
 
   private spareCash(): number {
     let n = 0;
-    for (const [r, v] of this.world.vaults) n += Math.max(0, v - this.floorIn(r));
+    // A region in debt (dues it couldn't cover) is swept from the others: it counts against them.
+    for (const [r, v] of this.world.vaults) n += v < 0 ? v : Math.max(0, v - this.floorIn(r));
     return n;
   }
 
@@ -2380,15 +3264,19 @@ export class FleetManager implements FleetHost {
     }
     const share = this.settings.resizeLoads ? this.settings.cashDuePct / 100 : 0;
     if (share > 0) {
+      // Paid where each passage ends; freight collateral back to the region it was escrowed from.
       const due = [...this.agents.values()]
         .filter((a) => a !== except && !a.gone)
         .map((a) => a.proceedsAboard())
         .filter((p): p is NonNullable<typeof p> => p !== null)
+        .flatMap((p) => [{ at: p.at, region: w.region(p.dest), pence: p.pence }, ...p.back.map((b) => ({ at: p.at, region: b.region, pence: b.pence }))])
+        .filter((p) => p.pence > 0)
         .sort((x, y) => x.at - y.at);
       const short = new Map<BankingRegion, number>();
       for (const p of due) {
-        const region = w.region(p.dest);
-        const gap = short.get(region) ?? Math.max(0, this.floorIn(region) - w.vault(region));
+        const region = p.region;
+        // A vault in debt already counts against the spare cash (spareCash): only the floor is refilled here.
+        const gap = short.get(region) ?? Math.max(0, this.floorIn(region) - Math.max(0, w.vault(region)));
         const pence = Math.round(p.pence * share);
         short.set(region, Math.max(0, gap - pence));
         // Never "now": at the buy only cash in hand counts.
@@ -2428,7 +3316,7 @@ export class FleetManager implements FleetHost {
     // First call on its own plan's cash in hand (ownCall); beyond that never what our other ships' loads count on.
     const budget = Math.max(this.cashAt(this.cashFlows(agent), this.world.now(), region, spare), Math.min(this.ownCall(agent), spare));
     if (budget <= 0) return 0;
-    return Math.min(budget, await this.ensureCash(region, Math.min(amount, budget), true));
+    return Math.min(budget, await this.ensureCash(region, Math.min(amount, budget), { fresh: true }));
   }
 
   private cashReport(): CashReport {
@@ -2441,6 +3329,13 @@ export class FleetManager implements FleetHost {
       duePence: Math.round(due.reduce((n, f) => n + f.pence, 0)),
       dueNextAt: due[0]?.at ?? null,
       resized: { ...this.resized },
+      bills: {
+        upkeepPerDay: Math.round(this.upkeepPerDay()),
+        rent: [...this.bills.rent].filter(([, p]) => p > 0),
+        homeFloor: this.homeRegion ? this.floorIn(this.homeRegion) : this.homeFloor(),
+        measuredAt: this.bills.at,
+      },
+      autoRemit: this.autoRemit ? { ...this.autoRemit } : null,
     };
   }
 
@@ -2498,13 +3393,18 @@ export class FleetManager implements FleetHost {
       const s = a.last?.ship;
       if (s && s.status !== "sailing" && s.current_port_id) ports.add(s.current_port_id);
     }
-    for (const p of await client.factors().catch(() => [] as string[])) ports.add(p);
+    const factors = await client.factors().catch(() => null);
+    if (factors) {
+      this.factorCount = factors.length;
+      this.factorPorts = factors;
+    }
+    for (const p of factors ?? []) ports.add(p);
     const intel = settings.rivalIntel;
     const [details, policies, forming, sailing, board] = await Promise.all([
       Promise.all([...ports].map((p) => client.port(p).catch(() => null))),
       intel ? client.policies({ limit: 200 }).catch(() => null) : null,
-      intel ? client.convoys({ status: "forming", limit: 50 }).catch(() => null) : null,
-      intel ? client.convoys({ status: "sailing", limit: 50 }).catch(() => null) : null,
+      intel ? client.convoyPages({ status: "forming" }).then((x) => x.items, () => null) : null,
+      intel ? client.convoyPages({ status: "sailing" }).then((x) => x.items, () => null) : null,
       intel && Date.now() >= this.nextLeaderboardAt ? client.leaderboard().catch(() => null) : null,
     ]);
     for (const d of details) if (d) world.observeGossip(d);
@@ -2581,12 +3481,18 @@ export class FleetManager implements FleetHost {
     const analysis = this.rivalAnalysis;
     if (!analysis) return;
     const now = world.now();
-    const [zones, ours] = await Promise.all([client.zones(), this.recentMarques(now)]);
-    const spent = ours.filter((m) => now - Date.parse(m.created_at) < 24 * 3_600_000).reduce((n, m) => n + m.cost_pence, 0);
+    const [zones, ours, patrols] = await Promise.all([client.zones(), this.recentMarques(now), this.recentPatrols(now)]);
+    this.zoneStatus = { at: Date.now(), zones };
+    this.ownNaval = { at: Date.now(), marques: ours, patrols };
+    // One budget for the marques and the AI's patrols alike.
+    const day = (x: { created_at: string }) => now - Date.parse(x.created_at) < 24 * 3_600_000;
+    const patrolSpent = patrols.filter(day).reduce((n, p) => n + p.cost_pence, 0);
+    const spent = ours.filter(day).reduce((n, m) => n + m.cost_pence, 0) + patrolSpent;
     const prize = ours.reduce((n, m) => n + m.prize_earned_pence, 0);
     const active = new Set(ours.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
     const traffic = analysis.zones;
     const own = await this.ownExposure();
+    this.ownExposureSeen = own;
 
     // Marques are sized to what the budget has left (a game day of it), not refused for being big.
     const days = MARQUE_GAME_HOURS / 24;
@@ -2621,6 +3527,7 @@ export class FleetManager implements FleetHost {
     // Our own exposure is only known once every ship has reported in.
     const unready = [...this.agents.values()].some((a) => !a.last);
     if (pick && !settings.marques) action = `off: would sponsor ${pick.best.bps} bps in ${pick.zone} for ${cr(cost)} (~${cr(pick.best.profit)} a game day)`;
+    else if (pick && world.seasonMode() !== "normal") action = `the season ends in ~${Math.round(world.seasonLeftMs() / 3_600_000)} h: no new marques`;
     else if (pick && unready) action = "waiting for every ship to report before weighing our own losses";
     else if (pick && (maxBps < 50 || spent + cost > settings.marqueBudgetPence)) action = `budget: ${cr(spent)} of ${cr(settings.marqueBudgetPence)} spent in the last 24 h`;
     else if (pick) {
@@ -2655,10 +3562,142 @@ export class FleetManager implements FleetHost {
       enabled: settings.marques,
       budgetPence: settings.marqueBudgetPence,
       spentPence: spent,
+      patrolSpentPence: patrolSpent,
       prizePence: prize,
       zones: rows,
       action,
     };
+  }
+
+  /** Our patrols, paged back like our marques. */
+  private async recentPatrols(now: number): Promise<NavalPatrol[]> {
+    const out: NavalPatrol[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const batch = await this.client.patrols({ cursor, limit: 200 });
+      out.push(...batch);
+      if (batch.length < 200 || batch.some((p) => now - Date.parse(p.created_at) > 24 * 3_600_000)) break;
+      cursor = batch[batch.length - 1].id;
+    }
+    return out;
+  }
+
+  /**
+   * The AI's marques and patrols (live only). Each is checked against its zone (open, that side under its cap),
+   * the season, the horizon left (the term is cut to it) and what the marque budget has left over the last 24 h
+   * (our marques and patrols together), then issued under the cash lock from spare cash after the fleet's loads,
+   * never by remitting. It is saved as being sent before the call; one whose call had no answer is never sent
+   * again, only looked for among ours (and taken as not issued once AI_NAVAL_SETTLE_MS has passed).
+   */
+  private async runAiNaval(): Promise<void> {
+    this.navalBusy = true;
+    try {
+      const { world, client } = this;
+      const now = world.now();
+      const [zones, marques, patrols] = await Promise.all([client.zones(), this.recentMarques(now), this.recentPatrols(now)]);
+      this.zoneStatus = { at: Date.now(), zones };
+      this.ownNaval = { at: Date.now(), marques, patrols };
+      let spent = this.navalSpent() ?? 0;
+      const claimed = new Set<string>();
+      for (const o of this.advisor.pendingNaval()) {
+        const label = `AI ${o.kind} (${o.bps} bps in ${o.zone})`;
+        if (o.status === "unknown") {
+          const sent = o.sentAt ?? 0;
+          const ours =
+            o.kind === "marque"
+              ? marques.map((m) => ({ id: m.id, zone: m.sea_zone_id, bps: m.added_piracy_bps, at: Date.parse(m.created_at), cost: m.cost_pence }))
+              : patrols.map((p) => ({ id: p.id, zone: p.sea_zone_id, bps: p.suppressed_piracy_bps, at: Date.parse(p.created_at), cost: p.cost_pence }));
+          const hit = ours.find((x) => x.zone === o.zone && x.bps === o.bps && x.at >= sent - 60_000 && !claimed.has(x.id));
+          if (hit) {
+            claimed.add(hit.id);
+            this.advisor.noteNaval(o.id, { status: "issued", issuedId: hit.id, costPence: hit.cost });
+            this.log("fleet", `${label}: it was issued after all (${cr(hit.cost)})`);
+          } else if (world.now() - sent > AI_NAVAL_SETTLE_MS) {
+            this.advisor.noteNaval(o.id, { status: "refused", code: "unknown_outcome" });
+            this.log("fleet", `${label}: not among ours ${Math.round(AI_NAVAL_SETTLE_MS / 60_000)} min after a call with no answer: taken as not issued (not sent again)`);
+          }
+          continue;
+        }
+        const refuse = (code: OrderCode, why: string) => {
+          this.advisor.noteNaval(o.id, { status: "refused", code, note: why });
+          this.log("fleet", `${label} refused: ${why}`);
+        };
+        const z = zones.find((x) => x.sea_zone_id === o.zone);
+        // The term never outlives the advice that asked for it.
+        const hours = Math.min(o.gameHours, Math.floor(((this.advisor.inForceUntil() ?? 0) - Date.now()) / (60 * world.gameMinuteMs)));
+        const cost = navalCost(o.bps, hours);
+        const side = !z ? 0 : o.kind === "marque" ? z.marque_piracy_bps : z.patrol_suppression_bps;
+        if (world.seasonMode() !== "normal") refuse("season", "the season is about to end");
+        else if (!z || z.phase > world.unlockedPhase) refuse("zone", "the zone isn't open");
+        else if (side + o.bps > ZONE_MARQUE_CAP) refuse("cap", `the zone's ${o.kind}s are at ${side} of ${ZONE_MARQUE_CAP} bps`);
+        else if (hours < NAVAL_TERM_MIN_H) this.advisor.noteNaval(o.id, { status: "lapsed", code: "horizon" });
+        else if (spent + cost > this.settings.marqueBudgetPence) refuse("budget", `${cr(spent)} of the ${cr(this.settings.marqueBudgetPence)} budget spent in the last 24 h`);
+        else spent += await this.issueNaval(o, hours, cost, label);
+      }
+    } finally {
+      this.navalBusy = false;
+    }
+  }
+
+  /** Sends one AI marque or patrol under the cash lock; returns what it spent (or may have: an unanswered call counts). */
+  private async issueNaval(o: NavalOrder, hours: number, cost: number, label: string): Promise<number> {
+    const { world, client } = this;
+    return this.withCash(async () => {
+      // Anything may have changed while waiting for the lock (or the vaults below): the advice (superseded, cleared,
+      // switched to shadow or off, the tripwire), a stop.
+      const live = () => !this.stopRequested && this.advisor.pendingNaval().some((x) => x.id === o.id && x.status === "pending");
+      if (!live()) return 0;
+      const wait = (why: string) => {
+        this.advisor.noteNaval(o.id, { status: "pending", code: "cash" });
+        this.logOnceFor(`naval|${o.id}|cash`, "fleet", `${label}: waiting, ${why}`);
+        return 0;
+      };
+      // Only spare money: never what the fleet's loads need, never by remitting.
+      if ([...this.agents.values()].some((a) => a.waitingForCash)) return wait("a ship is waiting for cash");
+      await world.refreshVaults();
+      if (!live()) return 0;
+      const home = this.homeRegion ?? "channel";
+      let committed = 0;
+      for (const a of this.agents.values()) committed += this.committedBy(a);
+      if (this.spareCash() - committed < cost || world.vault(home) - this.floorIn(home) < cost) return wait(`no spare ${cr(cost)} at home after the fleet's loads`);
+      // Saved, and written, before the call: after a crash it is never sent twice.
+      this.advisor.noteNaval(o.id, { status: "issuing", sentAt: world.now(), gameHours: hours, costPence: cost, code: undefined });
+      await this.journal?.flush();
+      try {
+        let id: string;
+        let paid: number;
+        let region: BankingRegion = home;
+        if (o.kind === "marque") {
+          const m = await client.issueMarque({ sea_zone_id: o.zone, added_piracy_bps: o.bps, duration_game_hours: hours });
+          [id, paid, region] = [m.id, m.cost_pence, m.banking_region ?? home];
+        } else {
+          const p = await client.fundPatrol({ sea_zone_id: o.zone, suppressed_piracy_bps: o.bps, duration_game_hours: hours });
+          [id, paid] = [p.id, p.cost_pence];
+        }
+        world.vaults.set(region, world.vault(region) - paid);
+        this.advisor.noteNaval(o.id, { status: "issued", issuedId: id, costPence: paid });
+        // Zone piracy (and so lanes and refits) changed.
+        this.worldDirty = true;
+        this.log("fleet", `${label}: issued for ${hours} game h, ${cr(paid)} (it runs its term; it can't be withdrawn)`);
+        return paid;
+      } catch (e) {
+        if (this.isFatal(e)) throw e;
+        if (isApiError(e, "world_paused") || (isApiError(e) && e.status === 429 && !outcomeUnknown(e))) {
+          // Not done: tried again later.
+          this.advisor.noteNaval(o.id, { status: "pending", code: "server" });
+          if (isApiError(e, "world_paused")) throw e;
+          return 0;
+        }
+        if (outcomeUnknown(e)) {
+          this.advisor.noteNaval(o.id, { status: "unknown", code: "unknown_outcome", note: (e as Error).message });
+          this.log("fleet", `${label}: no answer (${(e as Error).message}); never sent again, looked for among ours`);
+          return cost;
+        }
+        this.advisor.noteNaval(o.id, { status: "refused", code: "server", note: (e as Error).message });
+        this.log("fleet", `${label} refused by the game: ${(e as Error).message}`);
+        return 0;
+      }
+    });
   }
 
   /** Our marques, paged back until one is older than a real day (enough for the spending window). */
@@ -2683,13 +3722,22 @@ export class FleetManager implements FleetHost {
   private async runUnderwriting(): Promise<void> {
     const { world, client, settings } = this;
     if (!world.companyId) return;
-    const [open, active, held, vaults] = await Promise.all([
+    const [open, active, heldPages, vaults] = await Promise.all([
       client.policies({ status: "open", limit: 200 }),
       client.policies({ status: "active", limit: 200 }),
-      // Slices any of our companies wrote, whatever their status: that cover says nothing about Lloyd's.
-      Promise.all([...this.ourCompanyIds].map((id) => client.policies({ underwriter_company_id: id, limit: 200 }))).then((x) => x.flat()),
+      // Slices any of our companies hold on a live policy: that cover says nothing about Lloyd's. Open before
+      // active, so one setting sail meanwhile is still in one of them; every page, or nothing is written below.
+      Promise.all(
+        [...this.ourCompanyIds].map(async (id) => [
+          await client.policyPages({ underwriter_company_id: id, status: "open" }),
+          await client.policyPages({ underwriter_company_id: id, status: "active" }),
+        ]),
+      ).then((x) => x.flat()),
       client.vaults(),
     ]);
+    const held = heldPages.flatMap((x) => x.items);
+    // A slice of ours missed would read as Lloyd's own cover (and so as vetted): fail closed.
+    const heldComplete = heldPages.every((x) => x.complete);
     const locked = vaults.vaults.filter((v) => v.account_type === "escrow").reduce((n, v) => n + Math.max(0, v.balance_pence), 0);
     // The same lists are the public record of other companies' voyages: rival intel at no extra call.
     if (settings.rivalIntel) {
@@ -2713,7 +3761,9 @@ export class FleetManager implements FleetHost {
     const toWrite = rows.filter((r) => r.verdict === "write");
     let action = toWrite.length === 0 ? "nothing to write" : `off: would write ${toWrite.length} slice${toWrite.length === 1 ? "" : "s"}`;
     let lockedNow = locked;
-    if (settings.underwrite && toWrite.length > 0) {
+    if (settings.underwrite && toWrite.length > 0 && !heldComplete) {
+      action = `not writing this round: our own slices are too many to list in full (would write ${toWrite.length})`;
+    } else if (settings.underwrite && toWrite.length > 0) {
       let written = 0;
       for (const r of toWrite) {
         const ok = await this.withCash(async () => {
@@ -2885,19 +3935,27 @@ export class FleetManager implements FleetHost {
     const region = world.region(yard);
     const hired = await this.withCash(async () => {
       if (this.stopRequested || !this.settings.yardFactor) return false;
+      // Guide 3.9: at most 12 factors (the count from every factors read, ±1 on a hire or dismissal).
+      if (this.factorCount >= MAX_FACTORS) {
+        this.logOnceFor(`factor-cap|${this.factorCount}`, "fleet", `not hiring a factor at ${yard}: the company already has ${this.factorCount} (the most allowed is ${MAX_FACTORS})`);
+        return false;
+      }
       const cash = await this.ensureCash(region, FACTOR_FEE_PENCE);
       if (cash < FACTOR_FEE_PENCE) return false;
       try {
         await this.client.hireFactor(yard);
         world.vaults.set(region, world.vault(region) - FACTOR_FEE_PENCE);
+        this.factorCount++;
         return true;
       } catch (e) {
-        if (this.isFatal(e)) throw e;
+        // Paused: refused (nothing hired), not an outcome to look into or back off from.
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
         this.log("fleet", `hiring a factor at ${yard} failed: ${(e as Error).message}`);
         // Outcome unknown (network, 5xx): if the hire went through after all, it is ours to dismiss.
-        if (!isApiError(e) || e.status >= 500) {
-          const now = await this.client.factors().catch(() => [] as string[]);
-          if (now.includes(yard)) {
+        if (outcomeUnknown(e)) {
+          const now = await this.client.factors().catch(() => null);
+          if (now) this.factorCount = now.length;
+          if (now?.includes(yard)) {
             this.tempFactors.add(yard);
             this.persist(true);
           }
@@ -2928,6 +3986,7 @@ export class FleetManager implements FleetHost {
       try {
         await this.client.dismissFactor(yard);
         this.tempFactors.delete(yard);
+        this.factorCount = Math.max(0, this.factorCount - 1);
         this.persist(true);
         this.log("fleet", `dismissed the factor at ${yard}`);
       } catch (e) {
@@ -2944,15 +4003,18 @@ export class FleetManager implements FleetHost {
     await this.runBuyer([port]);
   }
 
-  /** One buyer pass at a time; `yards` null means every yard where we have presence. */
+  /** One buyer pass at a time; `yards` null means every yard where we have presence. An AI build order runs it as a one-off autoBuy. */
   private async runBuyer(yards: string[] | null): Promise<void> {
-    if (this.stopRequested || !this.settings.autoBuy || this.buying || Date.now() - this.lastBuy < BUY_COOLDOWN_MS) return;
+    const order = this.advisor.buildOrder();
+    if (order && !this.canBuild) this.noteBuild("refused", "scope", "the key lacks infra_manage");
+    if (this.stopRequested || (!this.settings.autoBuy && !(order && this.canBuild)) || this.buying || Date.now() - this.lastBuy < BUY_COOLDOWN_MS) return;
     this.lastBuyCheck = Date.now();
     this.buying = true;
     try {
       await this.considerPurchase(yards);
     } catch (e) {
-      if (this.isFatal(e)) throw e;
+      // A paused world goes to the caller, which waits on the clock (not a failed check).
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
       this.setBuyer(`last check failed: ${(e as Error).message}`, true);
     } finally {
       this.buying = false;
@@ -2962,6 +4024,14 @@ export class FleetManager implements FleetHost {
   private setBuyer(text: string, log = false): void {
     if (log && text !== this.buyer) this.log("fleet", `buyer: ${text}`);
     this.buyer = text;
+  }
+
+  /** What became of the AI's build order, logged once per change. */
+  private noteBuild(status: OrderStatus, code?: OrderCode, note?: string, shipId?: string): void {
+    const b = this.advisor.buildOrder();
+    if (b && this.advisor.noteBuild(status, code, note, shipId)) {
+      this.log("fleet", `AI build order (${b.cls} at ${b.yard}): ${status}${code ? ` (${code.replace(/_/g, " ")})` : ""}${note && status !== "done" ? `: ${note}` : ""}`);
+    }
   }
 
   private async considerPurchase(only: string[] | null): Promise<void> {
@@ -2976,12 +4046,27 @@ export class FleetManager implements FleetHost {
 
   private async considerPurchaseNow(only: string[] | null): Promise<void> {
     const { world, settings } = this;
-    if (this.agents.size >= settings.maxShips) return this.setBuyer(`fleet at the ${settings.maxShips}-ship limit`);
+    // The AI's build order: that class at that yard only, once, through every check below; its outcome goes back to it.
+    const order = this.advisor.buildOrder();
+    // Its outcome only while it is still the order in force (a newer one isn't marked with this pass's).
+    const current = () => !!order && this.advisor.buildOrder() === order;
+    const say = (text: string, status?: OrderStatus, code?: OrderCode, log = false) => {
+      if (status && current()) this.noteBuild(status, code, text);
+      this.setBuyer(text, log);
+    };
+    // A build whose outcome is unknown may yet turn up (scanShips): never a second hull on top of it.
+    const pending = this.pendingBuild;
+    if (pending) return say(`watching for the ${pending.cls} "${pending.name}" whose build at ${pending.yard} had no answer`, "waiting", "unknown_outcome");
+    if (this.agents.size >= settings.maxShips) return say(`fleet at the ${settings.maxShips}-ship limit`, "unmet", "fleet_full");
     const aiHold = this.advisor.buyHold();
     if (aiHold) return this.setBuyer(`AI: holding cash (${aiHold.slice(0, 160)})`);
-    const classes = world.catalog.ship_classes.filter((c) => settings.buyClasses.includes(c.id) && c.phase <= world.unlockedPhase);
-    if (classes.length === 0) return this.setBuyer("no allowed hull class can be built in this phase");
-    if ([...this.agents.values()].some((a) => a.waitingForCash)) return this.setBuyer("a ship is waiting for cash to load: not buying");
+    // Season end (guide 3.11): a hull must pay back before it; close to it, none is built (nor a factor hired).
+    const seasonMs = world.seasonLeftMs();
+    if (seasonMs < SEASON_ENDGAME_MS) return say(`the season ends in ~${Math.max(0, Math.round(seasonMs / 3_600_000))} h: no new hulls`, "unmet", "season");
+    const seasonHours = seasonMs / 3_600_000;
+    const classes = world.catalog.ship_classes.filter((c) => (order ? c.id === order.cls : settings.buyClasses.includes(c.id)) && c.phase <= world.unlockedPhase);
+    if (classes.length === 0) return say(order ? `a ${order.cls} can't be built in this phase` : "no allowed hull class can be built in this phase", "refused", "class");
+    if ([...this.agents.values()].some((a) => a.waitingForCash)) return say("a ship is waiting for cash to load: not buying", "waiting", "cash");
 
     await world.refreshVaults();
     // Cash the existing fleet still needs for loads it is bound to buy comes first (loads sized on
@@ -3010,18 +4095,25 @@ export class FleetManager implements FleetHost {
       const factors = await this.client.factors().catch((e) => {
         if (this.isFatal(e)) throw e;
         presenceKnown = false;
-        return [] as string[];
+        return null;
       });
-      for (const p of factors) if (world.port(p)?.has_shipyard && world.isOpen(p)) yards.add(p);
+      if (factors) {
+        this.factorCount = factors.length;
+        this.factorPorts = factors;
+      }
+      for (const p of factors ?? []) if (world.port(p)?.has_shipyard && world.isOpen(p)) yards.add(p);
     }
-    if (spare <= 0) return this.setBuyer(`no spare cash: ${cr(committed)} is committed to loads the fleet is about to buy${chestNote}`);
+    // An order builds at its own yard only.
+    if (order) for (const y of [...yards]) if (y !== order.yard) yards.delete(y);
+    if (spare <= 0) return say(`no spare cash: ${cr(committed)} is committed to loads the fleet is about to buy${chestNote}`, "waiting", "cash");
 
     // No presence at any yard: price a build at the yard nearest the work from the last quotes seen
     // (a factor would be hired for it). With no quotes yet, a factor is hired to get some.
     let factorYard: string | null = null;
     let factorPriced = false;
-    if (yards.size === 0 && !only && settings.yardFactor && presenceKnown && Date.now() >= this.factorBlockedUntil) {
-      const yard = this.factorYard();
+    // At the factor cap (counted from the read above) no factor can be hired for a build.
+    if (yards.size === 0 && !only && settings.yardFactor && presenceKnown && Date.now() >= this.factorBlockedUntil && this.factorCount < MAX_FACTORS) {
+      const yard = order ? order.yard : this.factorYard();
       const known = !!yard && classes.some((c) => this.hullQuotes.has(`${yard}|${c.id}`));
       // Before hiring just to get a quote: the cheapest hull seen at any yard, or a guess.
       const seen = classes.flatMap((c) => [...this.hullQuotes].filter(([k]) => k.endsWith(`|${c.id}`)).map(([, v]) => v));
@@ -3034,7 +4126,9 @@ export class FleetManager implements FleetHost {
         factorYard = yard;
       }
     }
-    if (yards.size === 0 && !factorPriced) return this.setBuyer(`waiting for a ship to call at a shipyard (spare ${cr(spare)} after ${cr(committed)} for loads${chestNote})`);
+    if (yards.size === 0 && !factorPriced) {
+      return say(`waiting for a ship to call at ${order ? order.yard : "a shipyard"} (spare ${cr(spare)} after ${cr(committed)} for loads${chestNote})`, "waiting", "no_presence");
+    }
 
     type Option = { yard: string; cls: string; hull: number; byom: boolean; guns: number; cost: number; payback: number; net: number; lane: Lane; upkeepFloor: number };
     const options: Option[] = [];
@@ -3085,12 +4179,20 @@ export class FleetManager implements FleetHost {
         // Planned with the cash left after building it, so the load it is credited with is one it can buy.
         // Without the AI's lane bias: it may only hold the buyer, never talk it into a ship. Nor is one
         // built for a crisis charter only expected from the news, in its own leg or the onward one.
-        const lane = (await rankLanes(world, this.specForClass(cls.id, guns), yard, this.reservations(), { ...this.planOptions(afterBuy), bias: undefined, noSpeculativeOnward: true })).find((l) => !l.speculative);
+        const planOpts = { ...this.planOptions(afterBuy), bias: undefined, noSpeculativeOnward: true };
+        const best = async (storesTons: number) =>
+          (await rankLanes(world, this.specForClass(cls.id, guns, storesTons), yard, this.reservations(), planOpts)).find((l) => !l.speculative);
+        let lane = await best(FIRST_STORES_GUESS_TONS);
+        // The stores its first lane really takes (a big crew on a long passage needs far more than the guess): when
+        // they leave less room than that load, planned again on the room they leave.
+        const real = lane ? await this.firstStores(cls, guns, lane) : null;
+        const stores = real !== null ? Math.ceil(real) : FIRST_STORES_GUESS_TONS;
+        if (lane && stores > FIRST_STORES_GUESS_TONS && lane.tons > this.specForClass(cls.id, guns, stores).cap) lane = await best(stores);
         if (!lane) {
           notes.push(`${cls.id}@${yard}: no paying lane it could afford`);
           continue;
         }
-        const capacity = Math.max(1, (cls.hold_capacity_tons ?? 40) - 2 * guns - 2);
+        const capacity = Math.max(1, this.specForClass(cls.id, guns, stores).cap);
         if (lane.tons < capacity * 0.3) {
           notes.push(`${cls.id}@${yard}: ${cr(cost)} leaves too little for cargo`);
           continue;
@@ -3099,6 +4201,10 @@ export class FleetManager implements FleetHost {
         const net = lane.profitPerHour - upkeepPerHour;
         if (net <= 0) {
           notes.push(`${cls.id}@${yard}: upkeep eats the profit`);
+          continue;
+        }
+        if (cost / net > seasonHours) {
+          notes.push(`${cls.id}@${yard}: can't pay back before the season ends`);
           continue;
         }
         // The charters it would serve must last, and hold enough tons, to pay the ship back. Expansion
@@ -3130,7 +4236,7 @@ export class FleetManager implements FleetHost {
         // (One-off freight lots don't count as repeatable work.)
         const marketTons = lane.parts.filter((p) => p.kind === "market").reduce((n, p) => n + p.tons, 0);
         const repeats = marketTons >= lane.tons * 0.3;
-        const earnable = Math.min(net * Math.min(settings.maxPaybackHours, hoursLeft), repeats ? Infinity : lane.margin * tonsLeft);
+        const earnable = Math.min(net * Math.min(settings.maxPaybackHours, hoursLeft, seasonHours), repeats ? Infinity : lane.margin * tonsLeft);
         if (earnable < cost) {
           notes.push(`${cls.id}@${yard}: its charters can't pay it back in time`);
           continue;
@@ -3141,31 +4247,35 @@ export class FleetManager implements FleetHost {
     }
 
     options.sort((a, b) => a.payback - b.payback);
+    // For the AI digest: the buyer's own view (an order narrows it to one option).
+    if (!order) this.buyerOptions = options.slice(0, 3).map((o) => ({ cls: o.cls, yard: o.yard, paybackHours: Math.round(o.payback * 10) / 10, costPence: o.cost }));
     const pick = options.find((o) => o.payback <= settings.maxPaybackHours);
     if (!pick) {
       // A factor hired to price builds led to none: don't hire again for a while.
       if (factorYard && !factorPriced) this.factorFailed();
       const best = options[0];
-      return this.setBuyer(
+      return say(
         best
           ? `best option ${best.cls} at ${best.yard} pays back in ${best.payback.toFixed(1)} h (limit ${settings.maxPaybackHours} h)`
           : `nothing affordable pays (${notes.slice(0, 3).join("; ") || `spare ${cr(spare)}`})`,
+        "unmet",
+        best ? "payback" : "no_paying_lane",
         true,
       );
     }
     // Priced without presence: hire the factor now, then the build below quotes it for real.
     if (factorPriced && !(await this.hireTempFactor(pick.yard))) {
-      return this.setBuyer(`a ${pick.cls} at ${pick.yard} would pay back in ${pick.payback.toFixed(1)} h, but no factor could be hired there`, true);
+      return say(`a ${pick.cls} at ${pick.yard} would pay back in ${pick.payback.toFixed(1)} h, but no factor could be hired there`, "waiting", "no_presence", true);
     }
 
     // Name first: the TopStats fetch must not sit between raising the cash and spending it.
-    const name = await pickShipName(new Set([...this.agents.values()].map((a) => a.name)));
+    const name = await pickShipName(new Set([...[...this.agents.values()].map((a) => a.name), ...(this.pendingBuild ? [this.pendingBuild.name] : [])]));
     const region = world.region(pick.yard);
-    const failLater = (why: string) => {
+    const failLater = (why: string, code: OrderCode = "server") => {
       this.lastBuy = Date.now() - BUY_COOLDOWN_MS + BUY_FAIL_COOLDOWN_MS;
       // A factor hired for this build earned nothing: don't hire one again straight away.
       if (pick.yard === factorYard) this.factorFailed();
-      this.setBuyer(why, true);
+      say(why, "unmet", code, true);
       return null;
     };
     // Materials bought for an own-materials build (on top of the build's own charge, the labour),
@@ -3174,6 +4284,9 @@ export class FleetManager implements FleetHost {
     let leaseBefore: number | null = null;
     const built = await this.withCash(async () => {
       if (this.stopRequested) return null;
+      // Withdrawn during the pass (cleared, shadow or off, the tripwire, its horizon, a newer answer), auto-buy switched
+      // off, or a payback limit the AI had raised gone back: nothing is built on what no longer holds.
+      if ((order ? !current() : !this.settings.autoBuy) || pick.payback > this.settings.maxPaybackHours) return null;
       // The quote may be minutes old by now: price it again and re-check what the fleet needs.
       const q = await this.client.shipyardQuote(pick.yard, pick.cls, "turnkey_cash").catch(() => null);
       const own = q && pick.byom ? this.byomPrice(q, pick.yard) : null;
@@ -3189,10 +4302,10 @@ export class FleetManager implements FleetHost {
       let committedNow = 0;
       for (const a of this.agents.values()) committedNow += this.committedBy(a);
       if (this.spareCash() - committedNow - pick.upkeepFloor - chest < price) {
-        return failLater(`after the fleet's loads${chest > 0 ? " and the cash kept for the next phase" : ""} there is no longer ${cr(price)} spare for a ${pick.cls}`);
+        return failLater(`after the fleet's loads${chest > 0 ? " and the cash kept for the next phase" : ""} there is no longer ${cr(price)} spare for a ${pick.cls}`, "cash");
       }
       const cash = await this.ensureCash(region, price);
-      if (cash < price) return failLater(`could not raise ${cr(price)} in ${region} for a ${pick.cls}`);
+      if (cash < price) return failLater(`could not raise ${cr(price)} in ${region} for a ${pick.cls}`, "cash");
       // Own materials: buy what the warehouse here lacks, then build from it.
       let mode: "byom" | "turnkey_cash" = "turnkey_cash";
       if (byom) {
@@ -3211,8 +4324,9 @@ export class FleetManager implements FleetHost {
       try {
         return await this.client.buildShip(pick.yard, name, pick.cls, mode);
       } catch (e) {
-        if (this.isFatal(e)) throw e;
-        if (!isApiError(e) || e.status >= 500 || e.code === "idempotency_request_in_flight") {
+        // Paused: refused, not an outcome to watch for (housekeeping waits on the clock).
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        if (outcomeUnknown(e)) {
           // Unknown outcome: look for the ship a few times before deciding it wasn't built.
           for (let i = 0; i < 3; i++) {
             const ships = await this.client.ships().catch(() => [] as ShipResult[]);
@@ -3232,10 +4346,11 @@ export class FleetManager implements FleetHost {
             leaseBefore,
             payback: pick.payback,
             lane: pick.lane.key,
+            at: world.now(),
           };
           leaseBefore = null;
           this.persist(true);
-          this.setBuyer(`building a ${pick.cls} at ${pick.yard}: outcome unknown (${(e as Error).message}); watching for "${name}"`, true);
+          say(`building a ${pick.cls} at ${pick.yard}: outcome unknown (${(e as Error).message}); watching for "${name}"`, "waiting", "unknown_outcome", true);
           return null;
         }
         // Usually presence lost (the ship sailed) or the price moved past our cash.
@@ -3244,8 +4359,10 @@ export class FleetManager implements FleetHost {
           `building a ${pick.cls} at ${pick.yard} failed: ${(e as Error).message}${mode === "byom" ? "; its materials stay in the warehouse there" : ""}`,
         );
       }
+    }).finally(() => {
+      // Whatever happened (a paused world's refusal thrown included): the lease goes back to what it was.
+      if (leaseBefore !== null) void this.shrinkLease(pick.yard, leaseBefore);
     });
-    if (leaseBefore !== null) void this.shrinkLease(pick.yard, leaseBefore);
     if (!built) return;
 
     this.lastBuy = Date.now();
@@ -3269,6 +4386,7 @@ export class FleetManager implements FleetHost {
       lane: pick.lane.key,
     });
     this.setBuyer(`bought ${pick.cls} "${name}" at ${pick.yard}`);
+    if (current()) this.noteBuild("done", undefined, undefined, built.ship_id);
     await this.scanShips();
   }
 }

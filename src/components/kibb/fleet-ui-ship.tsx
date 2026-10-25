@@ -612,10 +612,12 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
 
 // ── Convoys ───────────────────────────────────────────────────────────────────
 
-export function ConvoysPanel({ r, blocked, onDone }: Props) {
+export function ConvoysPanel({ r, blocked, onDone, policies }: Props & { policies?: S.InsurancePolicy[] }) {
   const { portName } = useCatalog();
   const s = r.ship;
   const port = s.current_port_id ?? "";
+  // Lloyd's may have priced a policy with the consorts: sailing without them can void it (guide 3.4).
+  const insured = (policies ?? []).find((p) => p.status === "open" || p.status === "active");
   const { data: forming, reload } = usePoll(
     port && s.status !== "sailing" ? () => kibbGet<S.ConvoyResult[]>("/v1/fleet/convoys", { port_id: port, status: "forming", limit: 50 }) : null,
     30_000,
@@ -648,7 +650,16 @@ export function ConvoysPanel({ r, blocked, onDone }: Props) {
             />
             {joined?.convoy.status === "forming" && (
               <Button size="sm" variant="outline" disabled={blocked || act.busy}
-                onClick={() => void act.run(() => kibbPost<S.ConvoyMembershipResult>("/v1/fleet/detach-convoy", { convoy_id: s.convoy_id, ship_id: s.id }))}>
+                onClick={() => {
+                  if (
+                    insured &&
+                    !confirm(
+                      `${s.name} holds an ${insured.status} policy to ${portName(insured.dest_port_id)}. If Lloyd's priced it with this convoy's consorts, sailing without them voids it. Leave the convoy anyway?`,
+                    )
+                  )
+                    return;
+                  void act.run(() => kibbPost<S.ConvoyMembershipResult>("/v1/fleet/detach-convoy", { convoy_id: s.convoy_id, ship_id: s.id }));
+                }}>
                 Leave convoy
               </Button>
             )}

@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ErrorNote, KV } from "@/components/kibb/bits";
 import { usePoll } from "@/hooks/use-poll";
-import { DashboardApiError, dash, kibbGet } from "@/lib/kibb/browser";
+import { DashboardApiError, dash, kibbGet, writeFetch } from "@/lib/kibb/browser";
 import { fmtCr } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
 
@@ -22,13 +22,8 @@ export interface InsurableValue {
  * carries the cap, which the usual helper drops. The error then states it in Crowns.
  */
 export async function createPolicy(body: S.CreateInsurancePolicyRequest): Promise<S.InsurancePolicy> {
-  const res = await fetch("/api/kibb/v1/insurance/create", {
-    method: "POST",
-    // The proxy adds the idempotency key (crypto.randomUUID needs HTTPS in the browser).
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
+  // One key per request: a retry after a timeout or 5xx replays it rather than listing a second policy.
+  const res = await writeFetch("POST", "/api/kibb/v1/insurance/create", JSON.stringify(body));
   const text = await res.text();
   let data: unknown = null;
   try {

@@ -273,8 +273,8 @@ export const ODDS_UNKNOWN = 0.25;
 const DEFAULT_HOLD_T = 90;
 /** Hourly leaderboard refreshes kept per company. */
 const WORTH_SAMPLES = 48;
-/** A zone's marques are capped at this in total (bps). */
-const ZONE_MARQUE_CAP = 5_000;
+/** A zone's marques are capped at this in total (bps); its patrols too. */
+export const ZONE_MARQUE_CAP = 5_000;
 /** Pirates go for the richest prizes: a cargo worth this (pence) draws the zone's raw piracy; richer more, cheaper less, empty almost none (estimates). */
 const ATTENTION_REF_PENCE = 1_000_000;
 const ATTENTION_MIN = 0.1;
@@ -306,6 +306,11 @@ export class RivalTracker {
   readonly ours = new Set<string>();
   /** Our player's company ids: their policies and convoy ships are not rivals'. */
   readonly ourIds = new Set<string>();
+  /**
+   * This company's own name among `ours` (the autopilot sets it; null: all of `ours` count as one). The others are
+   * our sibling companies: the server counts their deliveries as another company's (observeExpansion).
+   */
+  self: string | null = null;
   private readonly policies = new Map<string, PolicyRec>();
   /** Policies by lane (`from>to`), rebuilt after the list changes: every sighting is matched against it. */
   private byLane: Map<string, PolicyRec[]> | null = null;
@@ -609,7 +614,9 @@ export class RivalTracker {
    * delivered total's growth less our own share of it (`ours`: how much of a charter's growth was our
    * deliveries). Named when exactly one rival's tier contribution grew, by just those tons. Without
    * our own delivery record (the dashboard), or with more of ours on the board than it accounts for
-   * (a restart), an interval we delivered in can't be split.
+   * (a restart), an interval we delivered in can't be split. A sibling company's tons (`self` set) stay
+   * in what is returned, since the server counts them as another company's (they end a stall), but an
+   * interval one delivered in isn't put on the rival record: it can't be split from a rival's by charter.
    */
   observeExpansion(tier: ExpansionTier | null, now: number, ours?: (key: string, delta: number) => number): Map<string, number> {
     const out = new Map<string, number>();
@@ -625,7 +632,10 @@ export class RivalTracker {
     if (!prev || prev.phase !== tier.target_phase || !this.ours.size) return out;
     const growth = (n: string) => Math.max(0, (tons.get(n) ?? 0) - (prev.tons.get(n) ?? 0));
     const grew = [...tons.keys()].filter((n) => !this.ours.has(n) && growth(n) > 0);
-    const ourGrowth = [...this.ours].reduce((n, name) => n + growth(name), 0);
+    // Only this company's own growth is in our delivery record; a sibling's is the server's "another company".
+    const own = (name: string) => this.self === null || name === this.self;
+    const ourGrowth = [...this.ours].filter(own).reduce((n, name) => n + growth(name), 0);
+    const siblingGrowth = [...this.ours].filter((name) => !own(name)).reduce((n, name) => n + growth(name), 0);
     let accounted = 0;
     let rivalSum = 0;
     for (const [key, total] of totals) {
@@ -638,6 +648,7 @@ export class RivalTracker {
       rivalSum += total - before - mine;
     }
     if (ourGrowth > accounted + 0.5) return new Map();
+    if (siblingGrowth > 0.5) return out;
     const named = grew.length === 1 && Math.abs(growth(grew[0]) - rivalSum) <= 0.5 ? grew[0] : null;
     for (const [key, t] of out) {
       const [port, good] = key.split("|");

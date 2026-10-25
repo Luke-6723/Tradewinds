@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server";
 import type { FleetSettings } from "@/lib/kibb/fleet/manager";
 import { aiCommand, FleetSettingsError, getFleetView, updateFleet } from "@/lib/kibb/fleet-registry";
-import { authorizedCompany, unauthorizedResponse } from "@/lib/kibb/server";
+import { authorizedCompany, renewCompanyKeyIfDue, unauthorizedResponse } from "@/lib/kibb/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,6 +18,8 @@ async function company(req: NextRequest): Promise<string | NextResponse> {
 export async function GET(req: NextRequest) {
   const companyId = await company(req);
   if (companyId instanceof NextResponse) return companyId;
+  // Best effort, not waited for: a company key close to expiry is renewed while its owner is signed in (every 10 min at most).
+  void renewCompanyKeyIfDue(req, companyId).catch((e) => console.error(`[fleet] renewing the key of company ${companyId} failed: ${(e as Error).message}`));
   return NextResponse.json(await getFleetView(companyId));
 }
 

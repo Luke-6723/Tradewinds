@@ -2,9 +2,10 @@
  * In-process fleet autopilots, one per company, owned by the Next.js server.
  *
  * The enabled flag and settings persist in the local store, so `resumeFleets()` (called from
- * src/instrumentation.ts at server start) picks up where the last server left off. A lease file
- * (fleet/lease.ts) keeps a second process — another server or the CLI — from running the same
- * company. Changes for one company are serialised. Server-only.
+ * src/instrumentation.ts at server start) picks up where the last server left off. A lease
+ * (fleet/lease.ts: a file, and with MONGODB_URI a database document for other machines) keeps a
+ * second process — another server or the CLI — from running the same company. Changes for one
+ * company are serialised. Server-only.
  */
 
 import {
@@ -16,12 +17,18 @@ import {
   type FleetState,
 } from "./fleet/manager";
 import { KIBB_URL } from "./server";
-import { getCompanyKey, getStoredFleet, listStoredFleets, saveStoredFleet, STORE_DIR } from "./store";
+import { getCompanyKey, getStoredFleet, listCompanyKeys, listStoredFleets, saveStoredFleet, STORE_DIR } from "./store";
 
 // globalThis keeps one registry across Next.js HMR and route bundles.
-const g = globalThis as { __kibbFleets?: Map<string, FleetManager>; __kibbFleetLocks?: Map<string, Promise<unknown>> };
+const g = globalThis as {
+  __kibbFleets?: Map<string, FleetManager>;
+  __kibbFleetLocks?: Map<string, Promise<unknown>>;
+  __kibbResumeErrors?: Map<string, { at: string; error: string }>;
+};
 const fleets = (g.__kibbFleets ??= new Map<string, FleetManager>());
 const locks = (g.__kibbFleetLocks ??= new Map<string, Promise<unknown>>());
+/** Why an enabled autopilot couldn't be resumed at server start, until one is started for the company. */
+const resumeErrors = (g.__kibbResumeErrors ??= new Map<string, { at: string; error: string }>());
 
 export { FleetSettingsError };
 
@@ -29,6 +36,10 @@ export interface FleetView {
   enabled: boolean;
   settings: FleetSettings;
   state: FleetState | null;
+  /** When the stored company key expires (null: never, or none stored): shown even while the autopilot is stopped. */
+  keyExpiresAt: string | null;
+  /** The autopilot was enabled but couldn't be resumed when the server started. */
+  resumeError: { at: string; error: string } | null;
 }
 
 /** Runs `fn` after any earlier change for this company has finished. */
@@ -70,6 +81,7 @@ async function start(companyId: string, settings: FleetSettings): Promise<void> 
   );
   fleets.set(companyId, manager);
   manager.start();
+  resumeErrors.delete(companyId);
 }
 
 function isActive(m: FleetManager | undefined): boolean {
@@ -79,10 +91,13 @@ function isActive(m: FleetManager | undefined): boolean {
 
 export async function getFleetView(companyId: string): Promise<FleetView> {
   const stored = await getStoredFleet(companyId);
+  const key = (await listCompanyKeys()).find((k) => k.companyId === companyId);
   return {
     enabled: stored?.enabled ?? false,
     settings: await settingsFor(companyId),
     state: fleets.get(companyId)?.state ?? null,
+    keyExpiresAt: key?.expiresAt ?? null,
+    resumeError: resumeErrors.get(companyId) ?? null,
   };
 }
 
@@ -134,14 +149,24 @@ export function aiCommand(companyId: string, cmd: "run" | "clear" | "retry"): Pr
 }
 
 /**
- * Restarts the autopilot on the company's newest stored key (called after a key is minted): a
- * running one, or an enabled one that failed (typically on the old key's 401).
+ * Puts the autopilot on the company's newest stored key (called after a key is minted): a running one
+ * switches to it without a restart; an enabled one that failed (typically on the old key's 401), or that
+ * couldn't be resumed at server start, starts again on it.
  */
 export function refreshFleetKey(companyId: string): Promise<void> {
   return serial(companyId, async () => {
     const m = fleets.get(companyId);
+    const key = await getCompanyKey(companyId);
+    if (m && isActive(m) && key) {
+      try {
+        await m.useApiKey(key.apiKey);
+        return;
+      } catch (e) {
+        console.error(`[fleet] company ${companyId}: switching to the new key failed (${(e as Error).message}); restarting on it`);
+      }
+    }
     const enabled = (await getStoredFleet(companyId))?.enabled ?? false;
-    if (!isActive(m) && !(enabled && m?.state.status === "failed")) return;
+    if (!isActive(m) && !(enabled && (m?.state.status === "failed" || (!m && resumeErrors.has(companyId))))) return;
     await start(companyId, await settingsFor(companyId));
   });
 }
@@ -181,6 +206,8 @@ export async function resumeFleets(): Promise<void> {
         console.log(`[fleet] resumed autopilot for company ${f.companyId}`);
       } catch (e) {
         console.error(`[fleet] could not resume autopilot for company ${f.companyId}: ${(e as Error).message}`);
+        // Shown on the panel until it is started again.
+        resumeErrors.set(f.companyId, { at: new Date().toISOString(), error: (e as Error).message });
       }
     });
   }

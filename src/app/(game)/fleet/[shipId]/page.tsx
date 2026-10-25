@@ -312,7 +312,7 @@ export default function ShipPage() {
 
       <div className="grid items-start gap-4 lg:grid-cols-2">
         <InsurancePanel r={r} blocked={blocked} onDone={done} policies={policies} reload={() => void reloadPolicies()} />
-        <ConvoysPanel r={r} blocked={blocked} onDone={done} />
+        <ConvoysPanel r={r} blocked={blocked} onDone={done} policies={policies} />
       </div>
     </div>
   );

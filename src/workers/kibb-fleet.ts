@@ -3,7 +3,11 @@
  * The dashboard runs the same autopilot in-process; don't run both for one company.
  *
  * Env (e.g. in .env.local):
- *   KIBB_API_KEY          company-bound key (log in with company_id set)   — required
+ *   KIBB_API_KEY          company-bound key (log in with company_id set)   — required. A login key lasts 24 h
+ *                         unless you pass ttl_seconds (up to 31536000, a year); a sub-key minted with a Bearer key
+ *                         can't outlive that key; create-key with handle + passphrase and no ttl_seconds never
+ *                         expires. The autopilot stops when the key expires, and warns from whoami.expires_at at
+ *                         7 days, 1 day and 1 hour left: mint a new key and restart before then.
  *   KIBB_API_URL          default https://tradewinds.kibb.io
  *   KIBB_AUTO_BUY=0       don't build ships
  *   KIBB_MAX_SHIPS        fleet size cap (default 8)
@@ -25,7 +29,11 @@
  *   KIBB_RESIZE=0         don't size each load again at its source (and spend as before)
  *   KIBB_CASH_DUE         % of the cash our ships at sea are due to be paid that loads may count on (default 60; 0: cash in hand only)
  *   KIBB_WORLD_EVENTS=0   don't plan on world events' prices or on crisis charters not yet listed
- *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY
+ *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY. Live it may set any
+ *                         setting but its own within your ceilings (KIBB_MAX_SHIPS and the marque and underwriting budgets
+ *                         never exceeded, KIBB_RESERVE_CR only raised), ban ports/zones/goods/charters, order single ships,
+ *                         order one build, and issue marques or patrols within the marque budget (1,000 Cr in 24 h by
+ *                         default; an issued one can't be withdrawn); every order and its outcome is logged
  *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 2)
  *   KIBB_AI_MODEL         claude-opus-5-5 (default) | claude-sonnet-5-5
  *   KIBB_AI_EFFORT        low (default) | medium | high

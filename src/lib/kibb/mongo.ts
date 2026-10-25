@@ -24,6 +24,27 @@ function dbName(uri: string): string {
   return name || process.env.MONGODB_DB || "tradewinds";
 }
 
+/**
+ * Runs `op` on the database, rejecting when it hasn't finished within `ms` (connecting included), so a hung
+ * connection never holds the caller up; rejects too when no URI is configured. What `op` sent may still land later.
+ */
+export async function mongoWithin<T>(ms: number, op: (db: Db) => Promise<T>): Promise<T> {
+  const db = mongoDb();
+  if (!db) throw new Error("no database configured");
+  const run = db.then(op);
+  // A late failure, after the time ran out, is nobody's to handle.
+  run.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`no answer from the database in ${Math.round(ms / 1000)} s`)), ms);
+  });
+  try {
+    return await Promise.race([run, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** The database, connecting on first use; null when no URI is configured. A failed connect is retried next call. */
 export function mongoDb(): Promise<Db> | null {
   const uri = process.env.MONGODB_URI;

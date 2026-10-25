@@ -1,41 +1,54 @@
 /**
  * The AI advisor: Claude as the fleet's strategist. Every 30 minutes (15 near a phase turnover), and
  * soon after a phase change, a stall escalation, a lost ship or a trip far below its estimate, it
- * reads a digest of the fleet and the world (digest.ts) and answers with directives: temporary
- * setting overrides within limits, a bias on lane ranks, per-charter stall calls, and buy hold.
+ * reads a digest of the fleet and the world (digest.ts) and answers with directives (directives.ts):
+ * any setting but its own for the horizon (within ranges, spend ceilings the user's, the reserve only
+ * raised), bans and a bias on lanes, per-charter stall calls, orders to single ships (a lane, a
+ * charter, a port, hold, release), the buyer (hold, one build, classes forbidden), and marques or
+ * patrols within the marque budget.
  *
  * Off by default. In "shadow" mode it advises and logs but changes nothing; in "live" the directives
- * apply until their horizon lapses. Every check in the autopilot still runs: overrides are clamped,
- * a bias only reorders lanes that already pass, a stall call only works on a posting that is
- * stalled, and the buyer can only be told to hold.
+ * apply until their horizon lapses. Every check in the autopilot still runs: settings are clamped
+ * again wherever they are read, bans and orders go through the planner, loading and sailing as ever
+ * (anything unsafe or impossible is refused and reported back as a status code), a bias only reorders
+ * lanes that already pass, and a stall call only works on a posting that is stalled. An issued
+ * marque or patrol can't be withdrawn: it runs its term (at most the horizon).
  *
  * Safeguards: spend caps per UTC day and in total (a call is skipped if its worst case could pass
- * one), a tripwire that clears the directives if half the fleet sits idle for 20 minutes under them,
- * and auto-demotion to shadow when trips made under its advice earn clearly less than without.
- * Free text never reaches the strategist: notices go through the Haiku screen (screen.ts) first.
+ * one), a tripwire that clears the directives if half the fleet sits idle (or held) for 20 minutes
+ * under them, and auto-demotion to shadow when trips made under its advice earn clearly less than
+ * without. Free text never reaches the strategist: notices go through the Haiku screen (screen.ts)
+ * first, and its orders' outcomes come back as fixed codes.
  */
 
 import { randomUUID } from "node:crypto";
 import type { FleetSettings } from "../fleet/manager";
-import type { Lane } from "../fleet/planner";
+import type { Bans, Lane } from "../fleet/planner";
 import type { World } from "../fleet/world";
 import { mongoDb } from "../mongo";
 import { AI_MODEL_NAMES, callStructured, ClaudeCallError, claudeConfigured, describeError, notBilled, worstCaseUsd, type AiEffort } from "./claude";
+import { ADVICE_SCHEMA, buildDigest, systemPrompt, type Aliases, type DigestInput, type RawAdvice } from "./digest";
 import {
-  ADVICE_SCHEMA,
   BIAS_MAX,
   BIAS_MIN,
-  buildDigest,
-  ENVELOPE,
-  HORIZON_MAX,
-  HORIZON_MIN,
-  MAX_BIASES,
-  MAX_STALL_CALLS,
-  systemPrompt,
-  type Aliases,
-  type DigestInput,
-  type RawAdvice,
-} from "./digest";
+  bansOf,
+  normalizeActive,
+  OVERRIDE_KEYS,
+  sameSetting,
+  validateAnswer,
+  type Active,
+  type BanKind,
+  type BuildOrder,
+  type NavalOrder,
+  type OrderCode,
+  type OrderStatus,
+  type OverrideKey,
+  type OverrideSettings,
+  type ShipOrder,
+  type ShipOrderKind,
+  type StoredActive,
+  type ValidateCtx,
+} from "./directives";
 import { screenEvents, type RawEvent, type ScreenedEvent } from "./screen";
 
 export type AiMode = "off" | "shadow" | "live";
@@ -54,8 +67,8 @@ const MAX_PER_HOUR = 4;
 const STALE_MS = 10 * 60_000;
 /** More than this share of an answer's items invalid: the whole answer is discarded. */
 const MAX_INVALID = 0.3;
-/** Room for the answer (thinking included) by effort: thinking is most of a call's cost. */
-const MAX_TOKENS: Record<AiEffort, number> = { low: 6_000, medium: 10_000, high: 16_000 };
+/** Room for the answer (thinking included) by effort: thinking is most of a call's cost (the worst case reserved follows it). */
+const MAX_TOKENS: Record<AiEffort, number> = { low: 7_500, medium: 11_500, high: 17_500 };
 /** Idle tripwire: this share of the fleet idle under live directives for this long clears them. */
 const TRIPWIRE_IDLE = 0.5;
 const TRIPWIRE_MS = 20 * 60_000;
@@ -68,40 +81,6 @@ const SCREEN_GAP_MS = 60_000;
 const RAW_QUEUE_MAX = 20;
 const EVENTS_KEPT = 20;
 const DECISIONS_KEPT = 20;
-
-type OverrideKey = "bonusWeightPct" | "phaseChestPct" | "minMarginPence" | "holdForRepost";
-type OverrideSettings = Partial<Pick<FleetSettings, OverrideKey>>;
-const OVERRIDE_KEYS: OverrideKey[] = ["bonusWeightPct", "phaseChestPct", "minMarginPence", "holdForRepost"];
-
-interface Bias {
-  match: "dest" | "source" | "good" | "charter" | "lane";
-  /** Port or good id, charter id, or lane key. */
-  ref: string;
-  factor: number;
-  label: string;
-  reason: string;
-}
-
-interface StallCall {
-  /** `port|good` of the expansion charter. */
-  key: string;
-  call: "wait" | "deliver";
-  label: string;
-  reason: string;
-}
-
-/** The directives in force (live mode only). */
-interface Active {
-  decisionId: string;
-  /** Local ms when they lapse. */
-  until: number;
-  settings: OverrideSettings;
-  /** The user's value each override was clamped against: an override lapses once the user changes it. */
-  base?: OverrideSettings;
-  biases: Bias[];
-  stallCalls: StallCall[];
-  buyHold: string | null;
-}
 
 export interface AiDecision {
   id: string;
@@ -116,7 +95,7 @@ export interface AiDecision {
   settings: OverrideSettings;
   biases: Array<{ label: string; factor: number; reason: string }>;
   stallCalls: Array<{ label: string; call: "wait" | "deliver"; reason: string }>;
-  buy: { action: "auto" | "hold"; reason: string };
+  buy: { action: "auto" | "hold" | "build"; reason: string };
   alerts: string[];
   /** Items of the answer dropped as invalid (unknown alias or id, out of scope). */
   dropped: number;
@@ -125,6 +104,16 @@ export interface AiDecision {
   /** Trips finished while it was in force (live), and their profit. */
   trips: number;
   profitPence: number;
+  // Absent on decisions made before these existed.
+  settingReasons?: Partial<Record<OverrideKey, string>>;
+  avoid?: Array<{ kind: BanKind; label: string; reason: string }>;
+  /** Live: kept up to date with what became of each. */
+  shipOrders?: ShipOrder[];
+  build?: BuildOrder | null;
+  forbid?: string[];
+  naval?: NavalOrder[];
+  /** Marques and patrols it issued (pence): they run their term even after it is cleared. */
+  navalSpentPence?: number;
 }
 
 export interface AiReport {
@@ -145,13 +134,17 @@ export interface AiReport {
   avgCostUsd: number | null;
   /** Routine calls skipped because nothing important changed since the last answer. */
   skipped: number;
+  /** Every directive in force, with the reason it was given and (orders) what became of it. */
   active: {
     decisionId: string;
     until: string;
-    settings: OverrideSettings;
-    biases: Array<{ label: string; factor: number }>;
-    stallCalls: Array<{ label: string; call: "wait" | "deliver" }>;
-    buyHold: string | null;
+    settings: Array<{ key: string; from: unknown; to: unknown; reason: string }>;
+    avoid: Array<{ kind: BanKind; label: string; reason: string }>;
+    biases: Array<{ label: string; factor: number; reason: string }>;
+    stallCalls: Array<{ label: string; call: "wait" | "deliver"; reason: string }>;
+    shipOrders: Array<{ shipId: string; order: ShipOrderKind; label: string; status: OrderStatus; code?: OrderCode; note?: string; reason: string }>;
+    buy: { hold: string | null; build: BuildOrder | null; forbid: string[] };
+    naval: NavalOrder[];
   } | null;
   decisions: AiDecision[];
   events: ScreenedEvent[];
@@ -161,7 +154,7 @@ export interface AiReport {
 export interface AdvisorSnapshot {
   spend: { day: string; today: number; total: number };
   decisions: AiDecision[];
-  active: Active | null;
+  active: StoredActive | null;
   demoted: boolean;
   aiTrips: number[];
   baseTrips: number[];
@@ -174,13 +167,15 @@ export interface AdvisorHost {
   readonly world: World;
   /** The user's own settings (without the advisor's overrides). */
   userSettings(): FleetSettings;
-  /** The digest's inputs from the fleet's current state (events and decisions are filled in here). */
-  digestInput(): Omit<DigestInput, "events" | "decisions">;
-  /** Share of the fleet idle for want of a lane. */
+  /** The digest's inputs from the fleet's current state (events, decisions and the directives in force are filled in here). */
+  digestInput(): Omit<DigestInput, "events" | "decisions" | "inForce">;
+  /** What an answer is validated against: the user's settings, the key's scopes, the fleet, the zones, naval spend. */
+  limits(): ValidateCtx;
+  /** Share of the fleet idle for want of a lane, or held by an AI order. */
   idleShare(): number;
   log(msg: string): void;
   persist(now?: boolean): void;
-  /** The overrides, biases or stall calls in force changed: ships may re-plan. */
+  /** The directives in force changed (new, cleared, lapsed in part): settings, world flags, lanes and orders follow. */
   directivesChanged(): void;
   companyId(): string | null;
 }
@@ -188,6 +183,31 @@ export interface AdvisorHost {
 const today = () => new Date().toISOString().slice(0, 10);
 const mean = (xs: number[]) => (xs.length ? xs.reduce((n, x) => n + x, 0) / xs.length : null);
 const cr = (p: number) => `${Math.round(p / 100).toLocaleString("en-GB")} Cr`;
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** One past decision as the digest recalls it: what it did and (status codes only) what became of its orders. */
+function memory(d: AiDecision): string {
+  const orders = d.shipOrders ?? [];
+  const tally = (xs: Array<{ status: string }>) => {
+    const n = new Map<string, number>();
+    for (const x of xs) n.set(x.status, (n.get(x.status) ?? 0) + 1);
+    return [...n].map(([s, k]) => `${k} ${s}`).join(", ");
+  };
+  const naval = d.naval ?? [];
+  return [
+    d.status,
+    Object.keys(d.settings).length ? `settings ${JSON.stringify(d.settings)}` : "",
+    d.biases.length ? plural(d.biases.length, "bias", "biases") : "",
+    d.avoid?.length ? plural(d.avoid.length, "ban") : "",
+    orders.length ? `${plural(orders.length, "ship order")} (${tally(orders)})` : "",
+    d.buy.action === "hold" ? "buy held" : "",
+    d.build ? `build ${d.build.cls}@${d.build.yard} (${d.build.status}${d.build.code ? `: ${d.build.code}` : ""})` : "",
+    d.forbid?.length ? `forbid ${d.forbid.join(" ")}` : "",
+    naval.length ? `naval ${tally(naval)}${d.navalSpentPence ? `, ${cr(d.navalSpentPence)} spent` : ""}` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
 
 export class Advisor {
   private spend = { day: today(), today: 0, total: 0 };
@@ -248,10 +268,12 @@ export class Advisor {
     }
     if (next.aiIntervalMin !== prev.aiIntervalMin && this.lastRunAt) this.nextRunAt = this.lastRunAt + next.aiIntervalMin * 60_000;
     if (next.ai !== "live" && this.active) this.clear("cleared", `AI switched to ${next.ai}`);
-    // The user changed a setting the AI had overridden: theirs wins for the rest of this advice.
+    // The user changed a setting the AI had overridden: theirs wins for the rest of this advice (a
+    // forbidden class list goes with their class list).
     const a = this.active;
-    const gone = a ? OVERRIDE_KEYS.filter((k) => k in a.settings && prev[k] !== next[k]) : [];
-    if (a && gone.length) {
+    const gone = a ? OVERRIDE_KEYS.filter((k) => k in a.settings && !sameSetting(prev[k], next[k])) : [];
+    const forbidGone = !!a && a.forbid.length > 0 && !sameSetting(prev.buyClasses, next.buyClasses);
+    if (a && (gone.length || forbidGone)) {
       const settings = { ...a.settings };
       const base = { ...a.base };
       for (const k of gone) {
@@ -260,6 +282,7 @@ export class Advisor {
       }
       a.settings = settings;
       a.base = base;
+      if (forbidGone) a.forbid = [];
       this.host.directivesChanged();
       this.host.persist(true);
     }
@@ -285,14 +308,17 @@ export class Advisor {
     return Date.now() < this.active.until ? this.active : null;
   }
 
-  /** Setting overrides in force (clamped when applied), or null. One the user has since changed no longer applies. */
+  /**
+   * Setting overrides in force (validated when applied; the manager clamps them again), or null. One the user
+   * has since changed no longer applies.
+   */
   overrides(): OverrideSettings | null {
     const a = this.inForce();
     if (!a) return null;
     const user = this.host.userSettings();
     const out: OverrideSettings = {};
     for (const k of OVERRIDE_KEYS) {
-      if (!(k in a.settings) || !a.base || a.base[k] !== user[k]) continue;
+      if (!(k in a.settings) || !(k in a.base) || !sameSetting(a.base[k], user[k])) continue;
       (out as Record<string, unknown>)[k] = a.settings[k];
     }
     return Object.keys(out).length ? out : null;
@@ -306,6 +332,7 @@ export class Advisor {
   bias(lane: Lane): number {
     const a = this.inForce();
     if (!a) return 1;
+    const w = this.host.world;
     let f = 1;
     for (const b of a.biases) {
       const hit =
@@ -313,12 +340,16 @@ export class Advisor {
           ? lane.dest === b.ref
           : b.match === "source"
             ? lane.source === b.ref
-            : b.match === "good"
-              ? lane.good === b.ref || lane.parts.some((p) => p.good === b.ref)
-              : b.match === "charter"
-                ? // Both sides followed to the posting that now stands for them (it may have re-posted).
-                  lane.fills.some(([id]) => this.host.world.currentId(id) === this.host.world.currentId(b.ref))
-                : lane.key === b.ref;
+            : b.match === "port"
+              ? lane.source === b.ref || lane.dest === b.ref
+              : b.match === "zone"
+                ? !!lane.zones?.includes(b.ref)
+                : b.match === "good"
+                  ? lane.good === b.ref || lane.parts.some((p) => p.good === b.ref)
+                  : b.match === "charter"
+                    ? // Both sides followed to the posting that now stands for them (it may have re-posted).
+                      lane.fills.some(([id]) => w.currentId(id) === w.currentId(b.ref))
+                    : lane.key === b.ref;
       if (hit) f *= b.factor;
     }
     return Math.min(BIAS_MAX, Math.max(BIAS_MIN, f));
@@ -332,6 +363,107 @@ export class Advisor {
   /** Why the buyer should hold, or null. */
   buyHold(): string | null {
     return this.inForce()?.buyHold ?? null;
+  }
+
+  /** The bans in force (new plans only), or null. */
+  bans(): Bans | null {
+    const a = this.inForce();
+    return a ? bansOf(a.avoid, (id) => this.host.world.currentId(id)) : null;
+  }
+
+  /** The order in force for this ship, unless it is done or was refused. */
+  shipOrder(shipId: string): ShipOrder | undefined {
+    return this.inForce()?.shipOrders.find((o) => o.ship === shipId && o.status !== "done" && o.status !== "refused" && o.status !== "lapsed");
+  }
+
+  /** Ships an order in force holds in the roadstead. */
+  heldShips(): Set<string> {
+    return new Set((this.inForce()?.shipOrders ?? []).filter((o) => o.order === "hold" && o.status !== "done" && o.status !== "refused").map((o) => o.ship));
+  }
+
+  /** The build order in force, unless it is done or was refused. */
+  buildOrder(): BuildOrder | null {
+    const b = this.inForce()?.build ?? null;
+    return b && b.status !== "done" && b.status !== "refused" && b.status !== "lapsed" ? b : null;
+  }
+
+  /** Marques and patrols still to issue, and those whose outcome is unknown (to reconcile, never to send again). */
+  pendingNaval(): NavalOrder[] {
+    return (this.inForce()?.naval ?? []).filter((n) => n.status === "pending" || n.status === "unknown");
+  }
+
+  /**
+   * Expected cost (pence) of marques and patrols sent at server time `since` or later whose call had no answer and
+   * that haven't been found among ours yet (in force or not): they may have been paid for, so they count as spent.
+   */
+  unknownNavalPence(since: number): number {
+    const seen = new Map<string, NavalOrder>();
+    for (const n of [...this.decisions.flatMap((d) => d.naval ?? []), ...(this.active?.naval ?? [])]) seen.set(n.id, n);
+    let pence = 0;
+    for (const n of seen.values()) if (n.status === "unknown" && (n.sentAt ?? 0) >= since) pence += n.costPence;
+    return pence;
+  }
+
+  /** Local ms the directives in force lapse, or null. */
+  inForceUntil(): number | null {
+    return this.inForce()?.until ?? null;
+  }
+
+  /**
+   * What became of a ship's order (true when that changed it), only while that very order is in force: an outcome
+   * judged on an older answer's order never lands on a newer one for the same ship. Kept on the decision too.
+   */
+  noteOrder(order: ShipOrder, status: OrderStatus, code?: OrderCode, note?: string): boolean {
+    const o = this.inForce()?.shipOrders.find((x) => x === order);
+    if (!o || (o.status === status && o.code === code)) return false;
+    Object.assign(o, { status, code, note });
+    this.mirror();
+    return true;
+  }
+
+  /** What became of the build order (true when that changed it). */
+  noteBuild(status: OrderStatus, code?: OrderCode, note?: string, shipId?: string): boolean {
+    const b = this.inForce()?.build;
+    if (!b || (b.status === status && b.code === code)) return false;
+    Object.assign(b, { status, code, note, shipId: shipId ?? b.shipId });
+    this.mirror();
+    return true;
+  }
+
+  /** What became of a marque or patrol: saved at once while one is being sent or once sent (never sent twice). */
+  noteNaval(id: string, patch: Partial<NavalOrder>): void {
+    const n = this.active?.naval.find((x) => x.id === id);
+    // Superseded or cleared while it was being sent: what it became still goes on its own decision.
+    const d = this.decisions.find((x) => x.naval?.some((y) => y.id === id));
+    const rec = d?.naval?.find((y) => y.id === id);
+    const was = (n ?? rec)?.status;
+    if (!n && !rec) return;
+    if (n) Object.assign(n, patch);
+    if (rec) Object.assign(rec, patch);
+    const cur = (n ?? rec)!;
+    if (d && cur.status === "issued" && was !== "issued") d.navalSpentPence = (d.navalSpentPence ?? 0) + cur.costPence;
+    if (n) this.mirror();
+    this.host.persist(cur.status === "issuing" || cur.status === "issued" || cur.status === "unknown");
+  }
+
+  /** What was never acted on lapses with the directives in force (shown so on their decision). */
+  private lapseUnsent(): void {
+    const a = this.active;
+    if (!a) return;
+    for (const o of [...a.shipOrders, ...(a.build ? [a.build] : [])]) if (o.status === "pending" || o.status === "waiting") o.status = "lapsed";
+    for (const n of a.naval) if (n.status === "pending") n.status = "lapsed";
+    this.mirror();
+  }
+
+  /** The decision record follows its orders' outcomes (the dashboard's recent advice). */
+  private mirror(): void {
+    const a = this.active;
+    const d = a && this.decisions.find((x) => x.id === a.decisionId);
+    if (!a || !d) return;
+    d.shipOrders = a.shipOrders.map((o) => ({ ...o }));
+    d.build = a.build ? { ...a.build } : null;
+    d.naval = a.naval.map((n) => ({ ...n }));
+    this.host.persist();
   }
 
   // ── Inputs ──────────────────────────────────────────────────────────────────
@@ -402,9 +534,11 @@ export class Advisor {
     this.nextRunAt = 0;
   }
 
+  /** Ends what is in force (a marque or patrol already issued runs its term: it can't be withdrawn). */
   private clear(status: AiDecision["status"], note: string): void {
     const a = this.active;
     if (!a) return;
+    this.lapseUnsent();
     this.active = null;
     const d = this.decisions.find((x) => x.id === a.decisionId);
     if (d && d.status === "applied") {
@@ -434,12 +568,12 @@ export class Advisor {
     }
     if (mode !== "live" && this.active) this.clear("cleared", "not live");
 
-    // Tripwire: the fleet sitting idle under live directives.
+    // Tripwire: the fleet sitting idle (or held by its orders) under live directives.
     if (this.inForce() && this.host.idleShare() >= TRIPWIRE_IDLE) {
       this.idleSince ??= now;
       if (now - this.idleSince >= TRIPWIRE_MS) {
-        this.host.log("AI directives cleared: half the fleet sat idle under them for 20 minutes");
-        this.clear("tripwire", "half the fleet idle for 20 minutes");
+        this.host.log("AI directives cleared: half the fleet sat idle (or held by its orders) under them for 20 minutes; marques and patrols already issued run their term");
+        this.clear("tripwire", "half the fleet idle or held for 20 minutes");
       }
     } else this.idleSince = null;
 
@@ -461,13 +595,16 @@ export class Advisor {
    * The parts of the picture worth a fresh answer: the phase and tier (in 10% steps), which
    * charters are stalled and which the fleet is letting lapse, where each ship is and on what
    * lane, the best lanes, spare cash (by doubling), the newest notice, the mode, the user's
-   * settings it may move, and the advice in force. Unchanged, a routine call has nothing new to say.
+   * settings it may move, and the advice in force with what became of its orders (a refusal or a
+   * "done" is news). Unchanged, a routine call has nothing new to say.
    */
   private fingerprint(d: DigestInput, activeId: string | null): string {
     const u = d.user;
+    const a = this.active;
     return JSON.stringify([
       this.effective,
-      [u.bonusWeightPct, u.phaseChestPct, u.minMarginPence, u.holdForRepost],
+      OVERRIDE_KEYS.map((k) => u[k]),
+      a ? [a.shipOrders.map((o) => `${o.status}:${o.code ?? ""}`), a.build ? `${a.build.status}:${a.build.code ?? ""}` : null, a.naval.map((n) => n.status)] : null,
       d.phase,
       d.tier
         ? [
@@ -548,15 +685,12 @@ export class Advisor {
     try {
       if (!claudeConfigured()) throw new Error("ANTHROPIC_API_KEY is not set in .env.local");
       const world = this.host.world;
+      const a = this.inForce();
       const input: DigestInput = {
         ...this.host.digestInput(),
         events: [...this.events],
-        decisions: this.decisions.slice(-5).map((d) => ({
-          at: d.at,
-          posture: d.posture,
-          applied: `${d.status}${Object.keys(d.settings).length ? `, settings ${JSON.stringify(d.settings)}` : ""}${d.biases.length ? `, ${d.biases.length} biases` : ""}${d.buy.action === "hold" ? ", buy held" : ""}`,
-          outcome: d.mode === "live" ? `${d.trips} trips under it, ${cr(d.profitPence)} profit` : "shadow (not applied)",
-        })),
+        decisions: this.decisions.slice(-5).map((d) => ({ at: d.at, posture: d.posture, applied: memory(d), outcome: d.mode === "live" ? `${d.trips} trips under it, ${cr(d.profitPence)} profit` : "shadow (not applied)" })),
+        inForce: a ? { ...a, leftMs: Math.max(0, a.until - Date.now()) } : null,
       };
       // A quiet stretch: nothing important changed since the last answer, so a routine call is
       // skipped (a few in a row at most, so slow drifts still get a look).
@@ -620,90 +754,24 @@ export class Advisor {
     }
   }
 
-  /** Validates, clamps and resolves an answer, then applies it (live) or records it (shadow). */
+  /** Validates, clamps and resolves an answer (directives.ts), then applies it (live) or records it (shadow). */
   private apply(raw: RawAdvice, aliases: Aliases, meta: { trigger: string; builtAt: number; phase: number; model: string; costUsd: number }): AiDecision {
     const world = this.host.world;
     const user = this.host.userSettings();
-    let dropped = 0;
-    let items = 0;
-
-    // Settings: within the envelope and one step from the user's value; only real changes kept.
-    const settings: OverrideSettings = {};
-    const s = raw.settings ?? ({} as RawAdvice["settings"]);
-    // Within the envelope and one step of the user's value, in the direction asked; nothing if the
-    // user's own value is already outside the envelope or the answer repeats it.
-    const step = (v: number | null, base: number, e: { min: number; max: number; step: number }) => {
-      if (v === null || !Number.isFinite(v) || v === base || base < e.min || base > e.max) return null;
-      const lo = Math.max(e.min, base - e.step);
-      const hi = Math.min(e.max, base + e.step);
-      const r = Math.round(Math.min(hi, Math.max(lo, v)));
-      // Never past what was asked, and never the other way.
-      return (r - base) * (v - base) > 0 && (r - base) * (r - v) <= 0 ? r : null;
-    };
-    const bw = step(s.bonusWeightPct ?? null, user.bonusWeightPct, ENVELOPE.bonusWeightPct);
-    if (bw !== null && bw !== user.bonusWeightPct) settings.bonusWeightPct = bw;
-    const pc = step(s.phaseChestPct ?? null, user.phaseChestPct, ENVELOPE.phaseChestPct);
-    if (pc !== null && pc !== user.phaseChestPct) settings.phaseChestPct = pc;
-    if (s.minMarginPence !== null && Number.isFinite(s.minMarginPence)) {
-      const lo = Math.round(user.minMarginPence * ENVELOPE.minMarginFactor.min);
-      const hi = Math.round(user.minMarginPence * ENVELOPE.minMarginFactor.max);
-      const v = Math.round(Math.min(hi, Math.max(lo, s.minMarginPence!)));
-      if (v !== user.minMarginPence) settings.minMarginPence = v;
+    const { d: x, horizonMin, items, dropped } = validateAnswer(raw, aliases, this.host.limits());
+    const id = randomUUID();
+    // Unique across answers: a superseded answer's marque still being sent is never taken for this one's.
+    for (const n of x.naval) n.id = `${id.slice(0, 8)}:${n.id}`;
+    // Forbidden classes come off the user's list like any setting (and lapse with it once the user edits the list).
+    const kept = user.buyClasses.filter((c) => !x.forbid.includes(c));
+    if (kept.length < user.buyClasses.length) {
+      x.settings.buyClasses = kept;
+      x.settingReasons.buyClasses ??= String(raw.buy?.reason ?? "").slice(0, 200);
     }
-    if (typeof s.holdForRepost === "boolean" && s.holdForRepost !== user.holdForRepost) settings.holdForRepost = s.holdForRepost;
-
-    // Lane biases: resolve aliases and ids, drop what isn't real.
-    const biases: Bias[] = [];
-    for (const b of (raw.laneBias ?? []).slice(0, MAX_BIASES)) {
-      items++;
-      const factor = Math.min(BIAS_MAX, Math.max(BIAS_MIN, Number(b.factor)));
-      if (!Number.isFinite(factor)) {
-        dropped++;
-        continue;
-      }
-      let ref: string | undefined;
-      let label = "";
-      if (b.match === "dest" || b.match === "source") {
-        if (world.port(b.ref) && world.isOpen(b.ref)) ref = b.ref;
-        label = `${b.match === "dest" ? "to" : "from"} ${b.ref}`;
-      } else if (b.match === "good") {
-        if (world.catalog.commodities.some((c) => c.id === b.ref)) ref = b.ref;
-        label = `${b.ref}`;
-      } else if (b.match === "charter") {
-        const c = aliases.charters.get(b.ref);
-        if (c) {
-          ref = c.id;
-          label = `${c.good} -> ${c.port} charter`;
-        }
-      } else if (b.match === "lane") {
-        ref = aliases.lanes.get(b.ref);
-        label = ref ? `lane ${ref}` : "";
-      }
-      if (!ref) {
-        dropped++;
-        continue;
-      }
-      biases.push({ match: b.match, ref, factor, label, reason: String(b.reason ?? "").slice(0, 200) });
-    }
-
-    // Stall calls: expansion charters only.
-    const stallCalls: StallCall[] = [];
-    for (const sc of (raw.stallCalls ?? []).slice(0, MAX_STALL_CALLS)) {
-      items++;
-      const c = aliases.charters.get(sc.charter);
-      if (!c || !world.renews(c) || (sc.call !== "wait" && sc.call !== "deliver")) {
-        dropped++;
-        continue;
-      }
-      stallCalls.push({ key: `${c.port}|${c.good}`, call: sc.call, label: `${c.good} -> ${c.port}`, reason: String(sc.reason ?? "").slice(0, 200) });
-    }
-    items += Object.keys(settings).length;
-
-    const horizonMin = Math.round(Math.min(HORIZON_MAX, Math.max(HORIZON_MIN, Number(raw.horizonMin) || 60)));
-    const buy = { action: raw.buy?.action === "hold" ? ("hold" as const) : ("auto" as const), reason: String(raw.buy?.reason ?? "").slice(0, 200) };
+    const settings = x.settings;
     const live = this.effective === "live";
     const d: AiDecision = {
-      id: randomUUID(),
+      id,
       at: new Date().toISOString(),
       trigger: meta.trigger,
       mode: live ? "live" : "shadow",
@@ -712,16 +780,25 @@ export class Advisor {
       posture: String(raw.posture ?? "balanced"),
       horizonMin,
       rationale: String(raw.rationale ?? "").slice(0, 1_500),
-      settings,
-      biases: biases.map((b) => ({ label: b.label, factor: Math.round(b.factor * 100) / 100, reason: b.reason })),
-      stallCalls: stallCalls.map((x) => ({ label: x.label, call: x.call, reason: x.reason })),
-      buy,
+      settings: { ...settings },
+      biases: x.biases.map((b) => ({ label: b.label, factor: Math.round(b.factor * 100) / 100, reason: b.reason })),
+      stallCalls: x.stallCalls.map((s) => ({ label: s.label, call: s.call, reason: s.reason })),
+      buy: { action: x.buyHold ? "hold" : x.build ? "build" : "auto", reason: String(raw.buy?.reason ?? "").slice(0, 200) },
       alerts: (raw.alerts ?? []).slice(0, 5).map((a) => String(a).slice(0, 300)),
       dropped,
       status: live ? "applied" : "shadow",
       trips: 0,
       profitPence: 0,
+      settingReasons: { ...x.settingReasons },
+      avoid: x.avoid.map((b) => ({ kind: b.kind, label: b.label, reason: b.reason })),
+      shipOrders: x.shipOrders.map((o) => ({ ...o })),
+      build: x.build ? { ...x.build } : null,
+      forbid: [...x.forbid],
+      naval: x.naval.map((n) => ({ ...n })),
     };
+    // Recorded first: orders carried out as it is applied (a release) show on it at once.
+    this.decisions.push(d);
+    if (this.decisions.length > DECISIONS_KEPT) this.decisions.splice(0, this.decisions.length - DECISIONS_KEPT);
 
     // Discard: too many invalid items, a stale digest, or a phase that changed while it thought.
     const why =
@@ -732,7 +809,15 @@ export class Advisor {
           : world.unlockedPhase !== meta.phase
             ? "a phase opened while it was thinking"
             : null;
-    const any = Object.keys(settings).length > 0 || biases.length > 0 || stallCalls.length > 0 || buy.action === "hold";
+    const any =
+      Object.keys(settings).length > 0 ||
+      x.biases.length > 0 ||
+      x.stallCalls.length > 0 ||
+      x.buyHold !== null ||
+      x.avoid.length > 0 ||
+      x.shipOrders.length > 0 ||
+      x.build !== null ||
+      x.naval.length > 0;
     if (why) {
       d.status = "discarded";
       d.note = why;
@@ -742,33 +827,29 @@ export class Advisor {
       d.note = "no changes";
       if (this.active) this.clear("superseded", "a later answer changed nothing");
     } else if (live) {
+      // Superseded: the old answer's unsent marques, patrols and build go with it (one being sent is still recorded).
       const prev = this.active;
       if (prev) {
-        const p = this.decisions.find((x) => x.id === prev.decisionId);
+        this.lapseUnsent();
+        const p = this.decisions.find((y) => y.id === prev.decisionId);
         if (p && p.status === "applied") p.status = "superseded";
       }
       const base: OverrideSettings = {};
       for (const k of Object.keys(settings) as OverrideKey[]) (base as Record<string, unknown>)[k] = user[k];
-      this.active = {
-        decisionId: d.id,
-        until: Date.now() + horizonMin * 60_000,
-        settings: { ...settings },
-        base,
-        biases,
-        stallCalls,
-        buyHold: buy.action === "hold" ? buy.reason || "held by the AI" : null,
-      };
-      this.idleSince = null;
+      this.active = { ...x, decisionId: d.id, until: Date.now() + horizonMin * 60_000, settings: { ...settings }, base };
+      // The tripwire's idle clock runs on across answers (tick resets it once the fleet is busy again): frequent
+      // answers mustn't keep it from ever firing.
       this.host.directivesChanged();
     }
-    this.decisions.push(d);
-    if (this.decisions.length > DECISIONS_KEPT) this.decisions.splice(0, this.decisions.length - DECISIONS_KEPT);
 
     const changes = [
       Object.keys(settings).length ? `settings ${JSON.stringify(settings)}` : "",
-      biases.length ? `${biases.length} lane bias${biases.length === 1 ? "" : "es"}` : "",
-      stallCalls.length ? `${stallCalls.length} stall call${stallCalls.length === 1 ? "" : "s"}` : "",
-      buy.action === "hold" ? "buyer on hold" : "",
+      x.avoid.length ? `avoid ${x.avoid.map((b) => b.label).join(", ")}` : "",
+      x.biases.length ? plural(x.biases.length, "lane bias", "lane biases") : "",
+      x.stallCalls.length ? plural(x.stallCalls.length, "stall call") : "",
+      x.shipOrders.length ? plural(x.shipOrders.length, "ship order") : "",
+      x.buyHold ? "buyer on hold" : x.build ? `build a ${x.build.cls} at ${x.build.yard}` : "",
+      x.naval.length ? x.naval.map((n) => `${n.kind} ${n.bps} bps in ${n.zone} for ${n.gameHours} game h (~${cr(n.costPence)})`).join(", ") : "",
     ].filter(Boolean);
     this.host.log(
       `AI (${d.mode}, ${meta.trigger}, $${d.costUsd.toFixed(3)}): ${d.posture}; ${changes.join(", ") || "no changes"}` +
@@ -813,10 +894,13 @@ export class Advisor {
         ? {
             decisionId: a.decisionId,
             until: new Date(a.until).toISOString(),
-            settings: this.overrides() ?? {},
-            biases: a.biases.map((b) => ({ label: b.label, factor: b.factor })),
-            stallCalls: a.stallCalls.map((x) => ({ label: x.label, call: x.call })),
-            buyHold: a.buyHold,
+            settings: Object.entries(this.overrides() ?? {}).map(([key, to]) => ({ key, from: s[key as OverrideKey], to, reason: a.settingReasons[key as OverrideKey] ?? "" })),
+            avoid: a.avoid.map((b) => ({ kind: b.kind, label: b.label, reason: b.reason })),
+            biases: a.biases.map((b) => ({ label: b.label, factor: b.factor, reason: b.reason })),
+            stallCalls: a.stallCalls.map((x) => ({ label: x.label, call: x.call, reason: x.reason })),
+            shipOrders: a.shipOrders.map((o) => ({ shipId: o.ship, order: o.order, label: o.label, status: o.status, code: o.code, note: o.note, reason: o.reason })),
+            buy: { hold: a.buyHold, build: a.build ? { ...a.build } : null, forbid: [...a.forbid] },
+            naval: a.naval.map((n) => ({ ...n })),
           }
         : null,
       decisions: [...this.decisions].reverse().slice(0, 10),
@@ -842,7 +926,8 @@ export class Advisor {
     if (!s) return;
     this.spend = s.spend.day === today() ? { ...s.spend } : { day: today(), today: 0, total: s.spend.total ?? 0 };
     this.decisions = (s.decisions ?? []).slice(-DECISIONS_KEPT);
-    this.active = s.active && s.active.until > Date.now() ? s.active : null;
+    // Older saves lack the later directives; a marque or patrol cut off mid-call is unknown (never sent again).
+    this.active = s.active && s.active.until > Date.now() ? normalizeActive(s.active) : null;
     // One that lapsed while the autopilot was stopped is marked so.
     if (s.active && !this.active) {
       const d = this.decisions.find((x) => x.id === s.active!.decisionId);

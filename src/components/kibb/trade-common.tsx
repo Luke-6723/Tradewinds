@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { usePoll } from "@/hooks/use-poll";
-import { dash, kibbGet } from "@/lib/kibb/browser";
+import { dash, kibbGet, writeFetch } from "@/lib/kibb/browser";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { ContractListing } from "@/lib/kibb/schema";
 
@@ -81,12 +81,8 @@ export class BatchError extends Error {
  * so the form can point at the row that failed.
  */
 export async function postBatch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`/api/kibb${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
+  // One key per action: a retry after a timeout or 5xx replays it rather than sending the batch twice.
+  const res = await writeFetch("POST", `/api/kibb${path}`, JSON.stringify(body));
   const text = await res.text();
   let data: unknown = null;
   try {

@@ -59,6 +59,20 @@ function ConvoyCard({
   const fee = !joiner || asEscort || organizer ? 0 : c.escort_fee_pence_per_ton * joiner.hold_capacity_tons;
 
   const membership = (path: string, shipId: string) => act.run(() => kibbPost<S.ConvoyMembershipResult>(path, { convoy_id: c.id, ship_id: shipId }));
+  // Lloyd's may have priced a member's policy with the consorts: sailing without them voids it (guide 3.4), so ask first.
+  async function detach(shipId: string, pending: boolean) {
+    if (!pending) {
+      const held = await kibbGet<S.InsurancePolicy[]>("/v1/insurance/list", { ship_id: shipId, limit: 20 }).catch(() => null);
+      const p = held?.find((x) => x.status === "open" || x.status === "active");
+      const ask = !held
+        ? "This ship's insurance couldn't be read. If Lloyd's priced a policy on it with this convoy's consorts, sailing without them voids it. Detach anyway?"
+        : p
+          ? `${shipName(shipId) ?? "This ship"} holds an ${p.status} policy to ${portName(p.dest_port_id)}. If Lloyd's priced it with this convoy's consorts, sailing without them voids it. Detach anyway?`
+          : null;
+      if (ask && !confirm(ask)) return;
+    }
+    await membership("/v1/fleet/detach-convoy", shipId);
+  }
 
   const memberRow = (m: S.ConvoyMemberInfo, pending: boolean) => {
     const ours = m.company_id === ourId;
@@ -85,7 +99,7 @@ function ConvoyCard({
             </>
           )}
           {forming && ours && (
-            <Button size="sm" variant="outline" disabled={act.busy} onClick={() => membership("/v1/fleet/detach-convoy", m.ship_id)}>
+            <Button size="sm" variant="outline" disabled={act.busy} onClick={() => void detach(m.ship_id, pending)}>
               {pending ? "Withdraw" : "Detach"}
             </Button>
           )}

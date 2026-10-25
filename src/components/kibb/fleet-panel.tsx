@@ -28,6 +28,9 @@ const TIME_PARTS: Array<{ key: keyof TimeUse; label: string; className: string }
 
 const pct = (part: number, total: number) => (total > 0 ? Math.round((part / total) * 100) : 0);
 
+/** The company key's expiry is shown this long before it. */
+const KEY_WARN_MS = 7 * 24 * 3_600_000;
+
 /** One bar split by where the time went. */
 function TimeBar({ t }: { t: TimeUse }) {
   const total = t.laden + t.ballast + t.port + t.idle;
@@ -249,10 +252,10 @@ function SettingsForm({
           </div>
         </div>
         <p className="text-muted-foreground text-xs">
-          A posting nobody delivers to re-posts at about 25% more pay on 75% of the tons, and the higher pay stays for later postings; any
-          delivery cancels that, ours too (assumed: the feed counts a posting stalled only while nothing is delivered in it). For each
+          A posting under a tenth of its expected pace re-posts at about 25% more pay on 75% of the tons, and the higher pay stays for later
+          postings; another company&apos;s delivery cancels that, and ours is taken to as well until re-posts show it doesn&apos;t. For each
           stalled posting the fleet weighs the extra pay on the tons it expects to deliver there, times the chance it escalates (from
-          stalls seen, rival deliveries there, laden rivals inbound), against what waiting costs. While it lets one lapse, no ship delivers into it, the tons a load plans into it that land early wait in the roadstead, and ships take other work until a
+          stalls seen, rival deliveries there, laden rivals inbound), against what waiting costs. While it lets one lapse, no ship delivers into it (once learned safe: only a whole load that keeps it under 80% of the pace line), the tons a load plans into it that land early wait in the roadstead, and ships take other work until a
           run lands just after the lapse; if a rival delivers, holders deliver at once. Once the tier is 90% done or due within 2 hours,
           and for an hour after it turns over, the buyer leaves the kept-back share of spare cash for the next tier&apos;s charters.
         </p>
@@ -312,6 +315,10 @@ export function FleetPanel() {
   const st = view.state;
   const on = view.enabled;
   const t = st?.totals;
+  // The running autopilot's own reading (whoami), else the stored key's (a stopped one's reading may predate a renewal).
+  const managerUp = st?.status === "running" || st?.status === "starting";
+  const keyExpiresAt = (managerUp ? st?.keyExpiresAt : null) ?? view.keyExpiresAt ?? null;
+  const keyLeft = keyExpiresAt ? Date.parse(keyExpiresAt) - Date.now() : null;
   const net = t ? t.rewardPence + t.freightPence - t.spentPence - t.shipSpendPence : 0;
 
   async function command(ai: "run" | "clear" | "retry") {
@@ -352,12 +359,23 @@ export function FleetPanel() {
   const doing = (a: (typeof agents)[number]) => (a.status === "sailing" ? `→ ${portName(a.dest)} ${fmtIn(a.eta)}` : a.activity);
   const laneText = (a: (typeof agents)[number]) => (a.lane ? `${loadText(a.lane)}: ${portName(a.lane.source)} → ${portName(a.lane.dest)}` : null);
   const agentNet = (a: (typeof agents)[number]) => a.stats.rewardPence + a.stats.freightPence - a.stats.spentPence;
+  // The buyer as it runs: the AI may switch it for its horizon, or order one build.
+  // (A manager from before this report's shape, kept across a dev reload, reports none.)
+  const aiActive = Array.isArray(st?.ai?.active?.settings) ? st!.ai.active : null;
+  const aiBuy = aiActive?.settings.find((s) => s.key === "autoBuy")?.to;
+  const aiBuild = aiActive?.buy?.build ?? null;
+  const buyerOn = (typeof aiBuy === "boolean" ? aiBuy : view.settings.autoBuy) || !!aiBuild;
 
   return (
     <Panel
       title={
         <span className="flex items-center gap-2">
           Fleet autopilot {statusBadge}
+          {st?.paused && (st.status === "running" || st.status === "starting") && (
+            <Badge variant="warning" title="The operators paused the world: game time stands still and only reads are served. Ships wait; nothing is bought, sold or sailed until it resumes.">
+              World paused
+            </Badge>
+          )}
         </span>
       }
       action={
@@ -377,7 +395,16 @@ export function FleetPanel() {
         <p className="text-muted-foreground text-sm">
           {st ? `${agents.length} ship${agents.length === 1 ? "" : "s"} under command` : "Not running since the server started"}
           {" · "}
-          Buyer: {view.settings.autoBuy ? (st?.buyer ?? "idle") : "off"}
+          Buyer: {buyerOn ? (st?.buyer ?? "idle") : "off"}
+          {typeof aiBuy === "boolean" ? " (AI)" : aiBuild ? " (AI build order)" : ""}
+          {st?.season?.endsAt && (
+            <span
+              title={`The operators announced the season's end (it is ended by hand on that date). Only work landing at least 30 min before it is planned; in the last 12 h no hull is built.`}
+            >
+              {" · "}season ends {fmtIn(st.season.endsAt)}
+              {st.season.mode === "final" ? ": final hours" : st.season.mode === "endgame" ? ": endgame, no new hulls" : ""}
+            </span>
+          )}
           {st && st.capitalRate > 0 && (
             <span title="Cash is what limits the fleet: lanes are charged for the money their loads tie up, at part of the fleet's own return on cash">
               {" · "}cash is scarce: loads charged {(st.capitalRate * 100).toFixed(2)}%/h of the money they tie up
@@ -389,6 +416,24 @@ export function FleetPanel() {
               {fmtCr(st.cash.duePence)} due from cargo at sea
             </span>
           )}
+          {st?.cash?.bills && (
+            <span
+              title={`Billed every game day: fleet upkeep (sprawl, factors, oceanic hulls; what the ledger shows was charged when more) and warehouse rent per region${
+                st.cash.bills.rent.length ? ` (${st.cash.bills.rent.map(([r, p]) => `${r} ${fmtCr(p)}`).join(", ")})` : ""
+              }. The home region keeps 1.5 days of upkeep (or the reserve setting, if more) and every region 1.5 days of its rent; stores to sail safely may dip into that. ${
+                st.cash.bills.measuredAt ? `Ledger read ${fmtAgo(new Date(st.cash.bills.measuredAt).toISOString())}.` : "Not read from the ledger yet."
+              }${
+                st.cash.autoRemit
+                  ? st.cash.autoRemit.on
+                    ? ` Auto-remit for bills: on${st.cash.autoRemit.reservePence > 0 ? `, keeping ${fmtCr(st.cash.autoRemit.reservePence)} in every region` : ""} (the company page's setting; the autopilot never changes it).`
+                    : " Auto-remit for bills: off (each region pays its own; the company page can switch it on). The autopilot keeps the home vault at its floor from the other regions either way."
+                  : ""
+              }`}
+            >
+              {" · "}daily bills ~{fmtCr(st.cash.bills.upkeepPerDay + st.cash.bills.rent.reduce((n, [, p]) => n + p, 0))}, home keeps{" "}
+              {fmtCr(st.cash.bills.homeFloor)}
+            </span>
+          )}
           {st?.cash && st.cash.resized.grown + st.cash.resized.shrunk + st.cash.resized.switched > 0 && (
             <span title="Loads planned again at their source with the cash there was then">
               {" · "}re-sized at source: {st.cash.resized.grown} up (+{fmtTons(st.cash.resized.tonsAdded)}),{" "}
@@ -398,7 +443,21 @@ export function FleetPanel() {
           )}
         </p>
 
+        {st?.announcement && (
+          <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-destructive text-sm">
+            <span className="font-medium">Critical notice from the operators</span> ({fmtAgo(st.announcement.at)}): {st.announcement.message || "no text given"}
+          </p>
+        )}
         <ErrorNote error={actionError ?? st?.error ?? null} />
+        {on && view.resumeError && (
+          <ErrorNote error={`The autopilot couldn't be resumed when the server started (${fmtAgo(view.resumeError.at)}): ${view.resumeError.error}`} />
+        )}
+        {keyLeft !== null && keyLeft < KEY_WARN_MS && (
+          <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+            {keyLeft > 0 ? `The company key expires ${fmtIn(keyExpiresAt)}` : "The company key has expired"}: the autopilot stops when it does. The dashboard renews it
+            while you are signed in; if this note stays, sign in again and <Link href="/companies" className="underline">select the company</Link>.
+          </p>
+        )}
 
         <AiPanel
           mode={view.settings.ai ?? "off"}
@@ -406,8 +465,18 @@ export function FleetPanel() {
           running={st?.status === "running"}
           busy={busy}
           caps={{ daily: view.settings.aiDailyCapUsd, total: view.settings.aiTotalCapUsd }}
+          ships={agents.map((a) => ({ shipId: a.shipId, name: a.name }))}
           onMode={(m) => {
-            if (m === "live" && !confirm(`Let Claude steer the autopilot: temporary setting changes within limits, lane bias, stall calls and holding the ship buyer? Spend is capped at $${view.settings.aiDailyCapUsd} a day and $${view.settings.aiTotalCapUsd} in total.`)) return;
+            if (
+              m === "live" &&
+              !confirm(
+                `Let Claude steer the autopilot for its horizon: any setting within your ceilings (ship limit and budgets never above yours, the reserve only raised), ` +
+                  `bans on ports, zones, goods and charters, lane bias, stall calls, orders to single ships (a lane, a charter, a port, hold, release), ` +
+                  `the ship buyer (hold, one build, classes forbidden), and marques or patrols within your marque budget (${fmtCr(view.settings.marqueBudgetPence)} a day; an issued one can't be withdrawn)? ` +
+                  `Every autopilot check still runs. Spend is capped at $${view.settings.aiDailyCapUsd} a day and $${view.settings.aiTotalCapUsd} in total.`,
+              )
+            )
+              return;
             void send({ settings: { ai: m } });
           }}
           onCommand={(cmd) => void command(cmd)}
@@ -740,7 +809,22 @@ function ExpansionWatchView({ x }: { x: NonNullable<NonNullable<FleetView["state
                   {fmtCr(Math.round(c.rate * x.escalation.pay))}/t on {fmtTons(Math.floor(c.remaining * x.escalation.tons))}
                 </td>
                 <td className="text-xs">
-                  {c.stalled ? <Badge variant="warning" size="sm">stalled</Badge> : <span className="text-muted-foreground">being filled</span>}
+                  {c.stalled ? (
+                    <>
+                      <Badge variant="warning" size="sm">stalled</Badge>
+                      {c.delivered !== undefined && c.line !== undefined && (
+                        <div className="text-muted-foreground">
+                          {fmtTons(c.delivered)} of {fmtTons(Math.round(c.line))} pace line
+                        </div>
+                      )}
+                    </>
+                  ) : c.underPace && c.rivalDelivered ? (
+                    <span className="text-muted-foreground">under pace, but another company delivered</span>
+                  ) : c.underPace && (c.ownTons ?? 0) > 0 ? (
+                    <span className="text-muted-foreground">under pace, our {fmtTons(c.ownTons)} (taken to cancel it until learned)</span>
+                  ) : (
+                    <span className="text-muted-foreground">being filled</span>
+                  )}
                 </td>
                 <td className="text-xs">
                   {st ? (
@@ -772,11 +856,23 @@ function ExpansionWatchView({ x }: { x: NonNullable<NonNullable<FleetView["state
           </ul>
         </div>
       )}
+      {x.trickle && (
+        <p className="mt-2 text-muted-foreground text-xs">
+          Our own small deliveries into a stalled posting:{" "}
+          {x.trickle.allowed
+            ? `allowed up to 80% of its pace line (re-posts escalated after only ours ${x.trickle.confirmed} times in a row; ${x.trickle.refuted} counter-example${x.trickle.refuted === 1 ? "" : "s"} before)`
+            : `assumed to cancel the re-post (${x.trickle.confirmed} of ${x.trickle.needed} confirmations, ${x.trickle.refuted} counter-example${x.trickle.refuted === 1 ? "" : "s"})`}
+          .
+        </p>
+      )}
       <p className="mt-2 text-muted-foreground text-xs">
-        Stalled: nothing delivered in this posting yet. If that lasts until it lapses, it re-posts at about {Math.round((x.escalation.pay - 1) * 100)}% more
-        pay on {Math.round(x.escalation.tons * 100)}% of the tons (learned from escalations seen). Lanes landing after the lapse count that. The
-        fleet&apos;s call: let it lapse when the expected extra pay beats waiting (the odds count stalls seen, rival deliveries there and laden
-        rivals due first); rival deliveries come from the public contributor board.
+        Stalled (the guide): under a tenth of its expected pace (its tons spread over its window) delivered in this posting so far, and no other
+        company&apos;s delivery in it (any cancels the escalation; our own other companies count as others). Our own deliveries are taken to cancel it
+        too, until {x.trickle?.needed ?? 2} re-posts in a row after only ours under the line still escalate; one that doesn&apos;t switches that off
+        again. If it lasts until it lapses, it re-posts at about {Math.round((x.escalation.pay - 1) * 100)}% more pay on{" "}
+        {Math.round(x.escalation.tons * 100)}% of the tons (learned from escalations seen). Lanes landing after the lapse count that. The fleet&apos;s
+        call: let it lapse when the expected extra pay beats waiting (the odds count stalls seen, rival deliveries there and laden rivals due first);
+        rival deliveries come from the public contributor board.
       </p>
     </details>
   );
@@ -833,6 +929,33 @@ function WorldEventsView({ w }: { w: NonNullable<FleetView["state"]>["worldEvent
 
 const usd = (n: number) => `$${n.toFixed(n < 1 ? 3 : 2)}`;
 
+/** A setting's value as the user would read it. */
+function showSetting(key: string, v: unknown, cls: (id: string) => string): string {
+  if (typeof v === "boolean") return v ? "on" : "off";
+  if (Array.isArray(v)) return v.map((c) => cls(String(c))).join(", ") || "none";
+  if (typeof v !== "number") return String(v);
+  return key.endsWith("Pence") ? fmtCr(v) : key.endsWith("Pct") ? `${v}%` : key.endsWith("Bps") ? `${v} bps` : key === "maxPaybackHours" ? `${v} h` : String(v);
+}
+
+const statusVariant = (s: string) => (s === "active" || s === "done" || s === "issued" ? "success" : s === "refused" || s === "unknown" ? "warning" : "secondary");
+
+/** One directive in force: what, its status (orders), why, and any detail the game gave. */
+function DirectiveRow({ what, reason, status, code, note }: { what: string; reason?: string; status?: string; code?: string; note?: string }) {
+  return (
+    <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+      <span>{what}</span>
+      {status && (
+        <Badge variant={statusVariant(status)} size="sm">
+          {status}
+          {code ? `: ${code.replace(/_/g, " ")}` : ""}
+        </Badge>
+      )}
+      {reason && <span className="text-muted-foreground">· {reason}</span>}
+      {note && <span className="text-muted-foreground">({note})</span>}
+    </li>
+  );
+}
+
 /** AI support (Claude as strategist): the switch, what it costs, what it's doing and why. */
 function AiPanel({
   mode,
@@ -840,6 +963,7 @@ function AiPanel({
   running,
   busy,
   caps,
+  ships,
   onMode,
   onCommand,
 }: {
@@ -848,11 +972,20 @@ function AiPanel({
   running: boolean;
   busy: boolean;
   caps: { daily: number; total: number };
+  /** Our ships' names: the AI only ever sees aliases, the owner sees names. */
+  ships: Array<{ shipId: string; name: string }>;
   onMode: (m: AiMode) => void;
   onCommand: (cmd: "run" | "clear" | "retry") => void;
 }) {
+  const { portName, shipClassName } = useCatalog();
   const r = report;
-  const a = r?.active ?? null;
+  // (A manager from before this report's shape, kept across a dev reload, shows none.)
+  const a = r?.active && Array.isArray(r.active.settings) ? r.active : null;
+  const shipName = (id: string) => ships.find((s) => s.shipId === id)?.name ?? "a ship no longer in the fleet";
+  const orderText = (o: { order: string; label: string }) =>
+    o.order === "lane" ? `take the lane ${o.label}` : o.order === "charter" ? `fill the ${o.label}` : o.order === "port" ? `go to ${portName(o.label)}` : o.order === "hold" ? "hold in the roadstead" : "drop its planned lane";
+  const navalText = (n: { kind: string; bps: number; zone: string; gameHours: number; costPence: number }) =>
+    `${n.kind === "marque" ? "letter of marque +" : "naval patrol −"}${n.bps} bps in ${n.zone} for ${n.gameHours} game h, ~${fmtCr(n.costPence)}`;
   const status = !r
     ? mode === "off"
       ? "Off."
@@ -903,9 +1036,13 @@ function AiPanel({
         </div>
       </div>
       <p className="text-muted-foreground text-xs">
-        Shadow: Claude advises and every answer is logged, nothing changes. Live: its directives apply until they lapse (15-180 min):
-        setting overrides within limits, a bias on lane ranks, calls on stalled expansion charters, and holding the ship buyer. Every
-        autopilot check still runs. It drops back to shadow by itself if trips under its advice earn clearly less.
+        Shadow: Claude advises and every answer is logged, nothing changes. Live: its directives apply until they lapse (15-180 min): any
+        setting but its own within your ceilings (max ships and the marque and underwriting budgets never above yours, the reserve only
+        raised), bans on ports, sea zones, goods and charters, a bias on lane ranks, calls on stalled expansion charters, orders to single
+        ships (a lane, a charter, a port, hold in the roadstead, drop a planned lane), the ship buyer (hold, one build, classes forbidden),
+        and marques or patrols within your marque budget (set it to 0 to forbid them; an issued one runs its term and can&apos;t be withdrawn).
+        Every autopilot check still runs; what it refuses goes back to Claude as a status. Held ships count as idle for the tripwire. It
+        drops back to shadow by itself if trips under its advice earn clearly less.
       </p>
       {r && (
         <>
@@ -930,17 +1067,40 @@ function AiPanel({
           {a && (
             <div className="space-y-1 rounded-md bg-accent/40 px-3 py-2 text-sm">
               <div className="font-medium">{running ? `In force until ${fmtTime(a.until)}` : `Paused (autopilot stopped); in force until ${fmtTime(a.until)} if it restarts`}</div>
-              {Object.keys(a.settings).length > 0 && (
-                <div className="text-xs">
-                  Settings:{" "}
-                  {Object.entries(a.settings)
-                    .map(([k, v]) => `${k} ${k === "minMarginPence" ? fmtCr(v as number) : String(v)}`)
-                    .join(", ")}
-                </div>
+              <ul className="space-y-1 text-xs">
+                {a.settings.map((s) => (
+                  <DirectiveRow key={`s:${s.key}`} what={`${s.key}: ${showSetting(s.key, s.from, shipClassName)} → ${showSetting(s.key, s.to, shipClassName)}`} reason={s.reason} />
+                ))}
+                {a.avoid.map((b, i) => (
+                  <DirectiveRow key={`a:${i}`} what={`Avoid ${b.label}`} reason={b.reason} />
+                ))}
+                {a.biases.map((b, i) => (
+                  <DirectiveRow key={`b:${i}`} what={`Lane bias ${b.label} ×${b.factor}`} reason={b.reason} />
+                ))}
+                {a.stallCalls.map((s, i) => (
+                  <DirectiveRow key={`c:${i}`} what={`Stall call ${s.label}: ${s.call}`} reason={s.reason} />
+                ))}
+                {a.shipOrders.map((o) => (
+                  <DirectiveRow key={`o:${o.shipId}`} what={`${shipName(o.shipId)}: ${orderText(o)}`} reason={o.reason} status={o.status} code={o.code} note={o.note} />
+                ))}
+                {a.buy.hold && <DirectiveRow what="Ship buyer on hold" reason={a.buy.hold} />}
+                {a.buy.build && (
+                  <DirectiveRow
+                    what={`Build a ${shipClassName(a.buy.build.cls)} at ${portName(a.buy.build.yard)}`}
+                    reason={a.buy.build.reason}
+                    status={a.buy.build.status}
+                    code={a.buy.build.code}
+                    note={a.buy.build.status === "done" ? undefined : a.buy.build.note}
+                  />
+                )}
+                {a.buy.forbid.length > 0 && <DirectiveRow what={`The buyer may not build: ${a.buy.forbid.map(shipClassName).join(", ")}`} />}
+                {a.naval.map((n) => (
+                  <DirectiveRow key={`n:${n.id}`} what={navalText(n)} reason={n.reason} status={n.status} code={n.code} note={n.note} />
+                ))}
+              </ul>
+              {a.naval.length > 0 && (
+                <div className="text-muted-foreground text-xs">An issued marque or patrol runs its term (at most this advice&apos;s horizon): clearing the AI&apos;s changes doesn&apos;t withdraw it.</div>
               )}
-              {a.biases.length > 0 && <div className="text-xs">Lane bias: {a.biases.map((b) => `${b.label} x${b.factor}`).join(", ")}</div>}
-              {a.stallCalls.length > 0 && <div className="text-xs">Stall calls: {a.stallCalls.map((s) => `${s.label}: ${s.call}`).join(", ")}</div>}
-              {a.buyHold && <div className="text-xs">Ship buyer on hold: {a.buyHold}</div>}
             </div>
           )}
           {r.decisions.length > 0 && (
@@ -963,10 +1123,42 @@ function AiPanel({
                       </span>
                     </div>
                     <div>{x.rationale}</div>
-                    {Object.keys(x.settings).length > 0 && <div className="text-muted-foreground">Settings: {JSON.stringify(x.settings)}</div>}
+                    {Object.keys(x.settings).length > 0 && (
+                      <div className="text-muted-foreground">
+                        Settings:{" "}
+                        {Object.entries(x.settings)
+                          .map(([k, v]) => `${k} ${showSetting(k, v, shipClassName)}${x.settingReasons?.[k as keyof typeof x.settingReasons] ? ` (${x.settingReasons[k as keyof typeof x.settingReasons]})` : ""}`)
+                          .join("; ")}
+                      </div>
+                    )}
+                    {(x.avoid ?? []).length > 0 && <div className="text-muted-foreground">Avoid: {(x.avoid ?? []).map((b) => `${b.label} (${b.reason})`).join("; ")}</div>}
                     {x.biases.length > 0 && <div className="text-muted-foreground">Bias: {x.biases.map((b) => `${b.label} x${b.factor} (${b.reason})`).join("; ")}</div>}
                     {x.stallCalls.length > 0 && <div className="text-muted-foreground">Stall calls: {x.stallCalls.map((s) => `${s.label}: ${s.call} (${s.reason})`).join("; ")}</div>}
+                    {(x.shipOrders ?? []).length > 0 && (
+                      <div className="text-muted-foreground">
+                        Ship orders:{" "}
+                        {(x.shipOrders ?? [])
+                          .map((o) => `${shipName(o.ship)}: ${orderText(o)}${x.mode === "live" ? ` [${o.status}${o.code ? `: ${o.code.replace(/_/g, " ")}` : ""}]` : ""} (${o.reason})`)
+                          .join("; ")}
+                      </div>
+                    )}
                     {x.buy.action === "hold" && <div className="text-muted-foreground">Buyer held: {x.buy.reason}</div>}
+                    {x.build && (
+                      <div className="text-muted-foreground">
+                        Build: a {shipClassName(x.build.cls)} at {portName(x.build.yard)}
+                        {x.mode === "live" ? ` [${x.build.status}${x.build.code ? `: ${x.build.code.replace(/_/g, " ")}` : ""}]` : ""} ({x.build.reason})
+                      </div>
+                    )}
+                    {(x.forbid ?? []).length > 0 && <div className="text-muted-foreground">Forbidden classes: {(x.forbid ?? []).map(shipClassName).join(", ")}</div>}
+                    {(x.naval ?? []).length > 0 && (
+                      <div className="text-muted-foreground">
+                        Naval:{" "}
+                        {(x.naval ?? [])
+                          .map((n) => `${navalText(n)}${x.mode === "live" ? ` [${n.status}${n.code ? `: ${n.code.replace(/_/g, " ")}` : ""}]` : " (would cost that)"} (${n.reason})`)
+                          .join("; ")}
+                        {x.navalSpentPence ? ` · issued ${fmtCr(x.navalSpentPence)}` : ""}
+                      </div>
+                    )}
                     {x.alerts.map((t, i) => (
                       <div key={i} className="text-warning-foreground">Note: {t}</div>
                     ))}

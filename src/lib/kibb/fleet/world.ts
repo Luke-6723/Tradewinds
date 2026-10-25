@@ -33,6 +33,13 @@ const PRICE_TTL_MS = 3 * 60 * 60 * 1000;
 const SOLD_OUT_MS = 6 * 60 * 1000;
 /** A charter last seen live is recalled for this long (2 game days; real ms at 60×). */
 const RECALL_MS = 2 * 24 * 60 * 1000;
+/** A cached route plan is read again after this long (a phase unlock clears them all at once). */
+const ROUTE_TTL_MS = 30 * 60_000;
+/** The season is ended by hand on the announced date (guide 3.11): treated as over this much before it. */
+const SEASON_END_SLACK_MS = 30 * 60_000;
+/** Season left (real ms, after the slack) under which no hull is built (it can't pay back), and the final hours. */
+export const SEASON_ENDGAME_MS = 12 * 60 * 60_000;
+export const SEASON_FINAL_MS = 3 * 60 * 60_000;
 /**
  * Piracy since the October patch (formulas not published, so these are estimates the fleet refines
  * from its own raids): pirates go for the richest prizes, take a varying share of the cargo, and
@@ -95,19 +102,31 @@ const stormCell = (stormy: boolean, margin: number): StormCell =>
   `${stormy ? "storm" : "calm"}|${margin < 0 ? "under" : margin === 0 ? "rated" : "above"}`;
 
 /**
- * A tier's completion bonus is 12% of its value, split by the value each company delivered. Shares
- * value a ton at its charter's premium-inclusive rate (base price × premium), which the live share
- * movements bear out; this is the fallback rate when the pool can't be projected.
+ * A tier's completion bonus is 12% of its base value, split by the tons each company delivered valued
+ * at base rates (guide 3.8; `share_bps` in the spec), so the premium doesn't count; this is the
+ * fallback rate when the pool can't be projected.
  */
 const EXPANSION_BONUS_SHARE = 0.12;
 /**
- * A posting nobody delivers to before it lapses is re-posted richer: by default +25% pay on 75% of
- * the tons left (refined from what the feed shows when an escalation happens).
+ * A posting that stays stalled (under a tenth of its expected pace, nobody else delivering) until it
+ * lapses is re-posted richer: by default +25% pay on 75% of the tons left (refined from what the feed
+ * shows when an escalation happens).
  */
 const ESCALATION_PAY = 1.25;
 const ESCALATION_TONS = 0.75;
 /** Our own watch calls a posting stalled only after following it from its start for this long (game hours). */
 const STALL_MIN_WATCH_GAME_H = 6;
+/** A posting is stalled while under this share of its expected pace (its tons spread over its window) is delivered (guide 3.8). */
+const STALL_PACE_SHARE = 0.1;
+/** Our own deliveries into a camped posting stay this far under that line (the server's pace isn't published). */
+const TRICKLE_SAFETY = 0.8;
+/** Re-posts that escalated after only our own deliveries under the line, before ours are allowed in a camp; one that didn't resets it. */
+export const OWN_TRICKLE_CONFIRM = 2;
+const OWN_TRICKLE_SAMPLES = 20;
+/** A quiet port's berth dues a game day (10 Cr), until a port view shows the rate at its occupancy (tripled above 70%). */
+const BERTH_DUES_QUIET = 1_000;
+/** A berth stay is charged for at least this long (game hours, guide 3.3). */
+const BERTH_MIN_GAME_H = 6;
 /** Our own flow into a charter is measured over this much real time. */
 const OWN_RATE_WINDOW_MS = 6 * 60 * 60 * 1000;
 /** Our delivered tons not yet seen in a charter's total stop being matched after this. */
@@ -153,6 +172,30 @@ interface LapsedPosting {
   /** It was stalled late in its window, and its escalation count then (to learn whether the stall held). */
   lateStalled?: boolean;
   escalations?: number;
+  /** Under the pace line late in its window with only our tons in it (ExpansionWatch.lateTrickle), and its figures then. */
+  lateTrickle?: boolean;
+  ownTons?: number;
+  line?: number;
+  rate?: number;
+  remaining?: number;
+}
+
+/** A re-post of a posting only our ships delivered to (under the pace line): did it still escalate? */
+export interface TrickleSample {
+  at: number;
+  key: string;
+  ownTons: number;
+  line: number;
+  escalated: boolean;
+  payRatio: number | null;
+  tonsRatio: number | null;
+}
+
+/** What re-posts showed about our own small deliveries into stalled postings (OWN_TRICKLE_CONFIRM in a row allow them). */
+export interface TrickleRecord {
+  confirmed: number;
+  refuted: number;
+  samples: TrickleSample[];
 }
 
 /** What the world model had learned, saved so a restart doesn't start blind. */
@@ -188,10 +231,16 @@ export interface WorldSnapshot {
   /** An expected crisis charter's id → the charter found for it; shortages whose crisis charter was settled. */
   crisisLink?: Array<[string, string]>;
   crisisResolved?: string[];
+  /** Whether re-posts escalated after only our own deliveries under the pace line; absent in older saves. */
+  ownTrickle?: TrickleRecord;
+  /** Our expansion deliveries (posting id, server ms, tons); absent in older saves. */
+  ownDelivered?: Array<[string, number, number]>;
 }
 
 /** Ids of closed charters kept in a snapshot (the newest). */
 const SNAPSHOT_CLOSED = 1_000;
+/** Our expansion deliveries remembered (the newest): enough to span a posting's window across the fleet. */
+const OWN_DELIVERED_KEPT = 500;
 /** A stalled posting this close to its lapse (game hours) counts towards the stall-survival figure. */
 const LATE_STALL_GAME_H = 2;
 /** Prior for the stall-survival odds: as if this many lapses had been seen at 75%. */
@@ -253,8 +302,25 @@ export interface ExpansionWatch {
   beyondCoastal: boolean;
   /** Tons delivered across its postings. */
   deliveredTotal: number;
-  /** Nothing delivered in this posting so far (as far as we can tell): it re-posts richer if that lasts. */
+  /**
+   * It re-posts richer if it stays like this: under the guide's pace line, no rival delivery, and none of ours
+   * either until re-posts showed ours don't cancel it (World.judge).
+   */
   stalled: boolean;
+  /** This posting's tons, and when it began (server ms): known from its posting time or a re-post seen happen, else its lapse less the usual window. */
+  required?: number;
+  startAt?: number;
+  startKnown?: boolean;
+  /** Tons in this posting (undefined: unknown, the feed's count may be cumulative), and how many of them are ours. */
+  delivered?: number;
+  ownTons?: number;
+  /** Someone else delivered into this posting (a sibling company of ours counts: the server sees another company). */
+  rivalDelivered?: boolean;
+  /** Under STALL_PACE_SHARE of the pace so far, and that line in tons (as of the last judgement). */
+  underPace?: boolean;
+  line?: number;
+  /** Under the line late in its window with only our tons in it (or since): its re-post tests whether ours cancel the escalation. */
+  lateTrickle?: boolean;
   /** Seen stalled within a couple of game hours of its lapse (for learning how often stalls hold). */
   lateStalled?: boolean;
   /** One of our own ships delivered to this posting: its fate says nothing about rivals. */
@@ -437,6 +503,8 @@ export class World {
   unlockedPhase = 1;
   timeScale = 60;
   paused = false;
+  /** Server time the operators announced the season ends (`season_planned_end_at`; null: not announced). */
+  seasonEndsAt: number | null = null;
   /** Server clock minus local clock, ms. */
   skewMs = 0;
   charters: CharterInfo[] = [];
@@ -447,6 +515,8 @@ export class World {
   /** Other companies' ships and voyages: seen at ports where we have presence, and (rival intel) public records. */
   readonly rivals = new RivalTracker((g) => (this.catalog ? this.basePrice(g) : 0));
   vaults = new Map<BankingRegion, number>();
+  /** Our vault accounts' ids and their regions (to read the ledger). */
+  readonly vaultAccounts = new Map<string, BankingRegion>();
   /** Live net piracy per sea zone (bps): base + letters of marque − naval patrols. */
   piracy = new Map<string, number>();
   /** Charters of the expansion tier in play (their deliveries earn a share of its completion bonus). */
@@ -472,6 +542,18 @@ export class World {
   escalation = { pay: ESCALATION_PAY, tons: ESCALATION_TONS };
   /** Stalled postings seen lapse, and whether they re-posted richer. */
   private stallFates = { escalated: 0, not: 0 };
+  /** Re-posts after only our own deliveries under the pace line: whether ours cancel the escalation (noteTrickleFate). */
+  private ownTrickle: TrickleRecord = { confirmed: 0, refuted: 0, samples: [] };
+  /** Our charter deliveries in flight (or of unknown outcome, for a while) by posting: a listing meanwhile may already count them. */
+  private readonly inFlight = new Map<string, Array<{ tons: number; until: number }>>();
+  /** Our expansion deliveries (posting id, server ms, tons), newest last: a re-post seen after ours went into it counts them as ours. */
+  private ownDelivered: Array<[id: string, at: number, tons: number]> = [];
+  /** Berth dues a game day per port, as its port view (or a dock) last gave them. */
+  private readonly berthDues = new Map<string, number>();
+  /** Resting orders (`port|good|side` → order ids) ours can't trade with: our own other companies' (guide 3.2). */
+  private readonly unfillable = new Map<string, Set<string>>();
+  /** Customs per port as a book or port view last gave it (server time): newer than the catalog's, it wins. */
+  private readonly customsSeen = new Map<string, { bps: number; at: number }>();
   /** Our own pirate raids: shares of cargo taken (captures aside), and captures seen. */
   private raidTakes: number[] = [];
   captures = 0;
@@ -517,7 +599,7 @@ export class World {
   /** Expansion charters of the tier in play by `port|good`: our own flow into each, and its rival record. */
   private readonly lineages = new Map<string, Lineage>();
   private tierSamples: Array<{ at: number; delivered: number; phase: number }> = [];
-  /** Share value of a ton per expansion charter (pence: base price × premium), and the pool's rate on it. */
+  /** Share value of a ton per expansion charter (pence: its base price, as the bonus split counts it), and the pool's rate on it. */
   private expansionValue = new Map<string, number>();
   private expansionRate = EXPANSION_BONUS_SHARE;
   private rates = new Map<string, number>();
@@ -528,7 +610,9 @@ export class World {
   private readonly mergedAt = new Map<string, number>();
   /** Charters we saw filled or closed. */
   private readonly closed = new Set<string>();
-  private routes = new Map<string, Promise<RoutePlan>>();
+  private routes = new Map<string, { p: Promise<RoutePlan>; at: number }>();
+  /** Safe stores per route as departures warned of them (`from>to>class`). */
+  private readonly safeSeen = new Map<string, number>();
   private routeSlots = 8;
   private portIndex: Map<string, CatalogPort> | null = null;
   private readonly routeWaiters: Array<() => void> = [];
@@ -543,6 +627,22 @@ export class World {
   /** Real milliseconds per game minute (1 s at 60×). */
   get gameMinuteMs(): number {
     return 60_000 / this.timeScale;
+  }
+
+  /** Real ms of the season left, the slack taken off (Infinity until the end is announced). */
+  seasonLeftMs(now = this.now()): number {
+    return this.seasonEndsAt === null ? Infinity : this.seasonEndsAt - SEASON_END_SLACK_MS - now;
+  }
+
+  /** Whether server time `at` falls before the season ends (with the slack): charters and freight pay nothing after. */
+  beforeSeasonEnd(at: number): boolean {
+    return this.seasonEndsAt === null || at <= this.seasonEndsAt - SEASON_END_SLACK_MS;
+  }
+
+  /** normal; endgame (under SEASON_ENDGAME_MS left: no new hulls); final (under SEASON_FINAL_MS). */
+  seasonMode(now = this.now()): "normal" | "endgame" | "final" {
+    const left = this.seasonLeftMs(now);
+    return left < SEASON_FINAL_MS ? "final" : left < SEASON_ENDGAME_MS ? "endgame" : "normal";
   }
 
   async init(): Promise<void> {
@@ -578,6 +678,8 @@ export class World {
       shockCal: { ...this.shockCal, shortageBid: [...this.shockCal.shortageBid], glutAsk: [...this.shockCal.glutAsk], crisisPay: [...this.shockCal.crisisPay] },
       crisisLink: [...this.crisisLink],
       crisisResolved: [...this.crisisResolved],
+      ownTrickle: { ...this.ownTrickle, samples: [...this.ownTrickle.samples] },
+      ownDelivered: [...this.ownDelivered],
     };
   }
 
@@ -623,18 +725,37 @@ export class World {
     }
     for (const [a, b] of s.crisisLink ?? []) this.crisisLink.set(a, b);
     for (const id of s.crisisResolved ?? []) this.crisisResolved.add(id);
+    const t = s.ownTrickle;
+    if (t && Number.isFinite(t.confirmed) && Number.isFinite(t.refuted)) {
+      this.ownTrickle = { confirmed: t.confirmed, refuted: t.refuted, samples: Array.isArray(t.samples) ? t.samples.slice(-OWN_TRICKLE_SAMPLES) : [] };
+    }
+    if (Array.isArray(s.ownDelivered)) {
+      this.ownDelivered = s.ownDelivered.filter((x) => Array.isArray(x) && typeof x[0] === "string" && Number.isFinite(x[1]) && Number.isFinite(x[2])).slice(-OWN_DELIVERED_KEPT);
+    }
     this.updateBidHaircut();
   }
 
   /** Clock, charters, fees, vaults and world events (and the catalog now and again). */
   async refresh(): Promise<void> {
+    await this.readClock();
+    await this.refreshListings();
+  }
+
+  /** The clock alone: skew, phase, time scale, the pause flag, the season's end, the calendar (all a paused world reads). */
+  async readClock(): Promise<void> {
     const t0 = Date.now();
     const clock = await this.client.clock();
     const t1 = Date.now();
     this.skewMs = Date.parse(clock.real_utc) - (t0 + t1) / 2;
+    // New waters: the shortest unlocked routes (what depart sails) may now cross them.
+    if (clock.unlocked_phase !== this.unlockedPhase) this.routes.clear();
     this.unlockedPhase = clock.unlocked_phase;
     this.timeScale = clock.calendar.time_scale || 60;
     this.paused = clock.paused;
+    const end = clock.season_planned_end_at ? Date.parse(clock.season_planned_end_at) : NaN;
+    const ends = Number.isFinite(end) ? end : null;
+    if (ends !== null && ends !== this.seasonEndsAt) this.onNote?.(`the operators announced the season ends ${new Date(ends).toISOString()}: only work landing before then is planned`);
+    this.seasonEndsAt = ends;
     // The calendar, to tell storm season at any time ahead: 30-day months from 1 March (spec). If the
     // projection doesn't give the month the clock gives, the clock's month is used as it stands.
     const cal = clock.calendar;
@@ -643,7 +764,9 @@ export class World {
       this.calendar = { hours: cal.total_game_hours + (cal.minute ?? 0) / 60, month: cal.month, at: readAt, projectable: true };
       this.calendar.projectable = this.monthAt(readAt) === cal.month;
     }
+  }
 
+  private async refreshListings(): Promise<void> {
     const asked = Date.now();
     const since = new Date(this.now() - EVENT_LOOKBACK_GAME_DAYS * 24 * 60 * this.gameMinuteMs).toISOString();
     const [listing, freight, rates, zones, expansion, events] = await Promise.all([
@@ -671,11 +794,18 @@ export class World {
       const rivalTons = this.rivals.observeExpansion(live, this.now(), (k, d) => this.ownShare(k, d));
       this.expansionCharters = new Set(tier && !tier.completed ? tier.charters.filter((c) => c.status === "open").map((c) => c.contract_id) : []);
       this.expansionTonsLeft = tier && !tier.completed ? tier.tons_remaining : 0;
-      this.watchExpansion(live, rivalTons);
+      // When each charter was posted: an expansion posting's pace line counts from there.
+      const posted = new Map<string, number>();
+      for (const c of list) {
+        const t = c.created_at ? Date.parse(c.created_at) : NaN;
+        if (Number.isFinite(t)) posted.set(c.id, t);
+      }
+      this.watchExpansion(live, rivalTons, posted);
       if (tier && !tier.completed) {
         // Project the tier's final value: what is delivered, plus the tons still needed at the mix
-        // delivered so far. The pool over that is the bonus per unit of value.
-        const value = new Map(tier.charters.map((c) => [c.contract_id, this.basePrice(c.commodity_id) * (c.premium_bps / 10_000)]));
+        // delivered so far, every ton at its base price (the share counts no premium). The pool over
+        // that is the bonus per unit of value.
+        const value = new Map(tier.charters.map((c) => [c.contract_id, this.basePrice(c.commodity_id)]));
         let delivered = 0;
         let tons = 0;
         for (const c of tier.charters) {
@@ -711,11 +841,13 @@ export class World {
 
   /**
    * Follows each expansion charter across its postings: whether the current one is stalled (it
-   * re-posts richer if nothing is delivered before it lapses), what an escalation did to the pay
-   * and tons when we saw one, and how fast the tier as a whole is filling. `rivalTons`: rival tons
-   * delivered per charter since the last listing (the contribution board's deltas).
+   * re-posts richer if it stays under the pace line with no rival delivery before it lapses), what an
+   * escalation did to the pay and tons when we saw one, whether our own small deliveries cancel it
+   * (learned at re-posts), and how fast the tier as a whole is filling. `rivalTons`: rival tons
+   * delivered per charter since the last listing (the contribution board's deltas); `posted`: the
+   * charter listing's posting times by id.
    */
-  private watchExpansion(tier: ExpansionTier | null, rivalTons = new Map<string, number>()): void {
+  private watchExpansion(tier: ExpansionTier | null, rivalTons = new Map<string, number>(), posted = new Map<string, number>()): void {
     const now = this.now();
     if (!tier) {
       if (this.tierTargetPhase !== null) this.tierTurnedAt = now;
@@ -771,6 +903,9 @@ export class World {
           this.escalationsSeen++;
         } else this.stallFates.not++;
       }
+      // A posting only our ships delivered to, under the line, watched to its lapse: did its re-post still escalate?
+      const tested = prev && newPosting ? (prev.lateTrickle && !prev.rivalDelivered && !((rivalTons.get(key) ?? 0) > 0) ? prev : null) : lapsed?.lateTrickle ? lapsed : null;
+      if (tested) this.noteTrickleFate(key, tested, c);
       if (prev && prev.id !== c.contract_id) {
         this.repostOf.set(prev.id, c.contract_id);
         // Old links are long lapsed: keep the newest.
@@ -781,22 +916,32 @@ export class World {
       // Seen from its start (it replaced one we watched), so the base really is the posting's start.
       const sawStart = newPosting ? !!prev : prev.sawStart;
       const watchedLongEnough = sawStart && now - postingSeenAt >= STALL_MIN_WATCH_GAME_H * 60 * this.gameMinuteMs;
-      // Nothing delivered in this posting (the feed counts it per posting; across postings is
-      // tons_delivered_total). Only if the feed gives no lineage total (so the count may be
-      // cumulative): nothing since we watched this posting start, for a while.
-      const stalled = c.quantity_delivered === 0 || (c.tons_delivered_total === undefined && watchedLongEnough && total === postingBase);
-      // How rivals treat it: game hours it sat stalled while watched, and stalls they broke (any
-      // delivery ends one; our own aren't in `rivalTons`).
       const l = this.lineage(key);
-      if (prev?.seenStalled && prev.lastAt !== undefined) {
-        const end = newPosting && prev.expiresAt !== null ? Math.min(now, prev.expiresAt) : now;
-        l.stalledH += Math.max(0, Math.min(end - prev.lastAt, EXPOSURE_GAP_MS)) / (60 * this.gameMinuteMs);
-      }
-      // Across a re-post the tons went into the old posting (still stalled when last listed) or the new one.
-      if ((rivalTons.get(key) ?? 0) > 0 && prev && (newPosting ? !!prev.seenStalled || !stalled : !!prev.seenStalled && !stalled)) l.breaks++;
       // A re-post seen within a listing of its start: how long its postings run.
-      if (newPosting && prev?.lastAt !== undefined && now - prev.lastAt <= EXPOSURE_GAP_MS && expiresAt !== null && expiresAt > now) l.windowMs = expiresAt - now;
-      this.expansionWatch.set(key, {
+      const seenStart = newPosting && prev?.lastAt !== undefined && now - prev.lastAt <= EXPOSURE_GAP_MS && expiresAt !== null && expiresAt > now;
+      if (seenStart) l.windowMs = expiresAt - now;
+      // Its listed posting time gives that exactly, unless the span is too long for one posting (a re-post kept
+      // an earlier posting's id and time).
+      const created = posted.get(c.contract_id);
+      const createdAt = created !== undefined && expiresAt !== null && expiresAt > created && expiresAt - created <= 1.5 * this.defaultWindowMs(tier.target_phase) ? created : null;
+      if (createdAt !== null) l.windowMs = expiresAt! - createdAt;
+      // When this posting began: posted, seen replace the last one, carried over; else its lapse less the usual window.
+      const startKnown = createdAt !== null || seenStart || (!newPosting && !!prev.startKnown);
+      const startAt =
+        createdAt ?? (seenStart ? now : !newPosting && prev.startKnown ? prev.startAt : expiresAt !== null ? expiresAt - this.postingWindowMs(key) : undefined);
+      // Tons in this posting: the feed counts quantity_delivered per posting (across postings is
+      // tons_delivered_total). Without a lineage total the count may be cumulative: what grew since we
+      // watched this posting start, once watched a while; unknown before that.
+      // A new posting starts with ours logged into it before this listing showed it: into the same id after the last
+      // posting's lapse, or into a new id since its listed start (never taken for a rival's).
+      const last = prev ?? lapsed;
+      const since = last && last.id === c.contract_id ? (last.expiresAt ?? -Infinity) : (createdAt ?? -Infinity);
+      const ownTons = newPosting ? this.ownTonsSince(c.contract_id, since) : (prev.ownTons ?? 0);
+      const inPosting = c.quantity_delivered === 0 ? 0 : c.tons_delivered_total !== undefined ? c.quantity_delivered : watchedLongEnough ? total - postingBase : null;
+      // Anyone else's tons, a sibling company's included (the server sees another company). Ours in flight
+      // aren't anyone else's.
+      const rivalDelivered = (!newPosting && !!prev.rivalDelivered) || (inPosting !== null && inPosting > ownTons + this.inFlightTons(c.contract_id) + 0.5);
+      const w: ExpansionWatch = {
         id: c.contract_id,
         port: c.port_id,
         good: c.commodity_id,
@@ -806,48 +951,203 @@ export class World {
         escalations: c.escalations,
         beyondCoastal: c.beyond_coastal_water,
         deliveredTotal: total,
-        stalled,
-        seenStalled: stalled,
+        stalled: false,
         lastAt: now,
         postingSeenAt,
         postingBase,
         sawStart,
         lateStalled: false,
-      });
-      const w = this.expansionWatch.get(key)!;
+        required: c.quantity_required,
+        startAt,
+        startKnown,
+        // A listing a moment behind our own delivery: never fewer than ours.
+        delivered: inPosting === null ? undefined : Math.max(inPosting, ownTons),
+        ownTons,
+        rivalDelivered,
+        // Kept within a posting; a new posting starts clean (but for ours logged into it already).
+        ourDelivery: newPosting ? ownTons > 0 : !!prev.ourDelivery,
+      };
+      this.judge(w, now);
+      const stalled = w.stalled;
+      w.seenStalled = stalled;
+      // How rivals treat it: game hours it sat stalled while watched, and stalls they broke (any other
+      // company's delivery ends one, our sibling companies' included; this company's aren't in `rivalTons`).
+      if (prev?.seenStalled && prev.lastAt !== undefined) {
+        const end = newPosting && prev.expiresAt !== null ? Math.min(now, prev.expiresAt) : now;
+        l.stalledH += Math.max(0, Math.min(end - prev.lastAt, EXPOSURE_GAP_MS)) / (60 * this.gameMinuteMs);
+      }
+      // Across a re-post the tons went into the old posting (still stalled when last listed) or the new one.
+      if ((rivalTons.get(key) ?? 0) > 0 && prev && (newPosting ? !!prev.seenStalled || !stalled : !!prev.seenStalled && !stalled)) l.breaks++;
       const late = expiresAt !== null && expiresAt - now <= LATE_STALL_GAME_H * 60 * this.gameMinuteMs && expiresAt > now;
-      // Kept within a posting; a new posting starts clean.
-      w.ourDelivery = !newPosting && !!prev?.ourDelivery;
       // A late stall broken by someone else's delivery before the lapse: it didn't hold.
-      if (prev && !newPosting && prev.lateStalled && !w.stalled && !w.ourDelivery) this.stallFates.not++;
+      if (prev && !newPosting && prev.lateStalled && !stalled && !w.ourDelivery) this.stallFates.not++;
       // Carried over within a posting.
-      w.lateStalled = w.stalled && ((!newPosting && !!prev?.lateStalled) || late);
+      w.lateStalled = stalled && ((!newPosting && !!prev.lateStalled) || late);
+      // Under the line late in its window with only our tons in it: its re-post tests whether ours cancel the escalation.
+      w.lateTrickle = !!w.underPace && startKnown && !rivalDelivered && ownTons > 0 && ((!newPosting && !!prev.lateTrickle) || late);
+      this.expansionWatch.set(key, w);
     }
     for (const [k, w] of [...this.expansionWatch]) {
       if (seen.has(k)) continue;
       // Gone from the listing before its lapse: filled or closed. After it: awaiting its re-post.
-      if (w.expiresAt !== null && w.expiresAt <= now) this.lapsedPostings.set(k, { id: w.id, expiresAt: w.expiresAt, lateStalled: w.lateStalled && !w.ourDelivery, escalations: w.escalations });
+      if (w.expiresAt !== null && w.expiresAt <= now) {
+        this.lapsedPostings.set(k, {
+          id: w.id,
+          expiresAt: w.expiresAt,
+          lateStalled: w.lateStalled && !w.ourDelivery,
+          escalations: w.escalations,
+          lateTrickle: !!w.lateTrickle && !w.rivalDelivered,
+          ownTons: w.ownTons,
+          line: w.line,
+          rate: w.rate,
+          remaining: w.remaining,
+        });
+      }
       this.expansionWatch.delete(k);
     }
     for (const k of seen) this.lapsedPostings.delete(k);
   }
 
   /**
-   * One of our ships delivered `tons` to this charter: an expansion posting's stall is over (ours
-   * ends it too) and its fate isn't learned from it, and the tons are ours when its delivered total
-   * next grows (not a rival's).
+   * The guide's stall (under a tenth of the pace its tons over its window imply so far, guide 3.8) and
+   * whether the re-post still escalates: never after anyone else's delivery ("any rival delivering
+   * cancels the escalation"); after only ours, not until re-posts showed ours don't cancel it.
+   */
+  private judge(w: ExpansionWatch, now = this.now()): void {
+    if (w.delivered === undefined) {
+      w.underPace = w.stalled = false;
+      return;
+    }
+    const span = w.expiresAt !== null && w.startAt !== undefined ? w.expiresAt - w.startAt : 0;
+    const frac = span > 0 ? Math.min(1, Math.max(0, (now - w.startAt!) / span)) : 1;
+    w.line = STALL_PACE_SHARE * (w.required ?? 0) * frac;
+    w.underPace = w.delivered === 0 || w.delivered < w.line;
+    w.stalled = w.underPace && !w.rivalDelivered && (!((w.ownTons ?? 0) > 0) || this.ownTrickleOk);
+  }
+
+  /**
+   * A posting only our ships delivered to (under the line, late in its window) was re-posted: did it
+   * still escalate? Only the escalation count says so (a re-post's pay follows the port's NPC bid, so richer
+   * pay alone isn't one). OWN_TRICKLE_CONFIRM in a row allow ours into camped postings (under the line); one
+   * that didn't resets that (a stall can fail to escalate for other reasons: deliberately strict).
+   */
+  private noteTrickleFate(key: string, t: { escalations?: number; rate?: number; remaining?: number; ownTons?: number; line?: number }, c: ExpansionTier["charters"][number]): void {
+    const payRatio = t.rate ? c.reward_per_ton_pence / t.rate : null;
+    const tonsRatio = t.remaining ? c.quantity_remaining / t.remaining : null;
+    const escalated = c.escalations > (t.escalations ?? 0);
+    const r = this.ownTrickle;
+    const was = this.ownTrickleOk;
+    r.samples = [...r.samples, { at: this.now(), key, ownTons: t.ownTons ?? 0, line: Math.round(t.line ?? 0), escalated, payRatio, tonsRatio }].slice(-OWN_TRICKLE_SAMPLES);
+    if (escalated) r.confirmed++;
+    else {
+      r.refuted++;
+      r.confirmed = 0;
+    }
+    const [port, good] = key.split("|");
+    this.onNote?.(
+      this.ownTrickleOk !== was
+        ? this.ownTrickleOk
+          ? `our own small deliveries didn't cancel ${OWN_TRICKLE_CONFIRM} re-posts: delivering under the pace line into postings let lapse from now on`
+          : `the ${good} charter at ${port} didn't escalate after only our ${t.ownTons ?? 0} t: none of ours into postings let lapse again`
+        : `the ${good} charter at ${port} re-posted after only our ${t.ownTons ?? 0} t (under its ${Math.round(t.line ?? 0)} t pace line): ` +
+            `${escalated ? "escalated" : "did not escalate"} (${r.confirmed}/${OWN_TRICKLE_CONFIRM} to allow ours)`,
+    );
+  }
+
+  /** Re-posts have shown our own deliveries under the pace line don't cancel the escalation (noteTrickleFate). */
+  get ownTrickleOk(): boolean {
+    return this.ownTrickle.confirmed >= OWN_TRICKLE_CONFIRM;
+  }
+
+  /** What re-posts showed about our own small deliveries (dashboard). */
+  trickleRecord(): TrickleRecord {
+    return { ...this.ownTrickle, samples: [...this.ownTrickle.samples] };
+  }
+
+  /**
+   * Tons of ours that may go into this stalled posting now and keep it under the line (with
+   * TRICKLE_SAFETY): 0 until learned safe, after anyone else's delivery, or with its start unknown.
+   */
+  trickleRoom(charterId: string, now = this.now()): number {
+    if (!this.ownTrickleOk) return 0;
+    const id = this.currentId(charterId);
+    const w = [...this.expansionWatch.values()].find((x) => x.id === id);
+    if (!w || !w.startKnown || w.rivalDelivered || w.delivered === undefined) return 0;
+    // The line rises with time.
+    this.judge(w, now);
+    if (!w.stalled) return 0;
+    return Math.max(0, Math.ceil(w.line! * TRICKLE_SAFETY) - 1 - Math.ceil(w.delivered + this.inFlightTons(id)));
+  }
+
+  /**
+   * Marks our deliveries into these charters in flight until the returned function is called (once the
+   * result is booked: noteOwnDelivery), so a listing meanwhile doesn't read them as anyone else's.
+   * `unsure` (the call may have gone through): they stay marked for OWN_PENDING_MS.
+   */
+  delivering(entries: Array<{ id: string; tons: number }>): (unsure?: boolean) => void {
+    const marks = entries
+      .filter((e) => e.tons > 0)
+      .map((e) => {
+        const id = this.currentId(e.id);
+        const mark = { tons: e.tons, until: Infinity };
+        this.inFlight.set(id, [...(this.inFlight.get(id) ?? []), mark]);
+        return { id, mark };
+      });
+    return (unsure = false) => {
+      for (const { id, mark } of marks) {
+        if (unsure) mark.until = this.now() + OWN_PENDING_MS;
+        else {
+          const left = (this.inFlight.get(id) ?? []).filter((m) => m !== mark);
+          if (left.length) this.inFlight.set(id, left);
+          else this.inFlight.delete(id);
+        }
+      }
+    };
+  }
+
+  /** Our tons delivered into this posting id after server time `since` (noteOwnDelivery's log). */
+  private ownTonsSince(id: string, since: number): number {
+    return this.ownDelivered.reduce((n, [x, at, t]) => (x === id && at > since ? n + t : n), 0);
+  }
+
+  /** Our tons in flight into this posting (World.delivering). */
+  private inFlightTons(id: string): number {
+    const marks = this.inFlight.get(id);
+    if (!marks) return 0;
+    const now = this.now();
+    const live = marks.filter((m) => m.until > now);
+    if (live.length === 0) this.inFlight.delete(id);
+    else if (live.length < marks.length) this.inFlight.set(id, live);
+    return live.reduce((n, m) => n + m.tons, 0);
+  }
+
+  /**
+   * One of our ships delivered `tons` to this charter: they count in its posting as ours (judged again:
+   * ours end a stall until re-posts show they don't), its stall fate isn't learned from it, and the tons
+   * are ours when its delivered total next grows (not a rival's).
    */
   noteOwnDelivery(c: { id: string; port: string; good: string }, tons: number): void {
     if (!(tons > 0)) return;
     const id = this.currentId(c.id);
+    const now = this.now();
+    // Expansion postings' kept by id and time: a re-post under the same id that the listing hasn't shown yet gets them (watchExpansion).
+    if (this.expansionCharters.has(id) || [...this.expansionWatch.values(), ...this.lapsedPostings.values()].some((w) => w.id === id)) {
+      this.ownDelivered.push([id, now, tons]);
+      if (this.ownDelivered.length > OWN_DELIVERED_KEPT) this.ownDelivered.splice(0, this.ownDelivered.length - OWN_DELIVERED_KEPT);
+    }
     for (const w of this.expansionWatch.values()) {
-      if (w.id !== id) continue;
+      // A lapsed posting's watch: these went into its re-post, not into it.
+      if (w.id !== id || (w.expiresAt !== null && w.expiresAt <= now)) continue;
       w.ourDelivery = true;
-      w.stalled = false;
+      w.ownTons = (w.ownTons ?? 0) + tons;
+      // Unknown stays unknown (judged not stalled).
+      if (w.delivered !== undefined) w.delivered += tons;
+      this.judge(w, now);
+      const late = w.expiresAt !== null && w.expiresAt > now && w.expiresAt - now <= LATE_STALL_GAME_H * 60 * this.gameMinuteMs;
+      if (late && w.underPace && w.startKnown && !w.rivalDelivered) w.lateTrickle = true;
     }
     if (!this.expansionCharters.has(id) && this.expansionWatch.get(`${c.port}|${c.good}`)?.id !== id) return;
     const l = this.lineage(`${c.port}|${c.good}`);
-    const now = this.now();
     l.own = [...l.own.filter(([at]) => now - at <= OWN_RATE_WINDOW_MS), [now, tons]];
     l.ownPending = (now - l.ownPendingAt > OWN_PENDING_MS ? 0 : l.ownPending) + tons;
     l.ownPendingAt = now;
@@ -925,24 +1225,36 @@ export class World {
     return tons / (OWN_RATE_WINDOW_MS / 3_600_000);
   }
 
-  /** Real ms this charter's postings stay open: seen at a re-post, else by the tier's phase. */
+  /** Real ms this charter's postings stay open: seen at a re-post (or from a posting time), else by the tier's phase. */
   postingWindowMs(key: string): number {
-    return this.lineages.get(key)?.windowMs ?? (POSTING_GAME_DAYS[this.tierTargetPhase ?? 2] ?? 30) * 24 * 60 * this.gameMinuteMs;
+    return this.lineages.get(key)?.windowMs ?? this.defaultWindowMs();
+  }
+
+  /** Real ms a tier's postings stay open by the phase it unlocks (guide 3.8: 30, 60 or 90 game days). */
+  private defaultWindowMs(phase = this.tierTargetPhase ?? 2): number {
+    return (POSTING_GAME_DAYS[phase] ?? 30) * 24 * 60 * this.gameMinuteMs;
   }
 
   /**
-   * A public `charter_delivered` notice. Unless it was ours (`ours`, or failing that one of our own
-   * deliveries into the posting just now), a stalled posting's stall is over: returns its watch.
-   * Tons and company are counted from the next listing's board, not here.
+   * A public `charter_delivered` notice. Unless it was ours (`ours`: this company's; failing that, a
+   * delivery of ours into the posting just now or in flight), someone else delivered, a sibling
+   * company of ours included (the server sees another company): the posting's re-post won't escalate.
+   * Returns its watch if that ended a stall. `at`: the notice's time (before this posting began: it
+   * was into the last one). Tons and company are counted from the next listing's board, not here.
    */
-  noteCharterDelivered(charterId: string, ours: boolean | undefined): ExpansionWatch | undefined {
+  noteCharterDelivered(charterId: string, ours: boolean | undefined, at?: number): ExpansionWatch | undefined {
     const id = this.currentId(charterId);
     const now = this.now();
     for (const [key, w] of this.expansionWatch) {
-      if (w.id !== id || !w.stalled) continue;
-      if (ours ?? (this.lineages.get(key)?.own ?? []).some(([at]) => now - at <= OWN_MATCH_MS)) return undefined;
+      if (w.id !== id) continue;
+      if (ours ?? ((this.lineages.get(key)?.own ?? []).some(([t]) => now - t <= OWN_MATCH_MS) || this.inFlightTons(id) > 0)) return undefined;
+      if (at !== undefined && Number.isFinite(at) && w.startKnown && w.startAt !== undefined && at < w.startAt) return undefined;
+      // Kept for the rest of the posting (learning needs it whether or not it was stalled).
+      const was = w.stalled;
+      w.rivalDelivered = true;
       w.stalled = false;
-      return w;
+      w.lateTrickle = false;
+      return was ? w : undefined;
     }
     return undefined;
   }
@@ -1095,7 +1407,9 @@ export class World {
 
   async refreshVaults(): Promise<void> {
     const { vaults } = await this.client.vaults();
-    this.vaults = new Map(vaults.filter((v) => v.account_type === "vault").map((v) => [v.banking_region, v.balance_pence]));
+    const own = vaults.filter((v) => v.account_type === "vault");
+    this.vaults = new Map(own.map((v) => [v.banking_region, v.balance_pence]));
+    for (const v of own) this.vaultAccounts.set(v.account_id, v.banking_region);
   }
 
   // ── World events ────────────────────────────────────────────────────────────
@@ -1480,6 +1794,22 @@ export class World {
     return (this.port(portId)?.is_hub ? 1 : 2) * this.gameMinuteMs;
   }
 
+  /** A port's berth dues a game day, as a port view (or a dock) gave them at its occupancy then. */
+  noteBerthDues(portId: string, perDay: number | null | undefined): void {
+    if (typeof perDay === "number" && Number.isFinite(perDay) && perDay >= 0) this.berthDues.set(portId, perDay);
+  }
+
+  /**
+   * Berth dues for `ms` berthed at a port (guide 3.3: pro rata per game day, at least 6 game hours a
+   * stay; `minimum` off: the stay's minimum is already paid, the ship is there). The rate seen there
+   * last (its occupancy then), else a quiet port's.
+   */
+  berthDuesFor(portId: string, ms: number, minimum = true): number {
+    const perDay = this.berthDues.get(portId) ?? BERTH_DUES_QUIET;
+    const billed = Math.max(minimum ? BERTH_MIN_GAME_H * 60 * this.gameMinuteMs : 0, ms);
+    return Math.round((perDay * billed) / (24 * 60 * this.gameMinuteMs));
+  }
+
   /** Real ms to sail `nm` at `knots`. */
   sailMs(nm: number, knots: number): number {
     return (nm / Math.max(knots, 0.1)) * 60 * this.gameMinuteMs;
@@ -1487,15 +1817,32 @@ export class World {
 
   // ── Routes ──────────────────────────────────────────────────────────────────
 
-  route(from: string, to: string, shipClass: string): Promise<RoutePlan> {
+  /** The route `depart` would sail (cached up to ROUTE_TTL_MS; `maxAgeMs`: no older than this, e.g. as a hull is committed to it). */
+  route(from: string, to: string, shipClass: string, opts: { maxAgeMs?: number } = {}): Promise<RoutePlan> {
     const key = `${from}>${to}>${shipClass}`;
-    let p = this.routes.get(key);
-    if (!p) {
-      p = this.fetchRoute(from, to, shipClass);
-      p.catch(() => this.routes.delete(key));
-      this.routes.set(key, p);
-    }
-    return p;
+    const hit = this.routes.get(key);
+    if (hit && Date.now() - hit.at <= Math.min(opts.maxAgeMs ?? ROUTE_TTL_MS, ROUTE_TTL_MS)) return hit.p;
+    const entry = { p: this.fetchRoute(from, to, shipClass), at: Date.now() };
+    entry.p.catch(() => {
+      if (this.routes.get(key) === entry) this.routes.delete(key);
+    });
+    this.routes.set(key, entry);
+    return entry.p;
+  }
+
+  /** Our plan of this route proved stale (the server sailed or refused on another): read it afresh next time. */
+  forgetRoute(from: string, to: string, shipClass: string): void {
+    this.routes.delete(`${from}>${to}>${shipClass}`);
+  }
+
+  /** A departure warned the stores were under this route's safe figure (`stores_below_safe`): the server's figure, kept in memory. */
+  noteSafeStores(from: string, to: string, shipClass: string, tons: number): void {
+    if (Number.isFinite(tons) && tons > 0) this.safeSeen.set(`${from}>${to}>${shipClass}`, tons);
+  }
+
+  /** The safe stores a departure on this route last said it needs (0: none said). */
+  safeFloor(from: string, to: string, shipClass: string): number {
+    return this.safeSeen.get(`${from}>${to}>${shipClass}`) ?? 0;
   }
 
   /** At most a few route lookups in flight: a first planning pass asks for hundreds. */
@@ -1511,21 +1858,28 @@ export class World {
   }
 
   /**
-   * True when a hull of class `hull` is rated for every leg: the lane's own class and the class of
-   * the sea zone each leg ends in (hazards roll for that zone).
+   * True when a hull of class `hull` is rated for every leg: the leg's own class and the class of
+   * the sea zone its hazards roll for (World.hazardZone).
    */
   routeRated(plan: RoutePlan, hull: ZoneClass): boolean {
     const max = ZONE_RANK[hull];
+    // Every leg rolls hazards for the zone it ends in; the last leg ends at the port, whose own sea zone
+    // counts. A zone we can't place fails closed.
     return plan.legs.every((l) => {
-      const zone = this.catalog.sea_zones.find((z) => z.id === l.to_node);
-      return ZONE_RANK[l.edge_class] <= max && (!zone || ZONE_RANK[zone.zone_class] <= max);
+      const zone = this.hazardZone(l.to_node);
+      return ZONE_RANK[l.edge_class] <= max && !!zone && ZONE_RANK[zone.zone_class] <= max;
     });
   }
 
-  /** Phase-completion bonus a ton delivered to this charter is expected to earn (pence, unweighted). */
+  /**
+   * Phase-completion bonus a ton delivered to this charter is expected to earn (pence, unweighted): its
+   * base value (the share counts no premium) at the pool's rate. Nothing if the tier, at its recent pace,
+   * can't complete before the season ends (guide 3.11).
+   */
   charterBonus(c: { id: string; good: string }): number {
     if (!this.expansionCharters.has(c.id)) return 0;
-    return Math.round((this.expansionValue.get(c.id) ?? this.basePrice(c.good) * 1.3) * this.expansionRate);
+    if (this.seasonEndsAt !== null && (this.tierEtaMs === null || !this.beforeSeasonEnd(this.now() + this.tierEtaMs))) return 0;
+    return Math.round((this.expansionValue.get(c.id) ?? this.basePrice(c.good)) * this.expansionRate);
   }
 
   /**
@@ -1780,10 +2134,13 @@ export class World {
   observeBook(book: PortOrderBook): void {
     const at = book.as_of ? Date.parse(book.as_of) : this.now();
     const live = book.visibility === "quay" || book.visibility === "counting_house";
+    this.noteCustoms(book.port_id, book.customs_bps, at);
     for (const b of book.books) {
-      // A live bid after an older remembered one: how far did it drift for its age?
+      // A live bid after an older remembered one: how far did it drift for its age? (The best bid our asks can
+      // take: our own other companies' resting bids left out, noteUnfillable.)
       const prev = this.prices.get(`${book.port_id}|${b.commodity_id}`);
-      const bid = b.best_bid?.price_pence ?? null;
+      const best = this.fillable(book.port_id, b, "bid");
+      const bid = best?.price_pence ?? null;
       if (live && bid && prev?.bid && at > prev.at) {
         const days = (at - prev.at) / (24 * 60 * this.gameMinuteMs);
         if (days >= 0.25 && days <= 3) {
@@ -1792,13 +2149,15 @@ export class World {
           this.updateBidHaircut();
         }
       }
-      this.sampleShock(book.port_id, b.commodity_id, bid, b.best_ask?.price_pence ?? null, at);
+      // The best ask our bids can fill: our own other companies' resting asks left out (noteUnfillable).
+      const ask = this.fillable(book.port_id, b, "ask");
+      this.sampleShock(book.port_id, b.commodity_id, bid, ask?.price_pence ?? null, at);
       this.prices.set(`${book.port_id}|${b.commodity_id}`, {
-        ask: b.best_ask?.price_pence ?? null,
-        askQty: b.best_ask?.quantity ?? 0,
-        bid: b.best_bid?.price_pence ?? null,
-        bidQty: b.best_bid?.quantity ?? 0,
-        bidDepth: b.depth ? b.depth.bids.reduce((n, l) => n + l.remaining_quantity, 0) : null,
+        ask: ask?.price_pence ?? null,
+        askQty: ask?.quantity ?? 0,
+        bid,
+        bidQty: best?.quantity ?? 0,
+        bidDepth: b.depth ? b.depth.bids.filter((l) => !this.isUnfillable(book.port_id, b.commodity_id, l.order_id, "bid")).reduce((n, l) => n + l.remaining_quantity, 0) : null,
         stock: b.depth?.npc_current_stock ?? null,
         customsBps: book.customs_bps,
         at,
@@ -1807,9 +2166,51 @@ export class World {
     }
   }
 
-  /** Learns other ports' prices from the coffee-house gossip at a quay we stand on, and who sailed there. */
+  /**
+   * Orders never match our own other companies (guide 3.2): these resting asks (or bids) at `port` for
+   * `good` stayed untouched under an order of ours that crossed them, so they are left out of the ask
+   * (or bid) from now on (until they leave the book).
+   */
+  noteUnfillable(port: string, good: string, orderIds: string[], side: "ask" | "bid" = "ask"): void {
+    if (orderIds.length === 0) return;
+    const k = `${port}|${good}|${side}`;
+    this.unfillable.set(k, new Set([...(this.unfillable.get(k) ?? []), ...orderIds]));
+  }
+
+  /** A resting ask our bids can't fill, or a bid our asks can't (noteUnfillable). */
+  isUnfillable(port: string, good: string, orderId: string, side: "ask" | "bid" = "ask"): boolean {
+    return !!this.unfillable.get(`${port}|${good}|${side}`)?.has(orderId);
+  }
+
+  /** A book side's best level without the orders ours can't trade with (null: only those are left, as good as none). */
+  private fillable(port: string, b: PortOrderBook["books"][number], side: "ask" | "bid"): { price_pence: number; quantity: number } | null {
+    const k = `${port}|${b.commodity_id}|${side}`;
+    const top = (side === "ask" ? b.best_ask : b.best_bid) ?? null;
+    const skip = this.unfillable.get(k);
+    if (!skip || !b.depth) return top;
+    const levels = side === "ask" ? b.depth.asks : b.depth.bids;
+    // Gone from the book: forgotten.
+    for (const id of [...skip]) if (!levels.some((l) => l.order_id === id)) skip.delete(id);
+    if (skip.size === 0) this.unfillable.delete(k);
+    const open = levels.filter((l) => !skip.has(l.order_id));
+    if (open.length === 0) return levels.length > 0 ? null : top;
+    const prices = open.map((l) => l.price_pence);
+    const price = side === "ask" ? Math.min(...prices) : Math.max(...prices);
+    return { price_pence: price, quantity: open.filter((l) => l.price_pence === price).reduce((n, l) => n + l.remaining_quantity, 0) };
+  }
+
+  /** Customs a book or port view just gave for `port` (server time `at`). */
+  private noteCustoms(port: string, bps: number | null | undefined, at: number): void {
+    if (typeof bps !== "number" || !Number.isFinite(bps) || bps < 0 || !Number.isFinite(at)) return;
+    const prev = this.customsSeen.get(port);
+    if (!prev || at >= prev.at) this.customsSeen.set(port, { bps, at });
+  }
+
+  /** Learns other ports' prices from the coffee-house gossip at a quay we stand on, who sailed there, and its berth dues. */
   observeGossip(detail: PortDetail): void {
     this.rivals.addNotices(detail.recent_sailings);
+    this.noteBerthDues(detail.id, detail.berth_dues_per_day_pence);
+    this.noteCustoms(detail.id, detail.customs_bps, this.now());
     for (const g of detail.coffee_house_gossip ?? []) {
       const at = this.now() - g.age_seconds * 1000;
       for (const c of g.commodities) {
@@ -1874,8 +2275,11 @@ export class World {
     });
   }
 
+  /** A port's customs (paid by the buyer): the live figure from any book or port view read since the catalog, else the catalog's. */
   customsBps(portId: string): number {
-    return this.prices.get(`${portId}|provisions`)?.customsBps ?? this.port(portId)?.customs_bps ?? 300;
+    const seen = this.customsSeen.get(portId);
+    if (seen && seen.at >= this.catalogAt) return seen.bps;
+    return this.port(portId)?.customs_bps ?? seen?.bps ?? this.prices.get(`${portId}|provisions`)?.customsBps ?? 300;
   }
 
   // ── Money ───────────────────────────────────────────────────────────────────
@@ -1897,6 +2301,11 @@ export class World {
   /** Fleet sprawl upkeep per game day for this much coastal/regional hull tonnage. */
   sprawlPerDay(tons: number): number {
     return tons <= 40 ? 0 : Math.round(4_500 * Math.pow((tons - 40) / 100, 1.45));
+  }
+
+  /** Resident Factors' share of the fleet bill (guide 3.9): 120 Cr × factors^1.3 a game day. */
+  factorUpkeepPerDay(n: number): number {
+    return n > 0 ? Math.round(12_000 * n ** 1.3) : 0;
   }
 
   /** Extra upkeep per real hour from adding `addTons` of hull to a fleet of `fleetTons`. */
