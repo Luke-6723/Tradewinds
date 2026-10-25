@@ -1,14 +1,14 @@
 "use client";
 
-// Insurance pieces shared by the insurance page and the ship page: requesting a policy (keeping the
-// insurable cap from a refusal), and what underwriters have accepted before on a lane.
+// Insurance pieces shared by the insurance page and the ship page: quoting a voyage with Lloyd's first,
+// requesting a policy (keeping the insurable cap from a refusal), and Lloyd's posted prices on a lane.
 
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ErrorNote, KV } from "@/components/kibb/bits";
 import { usePoll } from "@/hooks/use-poll";
 import { DashboardApiError, dash, kibbGet, writeFetch } from "@/lib/kibb/browser";
-import { fmtCr } from "@/lib/kibb/format";
+import { fmtBps, fmtCr } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
 
 export interface InsurableValue {
@@ -21,7 +21,7 @@ export interface InsurableValue {
  * POST through the proxy keeping the whole problem body: an `exceeds_insurable_value` answer
  * carries the cap, which the usual helper drops. The error then states it in Crowns.
  */
-export async function createPolicy(body: S.CreateInsurancePolicyRequest): Promise<S.InsurancePolicy> {
+export async function createPolicy(body: S.CreateInsurancePolicyRequest): Promise<S.CreateInsurancePolicyResult> {
   // One key per request: a retry after a timeout or 5xx replays it rather than listing a second policy.
   const res = await writeFetch("POST", "/api/kibb/v1/insurance/create", JSON.stringify(body));
   const text = await res.text();
@@ -31,7 +31,7 @@ export async function createPolicy(body: S.CreateInsurancePolicyRequest): Promis
   } catch {
     data = text;
   }
-  if (res.ok) return data as S.InsurancePolicy;
+  if (res.ok) return data as S.CreateInsurancePolicyResult;
   const p = (data && typeof data === "object" ? data : {}) as { code?: string; detail?: string; title?: string; insurable_value?: InsurableValue };
   if (res.status === 401 && p.code === "not_signed_in") window.location.href = "/login";
   else if (res.status === 401 && (p.code === "no_company_key" || p.code === "no_company")) window.location.href = "/companies";
@@ -69,8 +69,113 @@ export function InsurableCap({ cap, valueCr, onUseMax }: { cap: InsurableValue; 
 /** Hull-only cover: nothing declared above the hull value, so it pays only on a sinking. */
 export const isHullOnly = (p: { insured_value_pence: number; hull_value_pence: number }) => p.insured_value_pence <= p.hull_value_pence;
 
-/** Lloyd's writes only if premium ≥ 1.25 × expected loss + 25 bps, so a premium it accepted bounds the expected loss (bps). */
-export const impliedMaxEl = (premiumBps: number) => Math.max(0, (premiumBps - 25) / 1.25);
+/**
+ * Lloyd's writes only if premium ≥ ceil(2.5 × expected loss) + 25 bps, so a premium it accepted bounds the expected
+ * loss (bps). Only where a listing doesn't carry Lloyd's own estimate (`lloyds_expected_loss_bps`).
+ */
+export const impliedMaxEl = (premiumBps: number) => Math.max(0, (premiumBps - 25) / 2.5);
+
+/** Most of the declared cargo one partial loss can claim: a storm 25%, pirates who let the ship go what they seized (at most 50%). */
+export const MAX_PARTIAL_SHARE = 0.5;
+
+/** The most a slice of a policy covered `coveredBps` may be: steps of 100 from 500, or a remainder under 500 whole (guide 3.6). */
+export function maxSliceFor(coveredBps: number): number {
+  const uncovered = Math.max(0, 10_000 - coveredBps);
+  return uncovered < 500 ? uncovered : Math.floor(uncovered / 100) * 100;
+}
+
+/** Whether `slice` bps may be written on a policy with `uncovered` bps left. */
+export function sliceOk(slice: number, uncovered: number): boolean {
+  if (uncovered <= 0 || slice <= 0) return false;
+  return uncovered < 500 ? slice === uncovered : slice >= 500 && slice <= uncovered && slice % 100 === 0;
+}
+
+/** Lloyd's price for a voyage, as `insurance/quote` gives it for this ship, port and sum insured; null until asked, undefined while loading. */
+export function useInsuranceQuote(shipId: string, dest: string, valuePence: number) {
+  const ok = !!shipId && !!dest && Number.isFinite(valuePence) && valuePence > 0;
+  return usePoll(
+    ok ? () => kibbGet<S.LloydsQuoteResult>("/v1/insurance/quote", { ship_id: shipId, dest_port_id: dest, insured_value_pence: Math.round(valuePence) }) : null,
+    30_000,
+    [shipId, dest, ok ? Math.round(valuePence) : 0],
+  );
+}
+
+/**
+ * Lloyd's price for the voyage (quoted before a policy is asked for): the cap, its estimate of the claim and its
+ * posted price, with buttons that declare the whole cargo and offer that price.
+ */
+export function QuoteGuide({
+  quote,
+  error,
+  valueCr,
+  premiumBps,
+  onValue,
+  onPremium,
+}: {
+  quote: S.LloydsQuoteResult | undefined;
+  error: Error | null;
+  valueCr: string;
+  premiumBps: number;
+  onValue: (cr: string) => void;
+  onPremium: (bps: string) => void;
+}) {
+  if (error) return <ErrorNote error={`Lloyd's couldn't quote this voyage: ${error.message}`} />;
+  if (!quote) return <p className="text-muted-foreground text-xs">Enter the port and sum insured for Lloyd&apos;s quote.</p>;
+  const maxCr = String(quote.max_insurable_pence / 100);
+  const short = quote.insured_value_pence < quote.max_insurable_pence;
+  const entered = Number.isFinite(premiumBps);
+  return (
+    <div className="space-y-2">
+      <KV
+        rows={[
+          ["Hull (rebuild quote + guns)", fmtCr(quote.hull_value_pence, 2)],
+          ["Most insurable (hull + all cargo aboard)", fmtCr(quote.max_insurable_pence, 2)],
+          ["Lloyd's expected claim (upper bound)", `${fmtBps(quote.lloyds_expected_loss_bps)} · ${fmtCr(quote.lloyds_expected_loss_pence)}`],
+          ["Lloyd's price", quote.lloyds_writes ? `${fmtBps(quote.lloyds_premium_bps)} · ${fmtCr(quote.lloyds_premium_pence)}` : "won't write it (over 3,000 bps)"],
+          ...(quote.priced_consort_ship_ids.length
+            ? ([["Priced with consorts", `${quote.priced_consort_ship_ids.length} convoy ship(s): they must sail with her`]] as Array<[string, string]>)
+            : []),
+        ]}
+      />
+      <div className="flex flex-wrap gap-2">
+        {valueCr !== maxCr && (
+          <Button size="sm" variant="outline" onClick={() => onValue(maxCr)}>
+            Declare everything ({fmtCr(quote.max_insurable_pence, 2)})
+          </Button>
+        )}
+        {quote.lloyds_writes && premiumBps !== quote.lloyds_premium_bps && (
+          <Button size="sm" variant="outline" onClick={() => onPremium(String(quote.lloyds_premium_bps))}>
+            Offer Lloyd&apos;s price ({fmtBps(quote.lloyds_premium_bps)})
+          </Button>
+        )}
+      </div>
+      {short && (
+        <p className="text-warning-foreground text-xs">
+          Declare the whole cargo: cover under what is aboard is void if the hold draws more pirates than the declared cargo would
+          (cargo_exceeds_declared). Load nothing after the policy is written.
+        </p>
+      )}
+      <p className="text-muted-foreground text-xs">
+        {entered && quote.lloyds_writes
+          ? premiumBps >= quote.lloyds_premium_bps
+            ? `At or above Lloyd's price: it covers what players leave once the policy is an hour old (within its caps)${premiumBps > quote.lloyds_premium_bps ? ", and nothing above the price is refunded" : ""}.`
+            : "Below Lloyd's price: only player underwriters may write it (they get the first hour); what they leave stays uncovered."
+          : "Offer less than Lloyd's price to attract player underwriters in the hour before Lloyd's looks, or the price to be sure of cover."}{" "}
+        The price moves with zone piracy, the season and your convoy: quote again just before asking.
+      </p>
+    </div>
+  );
+}
+
+/** What the game said of a policy just written: Lloyd's price for it, and whether the offer is above it. */
+export function createdText(p: S.CreateInsurancePolicyResult): string {
+  if (p.lloyds_premium_bps == null) return "Lloyd's won't write this voyage (or couldn't rate it): only player underwriters may.";
+  return p.above_lloyds_price
+    ? `Above Lloyd's price of ${fmtBps(p.lloyds_premium_bps)}: charged in full, Lloyd's covers what players leave.`
+    : p.premium_bps >= p.lloyds_premium_bps
+      ? `At Lloyd's price of ${fmtBps(p.lloyds_premium_bps)}: Lloyd's covers what players leave.`
+      : `Below Lloyd's price of ${fmtBps(p.lloyds_premium_bps)}: only player underwriters may write it.`;
+}
 
 const OWN_TTL = 120_000;
 let ownCover: { at: number; ids: Promise<Set<string>> } | null = null;
@@ -102,7 +207,10 @@ export function useOwnCover(): Set<string> | undefined {
   return usePoll(loadOwnCover, OWN_TTL).data;
 }
 
-/** Lowest premium (bps) of a policy on the lane that got any cover, by cover type; null where none did. */
+/**
+ * Lloyd's posted price (bps) on the lane's open policies (`lloyds_min_premium_bps`: other ships, guns and convoys), the
+ * lowest by cover type; null where no listing carries one.
+ */
 export interface LaneFloors {
   hull: number | null;
   cargo: number | null;
@@ -121,15 +229,13 @@ const laneInFlight = new Map<string, Promise<void>>();
 async function loadLane(key: string): Promise<void> {
   const [origin, dest] = key.split(">");
   try {
-    const [rows, own] = await Promise.all([
-      kibbGet<S.InsurancePolicy[]>("/v1/insurance/list", { origin_port_id: origin, dest_port_id: dest, limit: 200 }),
-      loadOwnCover().catch(() => new Set<string>()),
-    ]);
+    // Lloyd's own posted price on each listing still open for underwriting (no inference from who covered what).
+    const rows = await kibbGet<S.InsurancePolicyListing[]>("/v1/insurance/list", { origin_port_id: origin, dest_port_id: dest, limit: 200 });
     const floors: LaneFloors = { hull: null, cargo: null };
     for (const p of rows) {
-      if (p.covered_bps <= 0 || p.premium_bps <= 25 || own.has(p.id)) continue;
+      if (typeof p.lloyds_min_premium_bps !== "number") continue;
       const k = isHullOnly(p) ? "hull" : "cargo";
-      floors[k] = Math.min(floors[k] ?? Number.POSITIVE_INFINITY, p.premium_bps);
+      floors[k] = Math.min(floors[k] ?? Number.POSITIVE_INFINITY, p.lloyds_min_premium_bps);
     }
     laneCache.set(key, { at: Date.now(), floors });
   } catch {
@@ -181,8 +287,8 @@ export function useLaneFloors(lanes: Array<[string, string]>): Map<string, LaneF
 const bpsText = (n: number) => `${n.toLocaleString("en-GB")} bps`;
 
 /**
- * What has been covered on this lane before, for a new policy's premium. `hullOnly` null means the
- * cover type isn't known yet (no cap seen and cargo aboard): both figures show.
+ * Lloyd's posted prices on this lane's open policies, beside the quote for this very voyage. `hullOnly` null means
+ * the cover type isn't known yet (no cap seen and cargo aboard): both figures show.
  */
 export function LaneGuide({
   floors,
@@ -193,36 +299,32 @@ export function LaneGuide({
   hullOnly: boolean | null;
   premiumBps: number;
 }) {
-  if (floors === undefined) return <p className="text-muted-foreground text-xs">Checking what has been covered on this lane…</p>;
-  if (floors === null) return <p className="text-muted-foreground text-xs">Couldn&apos;t read past cover on this lane.</p>;
+  if (floors === undefined) return <p className="text-muted-foreground text-xs">Checking Lloyd&apos;s prices on this lane…</p>;
+  if (floors === null) return <p className="text-muted-foreground text-xs">Couldn&apos;t read the open policies on this lane.</p>;
   const typed = hullOnly === null ? null : floorFor(floors, hullOnly);
   const known = [floors.hull, floors.cargo].filter((n): n is number => n !== null);
-  const low = hullOnly === null ? (known.length ? Math.min(...known) : null) : typed;
   const entered = Number.isFinite(premiumBps);
 
   let line: string;
   if (hullOnly !== null) {
     line =
       typed === null
-        ? `No ${hullOnly ? "hull-only" : "with-cargo"} policy on this lane has been covered yet: nothing to price against.`
-        : `Policies on this lane have been covered at ≥ ${bpsText(typed)} (${hullOnly ? "hull only" : "with cargo"}).`;
+        ? `No open ${hullOnly ? "hull-only" : "with-cargo"} policy on this lane right now.`
+        : `Lloyd's posted price on this lane's open ${hullOnly ? "hull-only" : "with-cargo"} policies: from ${bpsText(typed)}.`;
   } else if (known.length === 0) {
-    line = "No policy on this lane has been covered yet: nothing to price against.";
+    line = "No open policy on this lane right now.";
   } else {
-    line = `Policies on this lane have been covered at ≥ ${floors.hull === null ? "—" : bpsText(floors.hull)} hull only, ≥ ${floors.cargo === null ? "—" : bpsText(floors.cargo)} with cargo.`;
+    line = `Lloyd's posted price on this lane's open policies: from ${floors.hull === null ? "—" : bpsText(floors.hull)} hull only, ${floors.cargo === null ? "—" : bpsText(floors.cargo)} with cargo.`;
   }
 
   return (
     <div className="space-y-2">
       <p className="text-muted-foreground text-xs">
-        {line} That cover may be Lloyd&apos;s or another player&apos;s, on a better-armed ship or in a calmer season, so price above
-        it. A policy nobody writes can&apos;t be withdrawn: it blocks a new one until the ship sails or it lapses.
+        {line} Those are other ships (guns, cargo, convoys): the quote above is this voyage&apos;s. A policy nobody writes can&apos;t be
+        withdrawn: it blocks a new one until the ship sails or it lapses.
       </p>
-      {entered && low !== null && premiumBps < low && (
-        <ErrorNote error={`${bpsText(premiumBps)} is below anything covered on this lane: Lloyd's will likely never write it.`} />
-      )}
-      {entered && hullOnly === null && low !== null && floors.cargo !== null && premiumBps >= low && premiumBps < floors.cargo && (
-        <p className="text-warning-foreground text-xs">Below the with-cargo figure: enough only for hull-only cover.</p>
+      {entered && typed !== null && premiumBps < typed && (
+        <p className="text-muted-foreground text-xs">{bpsText(premiumBps)} is below Lloyd&apos;s price on this lane&apos;s other policies of this cover.</p>
       )}
     </div>
   );

@@ -5,11 +5,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, PageHeader, Panel, Progress, Table } from "@/components/kibb/bits";
+import { useOurCompanyNames } from "@/components/kibb/naval-common";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { kibbGet } from "@/lib/kibb/browser";
 import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtGameHours, fmtIn, fmtTons } from "@/lib/kibb/format";
+import { bonusSplit } from "@/lib/kibb/rivals";
 import type * as S from "@/lib/kibb/schema";
 
 function Titles({ titles }: { titles: S.HallOfFameTitle[] }) {
@@ -62,8 +64,10 @@ function BoardPanel() {
         </Table>
       )}
       <p className="mt-3 text-muted-foreground text-xs">
-        Net worth: cash and escrow in every region, goods you own at catalog base prices, hulls afloat at build value. Each player ranks once, by
-        their best company; bankrupt companies never rank. Recomputed hourly.
+        Net worth: cash and escrow in every region, goods you own at catalog base prices (less freight carried for others), hulls afloat at build value
+        (each outside holder&apos;s 64ths count for the holder, not the owner), minus what you owe on loans (principal and interest), plus what you are owed on
+        active loans you made, your bank deposits (a bank&apos;s deposits count against it) and your capital in open ventures (a venture&apos;s cargo counts for its
+        investors). Borrowing never lifts you up the board. Each player ranks once, by their best company; bankrupt companies never rank. Recomputed hourly.
       </p>
     </Panel>
   );
@@ -72,8 +76,12 @@ function BoardPanel() {
 function ExpansionPanel() {
   const { portName, goodName } = useCatalog();
   const { data: exp, error } = usePoll(() => kibbGet<S.ExpansionStatusResult>("/v1/world/expansion"), 60_000);
+  const { data: profile } = usePoll(() => kibbGet<S.CompanyProfileResult>("/v1/company/profile"), 300_000);
+  const ourNames = useOurCompanyNames(profile?.company.name);
   if (!exp) return <Panel title="Expansion">{error ? <ErrorNote error={error} /> : <Loading />}</Panel>;
   const t = exp.current_tier;
+  // The bonus splits by the square root of each player's base-valued tons, a player's companies pooled (guide 3.15).
+  const split = bonusSplit(t?.contributors ?? [], ourNames);
   return (
     <Panel title={`Expansion · phase ${exp.unlocked_phase} open · ${exp.active_trading_companies} active companies`}>
       {!t ? (
@@ -95,7 +103,8 @@ function ExpansionPanel() {
                 rows={[
                   ["Tons still needed", fmtTons(t.tons_remaining)],
                   ["Open charters still take", fmtTons(t.charter_capacity_tons)],
-                  ["Completion bonus (split by share)", fmtCr(t.completion_bonus_pence)],
+                  ["Completion bonus (split by √ of each player's tons)", fmtCr(t.completion_bonus_pence)],
+                  ["Your bonus as it stands", `${(split.ours * 100).toFixed(1)}% · ~${fmtCr(t.completion_bonus_pence * split.ours)}`],
                   ["Sized for", `${t.active_companies} companies × ${fmtTons(t.tons_per_company)} (min ${fmtTons(t.min_tons)})`],
                 ]}
               />
@@ -129,15 +138,28 @@ function ExpansionPanel() {
             {t.contributors.length === 0 ? (
               <Empty>No deliveries yet.</Empty>
             ) : (
-              <Table head={["Company", "Tons", "Share"]}>
-                {t.contributors.map((c) => (
-                  <tr key={c.company_name}>
-                    <td>{c.company_name}</td>
-                    <td className="tabular-nums">{fmtTons(c.tons)}</td>
-                    <td className="tabular-nums">{fmtBps(c.share_bps)}</td>
-                  </tr>
-                ))}
+              <Table head={["Company", "Tons", "Share of value", "Bonus (est.)"]}>
+                {t.contributors.map((c) => {
+                  const share = split.byCompany.get(c.company_name) ?? 0;
+                  return (
+                    <tr key={c.company_name} className={ourNames.has(c.company_name) ? "bg-primary/5 font-medium" : undefined}>
+                      <td>{c.company_name}</td>
+                      <td className="tabular-nums">{fmtTons(c.tons)}</td>
+                      <td className="tabular-nums">{fmtBps(c.share_bps)}</td>
+                      <td className="tabular-nums">
+                        {(share * 100).toFixed(1)}% · ~{fmtCr(t.completion_bonus_pence * share)}
+                      </td>
+                    </tr>
+                  );
+                })}
               </Table>
+            )}
+            {t.contributors.length > 0 && (
+              <p className="mt-2 text-muted-foreground text-xs">
+                The bonus splits by the square root of each player&apos;s tons at base prices, a player&apos;s companies pooled (and shared among
+                them by their own deliveries): the first tons earn the most, so a leader&apos;s share of the bonus is smaller than its share of the
+                value. Estimated as the board stands; which company is whose isn&apos;t public, so each other company counts as its own player.
+              </p>
             )}
           </div>
         </div>

@@ -7,6 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
+import { CommissionsView } from "@/components/kibb/commissions";
+import { CHARTER } from "@/components/kibb/deals-common";
+import { CashLine, crToPence, firstProblem, regionName, useRegionOf, useVaults } from "@/components/kibb/finance-common";
 import { Checkbox } from "@/components/kibb/naval-common";
 import { Field, GoodSelect, PortSelect, ShipSelect } from "@/components/kibb/pickers";
 import {
@@ -84,12 +87,15 @@ function ChartersTab({
   sealed,
   unlockedPhase,
   autopilot,
+  ourIds,
   onDone,
 }: {
   ships: ShipResult[] | undefined;
   sealed: SealedTons;
   unlockedPhase: number | undefined;
   autopilot: Set<string>;
+  /** Every company of our player: a charter one of them posted can't be delivered to by ours. */
+  ourIds: Set<string>;
   onDone: () => void;
 }) {
   const { portName, goodName } = useCatalog();
@@ -269,14 +275,15 @@ function ChartersTab({
               {list.items.map((c) => {
                 const phase = targetPhase(c);
                 const here = candidates(c);
-                const deliverable = c.status === "open" && !c.stale && c.remaining_quantity > 0;
+                const ours = !!c.issuer_company_id && ourIds.has(c.issuer_company_id);
+                const deliverable = c.status === "open" && !c.stale && c.remaining_quantity > 0 && !ours;
                 return (
                   <tr key={c.id} className={plan[c.id] ? "bg-accent/50" : undefined}>
                     <td>
                       <input
                         type="checkbox"
                         disabled={!deliverable}
-                        title={c.stale ? "Gossip: sail there to see it live and deliver" : undefined}
+                        title={ours ? "Posted by one of your companies: the game refuses your deliveries to it" : c.stale ? "Gossip: sail there to see it live and deliver" : undefined}
                         checked={!!plan[c.id]}
                         onChange={(e) => pick(c, e.target.checked)}
                       />
@@ -286,7 +293,8 @@ function ChartersTab({
                       <div className="mt-0.5 flex flex-wrap gap-1">
                         {c.is_public && <Badge variant="info" size="sm">public</Badge>}
                         {phase !== null && <Badge variant="success" size="sm">expansion · phase {phase}</Badge>}
-                        {c.funded_by && <Badge variant="outline" size="sm">{c.funded_by}</Badge>}
+                        {c.funded_by && <Badge variant="outline" size="sm">{c.funded_by === "issuer" ? "player charter" : c.funded_by}</Badge>}
+                        {ours && <Badge variant="secondary" size="sm">yours: not deliverable</Badge>}
                         {c.status !== "open" && <Badge variant="secondary" size="sm">{c.status}</Badge>}
                         {c.stale && c.gossip && (
                           <Badge variant="warning" size="sm" title={`News as of ${fmtDateTime(c.gossip.news_as_of)}`}>
@@ -316,8 +324,9 @@ function ChartersTab({
           )}
           <LoadMore done={list.done} loading={list.loading} onMore={() => void list.more()} />
           <p className="text-muted-foreground text-xs">
-            Governor, crisis and guild charters are listed live only where you have quay presence; elsewhere you hear of them as
-            gossip, as they stood when the news left (they may be filled by now). Delivery is first come, first served.
+            Governor, crisis, guild and players&apos; own charters are listed live only where you have quay presence; elsewhere you hear of them as
+            gossip, as they stood when the news left (they may be filled by now). Delivery is first come, first served. A player&apos;s charter pays
+            from its poster&apos;s escrow and earns no prestige; one posted by any of your own companies can&apos;t be delivered to by them.
           </p>
         </div>
       </Panel>
@@ -908,6 +917,218 @@ function IssueFreightTab({ companyId, maxPhase, onDone }: { companyId: string | 
   );
 }
 
+// ── Post a charter ────────────────────────────────────────────────────────────
+
+/** Our own player charters (guide 3.7): post one to have goods brought to our warehouse, and cancel. */
+function PostCharterTab({ companyId, maxPhase }: { companyId: string | undefined; maxPhase: number | undefined }) {
+  const { catalog, portName, goodName } = useCatalog();
+  const regionOf = useRegionOf();
+  const vaults = useVaults();
+  const { data: warehouses, reload: reloadWarehouses } = usePoll(() => kibbGet<S.PortWarehouseResult[]>("/v1/warehouse/list"), 30_000);
+  // Ours still open: every open charter we can see, less everyone else's (the issuer always sees its own).
+  const { data: mine, error: mineError, reload: reloadMine } = usePoll(
+    companyId
+      ? async () =>
+          (await fetchAll<S.ContractListing>("/v1/contract/list", { contract_type: "charter", status: "open" }, 200, 10)).filter(
+            (c) => c.issuer_company_id === companyId && !c.stale,
+          )
+      : null,
+    30_000,
+    [companyId],
+  );
+  const [port, setPort] = useState("");
+  const [good, setGood] = useState("");
+  const [qty, setQty] = useState("");
+  const [reward, setReward] = useState("");
+  const [days, setDays] = useState(String(CHARTER.defaultDays));
+  const [isPublic, setIsPublic] = useState(false);
+  const [title, setTitle] = useState("");
+  const refresh = () => {
+    void reloadMine();
+    void reloadWarehouses();
+    void vaults.reload();
+  };
+  // Resolve to null when the confirmation is declined.
+  const post = useAction<S.ContractListing | null>((r) => r && refresh());
+  const cancel = useAction<S.CancelCharterResult | null>((r) => r && refresh());
+
+  const base = catalog?.commodities.find((c) => c.id === good)?.base_price_pence ?? 0;
+  const maxReward = base * CHARTER.rewardMaxX;
+  const wh = (warehouses ?? []).find((w) => w.port_id === port);
+  const free = wh?.free_tonnage ?? 0;
+  const region = regionOf(port);
+  const cash = vaults.cash(region);
+  const q = Number(qty);
+  const rp = crToPence(reward);
+  const d = Number(days);
+  const total = Number.isFinite(q) && rp > 0 ? Math.round(q * rp) : Number.NaN;
+  const why = firstProblem([
+    [!!port, "Choose the port the goods are delivered to."],
+    [!!good, "Choose the good."],
+    [Number.isInteger(q) && q >= 1, "Enter the tons wanted (whole tons)."],
+    [rp > 0, "Enter the reward per ton."],
+    [!base || rp <= maxReward, `The reward is at most 10× the good's base price: ${fmtCr(maxReward, 2)} a ton.`],
+    [Number.isInteger(d) && d >= CHARTER.minDays && d <= CHARTER.maxDays, "The term is 2..20 game days."],
+    [title.trim().length <= CHARTER.titleMax, "The title is at most 120 characters."],
+    [warehouses === undefined || free >= q, `Every ton needs free leased warehouse space at ${portName(port)}, reserved now: you have ${fmtTons(free)} free there. Lease more first.`],
+    [cash === undefined || !(total > 0) || cash >= total, `The whole reward (${fmtCr(total)}) is escrowed from your ${regionName(region)} vault, which holds ${fmtCr(cash)}.`],
+    [mine === undefined || mine.length < CHARTER.maxOpen, `You have ${mine?.length} open charters: at most ${CHARTER.maxOpen}. Cancel one first.`],
+  ]);
+
+  function submit() {
+    void post.run(async () => {
+      if (
+        !confirm(
+          `Post a charter for ${fmtTons(q)} of ${goodName(good)} delivered to ${portName(port)} at ${fmtCr(rp, 2)} a ton?\n\nThe whole reward (${fmtCr(total)}) is escrowed now from your ${regionName(region)} vault, and ${fmtTons(q)} of your free warehouse space there is reserved. Whoever delivers cargo carried in from another port is paid per ton from it, and the goods land in your warehouse. After ${d} game days (or when you cancel) what is left of the reward and the space comes back. Your own companies can't deliver to it.\n\n${isPublic ? "Listed to everyone." : "Seen live on its quay, and spreads elsewhere as coffee-house gossip."}`,
+        )
+      )
+        return null;
+      return kibbPost<S.ContractListing>("/v1/contract/post-charter", {
+        port_id: port,
+        commodity_id: good,
+        quantity: q,
+        reward_per_ton_pence: rp,
+        duration_game_days: d,
+        is_public: isPublic,
+        ...(title.trim() ? { title: title.trim() } : {}),
+      });
+    });
+  }
+
+  function cancelOne(c: S.ContractListing) {
+    const left = c.remaining_quantity * payPerTon(c);
+    void cancel.run(async () => {
+      if (
+        !confirm(
+          `Cancel "${c.title ?? "your charter"}"? The reward for the undelivered ${fmtTons(c.remaining_quantity)} (about ${fmtCr(left)}) comes back to your ${regionName(regionOf(c.origin_port_id))} vault and its warehouse space is freed. Deliveries already made stand.`,
+        )
+      )
+        return null;
+      return kibbPost<S.CancelCharterResult>("/v1/contract/cancel-charter", { contract_id: c.id });
+    });
+  }
+
+  return (
+    <div className="grid items-start gap-4 xl:grid-cols-3">
+      <div className="space-y-4 xl:col-span-2">
+        <Panel title="Your open charters">
+          <ErrorNote error={mineError ?? cancel.error} />
+          {cancel.result && (
+            <p className="mb-3 text-sm">
+              Cancelled: {fmtCr(cancel.result.refunded_pence)} refunded, {fmtTons(cancel.result.released_tons)} of warehouse space freed.
+            </p>
+          )}
+          {!mine ? (
+            !mineError && <Loading />
+          ) : mine.length === 0 ? (
+            <Empty>None open. Post one to have goods brought to your warehouse.</Empty>
+          ) : (
+            <Table head={["Charter", "Deliver to", "Good", "Remaining", "Pay/t", "Escrow left", "Expires", ""]}>
+              {mine.map((c) => (
+                <tr key={c.id}>
+                  <td>
+                    <div className="font-medium">{c.title ?? "Charter"}</div>
+                    <div className="mt-0.5 flex flex-wrap gap-1">{c.is_public ? <Badge variant="info" size="sm">public</Badge> : <Badge variant="outline" size="sm">quay and gossip</Badge>}</div>
+                  </td>
+                  <td>{portName(c.origin_port_id)}</td>
+                  <td>{goodName(c.commodity_id)}</td>
+                  <td className="whitespace-nowrap tabular-nums">
+                    {fmtTons(c.remaining_quantity)} <span className="text-muted-foreground">/ {fmtTons(c.quantity_required)}</span>
+                  </td>
+                  <td className="tabular-nums">{fmtCr(payPerTon(c), 2)}</td>
+                  <td className="tabular-nums">{fmtCr(c.remaining_quantity * payPerTon(c))}</td>
+                  <td className="whitespace-nowrap">{fmtIn(c.expires_at)}</td>
+                  <td className="text-right">
+                    <Button size="sm" variant="outline" disabled={cancel.busy} onClick={() => cancelOne(c)}>
+                      Cancel
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </Table>
+          )}
+          <p className="mt-3 text-muted-foreground text-xs">
+            Deliveries arrive as events (charter delivery received) and land in your warehouse at the charter&apos;s port. At most {CHARTER.maxOpen} open at once.
+          </p>
+        </Panel>
+        <Panel title="Post a charter">
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Deliver to (your warehouse there)">
+                <PortSelect value={port} onChange={setPort} placeholder="Choose…" maxPhase={maxPhase} />
+              </Field>
+              <Field label="Good">
+                <GoodSelect value={good} onChange={setGood} placeholder="Choose…" />
+              </Field>
+              <Field label="Tons wanted">
+                <Input type="number" min={1} step={1} value={qty} onChange={(e) => setQty(e.target.value)} />
+              </Field>
+              <Field label="Reward per ton (Cr)">
+                <Input type="number" min={0.01} step={0.01} value={reward} onChange={(e) => setReward(e.target.value)} placeholder={base ? (base / 100).toFixed(2) : undefined} />
+              </Field>
+              <Field label="Term (game days)">
+                <Input type="number" min={CHARTER.minDays} max={CHARTER.maxDays} step={1} value={days} onChange={(e) => setDays(e.target.value)} />
+              </Field>
+              <Field label={`Title (optional, ≤ ${CHARTER.titleMax})`}>
+                <Input value={title} maxLength={CHARTER.titleMax} onChange={(e) => setTitle(e.target.value)} placeholder={good && port ? `Wanted: ${q || "…"}t of ${goodName(good)} at ${portName(port)}` : undefined} />
+              </Field>
+            </div>
+            <Checkbox checked={isPublic} onChange={setIsPublic}>
+              List it to everyone (otherwise it is seen live on its quay and spreads elsewhere as coffee-house gossip, like a Crown charter)
+            </Checkbox>
+            {(port || good) && (
+              <KV
+                rows={[
+                  ["Base price", good ? `${fmtCr(base, 2)} a ton (reward at most ${fmtCr(maxReward, 2)})` : "—"],
+                  ["Reward escrowed now", total > 0 ? fmtCr(total) : "—"],
+                  [
+                    "Free warehouse space there",
+                    !port ? "—" : warehouses === undefined ? "…" : wh ? `${fmtTons(free)} free of ${fmtTons(wh.leased_tonnage)} leased` : "none leased",
+                  ],
+                ]}
+              />
+            )}
+            <CashLine region={region} cash={cash} need={total > 0 ? total : undefined} />
+            {port && warehouses !== undefined && Number.isFinite(q) && free < q && (
+              <p className="text-muted-foreground text-xs">
+                <Link href="/warehouses" className="text-primary hover:underline">
+                  Lease warehouse space
+                </Link>{" "}
+                at {portName(port)} first: each ton of the charter reserves a ton of it until delivered or released.
+              </p>
+            )}
+            <ErrorNote error={post.error ?? (port || good || qty || reward ? why : null)} />
+            {post.result && (
+              <p className="text-sm">
+                Posted &quot;{post.result.title ?? "charter"}&quot;: {fmtTons(post.result.quantity_required)} {goodName(post.result.commodity_id)} to{" "}
+                {portName(post.result.origin_port_id)}, lapsing {fmtIn(post.result.expires_at)}.
+              </p>
+            )}
+            <Button disabled={!!why || post.busy} onClick={submit}>
+              {post.busy ? "Posting…" : "Post charter"}
+            </Button>
+          </div>
+        </Panel>
+      </div>
+      <Panel title="How player charters work">
+        <div className="space-y-2 text-muted-foreground text-sm">
+          <p>A charter asks for goods delivered to your warehouse at its port, paying a reward per ton to whoever delivers, in parts, first come first served.</p>
+          <p>
+            Posting escrows the whole reward from your vault in the port&apos;s region and reserves a ton of free leased warehouse space for every ton wanted: you need
+            both up front.
+          </p>
+          <p>Only cargo carried in from another port counts for a deliverer. The goods go into your warehouse; deliverers earn no prestige.</p>
+          <p>
+            Cancel any time: the reward for the undelivered tons comes back and the space is freed; deliveries already made stand. The same happens when the term
+            (2–20 game days) ends.
+          </p>
+          <p>Your own companies (and linked ones) can&apos;t deliver to it, and the autopilot never targets it. Rewards far above the market are flagged to the Admiralty.</p>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
 export default function ContractsPage() {
   const { data: ships, reload: reloadShips } = usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { limit: 200 }), 15_000);
   const { data: profile } = usePoll(() => kibbGet<CompanyProfile>("/v1/company/profile"));
@@ -925,15 +1146,20 @@ export default function ContractsPage() {
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
-      <PageHeader title="Contracts" subtitle="Charters pay a premium for goods carried in from another port; freight pays to carry someone else's sealed cargo." />
+      <PageHeader
+        title="Contracts"
+        subtitle="Charters pay a premium for goods carried in from another port; freight pays to carry someone else's sealed cargo; commissions pay for a hull built to order."
+      />
       <Tabs defaultValue="charters">
         <TabsList>
           <TabsTab value="charters">Charters</TabsTab>
           <TabsTab value="freight">Freight</TabsTab>
           <TabsTab value="issue">Issue freight</TabsTab>
+          <TabsTab value="post-charter">Post a charter</TabsTab>
+          <TabsTab value="commissions">Commissions</TabsTab>
         </TabsList>
         <TabsPanel value="charters" className="pt-2">
-          <ChartersTab ships={ships} sealed={sealed} unlockedPhase={clock?.unlocked_phase} autopilot={autopilot} onDone={refresh} />
+          <ChartersTab ships={ships} sealed={sealed} unlockedPhase={clock?.unlocked_phase} autopilot={autopilot} ourIds={ourIds} onDone={refresh} />
         </TabsPanel>
         <TabsPanel value="freight" className="pt-2">
           <FreightTab
@@ -947,6 +1173,12 @@ export default function ContractsPage() {
         </TabsPanel>
         <TabsPanel value="issue" className="pt-2">
           <IssueFreightTab companyId={profile?.company.id} maxPhase={clock?.unlocked_phase} onDone={refresh} />
+        </TabsPanel>
+        <TabsPanel value="post-charter" className="pt-2">
+          <PostCharterTab companyId={profile?.company.id} maxPhase={clock?.unlocked_phase} />
+        </TabsPanel>
+        <TabsPanel value="commissions" className="pt-2">
+          <CommissionsView />
         </TabsPanel>
       </Tabs>
     </div>

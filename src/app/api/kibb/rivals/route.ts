@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { fleetRivals, getFleetView } from "@/lib/kibb/fleet-registry";
-import { analyseRivals, bestMarque, RECENT_LANDING_GAME_MIN, rivalProfiles, RivalTracker, type RivalAnalysis, type RivalsView } from "@/lib/kibb/rivals";
+import { analyseRivals, bestMarque, RECENT_LANDING_GAME_MIN, rivalProfiles, RivalTracker, ZONE_MARQUE_CAP, type MarqueOption, type RivalAnalysis, type RivalsView } from "@/lib/kibb/rivals";
 import { authorizedCompany, errorResponse, kibb, unauthorizedResponse } from "@/lib/kibb/server";
 import { getCompanyKey } from "@/lib/kibb/store";
 import type { Catalog, ExpansionStatus, RoutePlan } from "@/lib/kibb/types";
@@ -11,6 +11,8 @@ export const dynamic = "force-dynamic";
 // Routes and the catalog are fixed for a season: cache them for the server's life.
 const g = globalThis as { __kibbRivalRoutes?: Map<string, Promise<RoutePlan | null>>; __kibbRivalCatalog?: Promise<Catalog> };
 const routes = (g.__kibbRivalRoutes ??= new Map());
+/** Zones quoted for a marque when the autopilot isn't running (the busiest by rival traffic). */
+const QUOTED_ZONES = 6;
 
 /**
  * Rival companies and ships: a running autopilot's rival intel and last analysis when it is fresh;
@@ -94,7 +96,12 @@ export async function GET(req: NextRequest) {
       ]);
       expansion = exp;
       if (policies) tracker.addPolicies(policies);
-      for (const d of details) if (d) tracker.addNotices(d.recent_sailings);
+      for (const d of details) {
+        if (!d) continue;
+        tracker.addNotices(d.recent_sailings);
+        // Public forming convoys in the port's news (counted only with rival intel on, never on top of a listed one).
+        tracker.addConvoyNotices(d.convoy_notices);
+      }
       for (const s of fleet.sightings) tracker.add(s);
       tracker.prune(serverNow(), gameMinuteMs);
       analysis = await analyseRivals(tracker, { catalog, route, now: serverNow(), gameMinuteMs, piracy, intel: intelOn, quotes: new Map(fleet.intel?.quotes ?? []) });
@@ -102,24 +109,37 @@ export async function GET(req: NextRequest) {
     const now = serverNow();
     const traffic = analysis.zones;
 
-    // The autopilot's verdicts include our own ships' exposure; without it, judge on rival traffic alone.
+    // The autopilot's verdicts include our own ships' exposure; without it, the game's quote alone (a game day at
+    // the most bps the zone's cap allows) for the busiest zones, our own estimate from rival traffic beside it.
     const inForce = new Set(marques.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
+    const busiest = new Set([...traffic].sort((a, b) => b.exposure - a.exposure).slice(0, QUOTED_ZONES).map((t) => t.zone));
     const verdicts =
       fleet.report?.zones ??
-      traffic.flatMap((t) => {
-        const z = zones.find((x) => x.sea_zone_id === t.zone);
-        if (!z) return [];
-        const best = bestMarque(z, t.exposure, 0);
-        const active = inForce.has(t.zone);
-        const verdict = active
-          ? "our marque is in force"
-          : best.bps === 0
-            ? "the zone's marques are at their cap"
-            : best.profit > 0
-              ? "pays on rival traffic alone (start the autopilot to weigh our own ships)"
-              : "doesn't pay";
-        return [{ zone: t.zone, passages: t.passages, laden: t.laden, cargo: Math.round(t.cargo), next: t.next, best, active, verdict }];
-      });
+      (await Promise.all(
+        traffic.map(async (t) => {
+          const z = zones.find((x) => x.sea_zone_id === t.zone);
+          if (!z) return null;
+          const est = bestMarque(z, t.exposure, 0);
+          const active = inForce.has(t.zone);
+          const top = Math.floor(Math.min(1_500, ZONE_MARQUE_CAP - z.marque_piracy_bps) / 50) * 50;
+          const q = !active && top >= 50 && busiest.has(t.zone) ? await client.marqueQuote(t.zone, top, 24).catch(() => null) : null;
+          const best: MarqueOption = q
+            ? { bps: q.added_piracy_bps, prize: q.expected_net_prize_pence, cost: q.cost_pence, ownLoss: 0, profit: q.expected_net_prize_pence - q.cost_pence, quoted: true, rivalPrize: est.prize, floor: q.floor_applied }
+            : est;
+          const verdict = active
+            ? "our marque is in force"
+            : best.bps === 0
+              ? "the zone's marques are at their cap"
+              : !q
+                ? "not quoted (start the autopilot to quote and weigh our own ships)"
+                : q.floor_applied
+                  ? "the zone's traffic is worth less than the price floor"
+                  : best.profit > 0
+                    ? "pays on the quote if traffic holds (start the autopilot to weigh our own ships)"
+                    : "doesn't pay";
+          return { zone: t.zone, passages: t.passages, laden: t.laden, cargo: Math.round(t.cargo), next: t.next, best, active, verdict };
+        }),
+      )).filter((v): v is NonNullable<typeof v> => v !== null);
 
     // The expansion charters of the tier in play: as the running autopilot follows them, else as listed now.
     const running = view.state?.status === "running" ? view.state.expansion : null;

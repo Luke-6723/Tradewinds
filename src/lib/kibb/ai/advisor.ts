@@ -4,8 +4,9 @@
  * reads a digest of the fleet and the world (digest.ts) and answers with directives (directives.ts):
  * any setting but its own for the horizon (within ranges, spend ceilings the user's, the reserve only
  * raised), bans and a bias on lanes, per-charter stall calls, orders to single ships (a lane, a
- * charter, a port, hold, release), the buyer (hold, one build, classes forbidden), and marques or
- * patrols within the marque budget.
+ * charter, a port, hold, release), the buyer (hold, one build, classes forbidden), marques or
+ * patrols within the marque budget, and money orders (borrow for a load or a hull, repay a loan early,
+ * build a commission to order) through the autopilot's own checks.
  *
  * Off by default. In "shadow" mode it advises and logs but changes nothing; in "live" the directives
  * apply until their horizon lapses. Every check in the autopilot still runs: settings are clamped
@@ -39,6 +40,7 @@ import {
   type Active,
   type BanKind,
   type BuildOrder,
+  type FinanceOrder,
   type NavalOrder,
   type OrderCode,
   type OrderStatus,
@@ -114,6 +116,8 @@ export interface AiDecision {
   naval?: NavalOrder[];
   /** Marques and patrols it issued (pence): they run their term even after it is cleared. */
   navalSpentPence?: number;
+  /** Money orders (borrow, repay, accept a commission) and what became of them. */
+  finance?: FinanceOrder[];
 }
 
 export interface AiReport {
@@ -145,6 +149,8 @@ export interface AiReport {
     shipOrders: Array<{ shipId: string; order: ShipOrderKind; label: string; status: OrderStatus; code?: OrderCode; note?: string; reason: string }>;
     buy: { hold: string | null; build: BuildOrder | null; forbid: string[] };
     naval: NavalOrder[];
+    /** Absent from reports of managers older than money orders. */
+    finance?: FinanceOrder[];
   } | null;
   decisions: AiDecision[];
   events: ScreenedEvent[];
@@ -194,6 +200,7 @@ function memory(d: AiDecision): string {
     return [...n].map(([s, k]) => `${k} ${s}`).join(", ");
   };
   const naval = d.naval ?? [];
+  const money = d.finance ?? [];
   return [
     d.status,
     Object.keys(d.settings).length ? `settings ${JSON.stringify(d.settings)}` : "",
@@ -204,6 +211,7 @@ function memory(d: AiDecision): string {
     d.build ? `build ${d.build.cls}@${d.build.yard} (${d.build.status}${d.build.code ? `: ${d.build.code}` : ""})` : "",
     d.forbid?.length ? `forbid ${d.forbid.join(" ")}` : "",
     naval.length ? `naval ${tally(naval)}${d.navalSpentPence ? `, ${cr(d.navalSpentPence)} spent` : ""}` : "",
+    money.length ? `money ${money.map((o) => `${o.kind} ${o.status}${o.code ? `: ${o.code}` : ""}`).join(", ")}` : "",
   ]
     .filter(Boolean)
     .join(", ");
@@ -387,6 +395,20 @@ export class Advisor {
     return b && b.status !== "done" && b.status !== "refused" && b.status !== "lapsed" ? b : null;
   }
 
+  /** Money orders in force still to act on (borrow, repay, accept a commission): not done, refused or lapsed. */
+  financeOrders(): FinanceOrder[] {
+    return (this.inForce()?.finance ?? []).filter((o) => o.status !== "done" && o.status !== "refused" && o.status !== "lapsed");
+  }
+
+  /** What became of a money order (true when that changed it), only while that very order is in force. */
+  noteFinance(order: FinanceOrder, status: OrderStatus, code?: OrderCode, note?: string): boolean {
+    const o = this.inForce()?.finance.find((x) => x === order);
+    if (!o || (o.status === status && o.code === code)) return false;
+    Object.assign(o, { status, code, note });
+    this.mirror();
+    return true;
+  }
+
   /** Marques and patrols still to issue, and those whose outcome is unknown (to reconcile, never to send again). */
   pendingNaval(): NavalOrder[] {
     return (this.inForce()?.naval ?? []).filter((n) => n.status === "pending" || n.status === "unknown");
@@ -452,6 +474,8 @@ export class Advisor {
     if (!a) return;
     for (const o of [...a.shipOrders, ...(a.build ? [a.build] : [])]) if (o.status === "pending" || o.status === "waiting") o.status = "lapsed";
     for (const n of a.naval) if (n.status === "pending") n.status = "lapsed";
+    // A money order waiting on a call with no answer is reconciled by the autopilot whatever comes of the advice.
+    for (const o of a.finance) if (o.status === "pending" || (o.status === "waiting" && o.code !== "unknown_outcome")) o.status = "lapsed";
     this.mirror();
   }
 
@@ -463,6 +487,7 @@ export class Advisor {
     d.shipOrders = a.shipOrders.map((o) => ({ ...o }));
     d.build = a.build ? { ...a.build } : null;
     d.naval = a.naval.map((n) => ({ ...n }));
+    d.finance = a.finance.map((o) => ({ ...o }));
     this.host.persist();
   }
 
@@ -604,7 +629,9 @@ export class Advisor {
     return JSON.stringify([
       this.effective,
       OVERRIDE_KEYS.map((k) => u[k]),
-      a ? [a.shipOrders.map((o) => `${o.status}:${o.code ?? ""}`), a.build ? `${a.build.status}:${a.build.code ?? ""}` : null, a.naval.map((n) => n.status)] : null,
+      a
+        ? [a.shipOrders.map((o) => `${o.status}:${o.code ?? ""}`), a.build ? `${a.build.status}:${a.build.code ?? ""}` : null, a.naval.map((n) => n.status), a.finance.map((o) => `${o.status}:${o.code ?? ""}`)]
+        : null,
       d.phase,
       d.tier
         ? [
@@ -762,6 +789,7 @@ export class Advisor {
     const id = randomUUID();
     // Unique across answers: a superseded answer's marque still being sent is never taken for this one's.
     for (const n of x.naval) n.id = `${id.slice(0, 8)}:${n.id}`;
+    for (const o of x.finance) o.id = `${id.slice(0, 8)}:${o.id}`;
     // Forbidden classes come off the user's list like any setting (and lapse with it once the user edits the list).
     const kept = user.buyClasses.filter((c) => !x.forbid.includes(c));
     if (kept.length < user.buyClasses.length) {
@@ -795,6 +823,7 @@ export class Advisor {
       build: x.build ? { ...x.build } : null,
       forbid: [...x.forbid],
       naval: x.naval.map((n) => ({ ...n })),
+      finance: x.finance.map((o) => ({ ...o })),
     };
     // Recorded first: orders carried out as it is applied (a release) show on it at once.
     this.decisions.push(d);
@@ -817,7 +846,8 @@ export class Advisor {
       x.avoid.length > 0 ||
       x.shipOrders.length > 0 ||
       x.build !== null ||
-      x.naval.length > 0;
+      x.naval.length > 0 ||
+      x.finance.length > 0;
     if (why) {
       d.status = "discarded";
       d.note = why;
@@ -849,7 +879,8 @@ export class Advisor {
       x.stallCalls.length ? plural(x.stallCalls.length, "stall call") : "",
       x.shipOrders.length ? plural(x.shipOrders.length, "ship order") : "",
       x.buyHold ? "buyer on hold" : x.build ? `build a ${x.build.cls} at ${x.build.yard}` : "",
-      x.naval.length ? x.naval.map((n) => `${n.kind} ${n.bps} bps in ${n.zone} for ${n.gameHours} game h (~${cr(n.costPence)})`).join(", ") : "",
+      x.naval.length ? x.naval.map((n) => `${n.kind} ${n.bps} bps in ${n.zone} for ${n.gameHours} game h (${n.costPence > 0 ? `~${cr(n.costPence)}` : "priced by its quote when issued"})`).join(", ") : "",
+      x.finance.length ? x.finance.map((o) => o.label).join(", ") : "",
     ].filter(Boolean);
     this.host.log(
       `AI (${d.mode}, ${meta.trigger}, $${d.costUsd.toFixed(3)}): ${d.posture}; ${changes.join(", ") || "no changes"}` +
@@ -901,6 +932,7 @@ export class Advisor {
             shipOrders: a.shipOrders.map((o) => ({ shipId: o.ship, order: o.order, label: o.label, status: o.status, code: o.code, note: o.note, reason: o.reason })),
             buy: { hold: a.buyHold, build: a.build ? { ...a.build } : null, forbid: [...a.forbid] },
             naval: a.naval.map((n) => ({ ...n })),
+            finance: a.finance.map((o) => ({ ...o })),
           }
         : null,
       decisions: [...this.decisions].reverse().slice(0, 10),

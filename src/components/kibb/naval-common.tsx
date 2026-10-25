@@ -17,6 +17,25 @@ export function useCompanyId(): string | undefined {
   return data?.company.id;
 }
 
+/**
+ * Every company of the signed-in player (the active one included): their charters can't be delivered to and their
+ * freight and policies can't be taken by ours.
+ */
+export function useOurCompanyIds(): Set<string> {
+  const companyId = useCompanyId();
+  const { data } = usePoll(() => dash.get<{ companies: Array<{ id: string }> }>("/api/kibb/companies"), 300_000);
+  return new Set([...(data?.companies ?? []).map((c) => c.id), ...(companyId ? [companyId] : [])]);
+}
+
+/**
+ * The names of every company of the signed-in player (`active`: the active one's, from its profile, so it counts before
+ * the list loads): the completion bonus pools a player's companies (guide 3.15).
+ */
+export function useOurCompanyNames(active?: string): Set<string> {
+  const { data } = usePoll(() => dash.get<{ companies: Array<{ name: string }> }>("/api/kibb/companies"), 300_000);
+  return new Set([...(data?.companies ?? []).map((c) => c.name), ...(active ? [active] : [])]);
+}
+
 /** Game time per real time (60 unless the world says otherwise). */
 export function useTimeScale(): number {
   const { data } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"), 300_000);

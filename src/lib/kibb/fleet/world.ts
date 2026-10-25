@@ -10,12 +10,13 @@
  */
 
 import type { KibbClient } from "../client";
-import { landingOdds, ODDS_UNKNOWN, pirateAttention, RECENT_LANDING_GAME_MIN, RivalTracker, type RivalIntelSnapshot, type RivalLanding, type Sighting } from "../rivals";
+import { CAPTURE_PRIOR, landingOdds, ODDS_UNKNOWN, pirateAttention, RAID_TAKE_PRIOR, RECENT_LANDING_GAME_MIN, RivalTracker, sqrtShare, type RivalIntelSnapshot, type RivalLanding, type Sighting } from "../rivals";
 import type {
   BankingRegion,
   Catalog,
   CatalogPort,
   CatalogShipClass,
+  CharterFunding,
   ContractListing,
   ExpansionTier,
   PortDetail,
@@ -23,7 +24,7 @@ import type {
   RoutePlan,
   ZoneClass,
 } from "../types";
-import type { WorldEventResult, WorldEventType } from "../schema";
+import type { LloydsListNotice, MonopolyResult, UnderwritingFigures, WorldEventResult, WorldEventType } from "../schema";
 
 export const ZONE_RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
 
@@ -41,15 +42,19 @@ const SEASON_END_SLACK_MS = 30 * 60_000;
 export const SEASON_ENDGAME_MS = 12 * 60 * 60_000;
 export const SEASON_FINAL_MS = 3 * 60 * 60_000;
 /**
- * Piracy since the October patch (formulas not published, so these are estimates the fleet refines
- * from its own raids): pirates go for the richest prizes, take a varying share of the cargo, and
- * sometimes the ship itself. A raid's take starts at this guess and is learned from our raids.
+ * Piracy (guide 3.5; the formulas aren't published, so the fleet refines these from its own raids):
+ * pirates go for the richest prizes; an interception carries the ship off in 5-10% of cases (fewer the
+ * more guns face it), else seizes 20-50% of every cargo stack and of the stores and lets the ship go.
+ * A raid's take starts at the prior (rivals.ts) and is learned from our raids, within the guide's range.
  */
-const RAID_TAKE_PRIOR = 0.3;
 const RAID_TAKE_PRIOR_N = 5;
-/** Chance a raid takes the ship (cargo and all), unarmed; each gun cuts it sharply. */
-const CAPTURE_PER_RAID = 0.15;
-const CAPTURE_GUN_CUT = 0.6;
+const RAID_TAKE_MIN = 0.2;
+const RAID_TAKE_MAX = 0.5;
+/** An unarmed hull's capture odds per interception, learned from our captures within the guide's range; guns cut it towards the low end. */
+const CAPTURE_PRIOR_N = 20;
+const CAPTURE_MIN = 0.05;
+const CAPTURE_MAX = 0.1;
+const CAPTURE_GUN_CUT = 0.25;
 /** Assumed cut in interception odds per gun ("cut sharply by cannons"; the formula isn't published). */
 const GUN_DETERRENCE = 0.5;
 /**
@@ -80,8 +85,12 @@ const STORM_MULT_MIN = 0.1;
 const STORM_MULT_MAX = 5;
 /** A cell's record is halved past this many expected hits, so old evidence fades if the odds are retuned. */
 const STORM_CELL_CAP = 200;
-/** A hit leaves 3/4 of the stores; stock for as many hits as are likelier than 2%, up to three. */
-const STORES_LEFT_PER_HIT = 0.75;
+/**
+ * A storm leaves 3/4 of the stores; a pirate raid that lets the ship go leaves at least half (it seizes
+ * 20-50% of them). Stock for as many hits as are likelier than 2%, up to three, pirate raids first.
+ */
+const STORM_STORES_LEFT = 0.75;
+const PIRATE_STORES_LEFT = 0.5;
 const STORES_TAIL = 0.02;
 const STORES_MAX_HITS = 3;
 
@@ -102,11 +111,17 @@ const stormCell = (stormy: boolean, margin: number): StormCell =>
   `${stormy ? "storm" : "calm"}|${margin < 0 ? "under" : margin === 0 ? "rated" : "above"}`;
 
 /**
- * A tier's completion bonus is 12% of its base value, split by the tons each company delivered valued
- * at base rates (guide 3.8; `share_bps` in the spec), so the premium doesn't count; this is the
- * fallback rate when the pool can't be projected.
+ * A tier's completion bonus is 12% of its base value (guide 3.15), split by the square root of each player's tons
+ * valued at base rates (`share_bps` in the spec), so the premium doesn't count. This rate on a ton's base value is
+ * the fallback (a straight share of the pool) when the contribution board can't be split.
  */
 const EXPANSION_BONUS_SHARE = 0.12;
+/** The bonus a ton earns is judged over a load of about this size when the caller gives none (tons). */
+const BONUS_REF_TONS = 30;
+/** Our own resting orders (GET /v1/market/orders) are read again after this long (real ms): the fleet trades IOC only. */
+const OWN_ORDERS_TTL_MS = 10 * 60_000;
+/** A players' resting order in the news is counted at its tons less this share per game day of age, gone after 1/rate days. */
+const PLAYER_LEVEL_DECAY_PER_DAY = 0.5;
 /**
  * A posting that stays stalled (under a tenth of its expected pace, nobody else delivering) until it
  * lapses is re-posted richer: by default +25% pay on 75% of the tons left (refined from what the feed
@@ -235,6 +250,10 @@ export interface WorldSnapshot {
   ownTrickle?: TrickleRecord;
   /** Our expansion deliveries (posting id, server ms, tons); absent in older saves. */
   ownDelivered?: Array<[string, number, number]>;
+  /** Royal monopolies in force as last read (or told of by a refused buy); absent in older saves. */
+  monopolies?: MonopolyInfo[];
+  /** Charters the server refuses our deliveries to for good (403: our own player's or a linked company's); absent in older saves. */
+  noDelivery?: string[];
 }
 
 /** Ids of closed charters kept in a snapshot (the newest). */
@@ -370,7 +389,26 @@ export interface CharterInfo {
   /** Expected from a shortage's news, not listed yet (`crisis:<event id>`): trusted at most `trustCap`. */
   provisional?: boolean;
   trustCap?: number;
+  /** Who pays deliveries (`issuer`: a player charter, paid from its issuer's escrow) and the issuing company; absent in older saves. */
+  fundedBy?: CharterFunding | null;
+  issuer?: string | null;
 }
+
+/** A royal monopoly in force (guide 3.9): only its holder buys the good from the Crown's asks across the banking region. */
+export interface MonopolyInfo {
+  id: string;
+  region: BankingRegion;
+  good: string;
+  /** "" when only a refused buy told of it (the holder named in words), until the list shows it. */
+  holderId: string;
+  holder: string;
+  expiresAt: number;
+}
+
+/** Goods the Crown never sells a monopoly on (guide 3.9). */
+const NEVER_MONOPOLISED = new Set(["provisions", "silver_bullion"]);
+/** A monopoly known only from a refused buy stands this long (game hours) unless the list shows it first. */
+const MONOPOLY_SEEN_GAME_H = 6;
 
 /** An open freight lot we can see (listed only at its origin port, to companies present there). */
 export interface FreightInfo {
@@ -414,6 +452,27 @@ export interface PriceObs {
   at: number;
   /** From a live book (true) or gossip/snapshot (false). */
   live: boolean;
+  /**
+   * The best players' (not the NPC ladder's) resting ask our bids can fill and the tons at that price: from a
+   * live book's depth (ours left out) or gossip (anonymous: may be ours). Null: none seen; absent: not known.
+   */
+  playerAsk?: number | null;
+  playerAskQty?: number;
+  /**
+   * The best players' resting bid and its tons, as the coffee-house news gave it (gossip only: a live book's bid already
+   * counts players' bids). Anonymous: our own resting orders are left out against GET /v1/market/orders (playerLevel).
+   */
+  playerBid?: number | null;
+  playerBidQty?: number;
+}
+
+/** Our own company's resting order (GET /v1/market/orders), as the gossip's anonymous best levels may show it. */
+interface OwnOrder {
+  id: string;
+  side: "bid" | "ask";
+  price: number;
+  /** Tons still resting. */
+  tons: number;
 }
 
 function toCharters(list: ContractListing[]): CharterInfo[] {
@@ -432,6 +491,8 @@ function toCharters(list: ContractListing[]): CharterInfo[] {
       newsAt: c.stale && c.gossip?.news_as_of ? Date.parse(c.gossip.news_as_of) : null,
       createdAt: c.created_at ? Date.parse(c.created_at) : null,
       kind: typeof c.metadata?.charter_kind === "string" ? c.metadata.charter_kind : null,
+      fundedBy: c.funded_by ?? (typeof c.metadata?.funded_by === "string" ? (c.metadata.funded_by as CharterFunding) : null),
+      issuer: c.issuer_company_id ?? null,
     }));
 }
 
@@ -512,6 +573,12 @@ export class World {
   freight: FreightInfo[] = [];
   /** Our company (to skip freight we posted ourselves). */
   companyId: string | null = null;
+  /** Every company of our player (the manager fills it): their charters and freight are never ours to deliver or carry. */
+  readonly ourCompanyIds = new Set<string>();
+  /** Charters the server refused our deliveries to for good (403): a linked company's we can't see, say. */
+  private readonly noDelivery = new Set<string>();
+  /** Royal monopolies in force (GET /v1/world/monopolies, with the world; events and refused buys in between). */
+  monopolies: MonopolyInfo[] = [];
   /** Other companies' ships and voyages: seen at ports where we have presence, and (rival intel) public records. */
   readonly rivals = new RivalTracker((g) => (this.catalog ? this.basePrice(g) : 0));
   vaults = new Map<BankingRegion, number>();
@@ -599,9 +666,25 @@ export class World {
   /** Expansion charters of the tier in play by `port|good`: our own flow into each, and its rival record. */
   private readonly lineages = new Map<string, Lineage>();
   private tierSamples: Array<{ at: number; delivered: number; phase: number }> = [];
-  /** Share value of a ton per expansion charter (pence: its base price, as the bonus split counts it), and the pool's rate on it. */
+  /** Share value of a ton per expansion charter (pence: its base price, as the bonus split counts it), and the pool's rate on it (the linear fallback). */
   private expansionValue = new Map<string, number>();
   private expansionRate = EXPANSION_BONUS_SHARE;
+  /**
+   * The tier's contribution board as last read (guide 3.15): the bonus pool, the base value delivered so far and its
+   * projection at completion (pence), and each company's share of it; null with no tier in play or nobody on it.
+   */
+  private bonusBoard: { pool: number; delivered: number; projected: number; contributors: Array<{ company_name: string; share_bps: number }> } | null = null;
+  /** Our company's resting orders by `port|good` (market/orders), and when they were read (local ms; 0: never). */
+  private ownOrders = new Map<string, OwnOrder[]>();
+  private ownOrdersAt = 0;
+  /** The Lloyd's List as each quay last posted it (local ms): underwriters' recent results, policies open there. */
+  private readonly lloydsSeen = new Map<string, { at: number; notice: LloydsListNotice }>();
+  /**
+   * What each quay we stand on held when its port view was last read (local ms): the coffee-house reports' ages then
+   * (real ms) and the sailing notices' times (server ms), with whose ship each was (ours are never sealed). What an
+   * intelligence envelope sealed there could hold (not saved).
+   */
+  readonly quayNews = new Map<string, { at: number; reports: number[]; sailings: Array<{ at: number; company: string; ship: string }> }>();
   private rates = new Map<string, number>();
   private prices = new Map<string, PriceObs>();
   /** Last live copy of each charter seen live, for recall when it drops out of a listing. */
@@ -680,6 +763,8 @@ export class World {
       crisisResolved: [...this.crisisResolved],
       ownTrickle: { ...this.ownTrickle, samples: [...this.ownTrickle.samples] },
       ownDelivered: [...this.ownDelivered],
+      monopolies: this.monopolies.map((m) => ({ ...m })),
+      noDelivery: [...this.noDelivery].slice(-SNAPSHOT_CLOSED),
     };
   }
 
@@ -732,6 +817,11 @@ export class World {
     if (Array.isArray(s.ownDelivered)) {
       this.ownDelivered = s.ownDelivered.filter((x) => Array.isArray(x) && typeof x[0] === "string" && Number.isFinite(x[1]) && Number.isFinite(x[2])).slice(-OWN_DELIVERED_KEPT);
     }
+    // Lapsed grants drop out at the first look (monopolyBars checks the expiry, the refresh re-reads the list).
+    if (Array.isArray(s.monopolies)) {
+      this.monopolies = s.monopolies.filter((m) => m && typeof m.region === "string" && typeof m.good === "string" && Number.isFinite(m.expiresAt));
+    }
+    for (const id of s.noDelivery ?? []) if (typeof id === "string") this.noDelivery.add(id);
     this.updateBidHaircut();
   }
 
@@ -769,7 +859,7 @@ export class World {
   private async refreshListings(): Promise<void> {
     const asked = Date.now();
     const since = new Date(this.now() - EVENT_LOOKBACK_GAME_DAYS * 24 * 60 * this.gameMinuteMs).toISOString();
-    const [listing, freight, rates, zones, expansion, events] = await Promise.all([
+    const [listing, freight, rates, zones, expansion, events, , monopolies] = await Promise.all([
       this.client.contractPages({ contract_type: "charter", status: "open" }),
       this.client.contractPages({ contract_type: "freight", status: "open" }).catch(() => null),
       this.client.rates(),
@@ -778,9 +868,14 @@ export class World {
       // Public. A stream world_event only prompts this read (its payload isn't specified, and a port-scoped one may never reach us).
       this.client.worldEvents({ include_expired: true, since, limit: EVENT_PAGE }).catch(() => null),
       this.refreshVaults(),
+      // Public: who holds which royal monopoly (an unread list keeps the last one).
+      this.client.monopolyPages().catch(() => null),
+      // Our own resting orders now and again: the news' anonymous best levels may be ours.
+      this.refreshOwnOrders(),
     ]);
     const list = listing.items;
     if (freight) this.freight = toFreight(freight.items);
+    if (monopolies?.complete) this.setMonopolies(monopolies.items);
     if (zones) {
       this.piracy = new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps]));
       this.piracyAt = asked + this.skewMs;
@@ -817,7 +912,12 @@ export class World {
         const projected = delivered + tier.tons_remaining * avg;
         this.expansionValue = value;
         this.expansionRate = projected > 0 ? Math.min(0.2, Math.max(0.06, tier.completion_bonus_pence / projected)) : EXPANSION_BONUS_SHARE;
-      }
+        // The board the square-root split works from (guide 3.15); the pool as published, else 12% of the projection.
+        const contributors = (tier.contributors ?? []).filter((c) => typeof c.company_name === "string" && Number.isFinite(c.share_bps) && c.share_bps > 0);
+        this.bonusBoard = contributors.length
+          ? { pool: tier.completion_bonus_pence > 0 ? tier.completion_bonus_pence : EXPANSION_BONUS_SHARE * projected, delivered, projected: Math.max(projected, delivered), contributors }
+          : null;
+      } else this.bonusBoard = null;
     }
     const fresh = toCharters(list).filter((c) => !this.closed.has(c.id));
     // Ports re-listed live on arrival while this request was in flight keep that newer view.
@@ -833,7 +933,7 @@ export class World {
         ...fresh.filter((c) => !newer.has(c.port)),
         ...this.charters.filter((c) => newer.has(c.port)),
       ]),
-    );
+    ).filter((c) => this.deliverable(c));
     this.rates = new Map(rates.map((r) => [`${r.from_region}>${r.to_region}`, r.fee_bps]));
     // What ports make and import changes with a structural shift, and customs drift: re-read the catalog then, and now and again.
     if (this.catalogDue || this.now() - this.catalogAt > CATALOG_REFRESH_MS) await this.refreshCatalog().catch(() => undefined);
@@ -1355,7 +1455,101 @@ export class World {
     this.remember(fresh);
     this.mergedAt.set(port, Date.now());
     this.lookForCrisis(port, fresh);
-    this.charters = this.withProvisional(this.withRecalled([...this.charters.filter((c) => c.port !== port), ...fresh]));
+    this.charters = this.withProvisional(this.withRecalled([...this.charters.filter((c) => c.port !== port), ...fresh])).filter((c) => this.deliverable(c));
+  }
+
+  /**
+   * A charter one of our player's companies issued (a player charter, guide 3.7): its issuer, its player's other
+   * companies and linked companies can't deliver to it. Freight lots too (`issuer`).
+   */
+  ownIssued(c: { issuer?: string | null }): boolean {
+    return !!c.issuer && (c.issuer === this.companyId || this.ourCompanyIds.has(c.issuer));
+  }
+
+  /** Whether our ships may deliver to this charter: not our own player's, and not refused for good (refuseCharter). */
+  deliverable(c: { id: string; issuer?: string | null }): boolean {
+    return !this.ownIssued(c) && !this.noDelivery.has(c.id);
+  }
+
+  /** The server refused our delivery to this charter (403): never planned or offered again; it leaves the list now. */
+  refuseCharter(id: string): void {
+    this.noDelivery.add(id);
+    if (this.noDelivery.size > SNAPSHOT_CLOSED) this.noDelivery.delete(this.noDelivery.values().next().value!);
+    this.charters = this.charters.filter((c) => c.id !== id);
+  }
+
+  /** Our company ids are known (after the first listing at start-up): our own player's charters leave the list. */
+  dropOwnCharters(): void {
+    this.charters = this.charters.filter((c) => this.deliverable(c));
+  }
+
+  // ── Royal monopolies ─────────────────────────────────────────────────────────
+
+  /** The grants in force as listed; ones known only from a refused buy stand until the list shows them or they run out. */
+  private setMonopolies(list: MonopolyResult[]): void {
+    const now = this.now();
+    const listed: MonopolyInfo[] = list
+      .filter((m) => m.in_force && Date.parse(m.expires_at) > now)
+      .map((m) => ({ id: m.id, region: m.banking_region, good: m.commodity_id, holderId: m.holder_company_id, holder: m.holder_company_name, expiresAt: Date.parse(m.expires_at) }));
+    const seen = this.monopolies.filter((m) => !m.holderId && m.expiresAt > now && !listed.some((x) => x.region === m.region && x.good === m.good));
+    const before = new Set(this.monopolies.map((m) => `${m.region}|${m.good}|${m.holderId}`));
+    this.monopolies = [...listed, ...seen];
+    for (const m of listed) {
+      if (!before.has(`${m.region}|${m.good}|${m.holderId}`) && this.monopolyHits(m)) {
+        this.onNote?.(`royal monopoly: ${m.holder} holds ${m.good} in ${m.region} until ${new Date(m.expiresAt).toISOString()}: its Crown asks there are not ours to buy`);
+      }
+    }
+  }
+
+  /** A grant someone other than this company holds (the holder's sibling companies are barred too: guide 3.9). */
+  private monopolyHits(m: MonopolyInfo): boolean {
+    return !NEVER_MONOPOLISED.has(m.good) && m.holderId !== this.companyId;
+  }
+
+  /**
+   * The monopoly that bars this company from the Crown's (NPC) asks for `good` at `port` (its banking region), or
+   * undefined: none in force, ours, or a good never monopolised. Players' resting asks still fill.
+   */
+  monopolyBars(port: string, good: string): MonopolyInfo | undefined {
+    if (NEVER_MONOPOLISED.has(good) || this.monopolies.length === 0) return undefined;
+    const region = this.region(port);
+    const now = this.now();
+    return this.monopolies.find((m) => m.region === region && m.good === good && m.expiresAt > now && this.monopolyHits(m));
+  }
+
+  /** A buy was refused for a monopoly the list didn't show yet (`detail`: the refusal, naming the holder): barred until it does. */
+  noteMonopoly(port: string, good: string, detail: string): void {
+    if (NEVER_MONOPOLISED.has(good) || this.monopolyBars(port, good)) return;
+    const region = this.region(port);
+    this.monopolies.push({
+      id: `seen:${region}|${good}`,
+      region,
+      good,
+      holderId: "",
+      holder: detail.slice(0, 120) || "another company",
+      expiresAt: this.now() + MONOPOLY_SEEN_GAME_H * 60 * this.gameMinuteMs,
+    });
+    this.onNote?.(`royal monopoly on ${good} in ${region} (a buy was refused): its Crown asks there are not ours to buy`);
+  }
+
+  /** A public `monopoly_granted` / `monopoly_expired` notice (payload as in the list, its shape not otherwise published). */
+  noteMonopolyEvent(type: "monopoly_granted" | "monopoly_expired", p: Record<string, unknown>): void {
+    const src = (p.monopoly && typeof p.monopoly === "object" ? p.monopoly : p) as Record<string, unknown>;
+    const s = (k: string) => (typeof src[k] === "string" ? (src[k] as string) : undefined);
+    const region = s("banking_region") as BankingRegion | undefined;
+    const good = s("commodity_id");
+    const id = s("id") ?? s("monopoly_id");
+    if (type === "monopoly_expired") {
+      this.monopolies = this.monopolies.filter((m) => !(id && m.id === id) && !(region && good && m.region === region && m.good === good));
+      return;
+    }
+    const expiresAt = Date.parse(s("expires_at") ?? "");
+    if (!region || !good || !Number.isFinite(expiresAt)) return;
+    const holderId = s("holder_company_id") ?? "";
+    this.monopolies = [
+      ...this.monopolies.filter((m) => !(m.region === region && m.good === good)),
+      { id: id ?? `${region}|${good}`, region, good, holderId, holder: s("holder_company_name") ?? "another company", expiresAt },
+    ];
   }
 
   /** Replaces the open freight we know of at one port with a listing taken there. */
@@ -1569,7 +1763,8 @@ export class World {
 
   /** A non-public charter for the shortage's good at its port, posted since it began: its crisis charter (or a Governor's procurement, as good). */
   private isCrisisFor(c: CharterInfo, e: WorldEventInfo): boolean {
-    if (c.isPublic || c.provisional || c.port !== e.port || c.good !== e.good) return false;
+    // A player's charter (funded from its issuer's escrow) is never the Governor's.
+    if (c.isPublic || c.provisional || c.fundedBy === "issuer" || !!c.issuer || c.port !== e.port || c.good !== e.good) return false;
     const posted = c.createdAt !== undefined && c.createdAt !== null && Number.isFinite(c.createdAt) ? c.createdAt : null;
     // Without a posting time: its kind says so, or gossip of it is newer than the shortage.
     return posted !== null ? posted >= e.startsAt - CRISIS_MATCH_SLACK_GAME_MIN * this.gameMinuteMs : !!c.kind?.includes("crisis") || (c.newsAt ?? 0) >= e.startsAt;
@@ -1872,14 +2067,64 @@ export class World {
   }
 
   /**
-   * Phase-completion bonus a ton delivered to this charter is expected to earn (pence, unweighted): its
-   * base value (the share counts no premium) at the pool's rate. Nothing if the tier, at its recent pace,
-   * can't complete before the season ends (guide 3.11).
+   * Phase-completion bonus a ton delivered to this charter is expected to earn (pence, unweighted), on average over
+   * `tons` delivered together: the bonus splits by the square root of each player's base-valued tons (guide 3.15),
+   * so what a load adds is its marginal share of the pool (bonusMarginal), small for a player already far ahead and
+   * large for a first delivery. `extra`: base value (pence) our other ships are already bound to deliver into the
+   * tier. Without a board to split (nobody else on it, our names unknown): the ton's base value at the pool's straight
+   * rate, as before. Nothing if the tier, at its recent pace, can't complete before the season ends (guide 3.11).
    */
-  charterBonus(c: { id: string; good: string }): number {
+  charterBonus(c: { id: string; good: string }, tons = BONUS_REF_TONS, extra = 0): number {
     if (!this.expansionCharters.has(c.id)) return 0;
     if (this.seasonEndsAt !== null && (this.tierEtaMs === null || !this.beforeSeasonEnd(this.now() + this.tierEtaMs))) return 0;
-    return Math.round((this.expansionValue.get(c.id) ?? this.basePrice(c.good)) * this.expansionRate);
+    const unit = this.bonusUnit(c);
+    const t = Math.max(1, tons);
+    const marginal = this.bonusMarginal(unit * t, extra);
+    return Math.round(marginal === null ? unit * this.expansionRate : marginal / t);
+  }
+
+  /** What a ton delivered to this expansion charter counts for in the bonus split: its good's base price (pence). */
+  bonusUnit(c: { id: string; good: string }): number {
+    return this.expansionValue.get(c.id) ?? this.basePrice(c.good);
+  }
+
+  /**
+   * The bonus (pence) `value` more of base value delivered earns at completion: pool × [√(o+t)/(√(o+t)+Σ√others) −
+   * √o/(√o+Σ√others)], o our player's base value (all our companies on the board, plus `extra` already bound there),
+   * each other company as its own player (who owns which isn't public). The pool is paid on the final tons: everyone's
+   * share is taken to grow with the tier to its projected total, so a load counts at its part of that total (as though
+   * the board were already complete). Null when the board can't be split: no tier, nobody else on it yet (the share
+   * then turns on who joins), or our own names not known yet.
+   */
+  private bonusMarginal(value: number, extra = 0): number | null {
+    const b = this.bonusBoard;
+    if (!b || b.delivered <= 0 || this.rivals.ours.size === 0) return null;
+    let ours = 0;
+    const others: number[] = [];
+    for (const c of b.contributors) {
+      const v = (c.share_bps / 10_000) * b.delivered;
+      if (this.rivals.ours.has(c.company_name)) ours += v;
+      else others.push(v);
+    }
+    if (others.length === 0) return null;
+    // Everyone grows by `grow` to completion: tons added at the final scale count 1/grow at today's.
+    const grow = Math.max(1, b.projected / b.delivered);
+    const before = sqrtShare(ours + Math.max(0, extra) / grow, others);
+    const after = sqrtShare(ours + (Math.max(0, extra) + Math.max(0, value)) / grow, others);
+    return Math.max(0, b.pool * (after - before));
+  }
+
+  /** Our player's share of the completion bonus as the board stands (the square-root split), and the pool; null without a board to split. */
+  bonusStanding(): { share: number; pool: number } | null {
+    const b = this.bonusBoard;
+    if (!b || this.rivals.ours.size === 0) return null;
+    let ours = 0;
+    const others: number[] = [];
+    for (const c of b.contributors) {
+      if (this.rivals.ours.has(c.company_name)) ours += c.share_bps;
+      else others.push(c.share_bps);
+    }
+    return { share: sqrtShare(ours, others), pool: b.pool };
   }
 
   /**
@@ -1901,7 +2146,7 @@ export class World {
     if (rate <= 0) return { cargoShare: 0, capture: 0, raids: 0 };
     const attention = pirateAttention(cargoValue);
     const raids = Math.min(1, (rate * attention) / (1 + guns * GUN_DETERRENCE));
-    const capturePerRaid = CAPTURE_PER_RAID / (1 + guns * CAPTURE_GUN_CUT);
+    const capturePerRaid = this.capturePerRaid(guns);
     const take = this.raidTake;
     return {
       cargoShare: Math.min(0.6, raids * (capturePerRaid + (1 - capturePerRaid) * take)),
@@ -1927,14 +2172,25 @@ export class World {
     return this.piracyRisk(plan, guns, knots, cargoValue).cargoShare;
   }
 
-  /** Share of the cargo a raid takes, learned from our own raids (30% until some are seen). */
+  /** Share of the cargo a raid that lets the ship go seizes, learned from our own raids (35% until some are seen; the guide's 20-50%). */
   get raidTake(): number {
     const n = this.raidTakes.length;
     const sum = this.raidTakes.reduce((a, b) => a + b, 0);
-    return Math.min(0.9, Math.max(0.05, (sum + RAID_TAKE_PRIOR * RAID_TAKE_PRIOR_N) / (n + RAID_TAKE_PRIOR_N)));
+    return Math.min(RAID_TAKE_MAX, Math.max(RAID_TAKE_MIN, (sum + RAID_TAKE_PRIOR * RAID_TAKE_PRIOR_N) / (n + RAID_TAKE_PRIOR_N)));
   }
 
-  /** One of our ships was raided: the share of its cargo taken, or captured outright. */
+  /**
+   * Chance an interception carries the ship off with `guns` facing it (a convoy's pooled guns count): an unarmed
+   * hull's odds learned from our own interceptions (7.5% until some are seen, kept within the guide's 5-10%),
+   * falling with guns towards the 5% floor.
+   */
+  capturePerRaid(guns = 0): number {
+    const seen = this.raidTakes.length + this.captures;
+    const unarmed = Math.min(CAPTURE_MAX, Math.max(CAPTURE_MIN, (this.captures + CAPTURE_PRIOR * CAPTURE_PRIOR_N) / (seen + CAPTURE_PRIOR_N)));
+    return CAPTURE_MIN + (unarmed - CAPTURE_MIN) / (1 + Math.max(0, guns) * CAPTURE_GUN_CUT);
+  }
+
+  /** One of our ships was intercepted: the share of its cargo seized, or captured outright (count each capture once). */
   notePirateRaid(share: number | null, captured: boolean): void {
     if (captured) {
       this.captures++;
@@ -2022,15 +2278,20 @@ export class World {
   }
 
   /**
-   * Stores (tons) for a passage sailing at `sailsAt`. The route's safe figure covers one hit (storm or
-   * pirates, each taking a quarter of the stores); cover as many as the passage could plausibly take
-   * (likelier than 2%), up to three. Always at the learned odds: the user's storm weight doesn't apply.
+   * Stores (tons) for a passage sailing at `sailsAt`. The route's safe figure covers one storm only (a
+   * quarter of the stores); a pirate raid that lets the ship go may seize half. Cover as many hits as the
+   * passage could plausibly take (likelier than 2%), up to three, as many of them raids as are plausible on
+   * their own (the worst case). Always at the learned odds: the user's storm weight doesn't apply.
    */
   storesFor(plan: RoutePlan, hull: ZoneClass, guns: number, knots: number, cargoValue: number, sailsAt: number): number {
-    const lambda = this.stormRisk(plan, hull, knots, sailsAt).hits + this.piracyRisk(plan, guns, knots, cargoValue).raids;
+    const storms = this.stormRisk(plan, hull, knots, sailsAt).hits;
+    const raids = this.piracyRisk(plan, guns, knots, cargoValue).raids;
     let k = 1;
-    while (k < STORES_MAX_HITS && poissonTail(lambda, k + 1) > STORES_TAIL) k++;
-    return k === 1 ? plan.safe_provisions_tons : Math.max(plan.safe_provisions_tons, plan.expected_provisions_tons / STORES_LEFT_PER_HIT ** k);
+    while (k < STORES_MAX_HITS && poissonTail(storms + raids, k + 1) > STORES_TAIL) k++;
+    let kp = 0;
+    while (kp < k && poissonTail(raids, kp + 1) > STORES_TAIL) kp++;
+    if (kp === 0 && k === 1) return plan.safe_provisions_tons;
+    return Math.max(plan.safe_provisions_tons, plan.expected_provisions_tons / (PIRATE_STORES_LEFT ** kp * STORM_STORES_LEFT ** (k - kp)));
   }
 
   /**
@@ -2152,6 +2413,9 @@ export class World {
       // The best ask our bids can fill: our own other companies' resting asks left out (noteUnfillable).
       const ask = this.fillable(book.port_id, b, "ask");
       this.sampleShock(book.port_id, b.commodity_id, bid, ask?.price_pence ?? null, at);
+      // Players' asks alone (a royal monopoly leaves only those to non-holders): known only from the depth.
+      const players = b.depth?.asks.filter((l) => !l.is_npc && !this.isUnfillable(book.port_id, b.commodity_id, l.order_id)) ?? null;
+      const playerAsk = players && players.length ? Math.min(...players.map((l) => l.price_pence)) : null;
       this.prices.set(`${book.port_id}|${b.commodity_id}`, {
         ask: ask?.price_pence ?? null,
         askQty: ask?.quantity ?? 0,
@@ -2162,6 +2426,7 @@ export class World {
         customsBps: book.customs_bps,
         at,
         live,
+        ...(players ? { playerAsk, playerAskQty: players.filter((l) => l.price_pence === playerAsk).reduce((n, l) => n + l.remaining_quantity, 0) } : {}),
       });
     }
   }
@@ -2209,6 +2474,16 @@ export class World {
   /** Learns other ports' prices from the coffee-house gossip at a quay we stand on, who sailed there, and its berth dues. */
   observeGossip(detail: PortDetail): void {
     this.rivals.addNotices(detail.recent_sailings);
+    // Public forming convoys in its news (rival intel, low confidence) and its Lloyd's List (underwriting results).
+    this.rivals.addConvoyNotices(detail.convoy_notices);
+    if (detail.lloyds_list) this.lloydsSeen.set(detail.id, { at: Date.now(), notice: detail.lloyds_list });
+    if (detail.visibility === "quay") {
+      this.quayNews.set(detail.id, {
+        at: Date.now(),
+        reports: (detail.coffee_house_gossip ?? []).map((g) => g.age_seconds * 1000),
+        sailings: (detail.recent_sailings ?? []).map((s) => ({ at: Date.parse(s.seen_at), company: s.company_name, ship: s.ship_name })).filter((s) => Number.isFinite(s.at)),
+      });
+    }
     this.noteBerthDues(detail.id, detail.berth_dues_per_day_pence);
     this.noteCustoms(detail.id, detail.customs_bps, this.now());
     for (const g of detail.coffee_house_gossip ?? []) {
@@ -2228,9 +2503,81 @@ export class World {
           customsBps: prev?.customsBps ?? null,
           at,
           live: false,
+          // The best players' resting ask and bid in the news (anonymous: playerLevel leaves ours out); absent from older boards.
+          ...(c.best_player_ask_pence !== undefined ? { playerAsk: c.best_player_ask_pence, playerAskQty: c.best_player_ask_quantity ?? 0 } : {}),
+          ...(c.best_player_bid_pence !== undefined ? { playerBid: c.best_player_bid_pence, playerBidQty: c.best_player_bid_quantity ?? 0 } : {}),
         });
       }
     }
+  }
+
+  /**
+   * Underwriting as the quays' Lloyd's Lists last posted it (display only): the newest list's results for Lloyd's and
+   * for player underwriters as a group over its window, and the policies open at each quay that posted one.
+   */
+  lloydsFigures(): { at: number; windowDays: number; lloyds: UnderwritingFigures | null; players: UnderwritingFigures; openHere: Array<[port: string, policies: number]> } | null {
+    let newest: { at: number; notice: LloydsListNotice } | null = null;
+    for (const x of this.lloydsSeen.values()) if (!newest || x.at > newest.at) newest = x;
+    if (!newest) return null;
+    return {
+      at: newest.at,
+      windowDays: newest.notice.window_game_days,
+      lloyds: newest.notice.lloyds ?? null,
+      players: newest.notice.players,
+      // Counts from the last hour only (a quay read long ago says nothing about what is open there now).
+      openHere: [...this.lloydsSeen]
+        .filter(([, x]) => Date.now() - x.at < 3_600_000)
+        .map(([port, x]): [string, number] => [port, x.notice.policies_open_here])
+        .filter(([, n]) => n > 0),
+    };
+  }
+
+  /**
+   * Our own company's resting orders (GET /v1/market/orders), read at most every OWN_ORDERS_TTL_MS: the news'
+   * anonymous best levels may be ours, and a live book's depth shows ours among the players' (left out of the asks our
+   * bids fill and the bids our asks fill, noteUnfillable). The fleet trades IOC only, so this is usually empty; one
+   * page of 200. A failed read keeps the last.
+   */
+  private async refreshOwnOrders(): Promise<void> {
+    if (Date.now() - this.ownOrdersAt < OWN_ORDERS_TTL_MS) return;
+    this.ownOrdersAt = Date.now();
+    const list = await this.client.orders({ limit: 200 }).catch(() => null);
+    if (!list) return;
+    const by = new Map<string, OwnOrder[]>();
+    for (const o of list) {
+      const tons = o.quantity - o.filled_quantity;
+      if (!(tons > 0) || o.is_npc) continue;
+      const k = `${o.port_id}|${o.commodity_id}`;
+      by.set(k, [...(by.get(k) ?? []), { id: o.id, side: o.side, price: o.price_pence, tons }]);
+      this.noteUnfillable(o.port_id, o.commodity_id, [o.id], o.side);
+    }
+    this.ownOrders = by;
+  }
+
+  /**
+   * The best players' resting order on one side at a port as last seen (`ask`: one our bids can fill; `bid`: one our
+   * asks can sell into) and the tons we may count on at server time `at`: our own resting orders at that price left
+   * out (the news is anonymous), and the rest less PLAYER_LEVEL_DECAY_PER_DAY per game day of the news' age (it may be
+   * filled or withdrawn by then). A bid is the news' only (a live book's bid already counts players'). The news' levels
+   * count only with no sibling company of ours (theirs can't be told apart). Null: none.
+   */
+  playerLevel(portId: string, good: string, side: "bid" | "ask", at = this.now()): { price: number; tons: number } | null {
+    const p = this.price(portId, good);
+    if (!p || (side === "bid" && p.live)) return null;
+    // With sibling companies the news' anonymous level may be theirs (orders never match them, and only this company's
+    // own orders are read to leave out): not counted.
+    if (!p.live && this.rivals.ourIds.size > 1) return null;
+    const price = side === "ask" ? p.playerAsk : p.playerBid;
+    const qty = side === "ask" ? p.playerAskQty : p.playerBidQty;
+    if (!price || !qty || qty <= 0) return null;
+    // Ours at that price or better (the news shows the best price and the tons at it) aren't ours to trade with; a live
+    // book's depth already left them out by order id.
+    const mine = p.live
+      ? 0
+      : (this.ownOrders.get(`${portId}|${good}`) ?? []).filter((o) => o.side === side && (side === "ask" ? o.price <= price : o.price >= price)).reduce((n, o) => n + o.tons, 0);
+    const days = Math.max(0, at - p.at) / (24 * 60 * this.gameMinuteMs);
+    const tons = Math.floor((qty - mine) * Math.max(0, 1 - PLAYER_LEVEL_DECAY_PER_DAY * days));
+    return tons > 0 ? { price, tons } : null;
   }
 
   price(portId: string, good: string): PriceObs | undefined {
@@ -2242,17 +2589,27 @@ export class World {
    * Best guess at the ask when a ship buys at `at`: last seen (a glut's dip easing as it fades), else
    * base price (a producer sits near base when stocked), lower while a glut there is planned on. Null
    * while a recent look found nothing on offer (sold out until the ladder re-quotes), or with no ask
-   * seen since a structural collapse of its output there.
+   * seen since a structural collapse of its output there. `player`: a players' resting ask in the news below
+   * that, and the tons it may still offer (playerLevel): bought first, the rest from the ladder.
    */
-  estAsk(portId: string, good: string, at = this.now()): { ask: number; known: boolean } | null {
+  estAsk(portId: string, good: string, at = this.now()): { ask: number; known: boolean; maxTons?: number; player?: { ask: number; tons: number } } | null {
     const p = this.price(portId, good);
-    if (p && p.ask === null && this.now() - p.at < SOLD_OUT_MS * (60 / this.timeScale)) return null;
+    // Under a royal monopoly another company holds here, the Crown's asks aren't ours: only players' resting asks
+    // seen (the holder's among them, ours left out), and no more than they may still offer when we buy.
+    if (this.monopolyBars(portId, good)) {
+      const lvl = this.playerLevel(portId, good, "ask", at);
+      return lvl ? { ask: lvl.price, known: true, maxTons: lvl.tons } : null;
+    }
+    // A players' ask in the news (a live book's ask already counts them).
+    const lvl = p && !p.live ? this.playerLevel(portId, good, "ask", at) : null;
+    const player = (ask: number) => (lvl && lvl.price < ask ? { player: { ask: lvl.price, tons: lvl.tons } } : {});
+    if (p && p.ask === null && this.now() - p.at < SOLD_OUT_MS * (60 / this.timeScale)) return lvl ? { ask: lvl.price, known: true, maxTons: lvl.tons } : null;
     const seenAt = p?.ask ? p.at : null;
-    if (this.shiftedSince(portId, good, "production_collapse", seenAt ?? -Infinity)) return null;
+    if (this.shiftedSince(portId, good, "production_collapse", seenAt ?? -Infinity)) return lvl ? { ask: lvl.price, known: true, maxTons: lvl.tons } : null;
     const ask = p?.ask ? this.easeShock(portId, good, "supply_boom", p.ask, p.at, at) : Math.round(this.basePrice(good) * 1.05);
     const glut = this.glutAsk(portId, good, at, seenAt);
-    if (glut !== null && glut < ask) return { ask: glut, known: false };
-    return { ask, known: !!p?.ask };
+    if (glut !== null && glut < ask) return { ask: glut, known: false, ...player(glut) };
+    return { ask, known: !!p?.ask, ...player(ask) };
   }
 
   /**

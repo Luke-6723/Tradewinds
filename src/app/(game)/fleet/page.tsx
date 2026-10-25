@@ -155,27 +155,61 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
             <KV
               rows={[
                 ["Labour", fmtCr(quote.labour_pence)],
-                ["Materials", fmtCr(quote.materials_pence)],
-                [`Yard markup ${(quote.yard_markup_bps / 100).toFixed(1)}%`, fmtCr(quote.yard_markup_pence)],
+                ...(mode === "byom"
+                  ? ([] as Array<[string, string]>)
+                  : ([
+                      ["Materials (players' asks and the NPC ladder)", fmtCr(quote.materials_pence)],
+                      ["Customs on every fill", fmtCr(quote.customs_pence)],
+                      [
+                        `Yard markup ${(quote.yard_markup_bps / 100).toFixed(1)}% on the NPC part (${fmtCr(quote.npc_materials_pence)})`,
+                        fmtCr(quote.yard_markup_pence),
+                      ],
+                    ] as Array<[string, string]>)),
                 ["Total", <span key="t" className="font-semibold">{quote.total_cost_pence != null ? fmtCr(quote.total_cost_pence) : "can't be built now"}</span>],
               ]}
             />
-            <Table head={["Material", "Tons", mode === "byom" ? "In your warehouse" : "Yard supply", "Cost"]}>
+            <Table
+              head={
+                mode === "byom"
+                  ? ["Material", "Tons", "In your warehouse"]
+                  : ["Material", "Tons", "Yard supply", "From players / NPC", "Cost", "Customs"]
+              }
+            >
               {quote.materials.map((m) => (
                 <tr key={m.commodity_id}>
                   <td>{goodName(m.commodity_id)}</td>
                   <td className="tabular-nums">{m.quantity}</td>
                   <td>{m.in_stock ? <Badge variant="success" size="sm">yes</Badge> : <Badge variant="error" size="sm">short</Badge>}</td>
-                  <td className="tabular-nums">{m.cost_pence != null ? fmtCr(m.cost_pence) : "—"}</td>
+                  {mode !== "byom" && (
+                    <>
+                      <td className="whitespace-nowrap tabular-nums">
+                        {fmtTons(m.player_tons)} / {fmtTons(m.npc_tons)}
+                      </td>
+                      <td className="tabular-nums">
+                        {m.cost_pence != null ? fmtCr(m.cost_pence) : "—"}
+                        {m.npc_cost_pence != null && m.cost_pence != null && m.npc_cost_pence !== m.cost_pence && (
+                          <div className="text-muted-foreground text-xs">NPC part {fmtCr(m.npc_cost_pence)}</div>
+                        )}
+                      </td>
+                      <td className="tabular-nums">{m.customs_pence != null ? fmtCr(m.customs_pence) : "—"}</td>
+                    </>
+                  )}
                 </tr>
               ))}
             </Table>
+            {mode !== "byom" && (
+              <p className="text-muted-foreground text-xs">
+                Turnkey buys each material off this port&apos;s ask book, cheapest first: other players&apos; asks (never your own companies&apos;, none over 2.5×
+                the mid) and the NPC ladder. Customs is paid on every fill; the yard&apos;s markup only on what came from the NPCs, so a yard where players
+                sell materials builds cheaper. Under a royal monopoly on a material, only players&apos; asks can supply it.
+              </p>
+            )}
             {missing.length > 0 && (
               <ErrorNote
                 error={
                   mode === "byom"
                     ? `Your warehouse here is short of ${missing.map((m) => goodName(m.commodity_id)).join(", ")}.`
-                    : `The yard can't supply ${missing.map((m) => goodName(m.commodity_id)).join(", ")} right now.`
+                    : `The ask book here can't supply ${missing.map((m) => goodName(m.commodity_id)).join(", ")} right now (a build would be refused).`
                 }
               />
             )}

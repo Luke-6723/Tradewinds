@@ -7,7 +7,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
-import { ContractsPanel, ConvoysPanel, GunsPanel, InsurancePanel, StoresPanel, WarehousePanel } from "@/components/kibb/fleet-ui-ship";
+import { usePledgedShips } from "@/components/kibb/finance-common";
+import { ContractsPanel, ConvoysPanel, GunsPanel, InsurancePanel, OwnershipPanel, StoresPanel, WarehousePanel } from "@/components/kibb/fleet-ui-ship";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
@@ -154,6 +155,8 @@ export default function ShipPage() {
     30_000,
     [shipId],
   );
+  // A lien is a borrower loan pledging her; a defaulted one arrests her (guide 3.13.1).
+  const pledges = usePledgedShips();
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [override, setOverride] = useState(false);
@@ -167,7 +170,12 @@ export default function ShipPage() {
   const locked = s.status === "berthed" && !!s.turnaround_unlocks_at && Date.parse(s.turnaround_unlocks_at) > Date.now();
   const blocked = runnerOwnsShip && !override;
   const insured = (policies ?? []).some((p) => p.status === "open" || p.status === "active");
-  const done = () => void reload();
+  const lien = pledges.byShip.get(s.id);
+  const arrested = lien?.status === "defaulted";
+  const done = () => {
+    void reload();
+    void pledges.reload();
+  };
 
   async function dockAction(kind: "dock" | "offshore") {
     setBusy(true);
@@ -187,7 +195,13 @@ export default function ShipPage() {
       <PageHeader
         back={["/fleet", "Fleet"]}
         title={s.name}
-        badges={<ShipStatusBadge status={s.status} />}
+        badges={
+          <>
+            <ShipStatusBadge status={s.status} />
+            {arrested ? <Badge variant="error">arrested</Badge> : lien ? <Badge variant="warning">liened</Badge> : null}
+            {s.dispatches_sealed && <Badge variant="outline">dispatches sealed</Badge>}
+          </>
+        }
         subtitle={`${shipClassName(s.ship_class)} · ${cls?.hull_category ?? "?"} hull · ${s.cannons_count}/${cls?.max_cannons ?? "?"} guns · crew ${cls?.crew_required ?? "?"}`}
       />
 
@@ -199,6 +213,16 @@ export default function ShipPage() {
             I know, act anyway
           </label>
         </div>
+      )}
+
+      {arrested && (
+        <p className="rounded-md bg-destructive/10 px-3 py-2 text-destructive text-sm">
+          Arrested: the loan pledging her defaulted, so she can&apos;t depart or join a convoy until the lender has her or the debt is paid (
+          <Link href="/loans" className="underline">
+            Loans
+          </Link>
+          ).
+        </p>
       )}
 
       <div className="grid items-start gap-4 lg:grid-cols-3">
@@ -293,7 +317,7 @@ export default function ShipPage() {
           <Panel title="Depart" className="lg:col-span-2">
             <DepartForm
               r={r}
-              blocked={blocked}
+              blocked={blocked || arrested}
               locked={locked}
               policy={(policies ?? []).find((p) => p.status === "open" || p.status === "active")}
               onDone={done}
@@ -307,6 +331,7 @@ export default function ShipPage() {
         <div className="space-y-4">
           <WarehousePanel r={r} blocked={blocked} onDone={done} />
           <GunsPanel r={r} blocked={blocked} onDone={done} insured={insured} />
+          <OwnershipPanel r={r} insured={insured} lien={lien} liensKnown={pledges.known} onDone={done} />
         </div>
       </div>
 

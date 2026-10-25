@@ -75,6 +75,11 @@ const PAUSED_WAIT_MS       = 60_000;
 const STORES_BIAS_STEP_DAYS = 1;
 const STORES_BIAS_MAX_DAYS = 6;
 const STORES_BIAS_DECAY_DAYS = 0.5;
+/** An arrested ship looks again this often (real ms), and our loans are read for her release at most this often. */
+const ARREST_WAIT_MS       = 60_000;
+const ARREST_RECHECK_MS    = 5 * 60_000;
+/** A refusal that says the ship is under arrest (guide 3.13.1: a defaulted loan's pledge can't depart or join a convoy). */
+export const ARREST_RE     = /\barrest/i;
 
 export interface FleetHost {
   readonly world: World;
@@ -141,6 +146,11 @@ export interface FleetHost {
   laneVetoed(agent: ShipAgent, lane: Lane): boolean;
   /** Whether the AI's bans keep a ship from making for this port (by this passage, for this charter). */
   offLimits(port: string, plan?: RoutePlan, charterId?: string): boolean;
+  /**
+   * Whether our loans show this ship arrested (a defaulted loan she is pledged to, her seizure pending; guide 3.13.1).
+   * Null: our loans couldn't be read. `fresh`: read them again now.
+   */
+  shipArrested(shipId: string, fresh?: boolean): Promise<boolean | null>;
 }
 
 /** What one ship's agent saves, so a restart resumes its lane, sell floors and record. */
@@ -174,6 +184,8 @@ export interface AgentSnapshot {
   /** Extra game days of stores kept after a starving leg (decays on safe arrivals), and the voyage it was raised for; absent in older saves. */
   storesBiasDays?: number;
   starvedVoyage?: string | null;
+  /** Arrested for a defaulted loan (since when, local ms, and why); absent in older saves. */
+  arrest?: { at: number; why: string } | null;
 }
 
 /** A ship about to sail: alone, now in one of our convoys (joined or formed), or a convoy that couldn't be entered. */
@@ -225,7 +237,7 @@ export interface TripRecord {
   resizedTons?: number;
 }
 
-const IDLE_RE = /^(no lane pays|waiting for cash|waiting for provisions on sale|standing by|holding|waiting: the world is paused|AI order: holding)/;
+const IDLE_RE = /^(no lane pays|waiting for cash|waiting for provisions on sale|standing by|holding|waiting: the world is paused|AI order: holding|arrested)/;
 const TRIP_HISTORY = 8;
 
 export interface CarriedFreight {
@@ -265,6 +277,10 @@ export interface AgentState {
   trips: TripRecord[];
   guns: number;
   nextTickAt: string | null;
+  /** Arrested for a defaulted loan (guide 3.13.1): why; absent: not arrested. */
+  arrested?: string;
+  /** A packet holding its dispatches sealed (guide 3.11: it posts nothing to the boards it calls at). */
+  dispatchesSealed?: boolean;
 }
 
 /** One port call: what was done there, so nothing is repeated or mis-delivered. */
@@ -387,6 +403,12 @@ export class ShipAgent {
   private policy: { p: InsurancePolicy | null; at: number } | null = null;
   /** One-off log lines already written (by key: a policy, a lane), so a waiting ship doesn't repeat them. */
   private readonly noted = new Set<string>();
+  /**
+   * Arrested for a defaulted loan (guide 3.13.1: no departing or joining a convoy until the lender has her or the debt
+   * is paid; cargo of ours aboard is sold toward it): since when and why (local ms), and when our loans were last
+   * checked for her release. Null: free.
+   */
+  private arrest: { at: number; why: string; checkedAt: number } | null = null;
 
   constructor(
     private readonly host: FleetHost,
@@ -423,6 +445,8 @@ export class ShipAgent {
       trips: [...this.trips],
       guns: s?.cannons_count ?? 0,
       nextTickAt: this.nextTickAt ? new Date(this.nextTickAt).toISOString() : null,
+      ...(this.arrest ? { arrested: this.arrest.why } : {}),
+      ...(s?.dispatches_sealed ? { dispatchesSealed: true } : {}),
     };
   }
 
@@ -446,6 +470,7 @@ export class ShipAgent {
       stormVoyage: this.stormVoyage,
       storesBiasDays: this.storesBiasDays || undefined,
       starvedVoyage: this.starvedVoyage,
+      arrest: this.arrest ? { at: this.arrest.at, why: this.arrest.why } : undefined,
     };
   }
 
@@ -477,6 +502,29 @@ export class ShipAgent {
     const bias = s.storesBiasDays ?? 0;
     this.storesBiasDays = Number.isFinite(bias) ? Math.min(STORES_BIAS_MAX_DAYS, Math.max(0, bias)) : 0;
     this.starvedVoyage = s.starvedVoyage ?? null;
+    // Still arrested after the restart until our loans say otherwise (checked at the first port tick).
+    if (s.arrest && typeof s.arrest.why === "string" && Number.isFinite(s.arrest.at)) this.arrest = { at: s.arrest.at, why: s.arrest.why, checkedAt: 0 };
+  }
+
+  /**
+   * This ship is arrested (a 409 on departing or joining a convoy that says so, or a default on the loan she is pledged
+   * to): she waits in the roadstead, buying and sailing nothing, until our loans show her free (arrestWait). Her lane is
+   * given up: cargo of ours left aboard is sold toward the debt (guide 3.13.1).
+   */
+  noteArrest(why: string): void {
+    const text = why.replace(/\s+/g, " ").trim().slice(0, 160);
+    if (!this.arrest) {
+      this.log(`ARRESTED (${text}): she can't depart or join a convoy until the debt is paid or the lender takes her; waiting in the roadstead, buying nothing`);
+      if (this.lane) this.host.releaseLane(this);
+    }
+    this.arrest = { at: Date.now(), why: text, checkedAt: Date.now() };
+    this.host.persist(true);
+    this.nudge();
+  }
+
+  /** Whether this ship is held under arrest (as far as we know). */
+  get arrested(): boolean {
+    return this.arrest !== null;
   }
 
   /** After a restart: keep the restored lane only if its cargo (or freight) is still aboard, or nothing was loaded yet but some was bought. */
@@ -977,7 +1025,8 @@ export class ShipAgent {
       this.stay = null;
       this.noteVoyage(r);
       this.noteStarving(r);
-      if (!this.lane && this.freightSynced) this.adoptCargoLane(r);
+      // An arrested ship's cargo goes toward the debt where she arrives: no lane is rebuilt for it.
+      if (!this.lane && this.freightSynced && !this.arrest) this.adoptCargoLane(r);
       const eta = Date.parse(r.voyage?.estimated_arrival_at ?? s.leg_arrives_at ?? "") || 0;
       const ms = eta ? eta - world.now() : POLL_MS;
       const to = r.route_legs.at(-1)?.to_node ?? "?";
@@ -1060,8 +1109,10 @@ export class ShipAgent {
     if (!dest) return;
     for (const good of Object.keys(r.cargo_manifest)) {
       const tons = this.ownTons(r, good);
-      // Never an expected crisis charter: it isn't listed, so nothing could be delivered into it.
-      const c = this.host.world.charters.filter((x) => x.port === dest && x.good === good && !x.provisional).sort((a, b) => b.payPerTon - a.payPerTon)[0];
+      // Never an expected crisis charter (it isn't listed, so nothing could be delivered into it), nor one of our own player's.
+      const c = this.host.world.charters
+        .filter((x) => x.port === dest && x.good === good && !x.provisional && this.host.world.deliverable(x))
+        .sort((a, b) => b.payPerTon - a.payPerTon)[0];
       if (tons <= 0 || !c) continue;
       this.lane = cargoLane(good, r.route_legs[0]?.from_node ?? dest, dest, c.id, Math.min(tons, c.remaining), c.payPerTon);
       this.laneLoaded = this.lane.key;
@@ -1085,10 +1136,42 @@ export class ShipAgent {
     }
   }
 
+  /**
+   * Under arrest: wait in the roadstead, buying nothing (cargo of ours aboard goes toward the debt). Our loans are read
+   * every ARREST_RECHECK_MS: once they show no default holding her (paid, or the refusal wasn't hers to know of), and
+   * that long after the refusal, she goes back to work (another refusal arrests her again: never a tight loop).
+   * Returns the wait, or null when free.
+   */
+  private async arrestWait(r: ShipResult): Promise<number | null> {
+    const a = this.arrest;
+    if (!a) return null;
+    if (Date.now() - a.checkedAt >= ARREST_RECHECK_MS) {
+      a.checkedAt = Date.now();
+      const held = await this.host.shipArrested(this.shipId, true);
+      if (held === false && Date.now() - a.at >= ARREST_RECHECK_MS) {
+        this.log(`no longer under arrest (our loans show no default holding her): back to work`);
+        this.arrest = null;
+        this.host.persist(true);
+        return null;
+      }
+    }
+    // Nothing reserved for her meanwhile (a lane restored or planned before the arrest was known).
+    if (this.lane) this.host.releaseLane(this);
+    await this.park(r);
+    this.activity = `arrested (${a.why}): waiting in the roadstead until the debt is settled or the lender takes her`;
+    return ARREST_WAIT_MS;
+  }
+
   private async atPort(r: ShipResult, stay: Stay): Promise<number> {
     const { world } = this.host;
     const port = stay.port;
     const atYard = !!world.port(port)?.has_shipyard;
+
+    // Arrested (guide 3.13.1): nothing is bought, delivered or sailed until our loans show her free.
+    if (this.arrest) {
+      const wait = await this.arrestWait(r);
+      if (wait !== null) return wait;
+    }
 
     if (!stay.scouted) {
       stay.scouted = true;
@@ -1133,6 +1216,7 @@ export class ShipAgent {
         !c.provisional &&
         c.port === port &&
         (c.expiresAt === null || c.expiresAt > nowMs) &&
+        world.deliverable(c) &&
         this.roomIn(c) > 0 &&
         !stay.refused.has(c.id) &&
         deliverNow(c.good) > 0 &&
@@ -1245,23 +1329,13 @@ export class ShipAgent {
     }
     const freightFirst = !inTime;
     if (insuredTo && !freightFirst) {
-      // Only a load for the policy's port, bought here; whatever else is aboard rides along (a loaded lane
-      // bound elsewhere carries on from there). No sale here either: it would cut the cover.
-      if (this.lane && !this.loaded && (this.lane.source !== port || this.lane.dest !== insuredTo)) this.host.releaseLane(this);
-      let lane = this.loaded || stay.traded.has("cargo") ? null : this.lane;
-      if (!this.loaded && !lane && !stay.traded.has("cargo")) {
-        lane = await this.host.assignLane(this, port, r, { onlySource: port, onlyDest: insuredTo });
-        if (lane) this.sizedAt = { stay: stay.key, at: Date.now() };
-      }
-      // Guns suit a lane (one planned as if fully armed, say): refit for it while still at the yard, then plan it again on the new room.
-      if (lane && atYard && (await this.refitGuns(r, stay))) {
-        r = await this.reread();
-        lane = await this.host.assignLane(this, port, r, { onlySource: port, onlyDest: insuredTo });
-        if (lane) this.sizedAt = { stay: stay.key, at: Date.now() };
-      }
+      // Nothing is loaded once a policy is written, by any path (cargo_exceeds_declared voids it): she sails to
+      // the policy's port with what is aboard. A load for that port part-bought here is the load as it stands; any
+      // other lane not loaded is dropped (a loaded lane bound elsewhere carries on from there). No sale here either:
+      // it would cut the cover.
+      this.settleLoad(r, stay, insuredTo);
       await yardVisit();
-      if (lane && lane.source === port && lane.dest === insuredTo && !this.isAvoided(lane.key)) return this.loadAt(await this.reread(), lane, stay);
-      this.logOnce(`insured:${policy!.id}`, `insured for a voyage to ${insuredTo}: sailing there with what is aboard (the policy is void anywhere else)`);
+      this.logOnce(`insured:${policy!.id}`, `insured for a voyage to ${insuredTo}: sailing there with what is aboard, loading nothing more (the policy is void anywhere else, or if cargo is added)`);
       return this.sailTo(r, insuredTo, stay);
     }
     if (pinned) {
@@ -1395,7 +1469,7 @@ export class ShipAgent {
    * read at most every `maxAgeMs`. A failed read keeps the last; with none to keep (never read, or an insurance
    * event since: forgetPolicy) it is unknown (undefined), and callers take the safe side (wait, don't sell).
    */
-  async insuredPolicy(maxAgeMs = POLICY_TTL_MS): Promise<InsurancePolicy | null | undefined> {
+  async insuredPolicy(maxAgeMs = POLICY_TTL_MS, strict = false): Promise<InsurancePolicy | null | undefined> {
     if (this.policy && Date.now() - this.policy.at < maxAgeMs) return this.policy.p;
     try {
       const list = await this.host.client.policies({ ship_id: this.shipId, limit: 10 });
@@ -1405,6 +1479,8 @@ export class ShipAgent {
       this.policy = { p, at: Date.now() };
     } catch (e) {
       soft(e);
+      // `strict`: a failed read is unknown, never the last one kept.
+      if (strict) return undefined;
     }
     return this.policy ? this.policy.p : undefined;
   }
@@ -1412,6 +1488,59 @@ export class ShipAgent {
   /** An insurance event: read the policy again at the next decision (unknown until that read succeeds). */
   forgetPolicy(): void {
     this.policy = null;
+  }
+
+  /**
+   * Cargo loaded after a policy is written voids it (`cargo_exceeds_declared`, guide 3.6): read afresh before
+   * each purchase or freight lot, true when a policy is on her now (or that can't be told), so nothing more
+   * is loaded. The user may insure her at any moment from the dashboard.
+   */
+  private async policyNow(): Promise<InsurancePolicy | null | undefined> {
+    const p = await this.insuredPolicy(0, true);
+    // One for the voyage that ends here settles on arrival: it doesn't bind the next load.
+    if (p && p.dest_port_id === this.stay?.port) return null;
+    if (p) this.logOnce(`declared:${p.id}`, `insured for ${p.dest_port_id}: loading nothing more (cargo added after the policy is written voids it)`);
+    return p;
+  }
+
+  /**
+   * No more cargo this stay (a policy is on her): a lane for `dest` part-loaded at this source is the load as it
+   * stands (its trip kept, its sell floors set, finished where it lands); any other lane not loaded yet is dropped
+   * (one loaded elsewhere carries on), what it bought here aboard keeping a floor at its cost.
+   */
+  private settleLoad(r: ShipResult, stay: Stay, dest: string | null): void {
+    stay.traded.add("cargo");
+    const lane = this.lane;
+    if (!lane || this.loaded) return;
+    const aboard = this.laneGoodsAboard(r, lane) > 0 || lane.freight.some((f) => this.freight.has(f.id));
+    const bought = aboard && lane.source === stay.port;
+    const kept = bought && (dest === null || lane.dest === dest);
+    // Sell floors first, for what was bought here: bound elsewhere than the lane's port (it is dropped), the part aboard
+    // still never sells under what it cost.
+    if (bought) {
+      for (const p of lane.parts) {
+        const floor = Math.max(p.costPerTon, kept && p.kind === "market" ? Math.round(p.pay * (1 - SELL_FLOOR_DROP)) : 0);
+        if (floor > 0 && this.ownTons(r, p.good) > 0) this.minSale.set(p.good, Math.max(this.minSale.get(p.good) ?? 0, floor));
+      }
+    }
+    if (!kept) {
+      this.host.releaseLane(this);
+      if (bought) this.host.persist(true);
+      return;
+    }
+    this.laneLoaded = lane.key;
+    this.host.persist(true);
+  }
+
+  /** A policy came up while loading (or its read failed): nothing more goes aboard; the next decision sails for its port. */
+  private async stopLoading(stay: Stay, p: InsurancePolicy | undefined): Promise<number> {
+    if (!p) {
+      this.activity = "reading this ship's insurance policy failed; not loading yet";
+      return 15_000;
+    }
+    this.settleLoad(await this.reread(), stay, p.dest_port_id);
+    this.activity = `insured for ${p.dest_port_id}: loading nothing more`;
+    return 1_000;
   }
 
   /**
@@ -1534,6 +1663,9 @@ export class ShipAgent {
   private async loadAt(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
     if (stay.traded.has("cargo")) return this.sailTo(r, lane.dest, stay);
     const { world } = this.host;
+    // Insured since the plan (the user, from the dashboard): nothing goes aboard after a policy is written.
+    const insured = await this.policyNow();
+    if (insured !== null) return this.stopLoading(stay, insured);
     if (r.ship.status !== "berthed") {
       // Docking costs a berth stay: only when at least a ton (or the freight's collateral) can be paid for;
       // for a load counting on cash due, the main cargo buyPart would sail with (the rest waits in the roadstead).
@@ -1554,9 +1686,8 @@ export class ShipAgent {
     const untouched = this.laneGoodsAboard(r, lane) === 0 && !lane.freight.some((f) => this.freight.has(f.id));
     if (!fresh && untouched) {
       this.sizedAt = { stay: stay.key, at: Date.now() };
-      // Insured from here: a load bound for the policy's port only (unknown: kept as planned, nothing switched).
-      const policy = await this.insuredPolicy();
-      if (policy !== undefined) lane = (await this.host.resizeLane(this, stay.port, r, policy && policy.dest_port_id !== stay.port ? policy.dest_port_id : undefined)) ?? lane;
+      // Never insured here (checked just above): an insured ship loads nothing.
+      lane = (await this.host.resizeLane(this, stay.port, r)) ?? lane;
     }
     // Season end (guide 3.11): a load that can't land before it isn't bought (the planner's lanes all can; one
     // kept as planned when re-sizing found nothing may not).
@@ -1575,10 +1706,12 @@ export class ShipAgent {
     }
     r = await this.reread();
 
-    // The main cargo first: without it the lane is off.
+    // The main cargo first: without it the lane is off. Each purchase and lot reads the policy afresh first: one
+    // written meanwhile stops the loading where it stands (stopLoading).
     const extras = lane.kind === "freight" ? lane.parts : lane.parts.slice(1);
     if (lane.kind === "freight") {
       const got = await this.acceptLaneFreight(r, lane, stay);
+      if (got.stop) return this.stopLoading(stay, got.stop.p);
       if (got.taken === 0) {
         this.host.releaseLane(this);
         if (got.cashShort) {
@@ -1594,6 +1727,7 @@ export class ShipAgent {
     } else {
       const main = lane.parts[0];
       const res = await this.buyPart(r, lane, main, stay);
+      if (res.stop) return this.stopLoading(stay, res.stop.p);
       // Bought on an earlier tick of this stay (a later step failed): carry on loading. Surplus stores trimStores just
       // moved into cargo for a provisions charter count there too, but weren't bought.
       if (res.bought === 0 && (stay.boughtHere.get(main.good) ?? 0) - (main.good === STORES_GOOD ? trimmed : 0) === 0) {
@@ -1615,13 +1749,19 @@ export class ShipAgent {
       }
     }
     // Then the rest of the load: other goods, and freight lots for the same destination.
-    for (const p of extras) await this.buyPart(await this.reread(), lane, p, stay);
+    for (const p of extras) {
+      const res = await this.buyPart(await this.reread(), lane, p, stay);
+      if (res.stop) return this.stopLoading(stay, res.stop.p);
+    }
     // Never sell any of it for less than it cost to land (or, for market goods, the planned floor).
     for (const p of lane.parts) {
       const floor = Math.max(p.costPerTon, p.kind === "market" ? Math.round(p.pay * (1 - SELL_FLOOR_DROP)) : 0);
       if (floor > 0) this.minSale.set(p.good, Math.max(this.minSale.get(p.good) ?? 0, floor));
     }
-    if (lane.kind !== "freight" && lane.freight.length > 0) await this.acceptLaneFreight(await this.reread(), lane, stay);
+    if (lane.kind !== "freight" && lane.freight.length > 0) {
+      const got = await this.acceptLaneFreight(await this.reread(), lane, stay);
+      if (got.stop) return this.stopLoading(stay, got.stop.p);
+    }
     stay.traded.add("cargo");
     this.laneLoaded = lane.key;
     // An AI lane or charter order is met once its load is aboard.
@@ -1652,12 +1792,20 @@ export class ShipAgent {
    * Buys one good of the lane's load, up to its break-even price and the room left for it. `self`: nothing
    * filled because the asks under the limit were our own other companies' (they never match ours, guide 3.2).
    */
-  private async buyPart(r: ShipResult, lane: Lane, part: Part, stay: Stay): Promise<{ bought: number; reason: string; self?: boolean }> {
+  private async buyPart(
+    r: ShipResult,
+    lane: Lane,
+    part: Part,
+    stay: Stay,
+  ): Promise<{ bought: number; reason: string; self?: boolean; stop?: { p: InsurancePolicy | undefined } }> {
     const { client, world, settings } = this.host;
     const port = lane.source;
     const good = part.good;
     const want = Math.min(part.tons, this.liveTons(part)) - this.ownTons(r, good);
     if (want < 1) return { bought: 0, reason: `no room left in the ${good} charters` };
+    // Cargo bought after a policy is written voids it: read afresh before every purchase.
+    const policy = await this.policyNow();
+    if (policy !== null) return { bought: 0, reason: "insured", stop: { p: policy } };
     // Room for the cargo after the whole tons of stores the voyage still needs.
     const storesTarget = await this.storesTarget(lane.source, lane.dest, lane.source);
     const storesRoom = this.storesHoldNeed(r.stores.provisions_tons, storesTarget);
@@ -1665,12 +1813,17 @@ export class ShipAgent {
       const book = await client.book(port, good);
       world.observeBook(book);
       const b = book.books.find((x) => x.commodity_id === good);
+      // A royal monopoly another company holds in this region (guide 3.9): the Crown's asks aren't ours to take,
+      // only players' resting asks (the holder's among them).
+      const barred = world.monopolyBars(port, good);
+      if (barred && !b?.depth) return { bought: 0, reason: `${good} at ${port} is under a royal monopoly (${barred.holder})` };
       // Our own other companies' resting asks can't fill our bids: left out once found (World.noteUnfillable).
-      const depthAsks = b?.depth?.asks ?? [];
+      const depthAsks = (b?.depth?.asks ?? []).filter((l) => !barred || !l.is_npc);
       const fillable = depthAsks.filter((l) => !world.isUnfillable(port, good, l.order_id));
-      const bestAsk = fillable.length ? Math.min(...fillable.map((l) => l.price_pence)) : depthAsks.length ? null : (b?.best_ask?.price_pence ?? null);
+      const bestAsk = fillable.length ? Math.min(...fillable.map((l) => l.price_pence)) : depthAsks.length || barred ? null : (b?.best_ask?.price_pence ?? null);
       if (bestAsk === null) {
         if (depthAsks.length > 0) return { bought: 0, reason: `only our own companies' ${good} is on offer at ${port}`, self: true };
+        if (barred) return { bought: 0, reason: `${good} at ${port} is under a royal monopoly (${barred.holder}) and no player offers it` };
         world.observeNoAsk(port, good, b?.best_bid ?? null);
         return { bought: 0, reason: `no ${good} on offer at ${port}` };
       }
@@ -1686,11 +1839,14 @@ export class ShipAgent {
         this.log(`${good} at ${port} asks ${cr(bestAsk)}/t, above the ${cr(limit)}/t break-even for ${lane.dest}`);
         return { bought: 0, reason: `${good} too dear at ${port}` };
       }
-      const room = Math.min(r.effective_hold_capacity_tons - r.cargo_used_tons - storesRoom, want);
+      let room = Math.min(r.effective_hold_capacity_tons - r.cargo_used_tons - storesRoom, want);
       if (room <= 0) return { bought: 0, reason: "no room" };
 
       // Price `n` tons by walking the visible ask ladder up to the limit (beyond it: at the limit).
       const asks: OrderBookLevel[] = fillable.filter((l) => l.price_pence <= limit).sort((x, y) => x.price_pence - y.price_pence);
+      // Under a monopoly only the players' asks under the limit can fill (a bid past them would be refused).
+      if (barred) room = Math.min(room, Math.floor(asks.reduce((n, l) => n + l.remaining_quantity, 0)));
+      if (room <= 0) return { bought: 0, reason: `${good} at ${port} is under a royal monopoly (${barred!.holder}): players offer none under the limit` };
       const costFor = (n: number) => {
         let left = n;
         let cost = 0;
@@ -1763,6 +1919,13 @@ export class ShipAgent {
           this.log(`buy refused: ${e.message}`);
           return { bought: 0, reason: "refused" };
         }
+        // A royal monopoly kept the bid from filling (409 naming the holder): noted, so plans leave the Crown's asks
+        // here alone; the lane is re-planned around it (never a failed tick every 30 s until the grant expires).
+        if (isApiError(e) && e.status === 409 && (!!barred || /monopol/i.test(`${e.detail} ${e.message}`))) {
+          world.noteMonopoly(port, good, e.detail || e.message);
+          this.log(`buying ${good} at ${port} refused: a royal monopoly (${e.detail || e.message}); planning around it`);
+          return { bought: 0, reason: `${good} at ${port} is under a royal monopoly` };
+        }
         throw e;
       }
     });
@@ -1773,7 +1936,7 @@ export class ShipAgent {
    * voyage needs (sealed freight can't be eaten or sold to make room). Returns how many were taken,
    * and whether collateral money was what ran short.
    */
-  private async acceptLaneFreight(r: ShipResult, lane: Lane, stay: Stay): Promise<{ taken: number; cashShort: boolean }> {
+  private async acceptLaneFreight(r: ShipResult, lane: Lane, stay: Stay): Promise<{ taken: number; cashShort: boolean; stop?: { p: InsurancePolicy | undefined } }> {
     const port = stay.port;
     const need = await this.storesTarget(port, lane.dest, lane.source);
     let room = r.effective_hold_capacity_tons - r.cargo_used_tons - this.storesHoldNeed(r.stores.provisions_tons, need);
@@ -1782,6 +1945,7 @@ export class ShipAgent {
     for (const f of lane.freight) {
       if (this.freight.has(f.id) || f.tons > room) continue;
       const res = await this.acceptFreightLot(port, f.id, f.collateral, r, lane);
+      if (typeof res === "object") return { taken, cashShort, stop: { p: res.insured } };
       if (res === "taken") {
         taken++;
         room -= f.tons;
@@ -1790,9 +1954,20 @@ export class ShipAgent {
     return { taken, cashShort };
   }
 
-  /** Accepts one freight lot onto this ship (collateral from the port's region). */
-  private async acceptFreightLot(port: string, id: string, collateral: number, r: ShipResult, lane: Lane | null): Promise<"taken" | "cash" | "no"> {
+  /**
+   * Accepts one freight lot onto this ship (collateral from the port's region). Never once a policy is on her
+   * (read afresh: freight loaded after it is written voids it); `insured` then says which (undefined: unknown).
+   */
+  private async acceptFreightLot(
+    port: string,
+    id: string,
+    collateral: number,
+    r: ShipResult,
+    lane: Lane | null,
+  ): Promise<"taken" | "cash" | "no" | { insured: InsurancePolicy | undefined }> {
     const { client, world } = this.host;
+    const policy = await this.policyNow();
+    if (policy !== null) return { insured: policy };
     return this.host.withCash(async () => {
       const cash = await this.host.loadBudget(this, world.region(port), collateral);
       if (cash < collateral) return "cash";
@@ -1890,6 +2065,7 @@ export class ShipAgent {
           !c.provisional &&
           c.port === port &&
           (c.expiresAt === null || c.expiresAt > now) &&
+          world.deliverable(c) &&
           !stay.refused.has(c.id) &&
           this.roomIn(c) > 0 &&
           !this.campShut(c, Math.min(deliverable(c.good), this.roomIn(c))),
@@ -1926,9 +2102,9 @@ export class ShipAgent {
         // A charter may have taken less than asked: the pass below offers the rest to the others.
       } catch (e) {
         if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
-        if (e.status === 401 || e.status === 403 || FATAL_CODES.includes(e.code ?? "")) throw e;
+        if (e.status === 401 || FATAL_CODES.includes(e.code ?? "")) throw e;
         if (e.status === 429 || e.code === "idempotency_request_in_flight") return { delivered, retry: true };
-        // Nothing applied: find the refusal one charter at a time.
+        // Nothing applied (a 403 too: one of them may be our own player's charter): find the refusal one charter at a time.
       }
     }
 
@@ -1945,10 +2121,24 @@ export class ShipAgent {
         );
       } catch (e) {
         if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
-        if (e.status === 401 || e.status === 403 || FATAL_CODES.includes(e.code ?? "")) throw e;
+        if (e.status === 401 || FATAL_CODES.includes(e.code ?? "")) throw e;
         if (e.status === 429 || e.code === "idempotency_request_in_flight") {
           retry = true;
           break;
+        }
+        if (e.status === 403) {
+          // A player charter our player (or a company linked to ours) issued: the server refuses its deliveries for
+          // good (guide 4.2). Never offered again, by any ship; never a failed tick. A key or presence refusal
+          // isn't the charter's: refused for this stay only.
+          const notTheCharter = e.code === "missing_scope" || e.code === "company_key_required" || e.code === "no_port_presence";
+          if (!notTheCharter) this.host.world.refuseCharter(c.id);
+          stay.refused.add(c.id);
+          this.log(
+            notTheCharter
+              ? `${c.title} refused our delivery (${e.code}): ${e.detail || e.message}`
+              : `${c.title} refuses our deliveries for good (${e.code ?? "forbidden"}: one of our own or a linked company's charter): ${e.detail || e.message}`,
+          );
+          continue;
         }
         if (e.status === 404) {
           c.remaining = 0;
@@ -2197,6 +2387,8 @@ export class ShipAgent {
     const { client, world, settings } = this.host;
     const port = stay.port;
     if (!settings.useFreight || r.ship.status !== "berthed" || stay.traded.has("freight")) return;
+    // Insured (or unknown): sealed freight loaded after the policy voids it.
+    if ((await this.policyNow()) !== null) return;
     stay.traded.add("freight");
 
     let listings: ContractListing[];
@@ -2224,7 +2416,8 @@ export class ShipAgent {
     const storm = world.stormRisk(plan, hull, knots, sailsAt, settings.stormWeightPct / 100);
     const aboard = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0);
     const candidates = listings
-      .filter((c) => c.origin_port_id === port && c.dest_port_id === next && !c.stale)
+      // Never lots any of our player's companies issued (same-player dealing is refused, guide 4.2).
+      .filter((c) => c.origin_port_id === port && c.dest_port_id === next && !c.stale && !world.ownIssued({ issuer: c.issuer_company_id }))
       // Paid only if it lands before the season ends (guide 3.11): loaded, sailed, and the base lock there cleared.
       .filter((c) => world.beforeSeasonEnd(sailsAt + c.quantity_required * handling + sailMs + 30 * world.gameMinuteMs))
       .map((c) => {
@@ -2242,7 +2435,9 @@ export class ShipAgent {
     for (const { c } of candidates) {
       if (c.quantity_required > room || this.host.freightClaimed(this, c.id)) continue;
       const lane = this.lane && this.lane.dest === next ? this.lane : null;
-      if ((await this.acceptFreightLot(port, c.id, c.collateral_pence, r, lane)) === "taken") room -= c.quantity_required;
+      const res = await this.acceptFreightLot(port, c.id, c.collateral_pence, r, lane);
+      if (typeof res === "object") return;
+      if (res === "taken") room -= c.quantity_required;
     }
   }
 
@@ -2277,7 +2472,7 @@ export class ShipAgent {
 
     let best: { c: (typeof world.charters)[number]; take: number; value: number } | null = null;
     for (const c of world.charters) {
-      if (c.good !== good || c.port === port || c.stale || c.remaining <= 0 || !world.isOpen(c.port)) continue;
+      if (c.good !== good || c.port === port || c.stale || c.remaining <= 0 || !world.isOpen(c.port) || !world.deliverable(c)) continue;
       const plan = await world.route(port, c.port, this.shipClass).catch(() => null);
       // Not where the AI's bans rule out (cargo aboard is never stranded: selling here, or holding, remains).
       if (!plan || !reachable(plan) || this.host.offLimits(c.port, plan, c.id)) continue;
@@ -2417,6 +2612,8 @@ export class ShipAgent {
       surplus = Math.min(surplus, Math.max(0, want - room));
       if (surplus < 1) return 0;
     }
+    // Stores moved into cargo are cargo added: never once a policy is on her (or that can't be told).
+    if ((await this.policyNow()) !== null) return 0;
     if (forCharter) {
       await this.host.client.unprovision(this.shipId, surplus, "cargo");
       stay.boughtHere.set(STORES_GOOD, (stay.boughtHere.get(STORES_GOOD) ?? 0) + surplus);
@@ -2795,6 +2992,11 @@ export class ShipAgent {
     // convoy, and guns are pooled).
     if (this.noConvoyAt !== stay.key) {
       const c = await this.host.sailInConvoy(this, r, port, dest, plan);
+      if (c.kind === "failed" && ARREST_RE.test(c.why)) {
+        // Arrested ships can't join a convoy, nor depart (guide 3.13.1): parked, not tried again every tick.
+        this.noteArrest(c.why);
+        return 1_000;
+      }
       if (c.kind === "failed") {
         this.log(`convoy to ${dest} not possible (${c.why}): sailing alone`);
         this.noConvoyAt = stay.key;
@@ -2849,6 +3051,11 @@ export class ShipAgent {
         const m = /for (\d+)s more/.exec(e.detail);
         this.activity = `depart refused: ${e.detail}`;
         if (m) return (Number(m[1]) + 1) * 1_000;
+        // Arrested for a defaulted loan (guide 3.13.1): parked until our loans show her free, never retried in a loop.
+        if (ARREST_RE.test(e.detail)) {
+          this.noteArrest(e.detail);
+          return 1_000;
+        }
         // Some other conflict (convoy state, wrong port, sealed cargo): said once a stay, the ship read again,
         // then backing off; from the third, the lane is dropped and the ship waits in the roadstead.
         const n = ++stay.departRefusals;

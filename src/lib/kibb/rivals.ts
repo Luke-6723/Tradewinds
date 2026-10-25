@@ -20,7 +20,7 @@
  */
 
 import type { Catalog, ExpansionTier, LeaderboardResult, RoutePlan, SailingNotice } from "./types";
-import type { ConvoyResult, InsurancePolicy, InsuranceStatus } from "./schema";
+import type { ConvoyNotice, ConvoyResult, InsurancePolicy, InsuranceStatus } from "./schema";
 
 export type LoadState = "ballast" | "part_laden" | "laden";
 
@@ -41,8 +41,8 @@ export interface Sighting {
   matched?: string;
 }
 
-/** What saw a rival: a quay sighting, a public policy, a public convoy. */
-export type IntelSource = "quay" | "policy" | "convoy";
+/** What saw a rival: a quay sighting, a public policy, a public convoy, a coffee house's convoy news (low confidence). */
+export type IntelSource = "quay" | "policy" | "convoy" | "notice";
 
 export interface RivalShip {
   key: string;
@@ -136,6 +136,26 @@ export interface ConvoyRec {
   convoyStatus: string;
 }
 
+/**
+ * A public forming convoy as a coffee house's news gave it (`convoy_notices`, guide 3.10): its organizer, route,
+ * sailing and muster, as they stood when the news left its port. No ships, no cargo.
+ */
+export interface ConvoyNoticeRec {
+  convoyId: string;
+  name: string;
+  companyId: string;
+  from: string;
+  to: string;
+  /** Server ms: scheduled to sail; when the news left the origin. Local ms last seen on a board. */
+  departsAt: number;
+  newsAt: number;
+  seenAt: number;
+  /** Ships mustered (escorts included), escorts, and the guns the escorts mount. */
+  members: number;
+  escorts: number;
+  escortGuns: number;
+}
+
 /** Tons a rival delivered to a charter (from the expansion board's deltas, or a notice that named it). */
 export interface RivalDelivery {
   /** Null when no single rival can be named. */
@@ -221,11 +241,20 @@ export interface RivalIntelSnapshot {
   spans: Array<[string, number[]]>;
   homePorts: Array<[string, string]>;
   board: { phase: number; tons: Array<[string, number]>; charters: Array<[string, number]> } | null;
+  /** Convoy news (absent in older saves). */
+  notices?: ConvoyNoticeRec[];
 }
 
-/** A pirate hit destroys this share of every stack; the prize court pays half its base value. */
-const HIT_LOSS = 0.25;
+/**
+ * Pirates (guide 3.5): an interception carries the ship off in 5-10% of cases (fewer the more guns face it),
+ * else seizes 20-50% of every stack and lets it go. These are the priors; the world model learns both from
+ * our own raids (World.raidTake, World.capturePerRaid). The prize court pays half the seized cargo's base
+ * value, and keeps the Admiral's tenth of a sponsor's share.
+ */
+export const RAID_TAKE_PRIOR = 0.35;
+export const CAPTURE_PRIOR = 0.075;
 const PRIZE_OF_SEIZED = 0.5;
+const ADMIRALS_TENTH = 0.1;
 /** Assumed cut in interception odds per gun (the formula isn't published; as the planner assumes). */
 const GUN_DETERRENCE = 0.5;
 /** How full a hold is taken to be for each load state. */
@@ -255,6 +284,10 @@ const SPAN_SAMPLES = 20;
 const HULL_MATCH = 0.12;
 /** Sightings and policies or convoys are the same movement within this (real ms; the port list and notices differ a little). */
 const MATCH_SLACK_MS = 3 * 60_000;
+/** A quay sighting of a convoy sailing this close to its notice's schedule (real ms) is that convoy: the notice no longer counts. */
+const NOTICE_SAIL_SLACK_MS = 10 * 60_000;
+/** A convoy notice not on any board we read for this long (real ms) while its sailing is ahead may have been cancelled. */
+const STALE_NOTICE_MS = 30 * 60_000;
 /** Points before a company id is taken to be a name (and at least twice any other name's). */
 const LINK_EVIDENCE = 3;
 /** Company id <-> name pairings kept, and observations remembered so one isn't counted twice. */
@@ -283,6 +316,41 @@ const ATTENTION_MAX = 3;
 /** How much more (or less) than a zone's raw piracy a passage carrying `cargoValue` (pence) draws. */
 export function pirateAttention(cargoValue: number): number {
   return cargoValue <= 0 ? ATTENTION_MIN : Math.min(ATTENTION_MAX, Math.max(ATTENTION_MIN, Math.sqrt(cargoValue / ATTENTION_REF_PENCE)));
+}
+
+// ── Completion bonus ──────────────────────────────────────────────────────────
+
+/**
+ * A tier's completion bonus splits by the square root of each player's base-valued tons, counted across its
+ * companies (guide 3.15): our player's share of it (0-1) with `ours` and each of `others` in the same units
+ * (any: the split doesn't depend on the scale). 85.7% / 9.6% / 4.7% of the value take about 64% / 21% / 15%.
+ */
+export function sqrtShare(ours: number, others: readonly number[]): number {
+  const a = Math.sqrt(Math.max(0, ours));
+  const s = others.reduce((n, v) => n + Math.sqrt(Math.max(0, v)), 0);
+  return a + s > 0 ? a / (a + s) : 0;
+}
+
+/**
+ * The bonus split as the contribution board stands (`share_bps`: each company's share of the base value delivered):
+ * our player's pooled share (`ours`: our companies' names) and each company's (ours split among them by their own
+ * deliveries), 0-1. Which other company is whose isn't public: each counts as its own player.
+ */
+export function bonusSplit(contributors: ReadonlyArray<{ company_name: string; share_bps: number }>, ours: ReadonlySet<string>): { ours: number; byCompany: Map<string, number> } {
+  let mine = 0;
+  const others: number[] = [];
+  for (const c of contributors) {
+    if (ours.has(c.company_name)) mine += Math.max(0, c.share_bps);
+    else others.push(Math.max(0, c.share_bps));
+  }
+  const share = sqrtShare(mine, others);
+  const roots = Math.sqrt(mine) + others.reduce((n, v) => n + Math.sqrt(v), 0);
+  const byCompany = new Map<string, number>();
+  for (const c of contributors) {
+    const v = Math.max(0, c.share_bps);
+    byCompany.set(c.company_name, ours.has(c.company_name) ? (mine > 0 ? (share * v) / mine : 0) : roots > 0 ? Math.sqrt(v) / roots : 0);
+  }
+  return { ours: share, byCompany };
 }
 
 const spanKey = (from: string, to: string, cargo: boolean) => `${from}>${to}|${cargo ? "cargo" : "hull"}`;
@@ -315,6 +383,8 @@ export class RivalTracker {
   /** Policies by lane (`from>to`), rebuilt after the list changes: every sighting is matched against it. */
   private byLane: Map<string, PolicyRec[]> | null = null;
   private readonly convoyShips = new Map<string, ConvoyRec>();
+  /** Convoy news from the coffee houses, by convoy id (low confidence: counted only while no record or sighting has it). */
+  private readonly notices = new Map<string, ConvoyNoticeRec>();
   private deliveries: RivalDelivery[] = [];
   /** Named rival deliveries by `company|port|good` ([server ms, tons]): read per landing per plan. */
   private readonly feeds = new Map<string, Array<[number, number]>>();
@@ -484,6 +554,42 @@ export class RivalTracker {
       }
     }
     this.rematch();
+  }
+
+  /**
+   * Public forming convoys from a quay's news (`convoy_notices`, guide 3.10): organizer, route, sailing and muster,
+   * as they stood when the news left (a day or more from distant ports). Low confidence: no ships or cargo, and a
+   * convoy its public listing or a quay sighting shows is counted from those, never twice. Each notice names its
+   * organizer by id and name together: certain evidence linking the two.
+   */
+  addConvoyNotices(list: ConvoyNotice[] | null | undefined): void {
+    const at = Date.now();
+    for (const n of list ?? []) {
+      if (!n?.convoy_id || this.ourIds.has(n.organizer_company_id) || this.ours.has(n.organizer_company_name)) continue;
+      const departsAt = Date.parse(n.departs_at);
+      if (!Number.isFinite(departsAt)) continue;
+      const newsAt = Date.parse(n.news_as_of);
+      const prev = this.notices.get(n.convoy_id);
+      // Another board's older news of the same convoy: the newer stands.
+      if (prev && Number.isFinite(newsAt) && prev.newsAt > newsAt) {
+        prev.seenAt = at;
+        continue;
+      }
+      this.notices.set(n.convoy_id, {
+        convoyId: n.convoy_id,
+        name: n.name,
+        companyId: n.organizer_company_id,
+        from: n.origin_port_id,
+        to: n.dest_port_id,
+        departsAt,
+        newsAt: Number.isFinite(newsAt) ? newsAt : departsAt,
+        seenAt: at,
+        members: n.members,
+        escorts: n.escorts,
+        escortGuns: n.escort_cannons,
+      });
+      this.addEvidence(n.organizer_company_id, n.organizer_company_name, LINK_EVIDENCE, `ntc:${n.convoy_id}`);
+    }
   }
 
   /** Sightings that matched nothing so far may match now (new records, or a name or class now known). */
@@ -869,6 +975,44 @@ export class RivalTracker {
         sighting: sight,
       });
     }
+    // Convoy news (low confidence): one voyage per convoy, the organizer's, while neither its public listing nor a
+    // quay sighting of it sailing has it already.
+    const listed = new Set([...this.convoyShips.values()].map((c) => c.convoyId));
+    for (const n of this.notices.values()) {
+      // One announced with no members yet carries no one: no traffic.
+      if (listed.has(n.convoyId) || n.members === 0) continue;
+      const seenSailing = [...this.seen.values()].some((s) => s.convoy === n.name && s.port === n.from && s.direction === "sailed" && Math.abs(s.at - n.departsAt) <= NOTICE_SAIL_SLACK_MS);
+      if (seenSailing) continue;
+      // Server time against this machine's: the skew is seconds, a schedule's slack minutes.
+      const sailed = n.departsAt <= now;
+      out.push({
+        key: `ntc:${n.convoyId}`,
+        sources: ["notice"],
+        company: this.display(n.companyId),
+        companyId: n.companyId,
+        ship: null,
+        shipId: `ntc:${n.convoyId}`,
+        shipClass: null,
+        guns: n.escortGuns > 0 ? n.escortGuns : null,
+        from: n.from,
+        to: n.to,
+        load: null,
+        cargo: null,
+        convoy: n.name,
+        convoyId: n.convoyId,
+        convoyStatus: sailed ? "sailing" : "forming",
+        hull: null,
+        listedAt: n.newsAt,
+        sailedAt: null,
+        departsAt: n.departsAt,
+        endedAt: null,
+        arriveEst: null,
+        state: sailed ? "at_sea" : "in_port",
+        // Only forming convoys are posted: one off every board we read for a while before its sailing may be cancelled.
+        stale: !sailed && now - n.seenAt > STALE_NOTICE_MS,
+        sighting: null,
+      });
+    }
     return out;
   }
 
@@ -878,8 +1022,11 @@ export class RivalTracker {
     const intel = INTEL_KEEP_GAME_DAYS * 24 * 60 * gameMinuteMs;
     for (const [k, p] of this.policies) if (now - p.updatedAt > intel || (p.status === "open" && now > p.expiresAt + intel)) this.policies.delete(k);
     for (const [k, c] of this.convoyShips) if (now - c.departsAt > intel) this.convoyShips.delete(k);
+    // Convoy news says nothing once its convoy is a few days gone (no ships to follow).
+    for (const [k, n] of this.notices) if (now - n.departsAt > keep) this.notices.delete(k);
     trimOldest(this.policies, INTEL_MAX_RECORDS, (p) => p.updatedAt);
     trimOldest(this.convoyShips, INTEL_MAX_RECORDS, (c) => c.departsAt);
+    trimOldest(this.notices, INTEL_MAX_RECORDS, (n) => n.departsAt);
     while (this.shipNames.size > INTEL_MAX_RECORDS) this.shipNames.delete(this.shipNames.keys().next().value!);
     this.deliveries = this.deliveries.filter((d) => now - d.at <= intel).slice(-INTEL_MAX_RECORDS);
     for (const [k, list] of this.worth) if (now - (list.at(-1)?.[0] ?? 0) > intel) this.worth.delete(k);
@@ -904,6 +1051,7 @@ export class RivalTracker {
       spans: [...this.spans],
       homePorts: [...this.homePorts],
       board: this.board ? { phase: this.board.phase, tons: [...this.board.tons], charters: [...this.board.charters] } : null,
+      notices: [...this.notices.values()],
     };
   }
 
@@ -911,6 +1059,7 @@ export class RivalTracker {
   restore(s: Partial<RivalIntelSnapshot>): void {
     for (const p of s.policies ?? []) if (p?.id) this.policies.set(p.id, { ...p });
     for (const c of s.convoys ?? []) if (c?.convoyId) this.convoyShips.set(`${c.convoyId}|${c.shipId}`, { ...c });
+    for (const n of s.notices ?? []) if (n?.convoyId && Number.isFinite(n.departsAt)) this.notices.set(n.convoyId, { ...n });
     this.deliveries = (s.deliveries ?? []).filter((d) => d && d.tons > 0).map((d) => ({ ...d, company: d.company ?? null, phase: d.phase ?? 0 })).slice(-INTEL_MAX_RECORDS);
     for (const [k, v] of s.names ?? []) this.names.set(k, v);
     for (const [k, v] of s.evidence ?? []) this.evidence.set(k, v);
@@ -1104,6 +1253,8 @@ export async function analyseRivals(t: RivalTracker, deps: RivalDeps): Promise<R
   const ships = new Map(quay.map((s) => [s.key, s]));
   const latestVoyage = new Map<string, (typeof est)[number]>();
   for (const e of est) {
+    // Convoy news names no ship: its voyage counts in the traffic and the organizer's lanes, not as a ship.
+    if (e.x.sources.includes("notice")) continue;
     const prev = latestVoyage.get(e.x.shipId);
     if (!prev || e.v.departAt > prev.v.departAt) latestVoyage.set(e.x.shipId, e);
   }
@@ -1187,7 +1338,9 @@ export async function analyseRivals(t: RivalTracker, deps: RivalDeps): Promise<R
     // Declared cargo; else (a hull-only policy seen laden on the quay, a convoy ship) as for a sighting.
     const load = v.load ?? (v.cargo === null ? "part_laden" : "ballast");
     const cargo = v.cargo !== null && v.cargo > 0 ? v.cargo : hold * FILL[load] * valuePerTon(catalog, v.from);
-    passages.push({ group: x.convoyId ? `cvy:${x.convoyId}` : v.key, from: v.from, to: v.to, shipClass: v.shipClass ?? "", knots, load, cargo, guns: v.guns, next: ahead });
+    // Convoy news groups as the quay's sightings of that convoy do (by origin and name): one convoy, one passage.
+    const group = x.sources.includes("notice") ? `${v.from}|${x.convoy}` : x.convoyId ? `cvy:${x.convoyId}` : v.key;
+    passages.push({ group, from: v.from, to: v.to, shipClass: v.shipClass ?? "", knots, load, cargo, guns: v.guns, next: ahead });
   }
   const groups = new Map<string, Passage[]>();
   for (const p of passages) groups.set(p.group, [...(groups.get(p.group) ?? []), p]);
@@ -1332,39 +1485,60 @@ export interface ZonePiracy {
 
 export interface MarqueOption {
   bps: number;
-  /** Per game day, pence. */
+  /** Per game day, pence: prize money expected, after the Admiral's tenth (the game's quote when `quoted`). */
   prize: number;
+  /** Per game day, pence: what the marque costs (the game's quote when `quoted`; 0 when not priced). */
   cost: number;
-  /** Extra cargo our own ships are expected to lose in the zone. */
+  /** Extra our own ships are expected to lose in the zone: cargo seized, and ships taken. */
   ownLoss: number;
   profit: number;
+  /** Prize and cost are the game's `marque-quote` (traffic-priced); absent or false: our own estimate, cost unknown. */
+  quoted?: boolean;
+  /** Our own estimate of the prize from the rival traffic seen (after the tenth), beside a quote. */
+  rivalPrize?: number;
+  /** The quote's price floor applied: the zone's traffic is worth less than it. */
+  floor?: boolean;
 }
 
-/** Marque cost: 2 Cr per bps per game day. */
-export const MARQUE_PENCE_PER_BPS_DAY = 200;
+/** Patrol cost: 2 Cr per bps per game day (marques are priced by the game from each zone's traffic: `marque-quote`). */
+export const PATROL_PENCE_PER_BPS_DAY = 200;
+
+/** Share of a passage's cargo seized per interception: all of it when the ship is taken, else the raid's take. */
+export const seizedShare = (take: number, capture: number) => capture + (1 - capture) * take;
 
 /**
- * The marque size that earns most per game day in a zone, given the rival exposure there and our
- * own ships' exposure (both pence·days a game day, as ZoneTraffic.exposure). The prize court pays
- * half the seized cargo's base value times the marques' share of the zone's piracy, split among
- * marques by bps; interception odds per passage run at the zone's net piracy per game day at sea.
- * Returns the best option even when it loses money (callers decide).
+ * The marque size that earns most per game day in a zone by our own model, given the rival exposure there
+ * (pence·days a game day, as ZoneTraffic.exposure) and `ownRisk`: what our own ships lose per unit of zone
+ * piracy a game day (cargo seized and hulls taken: FleetManager.ownExposure). The prize court pays half the seized
+ * cargo's base value times the marques' share of the zone's piracy, split among marques by bps, less the
+ * Admiral's tenth; interception odds per passage run at the zone's net piracy per game day at sea. Without a
+ * price (`pricePerBpsDay` null: no quote) the cost is left out and the option is unpriced. Returns the best
+ * option even when it loses money (callers decide; the autopilot issues only on the game's quote).
  */
-export function bestMarque(zone: ZonePiracy, rivalExposure: number, ownExposure: number, maxBps = 1_500): MarqueOption {
+export function bestMarque(
+  zone: ZonePiracy,
+  rivalExposure: number,
+  ownRisk: number,
+  maxBps = 1_500,
+  m: { pricePerBpsDay?: number | null; take?: number; capture?: number } = {},
+): MarqueOption {
   const b = zone.base_piracy_bps;
   const others = zone.marque_piracy_bps;
   // The zone's marques are capped: past the cap a marque adds cost but no piracy.
   const top = Math.min(maxBps, 1_500, ZONE_MARQUE_CAP - others);
   if (top < 50) return { bps: 0, prize: 0, cost: 0, ownLoss: 0, profit: -1 };
+  // Rivals' guns aren't known: an unarmed hull's capture odds (a captured ship's whole cargo is seized).
+  const seized = seizedShare(m.take ?? RAID_TAKE_PRIOR, m.capture ?? CAPTURE_PRIOR);
+  const price = m.pricePerBpsDay ?? null;
   let best: MarqueOption | null = null;
   for (let bps = 50; bps <= top; bps += 50) {
     const net = Math.max(0, b + others + bps - zone.patrol_suppression_bps);
     const share = bps / Math.max(b + others + bps, 1);
-    const prize = rivalExposure * (net / 10_000) * HIT_LOSS * PRIZE_OF_SEIZED * share;
-    const cost = MARQUE_PENCE_PER_BPS_DAY * bps;
-    const ownLoss = ownExposure * (bps / 10_000) * HIT_LOSS;
+    const prize = rivalExposure * (net / 10_000) * seized * PRIZE_OF_SEIZED * share * (1 - ADMIRALS_TENTH);
+    const cost = price === null ? 0 : price * bps;
+    const ownLoss = ownRisk * (bps / 10_000);
     const profit = prize - cost - ownLoss;
-    if (!best || profit > best.profit) best = { bps, prize: Math.round(prize), cost, ownLoss: Math.round(ownLoss), profit: Math.round(profit) };
+    if (!best || profit > best.profit) best = { bps, prize: Math.round(prize), cost: Math.round(cost), ownLoss: Math.round(ownLoss), profit: Math.round(profit), quoted: false };
   }
   return best!;
 }

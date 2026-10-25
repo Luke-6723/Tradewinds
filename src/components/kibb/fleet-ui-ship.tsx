@@ -10,8 +10,21 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, Panel, Table } from "@/components/kibb/bits";
 import { Field, PortSelect } from "@/components/kibb/pickers";
-import { InsurableCap, LaneGuide, capFrom, createPolicy, laneKey, useLaneFloors, type InsurableValue } from "@/components/kibb/insurance-common";
-import { num } from "@/components/kibb/naval-common";
+import {
+  InsurableCap,
+  LaneGuide,
+  QuoteGuide,
+  capFrom,
+  createPolicy,
+  createdText,
+  laneKey,
+  useInsuranceQuote,
+  useLaneFloors,
+  type InsurableValue,
+} from "@/components/kibb/insurance-common";
+import { useCompanyNames } from "@/components/kibb/finance-common";
+import { num, useOurCompanyIds } from "@/components/kibb/naval-common";
+import { fetchAll } from "@/components/kibb/trade-common";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
@@ -186,8 +199,8 @@ export function StoresPanel({ r, blocked, onDone }: Props) {
           </>
         )}
         <p className="text-muted-foreground text-xs">
-          Stores are whole tons of hold (0.3 t takes a ton). Crews eat at half the sea rate in port. Stock to the safe figure: storms and
-          pirates destroy a quarter of the stores.
+          Stores are whole tons of hold (0.3 t takes a ton). Crews eat at half the sea rate in port. A storm destroys a quarter of the
+          stores and pirates who let the ship go seize up to half; the safe figure covers one storm only, so stock above it on pirate water.
         </p>
       </div>
     </Panel>
@@ -232,6 +245,136 @@ export function GunsPanel({ r, blocked, onDone, insured }: Props & { insured: bo
           </>
         )}
         <p className="text-muted-foreground text-xs">Guns cut piracy sharply; each displaces 2 t of cargo.</p>
+      </div>
+    </Panel>
+  );
+}
+
+// ── Sale, liens and dispatches ────────────────────────────────────────────────
+
+/**
+ * Whether the ship can change hands (guide 3.4), her lien and arrest state (3.13.1: a lien is a borrower loan's
+ * `collateral_ship_id`; a defaulted one arrests her), her listing, and a packet's sealed dispatches (3.11).
+ */
+export function OwnershipPanel({
+  r,
+  insured,
+  lien,
+  liensKnown,
+  onDone,
+}: {
+  r: ShipResult;
+  insured: boolean;
+  /** The borrower loan she is pledged to (active or defaulted), if any. */
+  lien: S.Loan | undefined;
+  liensKnown: boolean;
+  onDone: () => void;
+}) {
+  const { catalog, portName } = useCatalog();
+  const names = useCompanyNames();
+  const s = r.ship;
+  const cls = catalog?.ship_classes.find((c) => c.id === s.ship_class);
+  const arrested = lien?.status === "defaulted";
+  // Our listings, any status (no port: the game lists ours).
+  const { data: listings, reload } = usePoll(() => fetchAll<S.ShipListingResult>("/v1/fleet/ship-listings", {}, 200, 5), 60_000);
+  const listed = listings?.find((l) => l.ship_id === s.id && l.status === "open");
+  // Resolves to null when the confirmation is declined.
+  const seal = useAction<S.SealDispatchesResult | null>((x) => x && onDone());
+  const inPort = s.status === "berthed" || s.status === "anchored_roadstead";
+  const blockers = [
+    !inPort ? "she must be lying at a port" : null,
+    r.cargo_used_tons > 0 ? `her hold must be empty (${fmtTons(r.cargo_used_tons, 1)} aboard)` : null,
+    s.convoy_id ? "she must leave her convoy" : null,
+    insured ? "her open insurance policy must settle first" : null,
+    lien ? "her loan must be repaid (lien)" : null,
+  ].filter((x): x is string => !!x);
+
+  function toggleSeal() {
+    const sealed = !s.dispatches_sealed;
+    void seal.run(async () => {
+      const ask = sealed
+        ? `Seal ${s.name}'s dispatches? Her crew keeps recording every quay she sees but posts nothing to the coffee-house boards she calls at, so the news stays yours to sell sealed in an envelope where she lies.`
+        : `Release ${s.name}'s dispatches? ${inPort ? `Her crew's log is posted to ${portName(s.current_port_id)}'s coffee-house board at once` : "Her crew's log is posted at the next port she reaches"}, and she shares again from then on.`;
+      if (!confirm(ask)) return null;
+      return kibbPost<S.SealDispatchesResult>("/v1/fleet/seal-dispatches", { ship_id: s.id, sealed });
+    });
+  }
+
+  return (
+    <Panel title="Sale, liens and dispatches" action={<Link href="/ships-market" className="text-muted-foreground text-xs hover:text-foreground">Ship market →</Link>}>
+      <div className="space-y-3">
+        {arrested && lien && (
+          <ErrorNote
+            error={`Arrested: the loan pledging her defaulted ${lien.defaulted_at ? fmtDateTime(lien.defaulted_at) : ""}. She can't depart or join a convoy until the lender has her or you pay (${fmtCr(lien.owed_pence)} owed); any of your cargo left aboard is sold at half base price toward the debt.`}
+          />
+        )}
+        <KV
+          rows={[
+            [
+              "Lien",
+              !liensKnown ? (
+                "…"
+              ) : lien ? (
+                <span key="l">
+                  pledged to {names.label(lien.lender_company_id)}: {fmtCr(lien.owed_pence)} owed
+                  {lien.matures_at && !arrested ? `, matures ${fmtIn(lien.matures_at)}` : ""} ·{" "}
+                  <Link href="/loans" className="text-primary hover:underline">
+                    Loans
+                  </Link>
+                </span>
+              ) : (
+                "none"
+              ),
+            ],
+            ["Arrest", !liensKnown ? "…" : arrested ? <span key="a" className="text-destructive">arrested</span> : "no"],
+            [
+              "For sale",
+              !listings ? "…" : listed ? `listed at ${fmtCr(listed.price_pence)} since ${fmtDateTime(listed.created_at)}` : "not listed",
+            ],
+            ["Free to sell", blockers.length ? `no: ${blockers.join("; ")}` : liensKnown ? "yes" : "…"],
+          ]}
+        />
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="outline" render={<Link href={listed ? "/ships-market" : `/ships-market?list=${s.id}`} />}>
+            {listed ? "Manage the listing" : "List for sale"}
+          </Button>
+          {listed && (
+            <Button size="sm" variant="ghost" onClick={() => void reload()}>
+              Refresh
+            </Button>
+          )}
+        </div>
+        {lien && !arrested && (
+          <p className="text-muted-foreground text-xs">
+            A liened ship can still sail before any default, but can&apos;t be listed, sold, pledged again or carry a venture until the loan is repaid. If she sinks the
+            lien is lost and the loan stays owed.
+          </p>
+        )}
+        {cls?.can_seal_dispatches && (
+          <div className="space-y-2 border-t pt-3">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <span className="font-medium">Dispatches</span>
+              <Badge variant={s.dispatches_sealed ? "warning" : "outline"} size="sm">
+                {s.dispatches_sealed ? "sealed" : "shared"}
+              </Badge>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              {s.dispatches_sealed
+                ? "Her crew records every quay she sees and posts nothing: seal the news into an envelope where she lies (Envelopes page), or release it."
+                : "A packet may seal her dispatches: her crew still records quays but posts nothing to the boards she calls at, so her news is yours alone to sell."}
+            </p>
+            <ErrorNote error={seal.error} />
+            {seal.result && (
+              <Result>
+                Dispatches {seal.result.sealed ? "sealed" : "released"}
+                {seal.result.released_at_port_id ? `, posted at ${portName(seal.result.released_at_port_id)}` : ""}.
+              </Result>
+            )}
+            <Button size="sm" variant="outline" disabled={seal.busy} onClick={toggleSeal}>
+              {s.dispatches_sealed ? "Release dispatches" : "Seal dispatches"}
+            </Button>
+          </div>
+        )}
       </div>
     </Panel>
   );
@@ -372,18 +515,15 @@ export function ContractsPanel({ r, blocked, onDone }: Props) {
   const charter = useAction<DeliverCharterResult>(done);
   const accept = useAction<AcceptFreightResult>(done);
   const deliver = useAction<DeliverFreightResult>(done);
+  // A charter or freight lot any of our player's companies issued can't be delivered to or carried by ours.
+  const ourIds = useOurCompanyIds();
+  const ours = (c: ContractListing) => !!c.issuer_company_id && (ourIds.has(c.issuer_company_id) || c.issuer_company_id === s.company_id);
 
   const sealed = (active ?? []).filter((c) => c.carrier_ship_id === s.id);
   const sealedTons = new Map<string, number>();
   for (const c of sealed) if (c.commodity_id) sealedTons.set(c.commodity_id, (sealedTons.get(c.commodity_id) ?? 0) + c.quantity_required);
   const charters = (here ?? []).filter((c) => c.contract_type === "charter" && c.origin_port_id === port && !c.stale);
-  const freight = (here ?? []).filter(
-    (c) =>
-      c.contract_type === "freight" &&
-      c.origin_port_id === port &&
-      !c.carrier_ship_id &&
-      (c as S.ContractListing).issuer_company_id !== s.company_id,
-  );
+  const freight = (here ?? []).filter((c) => c.contract_type === "freight" && c.origin_port_id === port && !c.carrier_ship_id && !ours(c));
   const free = Math.max(0, r.effective_hold_capacity_tons - r.cargo_used_tons);
 
   return (
@@ -437,13 +577,16 @@ export function ContractsPanel({ r, blocked, onDone }: Props) {
                 <Table head={["Good", "Remaining", "Pay/t", "Aboard", "Expires", "Deliver"]}>
                   {charters.map((c) => {
                     const held = Math.max(0, (r.cargo_manifest[c.commodity_id ?? ""] ?? 0) - (sealedTons.get(c.commodity_id ?? "") ?? 0));
-                    const max = Math.min(held, c.remaining_quantity);
+                    // Our own player's charter: the game refuses our deliveries to it.
+                    const max = ours(c) ? 0 : Math.min(held, c.remaining_quantity);
                     const q = Math.min(qty[c.id] ?? max, max);
                     return (
                       <tr key={c.id}>
                         <td>
                           {goodName(c.commodity_id)}
                           {c.title && <div className="text-muted-foreground text-xs">{c.title}</div>}
+                          {ours(c) && <div className="text-muted-foreground text-xs">posted by one of your companies: not yours to deliver</div>}
+                          {!ours(c) && c.funded_by === "issuer" && <div className="text-muted-foreground text-xs">a player&apos;s charter: no prestige</div>}
                         </td>
                         <td className="tabular-nums">{fmtTons(c.remaining_quantity)}</td>
                         <td className="tabular-nums">{fmtCr(c.reward_per_ton_pence ?? Math.floor(c.reward_pence / Math.max(1, c.quantity_required)), 2)}</td>
@@ -535,9 +678,13 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
   const bps = num(premium);
   const bpsOk = Number.isInteger(bps) && bps >= 10 && bps <= 3000;
   const floors = useLaneFloors(port && dest ? [[port, dest]] : []).get(laneKey(port, dest));
-  // Cover type: from the cap once seen; an empty hold can only be hull-only; otherwise unknown.
-  const hullOnly = cap && valueOk ? value <= cap.hull_value_pence : r.cargo_used_tons <= 0 ? true : null;
-  const act = useAction<S.InsurancePolicy>(() => {
+  // Quoted first: Lloyd's price for this voyage (only while she is in port and uninsured).
+  const { data: quote, error: quoteError } = useInsuranceQuote(inPort && current.length === 0 && dest && dest !== port ? s.id : "", dest, value);
+  const quoted = quote && quote.ship_id === s.id && quote.dest_port_id === dest && quote.insured_value_pence === value ? quote : undefined;
+  // Cover type: from the quote or a cap once seen; an empty hold can only be hull-only; otherwise unknown.
+  const hull = quoted?.hull_value_pence ?? cap?.hull_value_pence;
+  const hullOnly = hull !== undefined && valueOk ? value <= hull : r.cargo_used_tons <= 0 ? true : null;
+  const act = useAction<S.CreateInsurancePolicyResult>(() => {
     onDone();
     reload();
   });
@@ -591,8 +738,9 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
             </div>
             {premium !== "" && !bpsOk && <ErrorNote error="The premium must be a whole number of bps from 10 to 3,000." />}
             <p className="text-muted-foreground text-xs">
-              Load everything first: cargo loaded after the policy is written voids it when the ship sails. A capture by pirates pays out as a total loss.
+              Load everything first and declare it all: cargo loaded after the policy is written voids it when the ship sails. A capture by pirates pays out as a total loss.
             </p>
+            {dest && <QuoteGuide quote={quoted} error={quoteError} valueCr={valueCr} premiumBps={bps} onValue={setValueCr} onPremium={setPremium} />}
             {dest && <LaneGuide floors={floors} hullOnly={hullOnly} premiumBps={bps} />}
             {cap && <InsurableCap cap={cap} valueCr={valueCr} onUseMax={setValueCr} />}
             <p className="text-muted-foreground text-xs">
@@ -605,6 +753,7 @@ export function InsurancePanel({ r, blocked, onDone, policies, reload }: Props &
             </Button>
           </div>
         )}
+        {act.result && <p className="text-sm">Policy open on the voyage to {portName(act.result.dest_port_id)}. {createdText(act.result)}</p>}
       </div>
     </Panel>
   );

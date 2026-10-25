@@ -9,19 +9,25 @@ import { Empty, ErrorNote, KV, Loading, Metrics, NativeSelect, PageHeader, Panel
 import {
   InsurableCap,
   LaneGuide,
+  MAX_PARTIAL_SHARE,
+  QuoteGuide,
   capFrom,
   createPolicy,
+  createdText,
   floorFor,
   impliedMaxEl,
   isHullOnly,
   laneKey,
+  maxSliceFor,
+  sliceOk,
+  useInsuranceQuote,
   useLaneFloors,
   useOwnCover,
   type InsurableValue,
   type LaneFloors,
 } from "@/components/kibb/insurance-common";
 import { Field, PortSelect, ShipSelect } from "@/components/kibb/pickers";
-import { AutopilotWarning, Checkbox, Pager, PAGE_SIZE, Segmented, num, shortId, useAutopilotShips, useCompanyId, useCursor } from "@/components/kibb/naval-common";
+import { AutopilotWarning, Checkbox, Pager, PAGE_SIZE, Segmented, num, shortId, useAutopilotShips, useCompanyId, useCursor, useTimeScale } from "@/components/kibb/naval-common";
 import { BatchError, postBatch } from "@/components/kibb/trade-common";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
@@ -41,37 +47,43 @@ const STATUS_VARIANT: Record<S.InsuranceStatus, "info" | "success" | "secondary"
   cancelled: "outline",
 };
 
-/** Edge over Lloyd's-implied expected loss worth highlighting (bps). */
+/** Edge over Lloyd's expected loss worth highlighting (bps). */
 const GOOD_EDGE = 150;
+/** Lloyd's looks at listings about a game hour old: until then the pick is the players'. */
+const FIRST_PICK_GAME_MIN = 60;
 
 interface Risk {
   collateral: number;
   premium: number;
-  /** Most one storm or pirate hit can cost the slice: 25% of declared cargo; 0 for hull-only cover. */
+  /** Most one partial loss can cost the slice: pirates who let the ship go up to half the declared cargo (a storm a quarter); 0 for hull-only cover. */
   maxHit: number;
-  /** Lloyd's-implied ceiling on the expected loss (bps), null without cover to go on. */
+  /** Ceiling on the expected loss (bps), null without anything to go on. */
   elMax: number | null;
-  /** Where elMax comes from: the policy's own cover by others (a real bound), or the lane's cheapest (a guide). */
-  basis: "policy" | "lane" | null;
-  /** premium − elMax (bps). */
+  /**
+   * Where elMax comes from: Lloyd's own estimate on the listing (an upper bound), the policy's own cover by others
+   * (implied by Lloyd's hurdle), or the lane's other policies (a guide).
+   */
+  basis: "listing" | "policy" | "lane" | null;
+  /** premium − elMax (bps): the listing's `premium_margin_bps` when it carries one. */
   edge: number | null;
   /** The edge in pence on the slice. */
   edgePence: number | null;
 }
 
 /** `own`: policies our companies hold slices of (their cover is ours, so it proves nothing). */
-function riskOf(p: S.InsurancePolicy, sliceBps: number, floors: LaneFloors | null | undefined, own: Set<string> | undefined): Risk {
+function riskOf(p: S.InsurancePolicyListing, sliceBps: number, floors: LaneFloors | null | undefined, own: Set<string> | undefined): Risk {
+  const listed = typeof p.lloyds_expected_loss_bps === "number";
   // Cover written by someone else (in practice Lloyd's) means this very policy passed its test.
   const vetted = p.covered_bps > 0 && !!own && !own.has(p.id);
   const floor = floorFor(floors, isHullOnly(p));
-  const basis = vetted ? "policy" : floor !== null ? "lane" : null;
-  const elMax = basis === "policy" ? impliedMaxEl(p.premium_bps) : floor !== null ? impliedMaxEl(floor) : null;
-  const edge = elMax === null ? null : p.premium_bps - elMax;
+  const basis = listed ? "listing" : vetted ? "policy" : floor !== null ? "lane" : null;
+  const elMax = listed ? p.lloyds_expected_loss_bps! : basis === "policy" ? impliedMaxEl(p.premium_bps) : floor !== null ? impliedMaxEl(floor) : null;
+  const edge = listed && typeof p.premium_margin_bps === "number" ? p.premium_margin_bps : elMax === null ? null : p.premium_bps - elMax;
   const cargo = Math.max(0, p.insured_value_pence - p.hull_value_pence);
   return {
     collateral: Math.ceil((p.insured_value_pence * sliceBps) / 10_000),
     premium: Math.floor((p.total_premium_pence * sliceBps) / 10_000),
-    maxHit: Math.floor((cargo * 0.25 * sliceBps) / 10_000),
+    maxHit: Math.floor((cargo * MAX_PARTIAL_SHARE * sliceBps) / 10_000),
     elMax,
     basis,
     edge,
@@ -152,17 +164,21 @@ function CreatePolicy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
   const [premium, setPremium] = useState("");
   const [cap, setCap] = useState<InsurableValue | null>(null);
   const [override, setOverride] = useState(false);
-  const act = useAction<S.InsurancePolicy>(onDone);
+  const act = useAction<S.CreateInsurancePolicyResult>(onDone);
 
   const ship = ships?.find((s) => s.ship.id === shipId);
   const from = ship?.ship.current_port_id ?? "";
   const value = Math.round(num(valueCr) * 100);
   const bps = num(premium);
   const onAutopilot = !!shipId && autopilot.has(shipId);
+  // Quoted first: Lloyd's price for this ship, port and sum insured.
+  const { data: quote, error: quoteError } = useInsuranceQuote(ship && dest && dest !== from ? shipId : "", dest, value);
+  const quoted = quote && quote.ship_id === shipId && quote.dest_port_id === dest && quote.insured_value_pence === value ? quote : undefined;
   const valid = !!ship && !!dest && dest !== from && value > 0 && bps >= 10 && bps <= 3000;
   const floors = useLaneFloors(from && dest ? [[from, dest]] : []).get(laneKey(from, dest));
-  // Cover type: from the cap once seen; an empty hold can only be hull-only; otherwise unknown.
-  const hullOnly = cap && value > 0 ? value <= cap.hull_value_pence : ship && ship.cargo_used_tons <= 0 ? true : null;
+  // Cover type: from the quote or a cap once seen; an empty hold can only be hull-only; otherwise unknown.
+  const hull = quoted?.hull_value_pence ?? cap?.hull_value_pence;
+  const hullOnly = hull !== undefined && value > 0 ? value <= hull : ship && ship.cargo_used_tons <= 0 ? true : null;
 
   useEffect(() => {
     setCap(null);
@@ -194,8 +210,8 @@ function CreatePolicy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
         />
       </Field>
       <AutopilotWarning show={onAutopilot}>
-        The fleet autopilot is sailing this ship and picks its own destinations: sailing anywhere but the insured port voids the policy, and its gun refits are
-        refused while the ship is insured. Stop it on the dashboard first.
+        The fleet autopilot is sailing this ship. Once insured it drops its own plan: it sails for the insured port with what is aboard and loads nothing
+        more (cargo added after the policy voids it), and it can&apos;t land guns while insured. Insure it only once it is loaded, or stop it on the dashboard first.
       </AutopilotWarning>
       {onAutopilot && (
         <Checkbox checked={override} onChange={setOverride}>
@@ -213,6 +229,9 @@ function CreatePolicy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
           <Input type="number" min={10} max={3000} placeholder="10–3,000" value={premium} onChange={(e) => setPremium(e.target.value)} />
         </Field>
       </div>
+      {ship && dest && dest !== from && (
+        <QuoteGuide quote={quoted} error={quoteError} valueCr={valueCr} premiumBps={bps} onValue={setValueCr} onPremium={setPremium} />
+      )}
       {from && dest && dest !== from && <LaneGuide floors={floors} hullOnly={hullOnly} premiumBps={bps} />}
       <p className="text-muted-foreground text-xs">
         The cap is the hull&apos;s rebuild quote plus 150 Cr a gun plus the cargo aboard. Ask for more and the game refuses with the cap, which then shows here.
@@ -227,7 +246,8 @@ function CreatePolicy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
       <ErrorNote error={act.error} />
       {act.result && (
         <p className="text-sm">
-          Policy open: {fmtCr(act.result.insured_value_pence)} on the voyage to {portName(act.result.dest_port_id)}, premium {fmtCr(act.result.total_premium_pence)}. Wait in port for underwriters.
+          Policy open: {fmtCr(act.result.insured_value_pence)} on the voyage to {portName(act.result.dest_port_id)}, premium {fmtCr(act.result.total_premium_pence)}.{" "}
+          {createdText(act.result)} Wait in port for underwriters, and load nothing more.
         </p>
       )}
       <Button className="w-full" disabled={!valid || act.busy || (onAutopilot && !override)} onClick={submit}>
@@ -237,11 +257,12 @@ function CreatePolicy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
   );
 }
 
-function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy; ourId: string | undefined; mine: boolean; onDone: () => void }) {
+function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicyListing; ourId: string | undefined; mine: boolean; onDone: () => void }) {
   const { portName } = useCatalog();
   const uncovered = 10_000 - policy.covered_bps;
-  const maxSlice = Math.floor(uncovered / 100) * 100;
-  const [slice, setSlice] = useState(String(Math.min(1000, maxSlice)));
+  // Steps of 100 from 500, or a remainder under 500 whole.
+  const maxSlice = maxSliceFor(policy.covered_bps);
+  const [slice, setSlice] = useState(String(uncovered < 500 ? maxSlice : Math.min(1000, maxSlice)));
   const [clamped, setClamped] = useState(false);
   const floors = useLaneFloors([[policy.origin_port_id, policy.dest_port_id]]).get(laneKey(policy.origin_port_id, policy.dest_port_id));
   const own = useOwnCover();
@@ -266,14 +287,21 @@ function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy
       ? `The policy is ${policy.status.replace("_", " ")}: it takes no more slices.`
       : !Number.isFinite(s)
         ? "Enter a slice."
-        : s < 500
-          ? "A slice is at least 500 bps (5%)."
-          : s > maxSlice
-            ? `Only ${maxSlice} bps are left uncovered.`
-            : s % 100 !== 0
-              ? "Slices go in steps of 100 bps."
-              : null;
-  const valid = !mine && why === null;
+        : uncovered < 500
+          ? s !== uncovered
+            ? `The ${uncovered} bps left can only be taken whole.`
+            : null
+          : s < 500
+            ? "A slice is at least 500 bps (5%)."
+            : s > maxSlice
+              ? `Only ${maxSlice} bps are left uncovered.`
+              : s % 100 !== 0
+                ? "Slices go in steps of 100 bps."
+                : null;
+  const valid = !mine && why === null && sliceOk(s, uncovered);
+  const timeScale = useTimeScale();
+  // Lloyd's looks at it about a game hour after listing: until then, the pick is the players'.
+  const firstPick = (Date.now() - Date.parse(policy.created_at)) / (60_000 / timeScale) < FIRST_PICK_GAME_MIN;
 
   return (
     <div className="space-y-3">
@@ -285,19 +313,22 @@ function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy
           ["Premium", `${fmtBps(policy.premium_bps)} = ${fmtCr(policy.total_premium_pence)}`],
           ["Covered", `${fmtBps(policy.covered_bps)} (${fmtBps(uncovered)} open)`],
           [
-            "Lloyd's-implied EL ≤",
-            risk.basis === "policy"
-              ? `${fmtBps(Math.round(risk.elMax ?? 0))} (from its own cover)`
-              : floors === undefined || own === undefined
-                ? "…"
-                : risk.basis === "lane"
-                  ? `${fmtBps(Math.round(risk.elMax ?? 0))} (lane floor ${floor} bps: other ships, only a guide)`
-                  : floors === null
-                    ? "couldn't read past cover on this lane"
-                    : `not covered yet, and no covered ${hullOnly ? "hull-only" : "with-cargo"} policy on this lane`,
+            "Expected loss ≤",
+            risk.basis === "listing"
+              ? `${fmtBps(Math.round(risk.elMax ?? 0))} (Lloyd's own estimate, an upper bound)`
+              : risk.basis === "policy"
+                ? `${fmtBps(Math.round(risk.elMax ?? 0))} (implied by its own cover)`
+                : floors === undefined || own === undefined
+                  ? "…"
+                  : risk.basis === "lane"
+                    ? `${fmtBps(Math.round(risk.elMax ?? 0))} (Lloyd's price on the lane's other policies, ${floor} bps: only a guide)`
+                    : floors === null
+                      ? "couldn't read the lane's open policies"
+                      : `no Lloyd's estimate listed (sailed, or no route), and no other open ${hullOnly ? "hull-only" : "with-cargo"} policy on this lane`,
           ],
+          ["Lloyd's price", typeof policy.lloyds_min_premium_bps === "number" ? fmtBps(policy.lloyds_min_premium_bps) : "—"],
           ["Edge", <EdgeText key="e" edge={risk.edge} />],
-          ["Open for", fmtAgo(policy.created_at).replace(/ ago$/, "")],
+          ["Open for", `${fmtAgo(policy.created_at).replace(/ ago$/, "")}${firstPick ? " (players' first pick: Lloyd's looks after about a game hour)" : ""}`],
           ["Lapses", fmtIn(policy.expires_at)],
         ]}
       />
@@ -306,16 +337,16 @@ function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy
         <p className="text-muted-foreground text-xs">
           {policy.insured_company_id === ourId ? "Your own policy" : "One of your other companies' policies"}: you can&apos;t underwrite it.
         </p>
-      ) : maxSlice < 500 ? (
-        <p className="text-muted-foreground text-xs">Less than 5% left uncovered: no slice can be written.</p>
+      ) : maxSlice <= 0 ? (
+        <p className="text-muted-foreground text-xs">Fully covered: no slice can be written.</p>
       ) : (
         <>
-          <Field label={`Slice (bps, 500..${maxSlice}, steps of 100)`}>
+          <Field label={uncovered < 500 ? `Slice (the ${uncovered} bps left, whole)` : `Slice (bps, 500..${maxSlice}, steps of 100)`}>
             <Input
               type="number"
-              min={500}
+              min={uncovered < 500 ? uncovered : 500}
               max={maxSlice}
-              step={100}
+              step={uncovered < 500 ? 1 : 100}
               value={slice}
               onChange={(e) => {
                 setSlice(e.target.value);
@@ -328,7 +359,7 @@ function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy
             rows={[
               ["Collateral locked (lost on a sinking)", Number.isFinite(s) ? fmtCr(risk.collateral) : "—"],
               ["Premium earned", Number.isFinite(s) ? fmtCr(risk.premium) : "—"],
-              ["Max partial claim per hit", hullOnly ? "none: hull-only pays only on a sinking" : Number.isFinite(s) ? fmtCr(risk.maxHit) : "—"],
+              ["Max partial claim per hit", hullOnly ? "none: hull-only pays only on a total loss" : Number.isFinite(s) ? fmtCr(risk.maxHit) : "—"],
               ["Edge on the slice", risk.edgePence === null || !Number.isFinite(s) ? "—" : fmtCr(risk.edgePence)],
             ]}
           />
@@ -343,8 +374,9 @@ function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy
         </>
       )}
       <p className="text-muted-foreground text-xs">
-        A storm or pirate hit pays at most 25% of the declared cargo, shared by slice; a sinking takes the whole collateral. The implied bound comes from the
-        cheapest policy of this cover type underwriters have covered on the lane.
+        A storm pays at most 25% of the declared cargo, pirates who let the ship go at most what they seized of it (up to 50%), shared by slice; a sinking or a
+        capture takes the whole collateral. The bound is Lloyd&apos;s own estimate on the listing (an upper bound, so the margin is at least the edge shown);
+        without one, what the policy&apos;s own cover or the lane&apos;s other policies imply.
       </p>
       <ErrorNote error={act.error} />
       {act.result && (
@@ -372,13 +404,108 @@ function UnderwritingsTable({ rows, ourId }: { rows: S.InsuranceUnderwriting[]; 
   );
 }
 
+const LLOYDS_LIST_DAYS = [7, 30, 90, 360];
+
+/** `GET /v1/insurance/lloyds-list` (guide 3.6): what underwriting has paid, for Lloyd's, players as one group, and everyone. */
+function LloydsListPanel() {
+  const [days, setDays] = useState(30);
+  const [period, setPeriod] = useState<"recent" | "all_time">("recent");
+  const { data, error } = usePoll(() => kibbGet<S.LloydsListResult>("/v1/insurance/lloyds-list", { days }), 300_000, [days]);
+  const groups: Array<[string, S.UnderwriterGroupResults | null | undefined]> = data
+    ? [
+        ["Lloyd's", data.lloyds],
+        ["Player underwriters", data.players],
+        ["Everyone", data.all_underwriters],
+      ]
+    : [];
+  const ratio = (bps: number | null | undefined) => (bps === null || bps === undefined ? "—" : fmtBps(bps));
+  const funds = data?.lloyds?.funds_pence;
+
+  return (
+    <Panel
+      title="Lloyd's List"
+      action={
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+          <div className="w-full sm:w-56">
+            <Segmented<"recent" | "all_time">
+              value={period}
+              onChange={setPeriod}
+              options={[
+                { value: "recent", label: `Last ${days} days` },
+                { value: "all_time", label: "This season" },
+              ]}
+            />
+          </div>
+          <div className="w-full sm:w-28">
+            <NativeSelect value={String(days)} onChange={(e) => setDays(Number(e.target.value))} disabled={period === "all_time"}>
+              {LLOYDS_LIST_DAYS.map((d) => (
+                <option key={d} value={d}>
+                  {d} game days
+                </option>
+              ))}
+            </NativeSelect>
+          </div>
+        </div>
+      }
+    >
+      <ErrorNote error={error} />
+      {!data ? (
+        !error && <Loading />
+      ) : (
+        <div className="space-y-3">
+          <Table head={["Underwriters", "Written", "Premiums earned", "Claims paid", "Net", "Loss ratio", "Return on cover", "Safe / lost / void", "With claims", "Locked now", "Open now"]}>
+            {groups.map(([label, g]) => {
+              const f = g?.[period];
+              return (
+                <tr key={label}>
+                  <td className="font-medium">
+                    {label}
+                    {f && label !== "Lloyd's" && f.underwriters > 0 && <span className="text-muted-foreground text-xs"> ({f.underwriters} companies)</span>}
+                  </td>
+                  {!g || !f ? (
+                    <td colSpan={10} className="text-muted-foreground">
+                      —
+                    </td>
+                  ) : (
+                    <>
+                      <td className="tabular-nums">{f.policies_written}</td>
+                      <td className="tabular-nums">{fmtCr(f.premiums_earned_pence)}</td>
+                      <td className="tabular-nums">{fmtCr(f.claims_paid_pence)}</td>
+                      <td className={`tabular-nums ${f.net_pence < 0 ? "text-destructive" : ""}`}>{fmtCr(f.net_pence)}</td>
+                      <td className="tabular-nums">{ratio(f.loss_ratio_bps)}</td>
+                      <td className="tabular-nums">{ratio(f.return_on_cover_bps)}</td>
+                      <td className="whitespace-nowrap tabular-nums">
+                        {f.policies_settled_safe} / {f.policies_claimed_loss} / {f.policies_voided}
+                      </td>
+                      <td className="tabular-nums">{f.policies_with_claims}</td>
+                      <td className="tabular-nums">{fmtCr(g.collateral_locked_pence)}</td>
+                      <td className="tabular-nums">{g.open_policies}</td>
+                    </>
+                  )}
+                </tr>
+              );
+            })}
+          </Table>
+          <p className="text-muted-foreground text-xs">
+            Results count once a policy settles (safe, lost, void or lapsed), with every premium its slices earned and every claim they paid. Loss ratio = claims ÷
+            premiums; return on cover = net ÷ the collateral locked. {period === "recent" ? `The window opened ${fmtDateTime(data.window_since)}; ` : ""}as of{" "}
+            {fmtDateTime(data.as_of)}.
+            {funds !== undefined &&
+              ` Lloyd's funds ${fmtCr(funds)}: it locks at most ${fmtCr(Math.floor(funds * 0.1))} on one policy and ${fmtCr(Math.floor(funds * 0.2))} across the ships leaving one sea zone.`}
+          </p>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 export default function InsurancePage() {
   const { portName } = useCatalog();
   const ourId = useCompanyId();
   const autopilot = useAutopilotShips();
   const [view, setView] = useState<View>("ours");
   const [marketStatus, setMarketStatus] = useState<"open" | "active">("open");
-  const [selected, setSelected] = useState<S.InsurancePolicy | null>(null);
+  const [selected, setSelected] = useState<S.InsurancePolicyListing | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [batchSlice, setBatchSlice] = useState("1000");
   const [failedId, setFailedId] = useState<string | null>(null);
@@ -397,7 +524,7 @@ export default function InsurancePage() {
         ? { underwriter_company_id: ourId }
         : { status: marketStatus };
   const { data: policies, error, reload } = usePoll(
-    view !== "market" && !ourId ? null : () => kibbGet<S.InsurancePolicy[]>("/v1/insurance/list", { ...filter, cursor: pager.cursor, limit: PAGE_SIZE }),
+    view !== "market" && !ourId ? null : () => kibbGet<S.InsurancePolicyListing[]>("/v1/insurance/list", { ...filter, cursor: pager.cursor, limit: PAGE_SIZE }),
     20_000,
     [view, marketStatus, ourId, pager.cursor],
   );
@@ -414,7 +541,7 @@ export default function InsurancePage() {
   const rows = (policies ?? []).filter((p) => view !== "market" || !isMine(p.insured_company_id));
   const laneFloors = useLaneFloors(view === "market" ? rows.map((p): [string, string] => [p.origin_port_id, p.dest_port_id]) : []);
   const ownCover = useOwnCover();
-  const floorsOf = (p: S.InsurancePolicy) => laneFloors.get(laneKey(p.origin_port_id, p.dest_port_id));
+  const floorsOf = (p: S.InsurancePolicyListing) => laneFloors.get(laneKey(p.origin_port_id, p.dest_port_id));
   const current = selected ? (rows.find((p) => p.id === selected.id) ?? selected) : null;
   const shipName = (id: string) => ships?.find((s) => s.ship.id === id)?.ship.name;
   const batch = useAction<S.InsurancePolicyDetailResult[]>(() => {
@@ -454,12 +581,17 @@ export default function InsurancePage() {
     });
   }
 
-  // Each picked policy gets the batch slice, cut to what it has left (in 100s); under 500 is skipped.
+  // Each picked policy gets the batch slice, cut to what it has left (in 100s); a remainder under 500 is taken whole, anything else under 500 skipped.
   const s = num(batchSlice);
   const pickedRows = rows.filter((p) => picked.has(p.id));
   const batchItems = pickedRows
-    .map((p) => ({ policy_id: p.id, slice_bps: Math.min(Number.isFinite(s) ? Math.floor(s / 100) * 100 : 0, Math.floor((10_000 - p.covered_bps) / 100) * 100) }))
-    .filter((i) => i.slice_bps >= 500);
+    .map((p) => {
+      const left = 10_000 - p.covered_bps;
+      const want = Number.isFinite(s) ? Math.floor(s / 100) * 100 : 0;
+      return { policy_id: p.id, slice_bps: left < 500 ? (want > 0 ? left : 0) : Math.min(want, maxSliceFor(p.covered_bps)), left };
+    })
+    .filter((i) => sliceOk(i.slice_bps, i.left))
+    .map(({ policy_id, slice_bps }) => ({ policy_id, slice_bps }));
   const batchRisk = batchItems.reduce(
     (t, i) => {
       const p = rows.find((x) => x.id === i.policy_id)!;
@@ -487,7 +619,7 @@ export default function InsurancePage() {
         known: t.known + 1,
         locked: t.locked + (live ? o.collateral_locked_pence : 0),
         premium: t.premium + o.premium_share_pence,
-        maxHit: t.maxHit + (live ? Math.floor((Math.max(0, p.insured_value_pence - p.hull_value_pence) * 0.25 * o.slice_bps) / 10_000) : 0),
+        maxHit: t.maxHit + (live ? Math.floor((Math.max(0, p.insured_value_pence - p.hull_value_pence) * MAX_PARTIAL_SHARE * o.slice_bps) / 10_000) : 0),
       };
     },
     { known: 0, locked: 0, premium: 0, maxHit: 0 },
@@ -495,10 +627,10 @@ export default function InsurancePage() {
 
   const head =
     view === "market"
-      ? ["", "Ship", "Voyage", "Status", "Insured", "Cover", "Premium", "EL ≤", "Edge", "Covered", "Age", "Lapses", ""]
+      ? ["", "Ship", "Voyage", "Status", "Insured", "Cover", "Premium", "EL ≤", "Edge", "Lloyd's price", "Covered", "Age", "Lapses", ""]
       : view === "underwriting"
         ? ["Ship", "Voyage", "Status", "Insured", "Premium", "Covered", "Our slice", "Collateral pledged", "Premium share", "Lapses", ""]
-        : ["Ship", "Voyage", "Status", "Insured", "Premium", "Covered", "Lapses", ""];
+        : ["Ship", "Voyage", "Status", "Insured", "Premium", "Lloyd's price", "Covered", "Lapses", ""];
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
@@ -614,22 +746,54 @@ export default function InsurancePage() {
                     <td className="tabular-nums">{fmtCr(p.insured_value_pence)}</td>
                     {view === "market" && <td className="whitespace-nowrap text-xs">{coverText(p)}</td>}
                     <td className="tabular-nums">{fmtBps(p.premium_bps)} <span className="text-muted-foreground text-xs">({fmtCr(p.total_premium_pence)})</span></td>
+                    {view === "ours" && (
+                      <td className="tabular-nums text-xs">
+                        {typeof p.lloyds_min_premium_bps === "number" ? (
+                          <span
+                            title={`Lloyd's expected loss ≤ ${fmtBps(p.lloyds_expected_loss_bps ?? 0)}; its posted price is the hurdle it writes at, an hour or more after the policy is listed`}
+                          >
+                            {fmtBps(p.lloyds_min_premium_bps)}
+                            <span className={p.premium_bps >= p.lloyds_min_premium_bps ? "text-success-foreground" : "text-muted-foreground"}>
+                              {p.premium_bps >= p.lloyds_min_premium_bps ? " · Lloyd's fills" : " · players only"}
+                            </span>
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    )}
                     {risk && (
                       <>
                         <td className="tabular-nums">
-                          {risk.basis === "policy" ? (
+                          {risk.basis === "listing" || risk.basis === "policy" ? (
                             fmtBps(Math.round(risk.elMax ?? 0))
                           ) : floorsOf(p) === undefined || ownCover === undefined ? (
                             "…"
                           ) : risk.elMax === null ? (
                             "—"
                           ) : (
-                            <span className="text-muted-foreground" title="From the lane's cheapest covered policy: other ships, only a guide">
+                            <span className="text-muted-foreground" title="From Lloyd's price on the lane's other open policies: other ships, only a guide">
                               ~{fmtBps(Math.round(risk.elMax))}
                             </span>
                           )}
                         </td>
                         <td className="tabular-nums"><EdgeText edge={risk.edge} /></td>
+                        <td className="tabular-nums">
+                          {typeof p.lloyds_min_premium_bps === "number" ? (
+                            <span
+                              className={p.premium_bps >= p.lloyds_min_premium_bps ? undefined : "text-muted-foreground"}
+                              title={
+                                p.premium_bps >= p.lloyds_min_premium_bps
+                                  ? "The premium meets Lloyd's price: once the policy is a game hour old, Lloyd's writes what players leave (within its caps)"
+                                  : "The premium is under Lloyd's price: only players will write it"
+                              }
+                            >
+                              {fmtBps(p.lloyds_min_premium_bps)}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
                       </>
                     )}
                     <td className="w-28">
@@ -658,10 +822,12 @@ export default function InsurancePage() {
           <Pager pager={pager} rows={policies} />
           {view === "market" && rows.length > 0 && (
             <p className="mt-3 text-muted-foreground text-xs">
-              EL ≤: Lloyd&apos;s writes a policy only if premium ≥ 1.25 × expected loss + 25 bps, so a policy it has covered implies EL ≤ (premium − 25) / 1.25.
-              A policy already partly covered by someone else (not you) uses its own premium: a real bound if that was Lloyd&apos;s. Otherwise ~ marks the
-              cheapest covered policy on the lane and cover type: other ships, guns and seasons, so only a guide (an uncovered policy past Lloyd&apos;s review
-              was likely declined). Edge = premium − that bound; {fmtBps(GOOD_EDGE)} or more is highlighted. The autopilot only writes the first kind.
+              EL ≤: Lloyd&apos;s own estimate of the claim on each policy still open for underwriting (an upper bound: legs summed, rescues
+              undercounted), so a slice earns at least the edge (premium − EL, the listing&apos;s margin). A listing without it (its ship sailed, or no
+              route) falls back on its own cover by someone else, which implies EL ≤ (premium − 25) / 2.5 (Lloyd&apos;s writes only at ≥ 2.5 × EL + 25), or
+              ~ for Lloyd&apos;s price on the lane&apos;s other policies: only a guide. {fmtBps(GOOD_EDGE)} or more is highlighted. Lloyd&apos;s price is its posted
+              hurdle (2.5 × EL + 25): a policy whose premium meets it is written by Lloyd&apos;s for what players leave, once it is about a game hour old, so until
+              then the pick is yours; one under it waits on players. The autopilot writes on Lloyd&apos;s listed estimate only (a listing without it is no longer open for underwriting).
             </p>
           )}
 
@@ -669,7 +835,7 @@ export default function InsurancePage() {
             <div className="mt-4 space-y-3 border-t pt-4">
               <div className="flex flex-wrap items-end gap-3">
                 <Field label="Slice for each (bps)" className="w-full sm:w-40">
-                  <Input type="number" min={500} step={100} value={batchSlice} onChange={(e) => setBatchSlice(e.target.value)} />
+                  <Input type="number" min={100} step={100} value={batchSlice} onChange={(e) => setBatchSlice(e.target.value)} />
                 </Field>
                 <div className="text-muted-foreground text-xs">
                   {batchItems.length} of {pickedRows.length} picked can take it
@@ -691,12 +857,12 @@ export default function InsurancePage() {
                       hint:
                         batchRisk.unknown || batchRisk.failed
                           ? [
-                              batchRisk.unknown ? `${batchRisk.unknown} without cover history left out` : "",
+                              batchRisk.unknown ? `${batchRisk.unknown} without a loss bound left out` : "",
                               batchRisk.failed ? `${batchRisk.failed} whose lane couldn't be read left out` : "",
                             ]
                               .filter(Boolean)
                               .join("; ")
-                          : "over the implied EL",
+                          : "over the expected loss",
                     },
                   ]}
                 />
@@ -721,17 +887,21 @@ export default function InsurancePage() {
             <ul className="list-disc space-y-1.5 pl-4 text-muted-foreground text-xs">
               <li>One policy per voyage, written in port or the roadstead. It binds at departure and is void (no claim ever) if the ship sails anywhere but the insured port.</li>
               <li>Sum insured ≤ hull rebuild quote + 150 Cr a gun + cargo aboard. Stores are not insurable. Cannons can&apos;t be removed while insured.</li>
-              <li>Declare your whole cargo: underwriters price pirate risk on the cargo declared, and cargo loaded after the policy is written voids it when the ship sails.</li>
-              <li>A sinking, or a capture by pirates, pays the full cover; a storm or pirate raid pays the lost share, capped at 25% of declared cargo (hull-only cover pays only on a total loss); a convoy rescue caps at 60%.</li>
-              <li>Pirates go for the richest prizes and sometimes take the ship itself (guns make that much rarer), so rich or dangerous runs cost more to insure.</li>
+              <li>Quote first: Lloyd&apos;s price for the very voyage, from the ship, its guns, the cargo, the season and any convoy. Offer less to draw player underwriters in the hour before Lloyd&apos;s looks, or the price to be sure of cover.</li>
+              <li>Declare your whole cargo, and load nothing after the policy is written: if the hold draws more pirates than the declared cargo would, it is void when the ship sails (cargo_exceeds_declared).</li>
+              <li>A sinking, or a capture by pirates, pays the full cover; a storm pays the lost share, capped at 25% of declared cargo; pirates who let the ship go pay what they seized of it, at most half (hull-only cover pays only on a total loss); a convoy rescue caps at 60%.</li>
+              <li>Pirates go for the richest prizes and take the ship itself in 5–10% of interceptions (fewer the more guns face them), so rich or dangerous runs cost more to insure.</li>
               <li>Arrival closes it settled safe: collateral goes back to underwriters and unwritten premium to you. Insure each leg anew. A mutiny pays nothing.</li>
-              <li>Lloyd&apos;s writes only policies open about a game hour, every couple of game hours, if the premium ≥ 1.25 × its expected loss + 25 bps; it locks at most 10% of its funds on one policy and 20% per sea zone.</li>
-              <li>A policy can&apos;t be withdrawn: one priced below what Lloyd&apos;s accepts on the lane just waits, and blocks a new one until the ship sails or it lapses.</li>
+              <li>Lloyd&apos;s looks only at policies open about a game hour, every couple of game hours, and writes at the premium offered if it is ≥ ceil(2.5 × its expected loss) + 25 bps (its price); it locks at most 10% of its funds on one policy and 20% per sea zone.</li>
+              <li>Slices are steps of 100 bps from 500 up to what is uncovered; a remainder under 500 may be taken whole.</li>
+              <li>A policy can&apos;t be withdrawn: one priced below Lloyd&apos;s price that no player writes just waits, and blocks a new one until the ship sails or it lapses.</li>
               <li>A policy still in port 15 game days after it was written lapses.</li>
             </ul>
           </Panel>
         </div>
       </div>
+
+      <LloydsListPanel />
     </div>
   );
 }

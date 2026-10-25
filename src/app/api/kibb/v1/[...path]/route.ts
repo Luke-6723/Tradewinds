@@ -98,7 +98,8 @@ async function forward(req: NextRequest, { params }: { params: Promise<{ path: s
         );
       }
     }
-    const out = new NextResponse(text, { status: upstream.status });
+    // A null-body status (204 from a withdrawal, say) can't carry even an empty body.
+    const out = new NextResponse([204, 205, 304].includes(upstream.status) ? null : text, { status: upstream.status });
     out.headers.set("content-type", upstream.headers.get("content-type") ?? "application/json");
     for (const h of FORWARD_HEADERS) {
       const v = upstream.headers.get(h);

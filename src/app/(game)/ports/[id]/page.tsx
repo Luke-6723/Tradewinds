@@ -131,13 +131,17 @@ export default function PortPage() {
                   <td className="capitalize">
                     {c.contract_type}
                     {c.stale && <Badge variant="outline" size="sm" className="ml-1.5">gossip</Badge>}
+                    {c.contract_type === "charter" && c.funded_by === "issuer" && <Badge variant="outline" size="sm" className="ml-1.5">player</Badge>}
                   </td>
-                  <td>{goodName(c.commodity_id)}</td>
-                  <td className="tabular-nums">{fmtTons(c.remaining_quantity)}</td>
+                  {/* A commission is a hull built to order here (its price is the reward), never freight. */}
+                  <td>{c.contract_type === "commission" ? `${shipClassName(c.ship_class)} hull` : goodName(c.commodity_id)}</td>
+                  <td className="tabular-nums">{c.contract_type === "commission" ? "—" : fmtTons(c.remaining_quantity)}</td>
                   <td className="tabular-nums">
                     {c.contract_type === "charter"
                       ? `${fmtCr(c.reward_per_ton_pence ?? Math.floor(c.reward_pence / Math.max(1, c.quantity_required)), 2)}/t`
-                      : `${fmtCr(c.reward_pence)} (collateral ${fmtCr(c.collateral_pence)})`}
+                      : c.contract_type === "commission"
+                        ? `${fmtCr(c.reward_pence)} price (builder's collateral ${fmtCr(c.collateral_pence)})`
+                        : `${fmtCr(c.reward_pence)} (collateral ${fmtCr(c.collateral_pence)})`}
                   </td>
                   <td>{c.contract_type === "freight" ? portName(c.dest_port_id) : "—"}</td>
                 </tr>
@@ -182,16 +186,27 @@ export default function PortPage() {
                   ))}
                 </div>
                 {gossipShown ? (
-                  <Table head={["Good", "Stock", "Bid", "Ask"]}>
-                    {gossipShown.commodities.map((c) => (
-                      <tr key={c.commodity_id}>
-                        <td>{goodName(c.commodity_id)}</td>
-                        <td className="tabular-nums">{fmtTons(c.current_stock)}</td>
-                        <td className="tabular-nums">{fmtCr(c.best_bid_pence, 2)}</td>
-                        <td className="tabular-nums">{fmtCr(c.best_ask_pence, 2)}</td>
-                      </tr>
-                    ))}
-                  </Table>
+                  <>
+                    <Table head={["Good", "Stock", "Bid", "Ask", "Player bid", "Player ask"]}>
+                      {gossipShown.commodities.map((c) => (
+                        <tr key={c.commodity_id}>
+                          <td>{goodName(c.commodity_id)}</td>
+                          <td className="tabular-nums">{fmtTons(c.current_stock)}</td>
+                          <td className="tabular-nums">{fmtCr(c.best_bid_pence, 2)}</td>
+                          <td className="tabular-nums">{fmtCr(c.best_ask_pence, 2)}</td>
+                          <td className="whitespace-nowrap tabular-nums">
+                            {c.best_player_bid_pence ? `${fmtCr(c.best_player_bid_pence, 2)} × ${fmtTons(c.best_player_bid_quantity)}` : "—"}
+                          </td>
+                          <td className="whitespace-nowrap tabular-nums">
+                            {c.best_player_ask_pence ? `${fmtCr(c.best_player_ask_pence, 2)} × ${fmtTons(c.best_player_ask_quantity)}` : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </Table>
+                    <p className="text-muted-foreground text-xs">
+                      Player bid and ask: the best resting company order on each side when the crew saw it, and its tons. Anonymous: your own orders count.
+                    </p>
+                  </>
                 ) : (
                   <Empty>Pick a port to see what crews reported there.</Empty>
                 )}

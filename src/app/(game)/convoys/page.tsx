@@ -7,14 +7,29 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
 import { Field, PortSelect, ShipSelect } from "@/components/kibb/pickers";
-import { AutopilotWarning, Checkbox, Pager, PAGE_SIZE, num, realTime, shortId, useAutopilotShips, useCompanyId, useCursor, useTimeScale } from "@/components/kibb/naval-common";
+import {
+  AutopilotWarning,
+  Checkbox,
+  Pager,
+  PAGE_SIZE,
+  num,
+  realTime,
+  shortId,
+  useAutopilotShips,
+  useCompanyId,
+  useCursor,
+  useOurCompanyIds,
+  useTimeScale,
+} from "@/components/kibb/naval-common";
+import { CONVOY, usePresence, type Presence } from "@/components/kibb/deals-common";
+import { firstProblem } from "@/components/kibb/finance-common";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { kibbGet, kibbPost } from "@/lib/kibb/browser";
-import { fmtCr, fmtDateTime, fmtIn, fmtTons } from "@/lib/kibb/format";
+import { fmtAgo, fmtCr, fmtDateTime, fmtGameHours, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
-import type { ShipResult, WorldClock } from "@/lib/kibb/types";
+import type { PortDetail, ShipResult, WorldClock } from "@/lib/kibb/types";
 
 const STATUS_VARIANT: Record<S.ConvoyStatus, "info" | "success" | "secondary" | "error"> = {
   forming: "info",
@@ -246,7 +261,8 @@ function CreateConvoy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
   const from = ship?.ship.current_port_id ?? "";
   const minutes = num(muster);
   const locked = ship?.ship.status === "berthed" && !!ship.ship.turnaround_unlocks_at && Date.parse(ship.ship.turnaround_unlocks_at) > Date.now();
-  const valid = !!ship && ship.ship.status === "anchored_roadstead" && !!dest && dest !== from && name.trim() !== "" && minutes >= 60 && minutes <= 4320;
+  const valid =
+    !!ship && ship.ship.status === "anchored_roadstead" && !!dest && dest !== from && name.trim() !== "" && minutes >= CONVOY.musterMinMin && minutes <= CONVOY.musterMaxMin;
 
   function submit() {
     const kn = num(minKn);
@@ -296,7 +312,7 @@ function CreateConvoy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
       </Field>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Muster (game min)">
-          <Input type="number" min={60} max={4320} value={muster} onChange={(e) => setMuster(e.target.value)} />
+          <Input type="number" min={CONVOY.musterMinMin} max={CONVOY.musterMaxMin} value={muster} onChange={(e) => setMuster(e.target.value)} />
         </Field>
         <Field label="Escort fee (Cr/t)">
           <Input type="number" min={0} step={0.01} value={feeCr} onChange={(e) => setFeeCr(e.target.value)} />
@@ -319,7 +335,8 @@ function CreateConvoy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
         </Field>
       </div>
       <p className="text-muted-foreground text-xs">
-        Musters for {Number.isFinite(minutes) ? `${Math.round(minutes)} game minutes (${realTime(minutes, timeScale)})` : "—"}, clamped to 1 game hour..3 game days.
+        Musters for {Number.isFinite(minutes) ? `${Math.round(minutes)} game minutes (${realTime(minutes, timeScale)})` : "—"}, clamped to 1 game hour..14 game days.
+        The flagship waits in the roadstead meanwhile (its crew eats): for a sailing days away, announce the convoy instead and join late.
       </p>
       <ErrorNote error={act.error} />
       {act.result && (
@@ -331,6 +348,186 @@ function CreateConvoy({ ships, autopilot, maxPhase, onDone }: { ships: ShipResul
         {act.busy ? "Organizing…" : "Organize convoy"}
       </Button>
     </div>
+  );
+}
+
+/** `POST /v1/fleet/announce-convoy` (guide 3.10): schedule a convoy with no ship yet, only a presence at the origin. */
+function AnnounceConvoy({ maxPhase, presence, forming, onDone }: { maxPhase: number; presence: Presence; forming: number | undefined; onDone: () => void }) {
+  const { portName } = useCatalog();
+  const timeScale = useTimeScale();
+  const [name, setName] = useState("");
+  const [origin, setOrigin] = useState("");
+  const [dest, setDest] = useState("");
+  const [hours, setHours] = useState("48");
+  const [admission, setAdmission] = useState<S.ConvoyAdmission>("approval");
+  const [visibility, setVisibility] = useState<S.ConvoyVisibility>("public");
+  const [minKn, setMinKn] = useState("");
+  const [feeCr, setFeeCr] = useState("0");
+  // Resolves to null when the confirmation is declined.
+  const act = useAction<S.ConvoyResult | null>((r) => r && onDone());
+  const h = num(hours);
+  const minutes = Math.round(h * 60);
+  const kn = num(minKn);
+  const fee = feeCr.trim() === "" ? 0 : Math.round(num(feeCr) * 100);
+  const why = firstProblem([
+    [name.trim() !== "", "Name the convoy."],
+    [!!origin, "Choose where it musters and sails from."],
+    [!presence.known || presence.any.has(origin), `You need a presence at ${portName(origin)}: a ship in port, a factor or a warehouse lease.`],
+    [!!dest && dest !== origin, "Choose a destination other than the origin."],
+    [Number.isFinite(h) && minutes >= CONVOY.musterMinMin && minutes <= CONVOY.musterMaxMin, "It sails 1 game hour..14 game days (336 h) from now."],
+    [Number.isFinite(fee) && fee >= 0 && fee <= CONVOY.escortFeeMaxPence, "The escort fee is 0..1,000 Cr a ton."],
+    [minKn.trim() === "" || kn > 0, "Leave the minimum speed empty, or enter knots."],
+  ]);
+
+  function submit() {
+    void act.run(async () => {
+      if (
+        !confirm(
+          `Announce the convoy "${name.trim()}" from ${portName(origin)} to ${portName(dest)}, sailing in ${fmtGameHours(h)} (${realTime(minutes, timeScale)})?\n\nNo ship is needed now. Your ships (no fee) and others' join from the roadstead at ${portName(origin)} any time before it sails; a ship in a forming convoy waits in the roadstead (no docking, no sailing alone, its crew eats), so join late. If no ship is anchored there when it is due, it is cancelled.${visibility === "public" ? " Its news spreads to other quays as convoy notices." : " Private: only invitees and members see it."}`,
+        )
+      )
+        return null;
+      return kibbPost<S.ConvoyResult>("/v1/fleet/announce-convoy", {
+        name: name.trim(),
+        origin_port_id: origin,
+        dest_port_id: dest,
+        depart_in_game_minutes: minutes,
+        admission,
+        visibility,
+        ...(Number.isFinite(kn) && kn > 0 ? { min_speed_centiknots: Math.round(kn * 100) } : {}),
+        escort_fee_pence_per_ton: fee,
+      });
+    });
+  }
+
+  return (
+    <div className="space-y-3">
+      <Field label="Name">
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Michaelmas Baltic fleet" />
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Musters at">
+          <PortSelect value={origin} onChange={setOrigin} placeholder="Choose…" maxPhase={maxPhase} filter={(p) => !presence.known || presence.any.has(p) || p === origin} />
+        </Field>
+        <Field label="Bound for">
+          <PortSelect value={dest} onChange={setDest} placeholder="Choose…" maxPhase={maxPhase} filter={(p) => p !== origin} />
+        </Field>
+        <Field label="Sails in (game hours)">
+          <Input type="number" min={1} max={336} step={1} value={hours} onChange={(e) => setHours(e.target.value)} />
+        </Field>
+        <Field label="Escort fee (Cr/t)">
+          <Input type="number" min={0} max={1000} step={0.01} value={feeCr} onChange={(e) => setFeeCr(e.target.value)} />
+        </Field>
+        <Field label="Admission">
+          <NativeSelect value={admission} onChange={(e) => setAdmission(e.target.value as S.ConvoyAdmission)}>
+            <option value="open">Open</option>
+            <option value="approval">Approval</option>
+            <option value="invite_only">Invite only</option>
+          </NativeSelect>
+        </Field>
+        <Field label="Visibility">
+          <NativeSelect value={visibility} onChange={(e) => setVisibility(e.target.value as S.ConvoyVisibility)}>
+            <option value="public">Public</option>
+            <option value="private">Private</option>
+          </NativeSelect>
+        </Field>
+        <Field label="Min speed (kn, optional)" className="col-span-2">
+          <Input type="number" min={0} step={0.1} value={minKn} onChange={(e) => setMinKn(e.target.value)} placeholder="none" />
+        </Field>
+      </div>
+      <p className="text-muted-foreground text-xs">
+        Sails {Number.isFinite(h) ? `in ${fmtGameHours(h)} (${realTime(minutes, timeScale)})` : "—"}. At most {CONVOY.announcedMax} announced convoys still forming per company
+        {forming !== undefined ? `; you organize ${forming} forming now (announced or not)` : ""}.
+      </p>
+      <ErrorNote error={act.error ?? (name || origin || dest ? why : null)} />
+      {act.result && (
+        <p className="text-sm">
+          Announced {act.result.convoy.name}: sails from {portName(act.result.convoy.origin_port_id)} {fmtIn(act.result.convoy.departs_at)}.
+        </p>
+      )}
+      <Button className="w-full" variant="outline" disabled={!!why || act.busy} onClick={submit}>
+        {act.busy ? "Announcing…" : "Announce convoy"}
+      </Button>
+    </div>
+  );
+}
+
+/** Public forming convoys as the coffee houses at our quays report them (`convoy_notices` in each port view). */
+function ConvoyNews({ presence, ourIds }: { presence: Presence; ourIds: Set<string> }) {
+  const { portName } = useCatalog();
+  const quayKey = [...presence.quay].sort().join(",");
+  const { data, error } = usePoll(
+    quayKey
+      ? async () => {
+          const ports = quayKey.split(",");
+          const views = await Promise.all(ports.map((p) => kibbGet<PortDetail>("/v1/world/port", { port_id: p }).catch(() => null)));
+          // The same convoy is reported at several quays: keep the freshest news of each.
+          const best = new Map<string, S.ConvoyNotice & { heardAt: string }>();
+          views.forEach((v, i) => {
+            for (const n of v?.convoy_notices ?? []) {
+              const had = best.get(n.convoy_id);
+              if (!had || Date.parse(n.news_as_of) > Date.parse(had.news_as_of)) best.set(n.convoy_id, { ...n, heardAt: ports[i] });
+            }
+          });
+          return { notices: [...best.values()].sort((a, b) => Date.parse(a.departs_at) - Date.parse(b.departs_at)), read: views.filter(Boolean).length, of: ports.length };
+        }
+      : null,
+    60_000,
+    [quayKey],
+  );
+  const rows = (data?.notices ?? []).filter((n) => Date.parse(n.departs_at) > Date.now() - 3_600_000);
+
+  return (
+    <Panel title="Convoy news at your quays">
+      <ErrorNote error={error} />
+      {!presence.known ? (
+        <Loading />
+      ) : presence.quay.size === 0 ? (
+        <Empty>No quay presence anywhere (a ship in port or a factor): convoy news is posted in each port&apos;s coffee house.</Empty>
+      ) : !data ? (
+        !error && <Loading />
+      ) : rows.length === 0 ? (
+        <Empty>No public forming convoys reported at your {data.of} quay{data.of === 1 ? "" : "s"}.</Empty>
+      ) : (
+        <Table head={["Convoy", "Organizer", "Route", "Sails", "Admission", "Escort fee", "Escorts", "Ships", "News"]}>
+          {rows.map((n) => {
+            const ours = ourIds.has(n.organizer_company_id);
+            return (
+              <tr key={n.convoy_id}>
+                <td>
+                  <span className="font-medium">{n.name}</span>
+                  {ours && (
+                    <Badge variant="outline" size="sm" className="ml-1.5">
+                      yours
+                    </Badge>
+                  )}
+                </td>
+                <td className="text-muted-foreground">{n.organizer_company_name}</td>
+                <td className="whitespace-nowrap text-xs">
+                  {portName(n.origin_port_id)} → {portName(n.dest_port_id)}
+                </td>
+                <td className="whitespace-nowrap text-xs" title={fmtDateTime(n.departs_at)}>
+                  {fmtIn(n.departs_at)}
+                </td>
+                <td className="text-xs">{ADMISSION_LABEL[n.admission]}</td>
+                <td className="whitespace-nowrap tabular-nums">{n.escort_fee_pence_per_ton ? `${fmtCr(n.escort_fee_pence_per_ton, 2)}/t` : "none"}</td>
+                <td className="tabular-nums">
+                  {n.escorts} <span className="text-muted-foreground text-xs">({n.escort_cannons} guns)</span>
+                </td>
+                <td className="tabular-nums">{n.members}</td>
+                <td className="whitespace-nowrap text-muted-foreground text-xs">
+                  {n.heardAt === n.origin_port_id ? "live" : `${fmtAgo(n.news_as_of)} via ${portName(n.heardAt)}`}
+                </td>
+              </tr>
+            );
+          })}
+        </Table>
+      )}
+      <p className="mt-3 text-muted-foreground text-xs">
+        A public forming convoy is news live at its origin, and reaches other quays after 6 game hours plus the sea distance at 5 knots, as it stood then.
+        {data && data.read < data.of ? ` ${data.of - data.read} of your quays couldn't be read.` : ""}
+      </p>
+    </Panel>
   );
 }
 
@@ -347,9 +544,18 @@ export default function ConvoysPage() {
     15_000,
     [port, status, pager.cursor],
   );
+  const ourIds = useOurCompanyIds();
+  const presence = usePresence();
+  // Our forming convoys (announced or organized with a flagship), against the cap on announced ones.
+  const { data: ourForming, reload: reloadForming } = usePoll(
+    ourId ? () => kibbGet<S.ConvoyResult[]>("/v1/fleet/convoys", { status: "forming", limit: 200 }).then((rs) => rs.filter((r) => r.convoy.organizer_company_id === ourId).length) : null,
+    60_000,
+    [ourId],
+  );
   const reloadAll = () => {
     void reload();
     void reloadShips();
+    void reloadForming();
   };
   const rows = convoys?.map((r) => ({ ...r, id: r.convoy.id }));
 
@@ -403,11 +609,15 @@ export default function ConvoysPage() {
             convoys.map((r) => <ConvoyCard key={r.convoy.id} r={r} ourId={ourId} ships={ships} autopilot={autopilot} onChange={reloadAll} />)
           )}
           <Pager pager={pager} rows={rows} />
+          <ConvoyNews presence={presence} ourIds={ourIds} />
         </div>
 
         <div className="space-y-4">
           <Panel title="Organize a convoy">
             <CreateConvoy ships={ships} autopilot={autopilot} maxPhase={clock?.unlocked_phase ?? 1} onDone={reloadAll} />
+          </Panel>
+          <Panel title="Announce a convoy (no ship yet)">
+            <AnnounceConvoy maxPhase={clock?.unlocked_phase ?? 1} presence={presence} forming={ourForming} onDone={reloadAll} />
           </Panel>
           <Panel title="How convoys work">
             <ul className="list-disc space-y-1.5 pl-4 text-muted-foreground text-xs">

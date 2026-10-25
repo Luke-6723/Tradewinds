@@ -17,8 +17,8 @@ import type { WorldClock } from "@/lib/kibb/types";
 
 type Kind = "marque" | "patrol";
 
-/** 2 Cr per bps per game day of the term, at least 100 Cr. */
-function sponsorCost(bps: number, hours: number): number {
+/** A patrol: 2 Cr per bps per game day of the term, at least 100 Cr (a marque is priced by the game: `marque-quote`). */
+function patrolCost(bps: number, hours: number): number {
   return Math.max(10_000, Math.round(200 * bps * (hours / 24)));
 }
 
@@ -32,23 +32,41 @@ function SponsorForm({ maxPhase, zone, setZone, onDone }: { maxPhase: number; zo
   const [bps, setBps] = useState("400");
   const [hours, setHours] = useState("60");
   const timeScale = useTimeScale();
-  const act = useAction<S.LetterOfMarque | S.NavalPatrol>(onDone);
+  // Resolves to null when the confirmation is declined.
+  const act = useAction<S.LetterOfMarque | S.NavalPatrol | null>((r) => r && onDone());
 
   const b = num(bps);
   const h = num(hours);
   const valid = !!zone && b >= 50 && b <= 1500 && h >= 5 && h <= 1440;
-  const cost = valid ? sponsorCost(b, h) : null;
+  // A marque's price comes from the zone's traffic: the game's quote, re-read as the inputs change.
+  const { data: quote, error: quoteError } = usePoll(
+    valid && kind === "marque"
+      ? () => kibbGet<S.MarqueQuote>("/v1/fleet/marque-quote", { sea_zone_id: zone, added_piracy_bps: Math.round(b), duration_game_hours: Math.round(h) })
+      : null,
+    30_000,
+    [kind, zone, Math.round(b), Math.round(h), valid],
+  );
+  // Only a quote for these very inputs (an older answer may still be showing).
+  const quoted = kind === "marque" && quote?.sea_zone_id === zone && quote.added_piracy_bps === Math.round(b) && quote.duration_game_hours === Math.round(h) ? quote : null;
+  const cost = !valid ? null : kind === "patrol" ? patrolCost(b, h) : (quoted?.cost_pence ?? null);
   const zoneName = catalog?.sea_zones.find((z) => z.id === zone)?.name ?? zone;
 
   function submit() {
     if (!valid || cost === null) return;
     const what = kind === "marque" ? `a letter of marque adding ${b} bps of piracy` : `a naval patrol suppressing ${b} bps of piracy`;
-    if (!confirm(`Pay ${fmtCr(cost)} for ${what} in ${zoneName} for ${fmtGameHours(h)}?`)) return;
-    void act.run(() =>
-      kind === "marque"
-        ? kibbPost<S.LetterOfMarque>("/v1/fleet/issue-marque", { sea_zone_id: zone, added_piracy_bps: Math.round(b), duration_game_hours: Math.round(h) })
-        : kibbPost<S.NavalPatrol>("/v1/fleet/fund-patrol", { sea_zone_id: zone, suppressed_piracy_bps: Math.round(b), duration_game_hours: Math.round(h) }),
-    );
+    void act.run(async () => {
+      // issue-marque charges the zone's quote as it stands then: priced again, and confirmed on that (not the last poll's).
+      const fresh =
+        kind === "marque"
+          ? await kibbGet<S.MarqueQuote>("/v1/fleet/marque-quote", { sea_zone_id: zone, added_piracy_bps: Math.round(b), duration_game_hours: Math.round(h) })
+          : null;
+      const pay = fresh ? fresh.cost_pence : cost;
+      const expect = fresh ? ` The game expects it to earn ~${fmtCr(fresh.expected_net_prize_pence)} in prize money if the zone's traffic holds.` : "";
+      if (!confirm(`Pay ${fmtCr(pay)} for ${what} in ${zoneName} for ${fmtGameHours(h)}?${expect}`)) return null;
+      return kind === "marque"
+        ? kibbPost<S.IssueMarqueResult>("/v1/fleet/issue-marque", { sea_zone_id: zone, added_piracy_bps: Math.round(b), duration_game_hours: Math.round(h) })
+        : kibbPost<S.NavalPatrol>("/v1/fleet/fund-patrol", { sea_zone_id: zone, suppressed_piracy_bps: Math.round(b), duration_game_hours: Math.round(h) });
+    });
   }
 
   return (
@@ -79,22 +97,42 @@ function SponsorForm({ maxPhase, zone, setZone, onDone }: { maxPhase: number; zo
         rows={[
           ["Effect", Number.isFinite(b) ? `${kind === "marque" ? "+" : "−"}${fmtBps(b)} piracy in the zone` : "—"],
           ["Term", Number.isFinite(h) ? `${fmtGameHours(h)} (${realTime(h * 60, timeScale)})` : "—"],
-          ["Cost", cost === null ? "50..1500 bps, 5..1440 h" : fmtCr(cost)],
+          [
+            "Cost",
+            !valid
+              ? "50..1500 bps, 5..1440 h"
+              : cost !== null
+                ? `${fmtCr(cost)}${quoted ? ` (${fmtCr(quoted.price_per_bps_day_pence, 2)} per bps a game day${quoted.floor_applied ? ", the price floor" : ""})` : ""}`
+                : quoteError
+                  ? "couldn't be quoted"
+                  : "quoting…",
+          ],
+          ...(quoted
+            ? ([
+                ["Expected prize", `~${fmtCr(quoted.expected_net_prize_pence)} after the Admiral's tenth, if traffic holds`],
+                [
+                  "Zone traffic",
+                  `${quoted.laden_passages} laden passages (${quoted.laden_passages_per_day.toFixed(1)} a game day) over ${quoted.window_game_days} game days, ~${fmtCr(quoted.avg_cargo_base_value_pence)} of cargo each at base; marques in force ${fmtBps(quoted.marque_bps_in_force)}`,
+                ],
+                ["Prize per bps-day", `~${fmtCr(quoted.expected_net_prize_per_bps_day_pence, 2)} expected, against ${fmtCr(quoted.price_per_bps_day_pence, 2)} charged`],
+              ] as Array<[string, string]>)
+            : []),
         ]}
       />
+      <ErrorNote error={quoteError} />
       <ErrorNote error={act.error} />
       {act.result && (
         <p className="text-sm">
           Paid {fmtCr(act.result.cost_pence)}; in force until {fmtDateTime(act.result.expires_at)} ({fmtIn(act.result.expires_at)}).
         </p>
       )}
-      <Button className="w-full" variant={kind === "marque" ? "destructive" : "default"} disabled={!valid || act.busy} onClick={submit}>
+      <Button className="w-full" variant={kind === "marque" ? "destructive" : "default"} disabled={!valid || cost === null || act.busy} onClick={submit}>
         {act.busy ? "Paying…" : kind === "marque" ? "Issue letter of marque" : "Fund naval patrol"}
       </Button>
       <p className="text-muted-foreground text-xs">
         {kind === "marque"
-          ? "A marque raises piracy for everyone sailing the zone, you included. While in force it pays you prize money: half the seized cargo's base value × the marques' share of the zone's piracy, split pro rata by bps, into the region you paid from. It pays only on a busy lane."
-          : "A patrol lowers piracy for everyone sailing the zone and cheapens Lloyd's cover there. Sponsors are anonymous."}{" "}
+          ? "A marque raises piracy for everyone sailing the zone, you included. While in force it pays you prize money: half the seized cargo's base value × the marques' share of the zone's piracy, split pro rata by bps, less the Admiral's tenth, into the region you paid from. The game prices it from the zone's last 7 game days of player traffic (60% of the prize it expects; the price is fixed at issue), so it pays only if that traffic holds."
+          : "A patrol costs 2 Cr per bps per game day (100 Cr at least), lowers piracy for everyone sailing the zone and cheapens Lloyd's cover there. Sponsors are anonymous."}{" "}
         Paid from the home vault. Each side stacks across companies, capped at 5,000 bps per zone.
       </p>
     </div>

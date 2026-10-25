@@ -145,6 +145,12 @@ export interface Lane {
   speculative?: boolean;
   /** Sea zones the laden passage's hazards roll for (absent on lanes saved before it was kept). */
   zones?: string[];
+  /**
+   * Planned at its source with a loan (FleetManager.leveragedLoad): at most `pence` borrowed when buying it, for the
+   * cash profit it adds over the cash-only load (`gain`), paid back on delivery (`paybackDays`, game days); `loanId`
+   * once taken. Absent: none.
+   */
+  borrow?: { pence: number; gain: number; paybackDays: number; state: "planned" | "taken" | "failed"; loanId?: string };
 }
 
 /** The AI's hard bans for its horizon (ai/directives.ts): no planned load touches them. */
@@ -287,6 +293,8 @@ interface Ctx {
   gameDayMs: number;
   /** Tons that can still earn the phase bonus (the tier's remainder less our other ships' loads). */
   bonusTons: number;
+  /** Base value (pence) our other ships are bound to deliver into the tier: the bonus split counts it as ours already. */
+  bonusExtra: number;
   /** Plannable charters by `port|good`. */
   charters: Map<string, CharterInfo[]>;
   /** Goods each port wants: charters for them there, or a recent bid. */
@@ -394,8 +402,13 @@ function charterCash(ctx: Ctx, c: CharterInfo, pay = c.payPerTon, at = ctx.now):
   return t * pay + (1 - t) * Math.min(salvage, pay);
 }
 
-function charterBonus(ctx: Ctx, c: CharterInfo): number {
-  return Math.round(ctx.world.charterBonus(c) * ctx.opts.bonusWeight * trust(ctx, c));
+/**
+ * Weighted phase bonus per ton into charter `c`, on average over `tons` delivered together into the tier on top of
+ * `extra` (base value our other ships and this load's earlier parts already bring): the square-root split gives each
+ * further ton less (World.charterBonus).
+ */
+function charterBonus(ctx: Ctx, c: CharterInfo, tons?: number, extra = ctx.bonusExtra): number {
+  return Math.round(ctx.world.charterBonus(c, tons, extra) * ctx.opts.bonusWeight * trust(ctx, c));
 }
 
 // ── Parts ─────────────────────────────────────────────────────────────────────
@@ -417,8 +430,43 @@ interface PartArgs {
   arriveAt: number;
   /** Phase-bonus tons still unclaimed in this lane (read only: taking a part claims them). */
   bonusTons: number;
+  /** Base value (pence) already bound for the tier: our other ships' loads and this lane's earlier parts. */
+  bonusExtra: number;
   /** Expected server time of buying at the source (its base lock cleared). */
   buyAt: number;
+}
+
+type AskEst = NonNullable<ReturnType<World["estAsk"]>>;
+
+/** Tons the source's asks can supply beyond what our other ships will buy there: all of it, unless only players' asks count (a royal monopoly). */
+function offered(est: { maxTons?: number }, reserved: number): number {
+  return est.maxTons === undefined ? Infinity : Math.max(0, Math.floor(est.maxTons - reserved));
+}
+
+/**
+ * Average ask per ton for `tons` more bought at the source after the `reserved` tons our other ships buy there: a
+ * players' resting ask in the news below the ladder (its tons, what the others leave of them) first, then the
+ * ladder's ask rising with what is bought from it.
+ */
+function askFor(est: AskEst, reserved: number, tons: number): number {
+  const p = est.player;
+  if (!p || p.ask >= est.ask || tons <= 0) return est.ask * (1 + IMPACT_PER_TON * (reserved + Math.max(0, tons) / 2));
+  const fromPlayer = Math.min(tons, Math.max(0, p.tons - reserved));
+  const rest = tons - fromPlayer;
+  const ladder = est.ask * (1 + IMPACT_PER_TON * (Math.max(0, reserved - p.tons) + rest / 2));
+  return (fromPlayer * p.ask + rest * ladder) / tons;
+}
+
+/** The cheapest an ask can be at the source (the best case, for a quick test): a cheaper players' level, else the ladder's. */
+const bestAsk = (est: AskEst) => Math.min(est.ask, est.player?.ask ?? Infinity);
+
+/**
+ * A players' resting bid in the news above what the port's buyers are expected to pay (World.playerLevel: ours left
+ * out, its tons marked down for the news' age at `at`), or null.
+ */
+function playerBid(ctx: Ctx, port: string, good: string, bid: number | null, at: number): { price: number; tons: number } | null {
+  const lvl = ctx.world.playerLevel(port, good, "bid", at);
+  return lvl && lvl.price > (bid ?? 0) ? lvl : null;
 }
 
 /** Landed cost per ton delivered at `ask`, and the cash it takes at the source per ton bought. */
@@ -437,11 +485,13 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   let usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
   const t = new Map(usable.map((c) => [c.id, terms(ctx, c, a.arriveAt)]));
   const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay, a.arriveAt);
-  const value = (c: CharterInfo) => cashOf(c) + charterBonus(ctx, c);
+  // The bonus per ton is ranked at about the tons this part can put into the tier (the split's returns diminish).
+  const refTons = Math.max(1, Math.min(a.room, a.bonusTons > 0 ? a.bonusTons : a.room));
+  const value = (c: CharterInfo) => cashOf(c) + charterBonus(ctx, c, refTons, a.bonusExtra);
   usable.sort((x, y) => value(y) - value(x));
 
-  const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + a.room / 2))).cash, 1));
-  const cap = Math.min(a.room, cashTons);
+  const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, askFor(est, reserved, a.room)).cash, 1));
+  const cap = Math.min(a.room, cashTons, offered(est, reserved));
   // Rivals due at the port before we land: what they likely deliver of this good goes to the best-paying
   // charters first, counted once across them; laden ones of unknown cargo take a share of each public
   // charter's room, and of a crisis charter expected from public news (it can be raced too).
@@ -465,12 +515,12 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
     return Math.max(0, Math.floor(Math.max(room * 0.4, room * share - (rivalTake.get(c.id) ?? 0))));
   };
   const avail = Math.min(cap, usable.reduce((n, c) => n + roomOf(c), 0));
-  const fullCost = costs(ctx, a, est.ask * (1 + IMPACT_PER_TON * (reserved + avail / 2))).landed;
+  const fullCost = costs(ctx, a, askFor(est, reserved, avail)).landed;
 
   let tons = 0;
   let cashTotal = 0;
-  let bonusTotal = 0;
   let bonusLeft = a.bonusTons;
+  const bonusFills: Array<[CharterInfo, number]> = [];
   let minPay = Infinity;
   let cashPay = Infinity;
   let holdUntil: number | null = null;
@@ -486,7 +536,8 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
     const hold = t.get(c.id)!.holdUntil;
     if (hold !== null) holdUntil = Math.max(holdUntil ?? 0, hold);
     if (world.expansionCharters.has(c.id)) {
-      bonusTotal += Math.min(take, bonusLeft) * charterBonus(ctx, c);
+      const b = Math.min(take, bonusLeft);
+      if (b > 0) bonusFills.push([c, b]);
       bonusLeft = Math.max(0, bonusLeft - take);
     }
     minPay = Math.min(minPay, value(c));
@@ -496,8 +547,11 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   }
   if (tons < MIN_PART_TONS) return null;
   const pay = cashTotal / tons;
+  // The tier's bonus for every ton this part puts into it, counted together (the square-root split).
+  const intoTier = bonusFills.reduce((n, [, b]) => n + b, 0);
+  const bonusTotal = intoTier > 0 ? bonusFills.reduce((n, [c, b]) => n + b * charterBonus(ctx, c, intoTier, a.bonusExtra), 0) : 0;
   const bonus = bonusTotal / tons;
-  const ask = est.ask * (1 + IMPACT_PER_TON * (reserved + tons / 2));
+  const ask = askFor(est, reserved, tons);
   const costPerTon = costs(ctx, a, ask).landed;
   const margin = pay + bonus - costPerTon;
   if (margin < opts.minMargin || pay < costPerTon) return null;
@@ -520,24 +574,35 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
 
 function marketPart(ctx: Ctx, a: PartArgs): Part | null {
   const { world, res, opts } = ctx;
-  const bid = expectedBid(ctx, a.dest, a.good, a.arriveAt);
+  const npcBid = expectedBid(ctx, a.dest, a.good, a.arriveAt);
+  // A players' resting bid in the news above the buyers' (its tons, aged): sold into first, up to its tons.
+  const player = playerBid(ctx, a.dest, a.good, npcBid, a.arriveAt);
+  const bid = Math.max(npcBid ?? 0, player?.price ?? 0);
   const est = world.estAsk(a.source, a.good, a.buyAt);
   if (!bid || !est || a.room < MIN_PART_TONS) return null;
   // Cheap test before any sizing: the best case must clear the margin.
-  if (bid - costs(ctx, a, est.ask).landed < opts.minMargin) return null;
+  if (bid - costs(ctx, a, bestAsk(est)).landed < opts.minMargin) return null;
 
   const reserved = res.sourceTons.get(`${a.source}|${a.good}`) ?? 0;
   const sold = res.sellTons.get(`${a.dest}|${a.good}`) ?? 0;
-  // A live book shows how much its buyers take; otherwise assume a modest depth.
-  const depth = world.price(a.dest, a.good)?.bidDepth ?? MARKET_MAX_TONS;
-  const max = Math.min(a.room, depth - sold);
+  // A live book shows how much its buyers take; otherwise assume a modest depth. The players' level adds its tons
+  // (what our other ships sell there takes it first).
+  const ladderDepth = npcBid === null ? 0 : (world.price(a.dest, a.good)?.bidDepth ?? MARKET_MAX_TONS);
+  const max = Math.min(a.room, ladderDepth + (player?.tons ?? 0) - sold, offered(est, reserved));
+  /** Average sale per ton for `tons` sold after our other ships' `sold`: the players' level first, then the buyers' falling bid. */
+  const saleFor = (tons: number) => {
+    const fromPlayer = player ? Math.min(tons, Math.max(0, player.tons - sold)) : 0;
+    const rest = tons - fromPlayer;
+    const ladder = (npcBid ?? 0) * (1 - SELL_IMPACT_PER_TON * (Math.max(0, sold - (player?.tons ?? 0)) + rest / 2));
+    return (fromPlayer * (player?.price ?? 0) + rest * ladder) / tons;
+  };
   // Profit falls per ton on both books: find the size that earns most.
   let best: { tons: number; sale: number; ask: number; landed: number; profit: number } | null = null;
   for (let tons = max; tons >= MIN_PART_TONS; tons -= Math.max(1, Math.round(max / 12))) {
-    const ask = est.ask * (1 + IMPACT_PER_TON * (reserved + tons / 2));
+    const ask = askFor(est, reserved, tons);
     const c = costs(ctx, a, ask);
     if (c.cash * tons > a.cash) continue;
-    const sale = bid * (1 - SELL_IMPACT_PER_TON * (sold + tons / 2));
+    const sale = saleFor(tons);
     if (sale - c.landed < opts.minMargin) continue;
     const profit = tons * (sale - c.landed);
     if (!best || profit > best.profit) best = { tons, sale, ask, landed: c.landed, profit };
@@ -570,7 +635,8 @@ function freightPicks(ctx: Ctx, source: string, dest: string, room: number, cash
         f.origin === source &&
         f.dest === dest &&
         !res.freightIds.has(f.id) &&
-        f.issuer !== world.companyId &&
+        // Never lots any of our player's companies issued (refused as same-player dealing).
+        !world.ownIssued(f) &&
         (f.expiresAt === null || f.expiresAt >= ctx.now) &&
         f.tons > 0,
     )
@@ -627,18 +693,24 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const storm = world.stormRisk(out, ship.hull, ship.knots * 0.8, sailsAt, opts.stormWeight ?? 1);
   const deadSink = dead ? world.stormRisk(dead, ship.hull, ship.knots, ctx.now, opts.stormWeight ?? 1).sink : 0;
   let bonusTons = ctx.bonusTons;
+  let bonusExtra = ctx.bonusExtra;
   let room = ship.cap;
   // Bought once at the source: cash due by then may count (onward legs: cash in hand only).
   let cash = !cheap && opts.cashAt ? opts.cashAt(buyAt, source) : (opts.cash ?? Number.MAX_SAFE_INTEGER);
   const parts: Part[] = [];
   let freight: FreightPick[] = [];
-  const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, storm: storm.cargoShare, deliverBy, arriveAt, buyAt, bonusTons });
+  const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, storm: storm.cargoShare, deliverBy, arriveAt, buyAt, bonusTons, bonusExtra });
   const charterAt = (good: string) => ctx.charters.get(`${dest}|${good}`) ?? [];
   const take = (p: Part) => {
     parts.push(p);
     room -= p.tons;
     cash -= costs(ctx, args(p.good), p.estAsk).cash * p.tons;
-    for (const [id, t] of p.fills) if (world.expansionCharters.has(id)) bonusTons = Math.max(0, bonusTons - t);
+    for (const [id, t] of p.fills) {
+      if (!world.expansionCharters.has(id)) continue;
+      // Later parts' bonus counts this part's tons as ours already (the split's returns diminish).
+      bonusExtra += Math.min(t, bonusTons) * world.bonusUnit({ id, good: p.good });
+      bonusTons = Math.max(0, bonusTons - t);
+    }
   };
 
   // The main cargo.
@@ -810,7 +882,12 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
     const bids = world.catalog.ports
       .filter((p) => world.isOpen(p.id) && world.trades(p.id, c.id) && portOk(p.id))
       .filter((p) => !onlyDest || p.id === onlyDest)
-      .map((p) => ({ port: p.id, bid: expectedBid(ctx, p.id, c.id) }))
+      .map((p) => {
+        // A players' resting bid in the news above the buyers' counts too (marketPart sells into it up to its tons).
+        const npc = expectedBid(ctx, p.id, c.id);
+        const best = Math.max(npc ?? 0, playerBid(ctx, p.id, c.id, npc, ctx.now)?.price ?? 0);
+        return { port: p.id, bid: best > 0 ? best : null };
+      })
       .filter((b): b is { port: string; bid: number } => b.bid !== null)
       .sort((a, b) => b.bid - a.bid);
     const buyers = [...bids.slice(0, MARKET_TOP), ...bids.slice(MARKET_TOP).filter((b) => world.shortageAt(b.port, c.id))];
@@ -819,8 +896,8 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
       .sellersOf(c.id)
       .filter((port) => (!only || port === only) && portOk(port))
       .map((port) => ({ port, ask: world.estAsk(port, c.id) }))
-      .filter((x): x is { port: string; ask: { ask: number; known: boolean } } => x.ask !== null)
-      .map((x) => ({ port: x.port, cost: x.ask.ask * (1 + world.customsBps(x.port) / 10_000) }))
+      .filter((x): x is { port: string; ask: AskEst } => x.ask !== null)
+      .map((x) => ({ port: x.port, cost: bestAsk(x.ask) * (1 + world.customsBps(x.port) / 10_000) }))
       .sort((a, b) => a.cost - b.cost);
     const sellers = [...offers.slice(0, MARKET_TOP), ...offers.slice(MARKET_TOP).filter((s) => world.glutAt(s.port, c.id))];
     for (const s of sellers) {
@@ -867,7 +944,14 @@ function overlaps(a: Lane, b: Lane): boolean {
 export async function rankLanes(world: World, ship: ShipSpec, from: string, res: Reservations, opts: PlanOptions): Promise<Lane[]> {
   if (ship.cap <= 0) return [];
   let reservedExpansion = 0;
-  for (const [id, t] of res.charterTons) if (world.renews({ id })) reservedExpansion += t;
+  let bonusExtra = 0;
+  for (const [id, t] of res.charterTons) {
+    if (!world.renews({ id })) continue;
+    reservedExpansion += t;
+    // Our other ships' loads for the tier: the bonus split counts them as ours (a charter no longer listed: its good unknown, skipped).
+    const c = world.charters.find((x) => x.id === id);
+    if (c) bonusExtra += t * world.bonusUnit(c);
+  }
   const ctx: Ctx = {
     world,
     ship,
@@ -877,6 +961,7 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     baseLockMs: 30 * world.gameMinuteMs,
     gameDayMs: 24 * 60 * world.gameMinuteMs,
     bonusTons: Math.max(0, world.expansionTonsLeft - reservedExpansion),
+    bonusExtra,
     charters: new Map(),
     wanted: new Map(),
     legs: new Map(),
@@ -888,7 +973,8 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
   };
   const bans = opts.bans;
   for (const c of world.charters) {
-    if (!world.isOpen(c.port) || c.remaining <= 0 || (c.stale && trust(ctx, c) <= GOSSIP_TRUST_MIN)) continue;
+    // Never our own player's charters (their deliveries are refused).
+    if (!world.isOpen(c.port) || c.remaining <= 0 || (c.stale && trust(ctx, c) <= GOSSIP_TRUST_MIN) || !world.deliverable(c)) continue;
     if (bans && (bans.ports.has(c.port) || bans.goods.has(c.good) || bans.charters.has(world.currentId(c.id)))) continue;
     const k = `${c.port}|${c.good}`;
     ctx.charters.set(k, [...(ctx.charters.get(k) ?? []), c]);

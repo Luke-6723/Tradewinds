@@ -1,14 +1,20 @@
 // TypeScript types for the kibb.io Tradewinds API (v1), from /api-docs/openapi.json.
 // Only the fields the bot uses are listed. Money is integer pence, weight is tons.
+// Every schema in full, generated: ./schema.ts (import type * as S from "@/lib/kibb/schema").
+
+import type * as S from "./schema";
 
 export type ShipStatus = "berthed" | "anchored_roadstead" | "sailing" | "sunk";
 export type ZoneClass = "coastal" | "regional" | "oceanic";
 export type OrderSide = "bid" | "ask";
 export type TimeInForce = "ioc" | "gtc";
 export type PortVisibility = "none" | "storage" | "counting_house" | "quay";
-export type ContractType = "charter" | "freight";
+/** `commission`: a hull ordered at a yard (`ship_class`, `reward_pence` = the price), not freight. */
+export type ContractType = "charter" | "freight" | "commission";
 export type ContractStatus = "open" | "active" | "completed" | "cancelled" | "defaulted";
-export type AccountType = "vault" | "escrow" | "crown" | "mint";
+/** Who pays a charter's deliveries: a world account, or (`issuer`) the player who posted it, from its escrow. */
+export type CharterFunding = "crown" | "mint" | "issuer";
+export type AccountType = "vault" | "escrow" | "crown" | "mint" | "venture";
 export type BankingRegion =
   | "channel"
   | "north_sea"
@@ -138,6 +144,8 @@ export interface CatalogShipClass {
   hold_capacity_tons: number;
   max_cannons: number;
   crew_required: number;
+  /** A news hull (the packet) whose owner may seal its dispatches (`POST /v1/fleet/seal-dispatches`). Merchant hulls always share. */
+  can_seal_dispatches: boolean;
 }
 
 export interface CatalogPort {
@@ -178,6 +186,14 @@ export interface GossipReport {
     current_stock: number;
     best_bid_pence?: number | null;
     best_ask_pence?: number | null;
+    /**
+     * The best resting company order on each side (not the NPC ladder) and the tons left at that price;
+     * null when none rested. Anonymous: they may be our own orders.
+     */
+    best_player_bid_pence?: number | null;
+    best_player_bid_quantity?: number | null;
+    best_player_ask_pence?: number | null;
+    best_player_ask_quantity?: number | null;
   }[];
 }
 
@@ -218,6 +234,10 @@ export interface PortDetail {
   /** Only at quay visibility. */
   coffee_house_gossip?: GossipReport[] | null;
   recent_sailings?: SailingNotice[] | null;
+  /** Public forming convoys mustering here, and those elsewhere whose news has reached this quay; soonest first. Quay only. */
+  convoy_notices?: S.ConvoyNotice[] | null;
+  /** The Lloyd's List posted here: underwriters' recent results and the policies open here. Quay only. */
+  lloyds_list?: S.LloydsListNotice | null;
 }
 
 /** `GET /v1/world/zones`: live piracy per sea zone. */
@@ -290,7 +310,10 @@ export interface ExpansionTier {
   progress_bps: number;
   active_companies: number;
   charters: ExpansionCharterProgress[];
-  /** Share of the tier so far by company: tons, and share of base value delivered (= share of the bonus). */
+  /**
+   * Share of the tier so far by company: tons, and share of base value delivered. Not the share of the bonus:
+   * that splits by the square root of each player's base-valued tons (across the player's companies).
+   */
   contributors?: Array<{ company_name: string; tons: number; share_bps: number }>;
 }
 
@@ -302,6 +325,10 @@ export interface ExpansionStatus {
 
 // ── Fleet ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Liens and arrest are not on the ship: a lien is a loan's `collateral_ship_id` (`S.Loan`, `collateral_kind:
+ * ship_lien`); a defaulted loan's ship is arrested (`409 conflict` on depart or joining a convoy) until settled.
+ */
 export interface Ship {
   id: string;
   name: string;
@@ -318,6 +345,8 @@ export interface Ship {
   cannons_count: number;
   convoy_id?: string | null;
   stores_provisions_units: number;
+  /** A packet's sealed dispatches: its crew's gossip is not posted to the boards it calls at. */
+  dispatches_sealed: boolean;
   created_at?: string;
 }
 
@@ -471,13 +500,19 @@ export interface ContractListing {
   reward_per_ton_pence?: number | null;
   collateral_pence: number;
   expires_at?: string | null;
-  /** Freight only: who is carrying it once accepted. */
+  /** Freight only: who is carrying it once accepted. Commissions: the builder once accepted. */
   carrier_company_id?: string | null;
-  /** Who posted it (freight: the issuer; charters: null for the Crown and governors). */
+  /**
+   * Who posted it (freight and player charters: the issuer; commissions: the buyer; Crown and governor
+   * charters: null). A player charter's issuer, and its player's other and linked companies, can't deliver.
+   */
   issuer_company_id?: string | null;
   carrier_ship_id?: string | null;
   title?: string | null;
-  funded_by?: "crown" | "mint" | null;
+  /** Charters: who pays deliveries (`issuer`: a player charter, the goods going to its warehouse, no prestige). Freight: null. */
+  funded_by?: CharterFunding | null;
+  /** Commissions: the hull ordered (built at `origin_port_id`). Null otherwise. */
+  ship_class?: string | null;
   /** True when this is second-hand news; `remaining_quantity` may be out of date. */
   stale: boolean;
   gossip?: { age_seconds: number; heard_at_port_id: string; news_as_of: string } | null;
@@ -540,17 +575,43 @@ export interface DeliverFreightResult {
 
 export type BuildMode = "byom" | "turnkey_cash";
 
+/**
+ * `GET /v1/shipyard/quote`. Turnkey buys each material off the port's ask book (players' asks and the NPC
+ * ladder, cheapest first; our own and sibling asks and asks over 2.5x the mid passed over), pays customs on
+ * every fill, and marks up only the NPC-sourced part. BYOM: labour only (materials, customs and markup 0).
+ */
 export interface BuildQuote {
   port_id: string;
   ship_class: string;
   build_mode: BuildMode;
   available: boolean;
   labour_pence: number;
+  /** Turnkey: sum of the materials' `cost_pence`, paid to the sellers (before customs and markup). */
   materials_pence: number;
+  /** Turnkey: the part of `materials_pence` bought off the NPC ladder (what the markup is charged on). */
+  npc_materials_pence: number;
+  /** Turnkey: sum of the materials' importer customs. */
+  customs_pence: number;
+  /** Markup on `npc_materials_pence` (`1,500` = 15%). */
+  yard_markup_bps: number;
   yard_markup_pence: number;
-  /** Null when a turnkey material cannot be supplied. */
+  /** `labour + materials + customs + markup`; null when a turnkey material cannot be supplied. */
   total_cost_pence?: number | null;
-  materials: { commodity_id: string; quantity: number; in_stock: boolean; cost_pence?: number | null }[];
+  materials: {
+    commodity_id: string;
+    quantity: number;
+    /** Turnkey: the asks we may buy from and the NPC stockpile cover `quantity`. BYOM: our warehouse here holds it unlocked. */
+    in_stock: boolean;
+    /** Turnkey: paid to the sellers for `quantity`; null if the book can't supply it all. BYOM: null. */
+    cost_pence?: number | null;
+    /** Turnkey: the part of `cost_pence` bought from the NPC merchants. BYOM: null. */
+    npc_cost_pence?: number | null;
+    /** Turnkey: importer customs on `cost_pence`. BYOM: null. */
+    customs_pence?: number | null;
+    /** Turnkey: tons bought from players' asks, and from the NPC merchants. BYOM: 0. */
+    player_tons: number;
+    npc_tons: number;
+  }[];
 }
 
 export interface BuildShipResult {

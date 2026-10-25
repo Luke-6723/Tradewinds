@@ -263,6 +263,8 @@ export class KibbClient {
       this.noteLimits(bucket, res);
 
       if (res.ok) {
+        // No Content (e.g. loan/withdraw-board-entry): nothing to parse.
+        if (res.status === 204) return undefined as T;
         try {
           return (await res.json()) as T;
         } catch (e) {
@@ -384,6 +386,17 @@ export class KibbClient {
   route = (from: string, to: string, shipClass?: string) =>
     this.get<RoutePlan>("/v1/world/route", { from, to, ship_class: shipClass });
 
+  /** Royal monopolies in force (with `include_expired`, their history too), newest first. Public. */
+  monopolies = (
+    filter: { banking_region?: BankingRegion; commodity_id?: string; include_expired?: boolean; cursor?: string; limit?: number } = {},
+  ) => this.get<S.MonopolyResult[]>("/v1/world/monopolies", filter);
+  /** Every page of a monopoly listing (200 a page). */
+  monopolyPages = (filter: Omit<NonNullable<Parameters<KibbClient["monopolies"]>[0]>, "cursor" | "limit"> = {}, maxPages = 10) =>
+    pages((cursor) => this.monopolies({ ...filter, cursor, limit: 200 }), (m) => m.id, 200, maxPages);
+  /** The monopoly on a good in a region for `termGameDays` (5, 10 or 20) as it would be charged now, and whether it can be bought. */
+  monopolyQuote = (region: BankingRegion, commodityId: string, termGameDays: number) =>
+    this.get<S.MonopolyQuoteResult>("/v1/world/monopoly-quote", { banking_region: region, commodity_id: commodityId, term_game_days: termGameDays });
+
   // ── Fleet ───────────────────────────────────────────────────────────────────
 
   ship = (shipId: string) => this.get<ShipResult>("/v1/fleet/ship", { ship_id: shipId });
@@ -410,6 +423,25 @@ export class KibbClient {
   unprovision = (shipId: string, tons: number, destination: "cargo" | "warehouse") =>
     this.post<StoresTransferResult>("/v1/fleet/unprovision", { ship_id: shipId, tons, destination });
 
+  /** Packets only (`can_seal_dispatches`): sealed, the crew's gossip stays off the boards it calls at; released, it posts at once in port. */
+  sealDispatches = (shipId: string, sealed: boolean) =>
+    this.post<S.SealDispatchesResult>("/v1/fleet/seal-dispatches", { ship_id: shipId, sealed });
+
+  // ── Ship market ─────────────────────────────────────────────────────────────
+
+  /** With `port_id`: the open listings there (needs quay presence). Without: our own listings, any status. */
+  shipListings = (filter: { port_id?: string; cursor?: string; limit?: number } = {}) =>
+    this.get<S.ShipListingResult[]>("/v1/fleet/ship-listings", filter);
+  /** Every page of a ship listing (200 a page). */
+  shipListingPages = (filter: { port_id?: string } = {}, maxPages = 10) =>
+    pages((cursor) => this.shipListings({ ...filter, cursor, limit: 200 }), (l) => l.id, 200, maxPages);
+  /** Offers a ship lying in port for sale at 50–150% of its rebuild value (empty hold, no convoy, insurance or lien). */
+  listShip = (shipId: string, pricePence: number) =>
+    this.post<S.ShipListingResult>("/v1/fleet/list-ship", { ship_id: shipId, price_pence: pricePence });
+  /** Needs quay presence at the listing's port; paid from our vault in that region. `409` if the rebuild value moved. */
+  buyShip = (listingId: string) => this.post<S.ShipSaleResult>("/v1/fleet/buy-ship", { listing_id: listingId });
+  cancelShipListing = (listingId: string) => this.post<S.ShipListingResult>("/v1/fleet/cancel-ship-listing", { listing_id: listingId });
+
   // ── Convoys, marques, patrols ───────────────────────────────────────────────
 
   convoys = (filter: { convoy_id?: string; port_id?: string; status?: S.ConvoyStatus; cursor?: string; limit?: number } = {}) =>
@@ -418,13 +450,19 @@ export class KibbClient {
   convoyPages = (filter: { port_id?: string; status?: S.ConvoyStatus } = {}, maxPages = 10) =>
     pages((cursor) => this.convoys({ ...filter, cursor, limit: 50 }), (c) => c.convoy.id, 50, maxPages);
   createConvoy = (req: S.CreateConvoyRequest) => this.post<S.ConvoyResult>("/v1/fleet/create-convoy", req);
+  /** A convoy scheduled with no ship yet (1 game hour to 14 game days out; needs presence at the origin); ships join later. */
+  announceConvoy = (req: S.AnnounceConvoyRequest) => this.post<S.ConvoyResult>("/v1/fleet/announce-convoy", req);
   joinConvoy = (req: S.JoinConvoyRequest) => this.post<S.ConvoyMembershipResult>("/v1/fleet/join-convoy", req);
   detachConvoy = (req: S.ConvoyMembershipRequest) => this.post<S.ConvoyMembershipResult>("/v1/fleet/detach-convoy", req);
   approveConvoyRequest = (req: S.ConvoyMembershipRequest) => this.post<S.ConvoyMembershipResult>("/v1/fleet/approve-convoy-request", req);
   rejectConvoyRequest = (req: S.ConvoyMembershipRequest) => this.post<S.ConvoyMembershipResult>("/v1/fleet/reject-convoy-request", req);
   kickConvoyMember = (req: S.ConvoyMembershipRequest) => this.post<S.ConvoyMembershipResult>("/v1/fleet/kick-convoy-member", req);
   inviteToConvoy = (req: S.ConvoyInviteRequest) => this.post<S.ConvoyInviteResult>("/v1/fleet/invite-to-convoy", req);
-  issueMarque = (req: S.IssueMarqueRequest) => this.post<S.LetterOfMarque>("/v1/fleet/issue-marque", req);
+  /** What `issueMarque` would charge now for `addedBps` over `durationGameHours` (default 60) in a zone, and the net prize it expects. */
+  marqueQuote = (seaZoneId: string, addedBps: number, durationGameHours?: number) =>
+    this.get<S.MarqueQuote>("/v1/fleet/marque-quote", { sea_zone_id: seaZoneId, added_piracy_bps: addedBps, duration_game_hours: durationGameHours });
+  /** Charged at the zone's quoted price, fixed for the term; `pricing` is the quote it was charged at. */
+  issueMarque = (req: S.IssueMarqueRequest) => this.post<S.IssueMarqueResult>("/v1/fleet/issue-marque", req);
   fundPatrol = (req: S.FundPatrolRequest) => this.post<S.NavalPatrol>("/v1/fleet/fund-patrol", req);
   marques = (filter: { sea_zone_id?: string; cursor?: string; limit?: number } = {}) => this.get<S.LetterOfMarque[]>("/v1/fleet/marques", filter);
   patrols = (filter: { sea_zone_id?: string; cursor?: string; limit?: number } = {}) => this.get<S.NavalPatrol[]>("/v1/fleet/patrols", filter);
@@ -444,6 +482,8 @@ export class KibbClient {
     this.get<S.OrderBook[]>("/v1/market/orders", filter);
   fills = (filter: { port_id?: string; commodity_id?: string; side?: S.OrderSide; cursor?: string; limit?: number } = {}) =>
     this.get<S.CompanyTradeFillResult[]>("/v1/market/fills", filter);
+  /** Buys a royal monopoly at the price `monopolyQuote` gives now (`max_price_pence` refuses it if that moved above). Never refunded. */
+  buyMonopoly = (req: S.BuyMonopolyRequest) => this.post<S.MonopolyResult>("/v1/market/buy-monopoly", req);
 
   // ── Contracts ───────────────────────────────────────────────────────────────
 
@@ -473,6 +513,20 @@ export class KibbClient {
     this.post<AcceptFreightResult[]>("/v1/contract/accept-freight-batch", { items });
   createFreight = (req: S.CreateFreightRequest) => this.post<S.Contract>("/v1/contract/create-freight", req);
 
+  /** A player charter: goods delivered to our warehouse at `port_id`, the reward escrowed and the space reserved there. */
+  postCharter = (req: S.PostCharterRequest) => this.post<ContractListing>("/v1/contract/post-charter", req);
+  /** Withdraws one of our open charters: the undelivered reward is refunded and its warehouse space freed. */
+  cancelCharter = (contractId: string) => this.post<S.CancelCharterResult>("/v1/contract/cancel-charter", { contract_id: contractId });
+  /** Orders a hull built at a yard for `price_pence` (escrowed now, 50–150% of its rebuild value) by a deadline. */
+  createCommission = (req: S.CreateCommissionRequest) => this.post<S.Contract>("/v1/contract/create-commission", req);
+  /** Binds us to build it (needs presence at the yard; escrows its collateral). */
+  acceptCommission = (contractId: string) => this.post<S.CommissionResult>("/v1/contract/accept-commission", { contract_id: contractId });
+  /** Withdraws one of our commissions nobody has accepted. */
+  cancelCommission = (contractId: string) => this.post<S.CommissionResult>("/v1/contract/cancel-commission", { contract_id: contractId });
+  /** Builds an accepted commission at its yard as build-ship would and hands the ship to the buyer; `409` if turnkey can't be supplied. */
+  deliverCommission = (contractId: string, name: string, buildMode: BuildMode = "turnkey_cash") =>
+    this.post<S.DeliverCommissionResult>("/v1/contract/deliver-commission", { contract_id: contractId, name, build_mode: buildMode });
+
   // ── Futures and insurance ───────────────────────────────────────────────────
 
   futures = (filter: { port_id?: string; commodity_id?: string; status?: S.FuturesStatus; cursor?: string; limit?: number } = {}) =>
@@ -494,11 +548,17 @@ export class KibbClient {
       cursor?: string;
       limit?: number;
     } = {},
-  ) => this.get<S.InsurancePolicy[]>("/v1/insurance/list", filter);
+  ) => this.get<S.InsurancePolicyListing[]>("/v1/insurance/list", filter);
   /** Every page of a policy listing (newest first, 200 a page). */
   policyPages = (filter: Omit<NonNullable<Parameters<KibbClient["policies"]>[0]>, "cursor" | "limit"> = {}, maxPages = 10) =>
     pages((cursor) => this.policies({ ...filter, cursor, limit: 200 }), (p) => p.id, 200, maxPages);
-  insure = (req: S.CreateInsurancePolicyRequest) => this.post<S.InsurancePolicy>("/v1/insurance/create", req);
+  /** Lloyd's posted price for insuring our ship in port to `destPortId` for `insuredValuePence`, as if written now. */
+  insuranceQuote = (shipId: string, destPortId: string, insuredValuePence: number) =>
+    this.get<S.LloydsQuoteResult>("/v1/insurance/quote", { ship_id: shipId, dest_port_id: destPortId, insured_value_pence: insuredValuePence });
+  /** Underwriting results (Lloyd's, players, everyone): this season and over the last `days` game days (default 30). */
+  lloydsList = (days?: number) => this.get<S.LloydsListResult>("/v1/insurance/lloyds-list", { days });
+  /** The policy, plus Lloyd's posted price for its voyage (`lloyds_premium_bps`, `above_lloyds_price`). */
+  insure = (req: S.CreateInsurancePolicyRequest) => this.post<S.CreateInsurancePolicyResult>("/v1/insurance/create", req);
   underwrite = (req: S.UnderwriteInsuranceRequest) => this.post<S.InsurancePolicyDetailResult>("/v1/insurance/underwrite", req);
   underwriteBatch = (items: S.UnderwriteInsuranceRequest[]) =>
     this.post<S.InsurancePolicyDetailResult[]>("/v1/insurance/underwrite-batch", { items });
@@ -524,10 +584,12 @@ export class KibbClient {
 
   // ── Shipyard ────────────────────────────────────────────────────────────────
 
+  /** Turnkey walks the port's ask book (players' asks and the NPC ladder, cheapest first) plus customs, and marks up the NPC part only. */
   shipyardQuote = (portId: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
     this.get<BuildQuote>("/v1/shipyard/quote", { port_id: portId, ship_class: shipClass, build_mode: buildMode });
 
-  buildShip = (portId: string, name: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
+  /** A turnkey build gets `409` when the ask book can't supply a material (or a royal monopoly bars it). */
+  buildShip =(portId: string, name: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
     this.post<BuildShipResult>("/v1/shipyard/build-ship", { port_id: portId, name, ship_class: shipClass, build_mode: buildMode });
 
   /** Sets the cannon count; adding guns needs a shipyard port (150 Cr each). */
@@ -544,4 +606,103 @@ export class KibbClient {
 
   ledger = (filter: { cursor?: string; limit?: number; banking_region?: BankingRegion; reason?: string } = {}) =>
     this.get<S.LedgerEntry[]>("/v1/treasury/ledger", filter);
+
+  // ── Loans ───────────────────────────────────────────────────────────────────
+
+  /** Loans we made (`lender`) or owe (`borrower`), or both, newest first, with `owed_pence`. */
+  loans = (filter: { role?: S.LoanRole; status?: S.LoanStatus; cursor?: string; limit?: number } = {}) =>
+    this.get<S.Loan[]>("/v1/loan/list", filter);
+  /** Every page of our loans (50 a page: the docs give this endpoint no maximum). */
+  loanPages = (filter: { role?: S.LoanRole; status?: S.LoanStatus } = {}, maxPages = 10) =>
+    pages((cursor) => this.loans({ ...filter, cursor, limit: 50 }), (l) => l.id, 50, maxPages);
+  /** Any company's public credit record. */
+  creditReport = (companyId: string) => this.get<S.CreditReport>("/v1/loan/credit", { company_id: companyId });
+  /** A region's credit board: standing offers (cheapest first) and requests (dearest first). */
+  creditBoard = (region: BankingRegion) => this.get<S.CreditBoard>("/v1/loan/board", { banking_region: region });
+  /** What the Goldsmiths' Company would lend against one of our ships (default region: home), and the rate floor and ceiling. */
+  backstopQuote = (shipId: string, region?: BankingRegion) =>
+    this.get<S.BackstopQuote>("/v1/loan/backstop-quote", { ship_id: shipId, banking_region: region });
+  /** Borrows from the Goldsmiths' Company against a lien on a ship (within `backstopQuote`, 1–30 game days, with recourse). */
+  borrowBackstop = (req: S.BackstopLoanRequest) => this.post<S.Loan>("/v1/loan/borrow-backstop", req);
+  /** A direct loan offer to another company; the principal is escrowed from our vault in that region. */
+  offerLoan = (req: S.OfferLoanRequest) => this.post<S.Loan>("/v1/loan/offer", req);
+  acceptLoan = (loanId: string) => this.post<S.Loan>("/v1/loan/accept", { loan_id: loanId });
+  declineLoan = (loanId: string) => this.post<S.Loan>("/v1/loan/decline", { loan_id: loanId });
+  /** Withdraws a direct loan offer we made. */
+  withdrawLoanOffer = (loanId: string) => this.post<S.Loan>("/v1/loan/withdraw", { loan_id: loanId });
+  /** Pays `amountPence` (omitted: everything owed) from our vault in the loan's region: interest to date first, then principal. */
+  repayLoan = (loanId: string, amountPence?: number) =>
+    this.post<S.Loan>("/v1/loan/repay", { loan_id: loanId, amount_pence: amountPence });
+  /** A standing offer on the credit board (escrows `available_pence`). */
+  postLoanOffer = (req: S.PostBoardOfferRequest) => this.post<S.BoardOffer>("/v1/loan/post-offer", req);
+  /** A loan request on the credit board. */
+  postLoanRequest = (req: S.PostLoanRequestRequest) => this.post<S.BoardRequest>("/v1/loan/post-request", req);
+  /** Borrows from a standing board offer at its rate, pledging what its collateral kind needs. */
+  takeLoanOffer = (req: S.TakeBoardOfferRequest) => this.post<S.Loan>("/v1/loan/take-offer", req);
+  /** Lends a standing board request. */
+  fundLoanRequest = (requestId: string) => this.post<S.Loan>("/v1/loan/fund-request", { request_id: requestId });
+  /** Takes one of our board offers (returning what it had left) or requests off the board. No body (204). */
+  withdrawBoardEntry = (entryId: string) => this.post<void>("/v1/loan/withdraw-board-entry", { entry_id: entryId });
+
+  // ── Banks ───────────────────────────────────────────────────────────────────
+
+  /** Every bank open or winding down, largest first. */
+  banks = () => this.get<S.BankResult[]>("/v1/bank/list");
+  bankStatus = (companyId: string) => this.get<S.BankResult>("/v1/bank/status", { company_id: companyId });
+  /** Our deposits (for a bank, the deposits it holds). */
+  deposits = () => this.get<S.DepositResult[]>("/v1/bank/deposits");
+  deposit = (req: S.DepositRequest) => this.post<S.DepositResult>("/v1/bank/deposit", req);
+  /** A demand deposit is paid at once as far as the bank's cash reaches; a notice deposit after its notice. */
+  withdrawDeposit = (depositId: string, amountPence?: number) =>
+    this.post<S.DepositResult>("/v1/bank/withdraw", { deposit_id: depositId, amount_pence: amountPence });
+  /** Takes a royal banking charter on these terms. */
+  charterBank = (req: S.BankTermsRequest) => this.post<S.BankResult>("/v1/bank/charter", req);
+  /** Our bank's terms for new deposits. */
+  setBankTerms = (req: S.BankTermsRequest) => this.post<S.BankResult>("/v1/bank/terms", req);
+  windDownBank = () => this.post<S.BankResult>("/v1/bank/wind-down");
+
+  // ── Ventures (commenda) ─────────────────────────────────────────────────────
+
+  /** With `port_id`: ventures raising capital there. Without: our own ventures and those we hold a stake in. */
+  ventures = (filter: { port_id?: string; status?: string } = {}) => this.get<S.Venture[]>("/v1/venture/list", filter);
+  openVenture = (req: S.OpenVentureRequest) => this.post<S.Venture>("/v1/venture/open", req);
+  investInVenture = (ventureId: string, amountPence: number) =>
+    this.post<S.Venture>("/v1/venture/invest", { venture_id: ventureId, amount_pence: amountPence });
+  /** An IOC buy into the venture's ship at its origin, reimbursed at once from the venture's capital. */
+  buyVentureCargo = (req: S.VentureTradeRequest) => this.post<S.Venture>("/v1/venture/buy", req);
+  /** Sells the venture's cargo at its destination. */
+  sellVentureCargo = (req: S.VentureTradeRequest) => this.post<S.Venture>("/v1/venture/sell", req);
+  /** Settles our venture (before sailing: cancels it). */
+  settleVenture = (ventureId: string) => this.post<S.Venture>("/v1/venture/settle", { venture_id: ventureId });
+
+  // ── Ship shares (64ths) ─────────────────────────────────────────────────────
+
+  /** Open listings of ship 64ths (of one ship, or all). */
+  shareListings = (shipId?: string) => this.get<S.ShareListing[]>("/v1/ship-shares/listings", { ship_id: shipId });
+  /** Our 64ths of other companies' ships, and our ships with outside holders. */
+  shareHoldings = () => this.get<S.ShareHolding[]>("/v1/ship-shares/holdings");
+  listShares = (req: S.ListSharesRequest) => this.post<S.ShareListing>("/v1/ship-shares/list", req);
+  buyShares = (listingId: string) => this.post<S.ShareListing>("/v1/ship-shares/buy", { listing_id: listingId });
+  cancelShareListing = (listingId: string) => this.post<S.ShareListing>("/v1/ship-shares/cancel", { listing_id: listingId });
+
+  // ── Intelligence envelopes ──────────────────────────────────────────────────
+
+  /** Public: open envelopes for sale anywhere, newest first (never their contents). */
+  envelopes = (
+    filter: { port_id?: string; category?: S.EnvelopeCategory; covers_port_id?: string; cursor?: string; limit?: number } = {},
+  ) => this.get<S.EnvelopeListing[]>("/v1/envelope/list", filter);
+  /** Every page of an envelope listing (200 a page). */
+  envelopePages = (filter: Omit<NonNullable<Parameters<KibbClient["envelopes"]>[0]>, "cursor" | "limit"> = {}, maxPages = 10) =>
+    pages((cursor) => this.envelopes({ ...filter, cursor, limit: 200 }), (e) => e.id, 200, maxPages);
+  /** Envelopes we sealed (any status) or bought, with their contents. */
+  myEnvelopes = (filter: { role?: S.EnvelopeRole; cursor?: string; limit?: number } = {}) =>
+    this.get<S.EnvelopeDetail[]>("/v1/envelope/mine", filter);
+  /** Every page of our envelopes (200 a page). */
+  myEnvelopePages = (filter: { role?: S.EnvelopeRole } = {}, maxPages = 10) =>
+    pages((cursor) => this.myEnvelopes({ ...filter, cursor, limit: 200 }), (e) => e.id, 200, maxPages);
+  /** Seals news we hold at a port with quay presence and lists it (at most 20 open). */
+  postEnvelope = (req: S.PostEnvelopeRequest) => this.post<S.EnvelopeDetail>("/v1/envelope/post", req);
+  /** Needs presence (storage tier or better) at the envelope's port. */
+  buyEnvelope = (envelopeId: string) => this.post<S.EnvelopeDetail>("/v1/envelope/buy", { envelope_id: envelopeId });
+  withdrawEnvelope = (envelopeId: string) => this.post<S.EnvelopeListing>("/v1/envelope/withdraw", { envelope_id: envelopeId });
 }

@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
+import { useOurCompanyIds } from "@/components/kibb/naval-common";
 import { Field, GoodSelect, PortSelect, ShipSelect } from "@/components/kibb/pickers";
 import {
   AutopilotWarning,
@@ -89,12 +90,45 @@ function Toggle<T extends string>({ value, options, onChange }: { value: T; opti
   );
 }
 
+/** Who holds a monopoly, from our side: this company, another of our player's (still barred), or someone else. */
+type Holder = "you" | "sibling" | "other";
+
+/** Royal monopolies in force on goods of this port's region (guide 3.9). */
+function MonopolyBanner({ monopolies, holderOf, region }: { monopolies: S.MonopolyResult[]; holderOf: (m: S.MonopolyResult) => Holder; region: string }) {
+  const { goodName } = useCatalog();
+  return (
+    <div className="space-y-1.5 rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+      {monopolies.map((m) => {
+        const h = holderOf(m);
+        return (
+          <p key={m.id}>
+            <strong>Royal monopoly on {goodName(m.commodity_id)}</strong> in {region.replace(/_/g, " ")}, held by{" "}
+            {h === "you" ? "you" : h === "sibling" ? `your other company ${m.holder_company_name} (this one is barred too)` : m.holder_company_name} until{" "}
+            {fmtDateTime(m.expires_at)}.{" "}
+            {h === "you"
+              ? "Only you buy it from the Crown's asks at this region's ports, and only your resting bids are filled by the Crown's ladder."
+              : "Here you can buy it only from players' resting asks (the holder's or others'): an IOC buy only the monopoly kept from filling is refused (409), and a GTC bid rests unfilled by the Crown's ladder."}
+          </p>
+        );
+      })}
+      <p className="text-xs">
+        Selling to the Crown is unaffected.{" "}
+        <Link href="/monopolies" className="underline">
+          Monopolies
+        </Link>
+      </p>
+    </div>
+  );
+}
+
 function OrderForm({
   port,
   book,
   customsBps,
   ships,
   autopilot,
+  monopoly,
+  holder,
   onDone,
 }: {
   port: string;
@@ -102,6 +136,9 @@ function OrderForm({
   customsBps: number;
   ships: ShipResult[];
   autopilot: Set<string>;
+  /** A royal monopoly in force on this good in the port's region. */
+  monopoly?: S.MonopolyResult;
+  holder?: Holder;
   onDone: () => void;
 }) {
   const { goodName } = useCatalog();
@@ -194,6 +231,14 @@ function OrderForm({
         </label>
       )}
       {effShip && autopilot.has(effShip) && <AutopilotWarning shipName={ship?.ship.name} />}
+      {side === "bid" && monopoly && holder !== "you" && (
+        <p className="rounded-md bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+          Under royal monopoly ({monopoly.holder_company_name}{holder === "sibling" ? ", your other company" : ""}): you can buy only from players&apos; resting asks.{" "}
+          {tif === "ioc"
+            ? "If only the monopoly keeps this buy from filling, it is refused (409)."
+            : "A resting bid is never filled by the Crown's ladder; only players' asks cross it."}
+        </p>
+      )}
       <KV
         rows={
           side === "bid"
@@ -629,6 +674,18 @@ function MarketView() {
   const [good, setGood] = useState<string | null>(null);
 
   const { data: book, error, reload } = usePoll(port ? () => kibbGet<PortOrderBook>("/v1/market/book", { port_id: port }) : null, 10_000, [port]);
+  // Royal monopolies bar non-holders from the Crown's asks across the whole banking region (guide 3.9).
+  const ourIds = useOurCompanyIds();
+  const region = catalog?.ports.find((p) => p.id === port)?.banking_region ?? "";
+  const { data: monopolies } = usePoll(
+    region ? () => kibbGet<S.MonopolyResult[]>("/v1/world/monopolies", { banking_region: region, limit: 200 }) : null,
+    60_000,
+    [region],
+  );
+  const inForce = (monopolies ?? []).filter((m) => m.in_force && m.banking_region === region);
+  const monopolyOf = (good: string) => inForce.find((m) => m.commodity_id === good);
+  const holderOf = (m: S.MonopolyResult): Holder =>
+    m.holder_company_id === profile?.company.id ? "you" : ourIds.has(m.holder_company_id) ? "sibling" : "other";
 
   const ports = (catalog?.ports ?? [])
     .filter((p) => p.phase <= (clock?.unlocked_phase ?? 1))
@@ -682,6 +739,8 @@ function MarketView() {
             <ErrorNote error={error} />
           )}
 
+          {inForce.length > 0 && <MonopolyBanner monopolies={inForce} holderOf={holderOf} region={region} />}
+
           {book && book.port_id === port && (
             <div className="grid items-start gap-4 xl:grid-cols-3">
               <Panel
@@ -706,7 +765,19 @@ function MarketView() {
                           onClick={() => setGood(b.commodity_id)}
                           className={`cursor-pointer hover:bg-accent/50 ${good === b.commodity_id ? "bg-accent" : ""}`}
                         >
-                          <td className="font-medium">{goodName(b.commodity_id)}</td>
+                          <td className="font-medium">
+                            {goodName(b.commodity_id)}
+                            {monopolyOf(b.commodity_id) && (
+                              <Badge
+                                variant={holderOf(monopolyOf(b.commodity_id)!) === "you" ? "info" : "warning"}
+                                size="sm"
+                                className="ml-1.5"
+                                title={`Royal monopoly: ${monopolyOf(b.commodity_id)!.holder_company_name}`}
+                              >
+                                {holderOf(monopolyOf(b.commodity_id)!) === "you" ? "your monopoly" : "monopoly"}
+                              </Badge>
+                            )}
+                          </td>
                           <td className="tabular-nums">{bid ? `${fmtCr(bid, 2)} × ${b.best_bid!.quantity}` : "—"}</td>
                           <td className="tabular-nums">{ask ? `${fmtCr(ask, 2)} × ${b.best_ask!.quantity}` : "—"}</td>
                           <td className="text-muted-foreground tabular-nums">{bid && ask ? fmtCr(ask - bid, 2) : "—"}</td>
@@ -727,6 +798,8 @@ function MarketView() {
                       customsBps={book.customs_bps}
                       ships={ships ?? []}
                       autopilot={autopilot}
+                      monopoly={monopolyOf(selected.commodity_id)}
+                      holder={monopolyOf(selected.commodity_id) ? holderOf(monopolyOf(selected.commodity_id)!) : undefined}
                       onDone={() => {
                         void reload();
                         void reloadShips();

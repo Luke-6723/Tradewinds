@@ -2,19 +2,19 @@
  * Which other companies' voyage policies to underwrite, and how big a slice (pure; the fleet
  * manager polls the public policy list and places the slices).
  *
- * The edge comes from Lloyd's: it writes only when the premium is at least ceil(1.25 × its
- * expected loss) + 25 bps, and its loss estimate is cautious. So a policy someone other than us
- * has already partly covered (in practice Lloyd's, which locks at most 10% of its funds on one
- * policy) implies that policy's expected loss is at most (premium − 25) / 1.25, and a slice of it
- * earns at least 0.2 × premium + 20 bps of the collateral. That bound holds for this ship, this
- * voyage and today's piracy; a bound borrowed from other ships on the lane wouldn't, so policies
- * nobody has covered are left alone: young ones wait for Lloyd's review, older ones were declined.
- * Losses are real: a sinking pays out the whole slice of the sum insured, a pirate or storm hit up
- * to a quarter of the declared cargo. So slices are small, capped per policy and in total, and
- * only on fresh policies whose ship is most likely still in port.
+ * The edge comes from Lloyd's: every policy still open for underwriting is listed with Lloyd's own
+ * estimate of its expected loss (`lloyds_expected_loss_bps`, an upper bound on the claim: legs summed,
+ * rescues undercounted) and the margin over it (`premium_margin_bps` = premium − that bound), so a
+ * slice earns at least that margin of its collateral. Lloyd's only looks at listings about a game hour
+ * old, every couple of game hours, so players get first pick: a fresh policy at a positive margin is
+ * ours if we take it before Lloyd's does. A listing without the estimate is no longer open for
+ * underwriting (sailed, fully covered, expired, or no route): never written. Losses are real: a sinking or a
+ * capture pays out the whole slice of the sum insured, a storm up to a quarter of the declared cargo,
+ * pirates who let the ship go up to what they seized of it (at most half). So slices are small, capped
+ * per policy and in total.
  */
 
-import type { InsurancePolicy } from "../schema";
+import type { InsurancePolicyListing } from "../schema";
 
 export interface UnderwriteRules {
   /** Our player's company ids: never our own policies. */
@@ -27,12 +27,12 @@ export interface UnderwriteRules {
   lockedPence: number;
   /** Most collateral on one policy (pence). */
   maxPerPolicyPence: number;
-  /** Least edge over the Lloyd's-implied expected loss (bps of the sum insured). */
+  /** Least edge over Lloyd's expected loss (bps of the sum insured). */
   minEdgeBps: number;
-  /** Every policy any of our companies has a slice of, whatever its status: their cover is ours, not Lloyd's. */
+  /** Every policy any of our companies has a slice of, whatever its status: never written on again. */
   held: Set<string>;
   /** The insured's public record on this lane and cover (rival intel), if known. */
-  record?: (p: InsurancePolicy) => { closed: number; losses: number } | undefined;
+  record?: (p: InsurancePolicyListing) => { closed: number; losses: number } | undefined;
 }
 
 export interface UnderwriteRow {
@@ -44,7 +44,7 @@ export interface UnderwriteRow {
   insured: number;
   premiumBps: number;
   coveredBps: number;
-  /** Upper bound on the expected loss implied by the policy's own cover (bps), or null. */
+  /** Upper bound on the expected loss (bps): Lloyd's estimate on the listing; null without it. */
   lossBoundBps: number | null;
   edgeBps: number | null;
   sliceBps: number;
@@ -53,31 +53,45 @@ export interface UnderwriteRow {
   verdict: string;
 }
 
-/** Lloyd's writes at most this long after listing, and ships leave soon after cover: older is likely at sea. */
+/** Without Lloyd's estimate on the listing, a policy this old (game hours) has probably sailed. */
 const MAX_AGE_GAME_HOURS = 36;
-/** Lloyd's reviews policies open about a game hour, every couple of game hours: uncovered past this, it declined. */
-const LLOYDS_REVIEW_GAME_HOURS = 4;
-/** Smallest slice the game accepts, and its step. */
+/** Lloyd's looks at listings about a game hour old: before that the pick is ours. */
+const FIRST_PICK_GAME_HOURS = 1;
+/** Smallest slice the game accepts, and its step; a remainder under the minimum may be taken whole. */
 const MIN_SLICE = 500;
 const SLICE_STEP = 100;
 /** Closed policies needed before an insured's own record on a lane counts. */
 const RECORD_MIN = 8;
 
-const coverOf = (p: InsurancePolicy): "hull" | "cargo" => (p.insured_value_pence <= p.hull_value_pence ? "hull" : "cargo");
+const coverOf = (p: InsurancePolicyListing): "hull" | "cargo" => (p.insured_value_pence <= p.hull_value_pence ? "hull" : "cargo");
+
+/**
+ * The most a slice of this policy may be (bps), within `capBps` of collateral: steps of 100 from 500 up to
+ * what is uncovered, or a remainder under 500 whole (guide 3.6). 0 when no slice fits.
+ */
+export function sliceFor(coveredBps: number, capBps = 10_000): number {
+  const uncovered = Math.max(0, 10_000 - coveredBps);
+  if (uncovered <= 0) return 0;
+  if (uncovered < MIN_SLICE) return capBps >= uncovered ? uncovered : 0;
+  const slice = Math.floor(Math.min(uncovered, capBps) / SLICE_STEP) * SLICE_STEP;
+  return slice >= MIN_SLICE ? slice : 0;
+}
 
 /** Best (highest-edge) first; rows that can't be written keep their order after them. */
-export function judgePolicies(policies: InsurancePolicy[], rules: UnderwriteRules): UnderwriteRow[] {
+export function judgePolicies(policies: InsurancePolicyListing[], rules: UnderwriteRules): UnderwriteRow[] {
   let room = Math.max(0, rules.budgetPence - rules.lockedPence);
   const rows: UnderwriteRow[] = [];
   // The same policy can come from more than one list: judge it once.
-  const open = [...new Map(policies.filter((p) => p.status === "open" || p.status === "active").map((p) => [p.id, p])).values()].sort(
-    (a, b) => b.premium_bps - a.premium_bps,
-  );
+  const open = [...new Map(policies.filter((p) => p.status === "open" || p.status === "active").map((p) => [p.id, p])).values()];
+  // Best margins first (the budget goes to them; Lloyd's takes what is left once a listing is an hour old).
+  const margin = (p: InsurancePolicyListing) => p.premium_margin_bps ?? -Infinity;
+  open.sort((a, b) => margin(b) - margin(a) || b.premium_bps - a.premium_bps);
   for (const p of open) {
-    // Cover that isn't ours: what Lloyd's (most likely) wrote, so the premium passed its test.
-    const vetted = p.covered_bps > 0 && !rules.held.has(p.id);
-    const lossBound = vetted ? Math.max(0, (p.premium_bps - 25) / 1.25) : null;
-    const edge = lossBound !== null ? p.premium_bps - lossBound : null;
+    // Lloyd's own estimate, listed only while the policy is open for underwriting (its ship in port at the origin, under
+    // 100% covered, unexpired, a route open): without it, never written.
+    const listed = typeof p.lloyds_expected_loss_bps === "number";
+    const lossBound = listed ? Math.max(0, p.lloyds_expected_loss_bps!) : null;
+    const edge = listed && typeof p.premium_margin_bps === "number" ? p.premium_margin_bps : lossBound !== null ? p.premium_bps - lossBound : null;
     const row: UnderwriteRow = {
       policy: p.id,
       lane: `${p.origin_port_id} → ${p.dest_port_id}`,
@@ -96,33 +110,33 @@ export function judgePolicies(policies: InsurancePolicy[], rules: UnderwriteRule
     rows.push(row);
 
     const ageGameHours = (rules.now - Date.parse(p.created_at)) / (60 * rules.gameMinuteMs);
-    const uncovered = Math.floor((10_000 - p.covered_bps) / SLICE_STEP) * SLICE_STEP;
     // Sinkings alone are a lower bound on the insured's loss rate (partial losses never show): this only refuses.
     const rec = edge !== null && edge >= rules.minEdgeBps ? rules.record?.(p) : undefined;
     if (rules.ours.has(p.insured_company_id)) row.verdict = "our own company";
     else if (rules.held.has(p.id)) row.verdict = "we hold a slice";
-    else if (ageGameHours > MAX_AGE_GAME_HOURS) row.verdict = "too old: the ship has probably sailed";
-    else if (edge === null)
-      row.verdict = ageGameHours > LLOYDS_REVIEW_GAME_HOURS ? "Lloyd's reviewed it and declined" : "waiting for Lloyd's review";
+    // The estimate is listed only while the policy is open for underwriting: without it, likely sailed.
+    else if (!listed) row.verdict = ageGameHours > MAX_AGE_GAME_HOURS ? "too old: the ship has probably sailed" : "no Lloyd's estimate listed (sailed, or no route)";
+    else if (edge === null) row.verdict = "no bound on its expected loss";
     else if (edge < rules.minEdgeBps) row.verdict = `edge ${Math.round(edge)} bps under the ${rules.minEdgeBps} bps minimum`;
     else if (rec && rec.closed >= RECORD_MIN && (rec.losses / rec.closed) * 10_000 > lossBound!)
       row.verdict = `the insured sank ${rec.losses} of ${rec.closed} on this lane: worse than Lloyd's bound`;
-    else if (uncovered < MIN_SLICE) row.verdict = "fully covered";
+    else if (sliceFor(p.covered_bps) === 0) row.verdict = "fully covered";
     else {
-      // The biggest slice the per-policy cap and the remaining budget allow, in 100 bps steps.
+      // The biggest slice the per-policy cap and the remaining budget allow (100 bps steps, or a small remainder whole).
       const cap = Math.min(rules.maxPerPolicyPence, room);
-      const slice = Math.min(uncovered, Math.floor(((cap * 10_000) / p.insured_value_pence) / SLICE_STEP) * SLICE_STEP);
-      if (slice < MIN_SLICE) row.verdict = room < rules.maxPerPolicyPence ? "budget used up" : "a 5% slice locks more than the per-policy cap";
+      const slice = sliceFor(p.covered_bps, (cap * 10_000) / p.insured_value_pence);
+      if (slice === 0) row.verdict = room < rules.maxPerPolicyPence ? "budget used up" : "the smallest slice locks more than the per-policy cap";
       else {
         row.sliceBps = slice;
-        row.collateral = Math.round((p.insured_value_pence * slice) / 10_000);
-        row.premiumShare = Math.round((p.total_premium_pence * slice) / 10_000);
-        row.verdict = "write";
+        row.collateral = Math.ceil((p.insured_value_pence * slice) / 10_000);
+        row.premiumShare = Math.floor((p.total_premium_pence * slice) / 10_000);
+        row.verdict = ageGameHours < FIRST_PICK_GAME_HOURS ? "write (first pick, before Lloyd's looks)" : "write";
         room -= row.collateral;
       }
     }
   }
   // Writable first, then those with an edge, then the rest.
-  const rank = (r: UnderwriteRow) => (r.verdict === "write" ? 0 : r.edgeBps !== null ? 1 : 2);
+  const writable = (r: UnderwriteRow) => r.sliceBps > 0 && r.verdict.startsWith("write");
+  const rank = (r: UnderwriteRow) => (writable(r) ? 0 : r.edgeBps !== null ? 1 : 2);
   return rows.sort((a, b) => rank(a) - rank(b) || (b.edgeBps ?? 0) - (a.edgeBps ?? 0));
 }

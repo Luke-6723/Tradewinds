@@ -29,11 +29,20 @@
  *   KIBB_RESIZE=0         don't size each load again at its source (and spend as before)
  *   KIBB_CASH_DUE         % of the cash our ships at sea are due to be paid that loads may count on (default 60; 0: cash in hand only)
  *   KIBB_WORLD_EVENTS=0   don't plan on world events' prices or on crisis charters not yet listed
+ *   KIBB_LEVERAGE=0       never borrow (on by default: bridge a new ship or a load cash can't fund, when it clearly pays;
+ *                         the key needs treasury_remit)
+ *   KIBB_MAX_DEBT_PCT     most owed on loans, % of net worth (default 25)
+ *   KIBB_MIN_LOAN_RETURN_X  a loan must earn this many times its interest over its term (default 2)
+ *   KIBB_IDLE_CASH=0      don't lend vault cash above the wealth levy's 500,000 Cr threshold on the credit board
+ *   KIBB_SHIP_DEALS=0     don't buy ships for sale under building cost, nor build commissions to order
+ *   KIBB_ENVELOPES=0      don't sell sealed news (intelligence envelopes) from our quays
  *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY. Live it may set any
  *                         setting but its own within your ceilings (KIBB_MAX_SHIPS and the marque and underwriting budgets
  *                         never exceeded, KIBB_RESERVE_CR only raised), ban ports/zones/goods/charters, order single ships,
- *                         order one build, and issue marques or patrols within the marque budget (1,000 Cr in 24 h by
- *                         default; an issued one can't be withdrawn); every order and its outcome is logged
+ *                         order one build, issue marques or patrols within the marque budget (1,000 Cr in 24 h by
+ *                         default; an issued one can't be withdrawn), and give money orders (borrow for a load or a hull
+ *                         within the debt cap, repay a loan early, build a commission to order) through every check;
+ *                         every order and its outcome is logged
  *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 2)
  *   KIBB_AI_MODEL         claude-opus-5-5 (default) | claude-sonnet-5-5
  *   KIBB_AI_EFFORT        low (default) | medium | high
@@ -74,6 +83,12 @@ try {
       resizeLoads: env.KIBB_RESIZE ? env.KIBB_RESIZE !== "0" : undefined,
       cashDuePct: env.KIBB_CASH_DUE ? Number(env.KIBB_CASH_DUE) : undefined,
       actOnEvents: env.KIBB_WORLD_EVENTS ? env.KIBB_WORLD_EVENTS !== "0" : undefined,
+      leverage: env.KIBB_LEVERAGE ? env.KIBB_LEVERAGE !== "0" : undefined,
+      maxDebtPct: env.KIBB_MAX_DEBT_PCT ? Number(env.KIBB_MAX_DEBT_PCT) : undefined,
+      minLoanReturnX: env.KIBB_MIN_LOAN_RETURN_X ? Number(env.KIBB_MIN_LOAN_RETURN_X) : undefined,
+      idleCash: env.KIBB_IDLE_CASH ? env.KIBB_IDLE_CASH !== "0" : undefined,
+      shipDeals: env.KIBB_SHIP_DEALS ? env.KIBB_SHIP_DEALS !== "0" : undefined,
+      envelopes: env.KIBB_ENVELOPES ? env.KIBB_ENVELOPES !== "0" : undefined,
       ai: env.KIBB_AI ? (env.KIBB_AI as FleetSettings["ai"]) : undefined,
       aiDailyCapUsd: env.KIBB_AI_DAILY_USD ? Number(env.KIBB_AI_DAILY_USD) : undefined,
       aiTotalCapUsd: env.KIBB_AI_TOTAL_USD ? Number(env.KIBB_AI_TOTAL_USD) : undefined,

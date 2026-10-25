@@ -15,10 +15,12 @@ import {
   Table,
 } from "@/components/kibb/bits";
 import { FleetPanel } from "@/components/kibb/fleet-panel";
+import { useOurCompanyIds, useOurCompanyNames } from "@/components/kibb/naval-common";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { kibbGet } from "@/lib/kibb/browser";
 import { fmtCr, fmtIn, fmtTons } from "@/lib/kibb/format";
+import { bonusSplit } from "@/lib/kibb/rivals";
 import type {
   CompanyProfile,
   ContractListing,
@@ -111,16 +113,19 @@ function VaultsPanel({ profile }: { profile: CompanyProfile | undefined }) {
 function ChartersPanel({
   expansion,
   charters,
-  companyName,
+  ourNames,
 }: {
   expansion: ExpansionStatus | undefined;
   charters: ContractListing[] | undefined;
-  companyName: string | undefined;
+  ourNames: Set<string>;
 }) {
   const { portName, goodName } = useCatalog();
+  const ourIds = useOurCompanyIds();
   const tier = expansion?.current_tier;
   const tierIds = new Set(tier?.charters.map((c) => c.contract_id));
   const others = (charters ?? []).filter((c) => !tierIds.has(c.id)).sort((a, b) => (b.reward_per_ton_pence ?? 0) - (a.reward_per_ton_pence ?? 0));
+  // The bonus splits by the square root of each player's base-valued tons, our companies pooled (guide 3.15).
+  const split = bonusSplit(tier?.contributors ?? [], ourNames);
 
   return (
     <Panel title="Charters">
@@ -132,7 +137,12 @@ function ChartersPanel({
             <div className="space-y-2">
               <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 text-sm">
                 <span className="font-medium">Phase {tier.target_phase}: {tier.title}</span>
-                <span className="text-muted-foreground text-xs">bonus {fmtCr(tier.completion_bonus_pence)} split by tons</span>
+                <span
+                  className="text-muted-foreground text-xs"
+                  title="Split among everyone who delivered, by the square root of each player's tons at base prices (a player's companies pooled): the first tons earn the most. Estimates as the board stands now; each other company counted as its own player."
+                >
+                  bonus {fmtCr(tier.completion_bonus_pence)} split by √ of each player&apos;s tons
+                </span>
               </div>
               <Progress value={tier.tons_delivered} max={tier.target_tons} />
               <div className="text-muted-foreground text-xs">
@@ -144,8 +154,8 @@ function ChartersPanel({
                     .slice()
                     .sort((a, b) => b.share_bps - a.share_bps)
                     .map((c) => (
-                      <span key={c.company_name} className={c.company_name === companyName ? "font-medium" : "text-muted-foreground"}>
-                        {c.company_name} {(c.share_bps / 100).toFixed(1)}% · ~{fmtCr((tier.completion_bonus_pence * c.share_bps) / 10_000)}
+                      <span key={c.company_name} className={ourNames.has(c.company_name) ? "font-medium" : "text-muted-foreground"}>
+                        {c.company_name} {(c.share_bps / 100).toFixed(1)}% of tons · ~{fmtCr(tier.completion_bonus_pence * (split.byCompany.get(c.company_name) ?? 0))}
                       </span>
                     ))}
                 </div>
@@ -181,7 +191,15 @@ function ChartersPanel({
                     <td>{goodName(c.commodity_id)}</td>
                     <td className="tabular-nums">{fmtTons(c.remaining_quantity)}</td>
                     <td className="tabular-nums">{fmtCr(c.reward_per_ton_pence ?? Math.floor(c.reward_pence / Math.max(1, c.quantity_required)), 2)}/t</td>
-                    <td>{c.stale && <Badge variant="outline" size="sm">gossip</Badge>}</td>
+                    <td className="space-x-1 whitespace-nowrap">
+                      {c.stale && <Badge variant="outline" size="sm">gossip</Badge>}
+                      {/* Posted by one of our companies: the game refuses our deliveries to it. */}
+                      {c.issuer_company_id && ourIds.has(c.issuer_company_id) ? (
+                        <Badge variant="secondary" size="sm">yours: not deliverable</Badge>
+                      ) : (
+                        c.funded_by === "issuer" && <Badge variant="outline" size="sm">player charter</Badge>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </Table>
@@ -209,8 +227,11 @@ export default function DashboardPage() {
   const escrow = profile?.vaults.filter((v) => v.account_type === "escrow").reduce((n, v) => n + v.balance_pence, 0);
   const sailing = ships?.filter((s) => s.ship.status === "sailing").length ?? 0;
   const tier = expansion?.current_tier;
-  const ours = tier?.contributors?.find((c) => c.company_name === profile?.company.name);
-  const leader = tier?.contributors?.slice().sort((a, b) => b.share_bps - a.share_bps)[0];
+  const ourNames = useOurCompanyNames(profile?.company.name);
+  // Our player's share of the bonus (our companies pooled, the square-root split), and the largest other company's.
+  const split = bonusSplit(tier?.contributors ?? [], ourNames);
+  const leader = tier?.contributors?.filter((c) => !ourNames.has(c.company_name)).sort((a, b) => b.share_bps - a.share_bps)[0];
+  const leaderShare = leader ? (split.byCompany.get(leader.company_name) ?? 0) : 0;
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
@@ -239,8 +260,8 @@ export default function DashboardPage() {
           value={tier ? `${(tier.progress_bps / 100).toFixed(1)}%` : "—"}
           sub={
             tier
-              ? `${fmtTons(tier.tons_remaining)} to go · your bonus share ${((ours?.share_bps ?? 0) / 100).toFixed(1)}%${
-                  leader && leader.company_name !== profile?.company.name ? ` (leader ${(leader.share_bps / 100).toFixed(0)}%)` : ""
+              ? `${fmtTons(tier.tons_remaining)} to go · your bonus share ${(split.ours * 100).toFixed(1)}% (~${fmtCr(tier.completion_bonus_pence * split.ours)})${
+                  leader && leaderShare > split.ours ? ` (leader ${(leaderShare * 100).toFixed(0)}%)` : ""
                 }`
               : undefined
           }
@@ -261,7 +282,7 @@ export default function DashboardPage() {
           <ShipsPanel ships={ships} />
         </div>
         <div className="min-w-0 lg:col-span-2">
-          <ChartersPanel expansion={expansion} charters={charters} companyName={profile?.company.name} />
+          <ChartersPanel expansion={expansion} charters={charters} ourNames={ourNames} />
         </div>
       </div>
     </div>

@@ -16,7 +16,7 @@ import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { RivalShip, RivalsView } from "@/lib/kibb/rivals";
 
 const LOAD_LABEL = { ballast: "in ballast", part_laden: "part laden", laden: "laden" } as const;
-const SOURCE_LABEL = { quay: "quay", policy: "policy", convoy: "convoy" } as const;
+const SOURCE_LABEL = { quay: "quay", policy: "policy", convoy: "convoy", notice: "convoy news" } as const;
 
 /** `now` and `local` are on the server's clock; `local` turns a server time into a browser one for "in"/"ago" texts. */
 function whereabouts(r: RivalShip, now: number, local: (ts: number) => string, portName: (id: string | null | undefined) => string): string {
@@ -83,10 +83,11 @@ function MarqueSettings({ view, onDone }: { view: RivalsView; onDone: () => void
       </div>
       <ErrorNote error={act.error} />
       <p className="text-muted-foreground text-xs">
-        A marque raises piracy in its zone for everyone, your ships included, and pays you a share of what pirates seize there. The
-        autopilot sponsors one, for a game day at a time, only where the rival traffic it has seen makes the expected prize money beat
-        the cost plus your own ships&apos; extra losses by half again, and never past the budget. Your lanes already price the zone&apos;s
-        piracy, so your ships steer around it when that is cheaper.
+        A marque raises piracy in its zone for everyone, your ships included, and pays you a share of what pirates seize there, less the
+        Admiral&apos;s tenth. The game prices it per zone from the last 7 game days of player traffic (60% of the prize it expects). The
+        autopilot quotes the zones with rival traffic seen and sponsors one, for a game day at a time, only where the quoted prize beats
+        the quoted cost plus your own ships&apos; extra losses (cargo seized and ships taken), and never past the budget. Your lanes already
+        price the zone&apos;s piracy, so your ships steer around it when that is cheaper.
       </p>
     </div>
   );
@@ -371,7 +372,7 @@ export default function RivalsPage() {
             {view.verdicts.length === 0 ? (
               <Empty>No rival sailings seen in the last game day.</Empty>
             ) : (
-              <Table head={["Zone", "Piracy now", "Passages", "Laden", "Cargo", "Next day", "Best marque", "Prize", "Cost", "Our losses", "Verdict"]}>
+              <Table head={["Zone", "Piracy now", "Passages", "Laden", "Cargo", "Next day", "Best marque", "Prize (quoted)", "Cost (quoted)", "Our losses", "Verdict"]}>
                 {view.verdicts.map((v) => {
                   const z = view.zones.find((x) => x.sea_zone_id === v.zone);
                   return (
@@ -386,8 +387,13 @@ export default function RivalsPage() {
                       <td className="whitespace-nowrap tabular-nums">{fmtCr(v.cargo)}</td>
                       <td className="tabular-nums">{v.next ? v.next.passages.toFixed(1) : "—"}</td>
                       <td className="tabular-nums">{fmtBps(v.best.bps)}</td>
-                      <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.prize)}</td>
-                      <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.cost)}</td>
+                      <td className="whitespace-nowrap tabular-nums">
+                        {v.best.quoted ? fmtCr(v.best.prize) : <span className="text-muted-foreground" title="Our own estimate from the rival traffic seen (not quoted)">~{fmtCr(v.best.prize)}</span>}
+                        {v.best.quoted && v.best.rivalPrize !== undefined && (
+                          <div className="text-muted-foreground text-xs" title="Our own estimate from the rival traffic seen">rivals seen ~{fmtCr(v.best.rivalPrize)}</div>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap tabular-nums">{v.best.quoted ? fmtCr(v.best.cost) : <span className="text-muted-foreground">not quoted</span>}</td>
                       <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.ownLoss)}</td>
                       <td className={`text-xs ${v.verdict === "pays" ? "text-success-foreground" : "text-muted-foreground"}`}>{v.verdict}</td>
                     </tr>
@@ -397,10 +403,14 @@ export default function RivalsPage() {
             )}
             <p className="mt-3 text-muted-foreground text-xs">
               Per game day. Passages count rival sailings seen in the last {view.windowGameHours} game hours, plus the voyages public policies and
-              convoys announce (no presence needed; next day: those not sailed yet); a convoy counts once (pirates board one ship), at its richest
+              convoys announce (no presence needed; next day: those not sailed yet), and convoys only the coffee houses&apos; news tells of (a
+              guessed part load, until a listing or a sighting shows them); a convoy counts once (pirates board one ship), at its richest
               member&apos;s cargo. Cargo is the policy&apos;s declared cargo, else estimated from each ship&apos;s class and load and the goods its port
               of departure makes. Rivals that neither insure nor pass your ports aren&apos;t counted, so these figures run low. The prize court pays
-              half the seized cargo&apos;s base value times the marques&apos; share of the zone&apos;s piracy.
+              half the seized cargo&apos;s base value (all of it when pirates take the ship) times the marques&apos; share of the zone&apos;s piracy, less
+              the Admiral&apos;s tenth. Quoted prize and cost are the game&apos;s marque quote for one game day, from every player ship&apos;s passages over
+              the last 7 game days (ours included): it pays about 1.67× its price if that traffic holds. ~ marks our own estimate where a zone
+              wasn&apos;t quoted.
             </p>
           </Panel>
         </>

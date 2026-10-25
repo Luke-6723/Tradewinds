@@ -3,15 +3,19 @@
  * I/O). Shared by the digest (the schema's enums, the ranges it shows), the advisor (validation, what is
  * in force) and the manager (the settings overlay and its hard floors).
  *
- * Ranges (the user's decisions): every setting in its full valid range, with hard floors: max ships and
- * the marque and underwriting budgets never above the user's values, the home reserve only ever raised,
- * and the AI's own settings not even nameable (they are not in the schema's enum).
+ * Ranges (the user's decisions): every setting in its full valid range, with hard floors: max ships, the
+ * marque and underwriting budgets, the debt cap and the cash due counted on never above the user's values,
+ * leverage and idle-cash lending only ever switched off (the user's "off" is a ceiling), the home reserve and a
+ * loan's required return only ever raised, and the AI's own settings not even nameable (they are not in the
+ * schema's enum). Money orders (borrow for a load or a hull, repay a loan early, build a commission to order) refer
+ * only to what the digest listed and are carried out through the autopilot's own checks.
  */
 
 import type { FleetSettings, GunPolicy } from "../fleet/manager";
 import type { Bans, Lane } from "../fleet/planner";
 import type { Catalog, ZoneClass } from "../types";
-import { MARQUE_PENCE_PER_BPS_DAY, ZONE_MARQUE_CAP } from "../rivals";
+import { PATROL_PENCE_PER_BPS_DAY, ZONE_MARQUE_CAP } from "../rivals";
+import { LOAN_MIN_PRINCIPAL_PENCE } from "../fleet/finance";
 import type { Aliases, RawAdvice } from "./digest";
 
 // ── Limits on one answer ─────────────────────────────────────────────────────
@@ -23,6 +27,9 @@ export const MAX_BIASES = 12;
 export const MAX_STALL_CALLS = 10;
 export const MAX_BANS = 12;
 export const MAX_NAVAL = 2;
+/** Money orders in one answer: one loan, and at most this many repayments and commissions each. */
+export const MAX_REPAY = 2;
+export const MAX_COMMISSIONS = 2;
 /** One order per ship; a list longer than any fleet is cut here. */
 const MAX_SHIP_ORDERS = 30;
 /** How long its directives last before they lapse (real minutes). */
@@ -52,6 +59,8 @@ export const NUMBER_KEYS = [
   "underwriteMinEdgeBps",
   "phaseChestPct",
   "cashDuePct",
+  "maxDebtPct",
+  "minLoanReturnX",
 ] as const satisfies readonly KeysOfType<FleetSettings, number>[];
 export const SWITCH_KEYS = [
   "autoBuy",
@@ -66,7 +75,13 @@ export const SWITCH_KEYS = [
   "captureEscalations",
   "actOnEvents",
   "resizeLoads",
+  "leverage",
+  "idleCash",
+  "shipDeals",
+  "envelopes",
 ] as const satisfies readonly KeysOfType<FleetSettings, boolean>[];
+/** Risky switches the user's "off" is a ceiling for: the AI may only turn them off. */
+export const CEILING_SWITCHES = ["leverage", "idleCash"] as const satisfies readonly SwitchKey[];
 /** Never the AI's: its mode, caps, model, effort and cadence. */
 export const AI_KEYS = ["ai", "aiDailyCapUsd", "aiTotalCapUsd", "aiModel", "aiEffort", "aiIntervalMin"] as const satisfies readonly (keyof FleetSettings)[];
 
@@ -96,7 +111,12 @@ const RANGES: Record<NumberKey, (v: number) => { min: number; max: number; int: 
   // Below ~50 bps the edge is inside the noise of the Lloyd's-implied bound.
   underwriteMinEdgeBps: (v) => ({ min: 50, max: Math.max(4 * v, 600), int: true }),
   phaseChestPct: () => ({ min: 0, max: 90, int: true }),
-  cashDuePct: () => ({ min: 0, max: 90, int: true }),
+  // A ceiling: never more of the cash due counted on than the user counts.
+  cashDuePct: (v) => ({ min: 0, max: Math.min(90, Math.max(0, v)), int: true }),
+  // A ceiling: what may be owed never above the user's share of net worth.
+  maxDebtPct: (v) => ({ min: 0, max: Math.max(0, v), int: false }),
+  // Only ever stricter than the user's: up to 4x.
+  minLoanReturnX: (v) => ({ min: v, max: Math.max(v, 4 * v), int: false }),
 };
 
 export function aiRange(k: NumberKey, user: FleetSettings): { min: number; max: number; int: boolean } {
@@ -116,9 +136,10 @@ export function sameSetting(a: unknown, b: unknown): boolean {
 
 /**
  * The hard floors, applied wherever settings are read (defence in depth, whatever an override says): the
- * AI's own settings are the user's, every number within its range, spend ceilings and max ships at most
- * the user's, the reserve at least the user's, only classes the user allows, and no ship buying without
- * the key's `infra_manage` scope.
+ * AI's own settings are the user's, every number within its range, spend ceilings, the debt cap, the cash due
+ * counted on and max ships at most the user's, the reserve and a loan's required return at least the user's,
+ * leverage and idle-cash lending never on while the user's are off, only classes the user allows, and no ship
+ * buying without the key's `infra_manage` scope.
  */
 export function enforceFloors(own: FleetSettings, eff: FleetSettings, caps: { canBuild: boolean }): FleetSettings {
   const out: FleetSettings = { ...eff };
@@ -130,6 +151,8 @@ export function enforceFloors(own: FleetSettings, eff: FleetSettings, caps: { ca
     w[k] = Number.isFinite(v) ? clampTo(k, v, own) : own[k];
   }
   for (const k of SWITCH_KEYS) if (typeof out[k] !== "boolean") w[k] = own[k];
+  // Borrowing and lending stay off while the user's are off.
+  for (const k of CEILING_SWITCHES) if (!own[k]) out[k] = false;
   if (!GUNS.includes(out.guns)) out.guns = own.guns;
   // One extra class comes only through a build order, never this list.
   out.buyClasses = Array.isArray(out.buyClasses) ? out.buyClasses.filter((c) => own.buyClasses.includes(c)) : own.buyClasses;
@@ -190,6 +213,14 @@ export const ORDER_CODES = [
   "server",
   "unknown_outcome",
   "horizon",
+  "switched_off",
+  "debt_cap",
+  "no_lender",
+  "not_needed",
+  "margin",
+  "deadline",
+  "gone",
+  "underwritten",
 ] as const;
 export type OrderCode = (typeof ORDER_CODES)[number];
 
@@ -224,7 +255,7 @@ export interface NavalOrder {
   zone: string;
   bps: number;
   gameHours: number;
-  /** Expected cost (pence); the game's own once issued. */
+  /** Expected cost (pence): a patrol's formula, a marque at its zone's last quoted price (0: not quoted yet, priced when issued); the game's own once issued. */
   costPence: number;
   reason: string;
   status: NavalStatus;
@@ -233,6 +264,27 @@ export interface NavalOrder {
   /** The marque or patrol it became, and when (server ms) it was sent. */
   issuedId?: string;
   sentAt?: number;
+}
+
+/**
+ * A money order, carried out with every check of the autopilot's own (the debt cap, a loan's required return and
+ * payback, cash after loads, a commission's margin, presence and deadline): `borrow_load` up to `pence` for that ship's
+ * next load at its source (leverage and re-sizing on), `borrow_hull` up to `pence` for a hull our cash can't fund (not
+ * only against cash due), `repay` that loan early in full from spare cash, `commission` build that commission to order.
+ */
+export type FinanceKind = "borrow_load" | "borrow_hull" | "repay" | "commission";
+export interface FinanceOrder {
+  id: string;
+  kind: FinanceKind;
+  /** Ship id (borrow_load), loan id (repay), commission (contract) id; "" for borrow_hull. */
+  ref: string;
+  /** The most to borrow (pence; borrows only, else 0). */
+  pence: number;
+  label: string;
+  reason: string;
+  status: OrderStatus;
+  code?: OrderCode;
+  note?: string;
 }
 
 export interface Directives {
@@ -247,6 +299,8 @@ export interface Directives {
   /** Classes the buyer may not build (folded into buyClasses while the user's list is unchanged). */
   forbid: string[];
   naval: NavalOrder[];
+  /** Borrow, repay, accept a commission (absent from older saves: normalizeActive). */
+  finance: FinanceOrder[];
 }
 
 /** The directives in force (live mode only). */
@@ -283,6 +337,7 @@ export function normalizeActive(s: StoredActive): Active {
     forbid: list(s.forbid),
     // It may have landed: never sent again, reconciled from our marques and patrols.
     naval: list(s.naval).map((n) => (n.status === "issuing" ? { ...n, status: "unknown" as const } : n)),
+    finance: list(s.finance),
   };
 }
 
@@ -305,9 +360,14 @@ export function laneBanned(l: Lane, b: Bans, currentId: (id: string) => string):
   );
 }
 
-/** What a marque or patrol costs (guide: 2 Cr per bps per game day of the term, 100 Cr at least). */
-export function navalCost(bps: number, gameHours: number): number {
-  return Math.max(NAVAL_MIN_PENCE, Math.round(MARQUE_PENCE_PER_BPS_DAY * bps * (gameHours / 24)));
+/** What a patrol costs (guide: 2 Cr per bps per game day of the term, 100 Cr at least). */
+export function patrolCost(bps: number, gameHours: number): number {
+  return marqueCost(PATROL_PENCE_PER_BPS_DAY, bps, gameHours);
+}
+
+/** A marque at its zone's quoted price per bps per game day (`marque-quote`: set by the zone's traffic), 100 Cr at least. */
+export function marqueCost(pricePerBpsDay: number, bps: number, gameHours: number): number {
+  return Math.max(NAVAL_MIN_PENCE, Math.ceil(pricePerBpsDay * bps * (gameHours / 24)));
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -329,6 +389,8 @@ export interface ValidateCtx {
   navalSpent24h: number;
   /** Each zone's marque and patrol totals (bps), as last read. */
   zoneBps: Map<string, { marque: number; patrol: number }>;
+  /** A marque's price per bps per game day (pence) in each zone, from the last quotes read; a zone not quoted is priced when issued. */
+  marquePrice: Map<string, number>;
   gameMinuteMs: number;
 }
 
@@ -346,7 +408,7 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
   let dropped = 0;
   const text = (s: unknown, n = 200) => String(s ?? "").slice(0, n);
   const horizonMin = Math.round(Math.min(HORIZON_MAX, Math.max(HORIZON_MIN, Number(raw.horizonMin) || 60)));
-  const d: Directives = { settings: {}, settingReasons: {}, avoid: [], biases: [], stallCalls: [], shipOrders: [], buyHold: null, build: null, forbid: [], naval: [] };
+  const d: Directives = { settings: {}, settingReasons: {}, avoid: [], biases: [], stallCalls: [], shipOrders: [], buyHold: null, build: null, forbid: [], naval: [], finance: [] };
   const set = (k: OverrideKey, v: unknown, reason: unknown) => {
     (d.settings as Record<string, unknown>)[k] = v;
     d.settingReasons[k] = text(reason);
@@ -372,7 +434,8 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
   for (const s of list(raw.switches)) {
     items++;
     const k = s?.key as SwitchKey;
-    if (!SWITCH_KEYS.includes(k) || seen.has(k) || typeof s.value !== "boolean" || (k === "autoBuy" && s.value && !ctx.canBuild)) {
+    const ceiling = (CEILING_SWITCHES as readonly string[]).includes(k) && s?.value === true && !u[k];
+    if (!SWITCH_KEYS.includes(k) || seen.has(k) || typeof s.value !== "boolean" || (k === "autoBuy" && s.value && !ctx.canBuild) || ceiling) {
       dropped++;
       continue;
     }
@@ -508,7 +571,9 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
   }
 
   // Naval: an open zone each, under the zone's cap, within the horizon and what the marque budget has left
-  // over the last 24 h (reduced in 50 bps steps to what fits). Issued ones can't be withdrawn.
+  // over the last 24 h (reduced in 50 bps steps to what fits). A patrol costs 2 Cr a bps-day; a marque its
+  // zone's quoted price (traffic-set): one not quoted yet is sized and checked on its quote when issued
+  // (manager runAiNaval). Issued ones can't be withdrawn.
   const budget = Math.min(u.marqueBudgetPence, d.settings.marqueBudgetPence ?? u.marqueBudgetPence);
   let room = budget - ctx.navalSpent24h;
   const maxH = Math.min(NAVAL_TERM_MAX_H, Math.floor((horizonMin * 60_000) / (60 * ctx.gameMinuteMs)));
@@ -524,10 +589,11 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
     const hours = Math.min(maxH, Math.max(NAVAL_TERM_MIN_H, Math.round(Number(n.gameHours) || NAVAL_TERM_MIN_H)));
     const live = ctx.zoneBps.get(z.id);
     const capLeft = ZONE_MARQUE_CAP - (kind === "marque" ? (live?.marque ?? 0) : (live?.patrol ?? 0));
-    const fits = Math.floor(room / (MARQUE_PENCE_PER_BPS_DAY * (hours / 24)) / 50) * 50;
+    const price = kind === "patrol" ? PATROL_PENCE_PER_BPS_DAY : (ctx.marquePrice.get(z.id) ?? null);
+    const fits = price === null ? NAVAL_BPS_MAX : Math.floor(room / (Math.max(price, 0.1) * (hours / 24)) / 50) * 50;
     const bps = Math.min(NAVAL_BPS_MAX, capLeft, fits, Math.max(NAVAL_BPS_MIN, Math.round(asked)));
-    const cost = navalCost(bps, hours);
-    if (bps < NAVAL_BPS_MIN || cost > room) {
+    const cost = price === null ? 0 : marqueCost(price, bps, hours);
+    if (bps < NAVAL_BPS_MIN || cost > room || room < NAVAL_MIN_PENCE) {
       dropped++;
       continue;
     }
@@ -535,5 +601,48 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
     d.naval.push({ id: String(i), kind, zone: z.id, bps, gameHours: hours, costPence: cost, reason: text(n.reason), status: "pending" });
   }
 
+  // Money: one loan (for a ship of ours' next load, or a hull), early repayment of loans the digest lists, commissions the
+  // digest lists to build. Acted on through every check of the autopilot's own (debt cap, return, payback, cash, margin).
+  const money = raw.money;
+  const b = money?.borrow;
+  if (b && b.use !== "none") {
+    items++;
+    const pence = Math.round(Number(b.pence));
+    const ship = b.use === "load" ? fleet.find((s) => s.id === aliases.ships.get(b.ship)) : undefined;
+    if (!Number.isFinite(pence) || pence < LOAN_MIN_PRINCIPAL_PENCE || (b.use !== "load" && b.use !== "hull") || (b.use === "load" && !ship)) dropped++;
+    else {
+      const load = b.use === "load";
+      d.finance.push({
+        id: "b",
+        kind: load ? "borrow_load" : "borrow_hull",
+        ref: ship?.id ?? "",
+        pence,
+        label: `borrow up to ${crs(pence)} for ${load ? "a ship's next load" : "a new hull"}`,
+        reason: text(b.reason),
+        status: "pending",
+      });
+    }
+  }
+  for (const [i, r] of list(money?.repay).slice(0, MAX_REPAY).entries()) {
+    items++;
+    const loan = aliases.loans.get(r?.loan);
+    if (!loan || d.finance.some((x) => x.kind === "repay" && x.ref === loan.id)) {
+      dropped++;
+      continue;
+    }
+    d.finance.push({ id: `r${i}`, kind: "repay", ref: loan.id, pence: 0, label: `repay early a loan owing ${crs(loan.owed)}`, reason: text(r.reason), status: "pending" });
+  }
+  for (const [i, c] of list(money?.accept).slice(0, MAX_COMMISSIONS).entries()) {
+    items++;
+    const k = aliases.commissions.get(c?.commission);
+    if (!k || k.ours || !!bans?.ports.has(k.yard) || d.finance.some((x) => x.kind === "commission" && x.ref === k.id)) {
+      dropped++;
+      continue;
+    }
+    d.finance.push({ id: `k${i}`, kind: "commission", ref: k.id, pence: 0, label: `build a ${k.cls} at ${k.yard} to order for ${crs(k.price)}`, reason: text(c.reason), status: "pending" });
+  }
+
   return { d, horizonMin, items, dropped };
 }
+
+const crs = (pence: number) => `${Math.round(pence / 100).toLocaleString("en-GB")} Cr`;
