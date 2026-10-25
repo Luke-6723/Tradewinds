@@ -28,7 +28,7 @@ import type { Bans, Lane } from "../fleet/planner";
 import type { World } from "../fleet/world";
 import { mongoDb } from "../mongo";
 import { AI_MODEL_NAMES, callStructured, ClaudeCallError, claudeConfigured, describeError, notBilled, worstCaseUsd, type AiEffort } from "./claude";
-import { ADVICE_SCHEMA, buildDigest, systemPrompt, type Aliases, type DigestInput, type RawAdvice } from "./digest";
+import { ADVICE_SCHEMA, buildDigest, fromWire, systemPrompt, type Aliases, type DigestInput, type RawAdvice, type WireAdvice } from "./digest";
 import {
   BIAS_MAX,
   BIAS_MIN,
@@ -761,7 +761,7 @@ export class Advisor {
       reserved = 0;
       this.skips = 0;
       if (this.stopped) return;
-      const d = this.apply(res.json as RawAdvice, aliases, { trigger, builtAt, phase, model: res.model, costUsd: res.costUsd });
+      const d = this.apply(fromWire(res.json as WireAdvice), aliases, { trigger, builtAt, phase, model: res.model, costUsd: res.costUsd });
       // The picture as this answer left it (its own advice now in force); a discarded answer
       // doesn't count as having seen it.
       this.lastPrint = d.status === "discarded" ? null : this.fingerprint(input, this.active?.decisionId ?? null);

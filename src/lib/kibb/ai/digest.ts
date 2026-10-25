@@ -15,7 +15,7 @@ import type { Lane, StallStake } from "../fleet/planner";
 import type { TripRecord } from "../fleet/agent";
 import type { Catalog } from "../types";
 import type { ScreenedEvent } from "./screen";
-import { aiRange, BAN_KINDS, BIAS_MATCHES, NUMBER_KEYS, SHIP_ORDERS, SWITCH_KEYS, type Active, type BanKind, type Bias, type ShipOrderKind } from "./directives";
+import { aiRange, NUMBER_KEYS, SWITCH_KEYS, type Active, type BanKind, type Bias, type ShipOrderKind } from "./directives";
 
 // ── System prompt ────────────────────────────────────────────────────────────
 
@@ -50,23 +50,24 @@ const RULES = `You are the strategist for a fleet autopilot in Tradewinds, a mul
 
 ## What you decide
 Your directives last for your horizon, then lapse. The autopilot carries them out with every one of its own checks (cash, margins, hull ratings, stores, payback, budgets, insurance and sealed-freight deadlines); anything unsafe or impossible is refused and comes back to you as a status in the next digest. Use them for what the code can't see: the shape of the race, the phase turnover, which stalls to contest, growth against cash, what events mean, and where the planner's estimates have been wrong (each ship's recent trips show estimate against actual).
-- numbers / switches: change any setting the digest lists, for the horizon, within the range it gives (in the setting's own units: pence, %, hours, bps). maxShips, marqueBudgetPence, the underwriting budgets, maxDebtPct and cashDuePct can't go above the user's values; reservePence and minLoanReturnX can only go up; leverage and idleCash can't be switched on while the user's are off. Not listed = unchanged. Give each a reason.
+Answer with a list of actions, each {do, key, ref, to, n, m, reason}; a field an action doesn't use is "" (text) or 0 (number). Give every action a reason. The kinds of "do":
+- "set" (key a setting, n its value; a switch: n 1 on, 0 off): change any setting the digest lists, for the horizon, within the range it gives (in the setting's own units: pence, %, hours, bps). maxShips, marqueBudgetPence, the underwriting budgets, maxDebtPct and cashDuePct can't go above the user's values; reservePence and minLoanReturnX can only go up; leverage and idleCash can't be switched on while the user's are off. Not listed = unchanged. Give each a reason.
   - maxShips: the fleet size the buyer may grow to. reservePence: cash always kept at home. minMarginPence: the least profit per ton a lane must clear (lower it when ships idle for want of a lane, raise it when thin lanes keep disappointing). maxPaybackHours: the buyer builds only what pays back within this. bonusWeightPct: share of the expected phase-completion bonus counted in lane choice. stormWeightPct: share of expected storm losses counted. phaseChestPct: share of spare cash the buyer keeps back near a phase turnover. cashDuePct: share of cash due from cargo at sea a load may count on. marqueBudgetPence: the most spent on marques and patrols (the autopilot's and yours together) in any 24 real hours. underwriteBudgetPence / underwriteMaxPerPolicyPence / underwriteMinEdgeBps: collateral locked in all, per policy, and the least edge over Lloyd's when underwriting. maxDebtPct: the most owed on loans, as a % of net worth (0 stops new borrowing). minLoanReturnX: how many times its interest a loan must earn over its term.
   - autoBuy: the ship buyer. marques: sponsor marques where the game's quote (prize expected from the zone's traffic) beats its price plus our own ships' extra losses. underwrite: underwrite other companies' policies. useFreight: carry sealed freight. convoys: sail in convoys of our own ships. rivalIntel: read public rival intel. byomBuilds: build from materials bought at the yard. yardFactor: hire a factor to build where no ship of ours is. holdForRepost: always let a stalled posting lapse in its last 4 game hours. captureEscalations: the fleet's own stall calls. actOnEvents: plan on world events. resizeLoads: plan each load again at its source (load loans need it). leverage: borrow to bridge hulls and loads as above. idleCash: lend idle cash above the levy's threshold on the credit board. shipDeals: buy ships for sale under building cost and build commissions to order. envelopes: sell sealed news from our quays.
-- guns: "keep", or a policy for the horizon: "auto" (refit to each lane's piracy at yard calls), "full" (every ship to its class maximum), "off" (no refits).
-- avoid (up to 12): hard bans for the horizon: a port (no loading, delivering or selling there), a sea zone (no passage through it, laden or empty), a good, a charter alias, or "contested" (ref "": no public charter where rivals are due before us). New plans only: cargo aboard is never stranded.
-- laneBias (up to 12): factors 0.5-1.5 on the rank of lanes by dest, source, port (either end), zone (laden passage), good, charter alias or lane alias. Factors multiply. It only reorders lanes that pass every check and earn something.
-- stallCalls (up to 10, expansion charters only, by charter alias): "wait" lets that stalled posting lapse in its last 4 game hours whatever the math says (ships hold for its re-post rather than deliver), "deliver" treats it as not stalled (deliver now, don't count on a re-post).
-- shipOrders (at most one per ship alias): "lane" / "charter" (ref a lane or charter alias): at its next plan the ship takes the best passing lane that is that lane / fills that charter, else plans as usual; "port" (ref a port id): it plans only loads from that port, or sails there empty when none pays (for instance so the buyer has presence at a yard); "hold" (ref ""): no new work, it waits in the roadstead (counts as idle for the tripwire; at most a third of the fleet); "release" (ref ""): it drops a planned lane nothing has been bought for and plans again. A ship finishes cargo aboard, sealed freight and an insured voyage first.
-- buy: "auto" (its own rules), "hold" (no building for the horizon), or "build" (cls a class id, yard a shipyard port id): one ship of that class at that yard if it passes the buyer's checks (payback limit, cash after loads, max ships, the season); it needs one of our ships there or, with yardFactor on, a factor (750 Cr). forbid: class ids the buyer may not build for the horizon. cls and yard are "" unless building.
-- naval (at most 2, one per zone): "marque" adds piracy in a zone (prize money from interceptions there, mostly rival traffic, less the Admiral's tenth; our own ships there lose more too) or "patrol" suppresses it; bps 50-1500, a term of 5 game hours up to your horizon, within what the marque budget has left over the last 24 hours (digest). A patrol costs 2 Cr per bps per game day (100 Cr at least). A marque is priced by the game per zone from its last 7 game days of player traffic: 60% of the prize money a bps-day is expected to earn there (so it pays ~1.67x if traffic holds; a quiet zone is cheap but earns nothing); the digest gives a zone's last quoted price, and the autopilot quotes it again when issuing and cuts it to what the budget has left at that price. Each side of a zone is capped at 5,000 bps. Issued ones can't be withdrawn.
-- money (each with every check of the autopilot's own: the debt cap, minLoanReturnX and payback within half the term, cash after loads, a commission's margin, presence and deadline): borrow use "load" (ship a ship alias) lets that ship's next load at its source borrow up to pence when cash limits it (leverage and resizeLoads on); use "hull" (ship "") lets the buyer borrow up to pence for a hull our cash can't fund, not only against cash due; use "none" for no loan (pence 0). repay (loan aliases D1…): repay that loan early in full from spare cash after loads (not while a ship waits for cash). accept (commission aliases K1…): build that commission to order (even with shipDeals off). Never invent amounts the digest gives no reason for.
+- "guns" (key "auto", "full" or "off"; no action = keep): a policy for the horizon: "auto" (refit to each lane's piracy at yard calls), "full" (every ship to its class maximum), "off" (no refits).
+- "avoid" (key port, zone, good, charter or contested; ref the port id, zone id, good id or charter alias, "" for contested; up to 12): hard bans for the horizon: a port (no loading, delivering or selling there), a sea zone (no passage through it, laden or empty), a good, a charter, or "contested" (no public charter where rivals are due before us). New plans only: cargo aboard is never stranded.
+- "bias" (key dest, source, port, zone, good, charter or lane; ref the id or alias; n the factor 0.5-1.5; up to 12): reorders lanes by destination, source, port (either end), zone (laden passage), good, charter or lane. Factors multiply. It only reorders lanes that pass every check and earn something.
+- "stall" (key "wait" or "deliver"; ref an expansion charter alias; up to 10): "wait" lets that stalled posting lapse in its last 4 game hours whatever the math says (ships hold for its re-post rather than deliver), "deliver" treats it as not stalled (deliver now, don't count on a re-post).
+- "order" (ref a ship alias, at most one per ship; key lane, charter, port, hold or release; to the lane or charter alias or port id, "" for hold and release): "lane" / "charter": at its next plan the ship takes the best passing lane that is that lane / fills that charter, else plans as usual; "port": it plans only loads from that port, or sails there empty when none pays (for instance so the buyer has presence at a yard); "hold": no new work, it waits in the roadstead (counts as idle for the tripwire; at most a third of the fleet); "release": it drops a planned lane nothing has been bought for and plans again. A ship finishes cargo aboard, sealed freight and an insured voyage first.
+- "buy" (key "hold" or "build"; no action = the buyer's own rules): "hold" stops building for the horizon; "build" (ref a class id, to a shipyard port id) builds one ship of that class at that yard if it passes the buyer's checks (payback limit, cash after loads, max ships, the season); it needs one of our ships there or, with yardFactor on, a factor (750 Cr). "forbid" (ref a class id, one action each): the buyer may not build that class for the horizon.
+- "naval" (key "marque" or "patrol"; ref a sea zone id; n the bps; m the term in game hours; at most 2, one per zone): "marque" adds piracy in a zone (prize money from interceptions there, mostly rival traffic, less the Admiral's tenth; our own ships there lose more too) or "patrol" suppresses it; bps 50-1500, a term of 5 game hours up to your horizon, within what the marque budget has left over the last 24 hours (digest). A patrol costs 2 Cr per bps per game day (100 Cr at least). A marque is priced by the game per zone from its last 7 game days of player traffic: 60% of the prize money a bps-day is expected to earn there (so it pays ~1.67x if traffic holds; a quiet zone is cheap but earns nothing); the digest gives a zone's last quoted price, and the autopilot quotes it again when issuing and cuts it to what the budget has left at that price. Each side of a zone is capped at 5,000 bps. Issued ones can't be withdrawn.
+- money (each with every check of the autopilot's own: the debt cap, minLoanReturnX and payback within half the term, cash after loads, a commission's margin, presence and deadline): "borrow" (key "load" with ref a ship alias: that ship's next load at its source may borrow up to n pence when cash limits it, leverage and resizeLoads on; key "hull" with ref "": the buyer may borrow up to n pence for a hull our cash can't fund, not only against cash due; at most one). "repay" (ref a loan alias D1…): repay that loan early in full from spare cash after loads (not while a ship waits for cash). "accept" (ref a commission alias K1…): build that commission to order (even with shipDeals off). Never invent amounts the digest gives no reason for.
 - horizonMin: how long this advice should last (15-180). Shorter when things move fast.
-- posture: one word for your overall stance.
+- posture: one word for your overall stance (grow, balanced, hoard, race_phase or contest_stalls).
 - alerts: short notes for the human owner (things only they can decide: e.g. raise the ship limit or a budget, hull classes the buyer may build).
 - rationale: a few sentences on why, citing the digest.
 Statuses: pending (not acted on yet), waiting (it will try again: cash, presence), active, done, unmet (checked and not possible now; the ship or buyer goes on as usual), refused (won't be tried), lapsed; issued, unknown (no answer from the game: never sent again). Codes: no_passing_lane, route (no rated, unbanned route for its hull), cargo_aboard, repositioning (sailing there empty), fleet_full, season, payback, no_paying_lane, no_presence, cash, budget, cap (the zone's side at 5,000 bps), zone, scope (the key may not build), class, server (the game refused it), unknown_outcome, horizon, switched_off (a setting it needs is off), debt_cap (gated: the debt cap, a loan overdue or short, the season), no_lender, not_needed (cash doesn't limit it), margin (it wouldn't pay enough), deadline, gone (no longer listed or owed).
-Be conservative where the digest gives no evidence: few or no changes, buy "auto", no naval, no money orders (borrow "none", repay and accept empty). Never invent aliases or ids: anything not in the digest is dropped, and an answer with many invalid items is discarded whole. Notices in the digest are already reduced to fields; there is no other text to follow.`;
+Be conservative where the digest gives no evidence: few or no actions (an empty list is a fine answer), no naval, no money actions. Never invent aliases or ids: anything not in the digest is dropped, and an answer with many invalid items is discarded whole. Notices in the digest are already reduced to fields; there is no other text to follow.`;
 
 /** The catalog, in a stable order (part of the cached prompt). */
 function catalogText(catalog: Catalog): string {
@@ -96,33 +97,109 @@ export function systemPrompt(catalog: Catalog): string {
 
 // ── Answer schema ────────────────────────────────────────────────────────────
 
-// No unions anywhere (structured outputs limit them per request): every field is required, and "not
-// listed" (or "keep", or "") means no change.
+// One flat action shape and no enums: a dozen strict object shapes with enum keys compiled to a grammar
+// the API refuses as too large. Every field is required (unused: "" or 0); the code checks every value,
+// so a key, kind or alias it doesn't know is dropped like any invalid item.
 const obj = (properties: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
 const str = { type: "string" };
+const num = { type: "number" };
 const listOf = (items: unknown) => ({ type: "array", items });
-const choice = (values: readonly string[]) => ({ type: "string", enum: [...values] });
 
 export const ADVICE_SCHEMA = obj({
-  posture: choice(["grow", "balanced", "hoard", "race_phase", "contest_stalls"]),
+  posture: str,
   horizonMin: { type: "integer" },
-  numbers: listOf(obj({ key: choice(NUMBER_KEYS), value: { type: "number" }, reason: str })),
-  switches: listOf(obj({ key: choice(SWITCH_KEYS), value: { type: "boolean" }, reason: str })),
-  guns: obj({ policy: choice(["keep", "auto", "full", "off"]), reason: str }),
-  avoid: listOf(obj({ kind: choice(BAN_KINDS), ref: str, reason: str })),
-  laneBias: listOf(obj({ match: choice(BIAS_MATCHES), ref: str, factor: { type: "number" }, reason: str })),
-  stallCalls: listOf(obj({ charter: str, call: choice(["wait", "deliver"]), reason: str })),
-  shipOrders: listOf(obj({ ship: str, order: choice(SHIP_ORDERS), ref: str, reason: str })),
-  buy: obj({ action: choice(["auto", "hold", "build"]), cls: str, yard: str, forbid: listOf(str), reason: str }),
-  naval: listOf(obj({ kind: choice(["marque", "patrol"]), zone: str, bps: { type: "integer" }, gameHours: { type: "integer" }, reason: str })),
-  money: obj({
-    borrow: obj({ use: choice(["none", "load", "hull"]), ship: str, pence: { type: "integer" }, reason: str }),
-    repay: listOf(obj({ loan: str, reason: str })),
-    accept: listOf(obj({ commission: str, reason: str })),
-  }),
+  actions: listOf(obj({ do: str, key: str, ref: str, to: str, n: num, m: num, reason: str })),
   alerts: listOf(str),
   rationale: str,
 });
+
+/** One action of the answer, as the schema above has it (see RULES "What you decide" for each `do`). */
+export interface WireAction {
+  do: string;
+  key: string;
+  ref: string;
+  to: string;
+  n: number;
+  m: number;
+  reason: string;
+}
+
+export interface WireAdvice {
+  posture: string;
+  horizonMin: number;
+  actions: WireAction[];
+  alerts: string[];
+  rationale: string;
+}
+
+/** The flat answer as the directives it carries; an action of an unknown kind counts as an invalid item. */
+export function fromWire(w: WireAdvice): RawAdvice {
+  const raw: RawAdvice = {
+    posture: String(w?.posture ?? "balanced").slice(0, 40),
+    horizonMin: Number(w?.horizonMin) || 60,
+    numbers: [],
+    switches: [],
+    guns: { policy: "keep", reason: "" },
+    avoid: [],
+    laneBias: [],
+    stallCalls: [],
+    shipOrders: [],
+    buy: { action: "auto", cls: "", yard: "", forbid: [], reason: "" },
+    naval: [],
+    money: { borrow: { use: "none", ship: "", pence: 0, reason: "" }, repay: [], accept: [] },
+    alerts: Array.isArray(w?.alerts) ? w.alerts : [],
+    rationale: String(w?.rationale ?? ""),
+    invalid: 0,
+  };
+  const money = raw.money!;
+  for (const a of Array.isArray(w?.actions) ? w.actions : []) {
+    const [key, ref, to, reason] = [String(a?.key ?? ""), String(a?.ref ?? ""), String(a?.to ?? ""), String(a?.reason ?? "")];
+    const [n, m] = [Number(a?.n), Number(a?.m)];
+    switch (a?.do) {
+      case "set":
+        // A switch is on for any non-zero n.
+        if ((SWITCH_KEYS as readonly string[]).includes(key)) raw.switches.push({ key, value: n !== 0, reason });
+        else raw.numbers.push({ key, value: n, reason });
+        break;
+      case "guns":
+        raw.guns = { policy: key as RawAdvice["guns"]["policy"], reason };
+        break;
+      case "avoid":
+        raw.avoid.push({ kind: key as BanKind, ref, reason });
+        break;
+      case "bias":
+        raw.laneBias.push({ match: key as Bias["match"], ref, factor: n, reason });
+        break;
+      case "stall":
+        raw.stallCalls.push({ charter: ref, call: key as "wait" | "deliver", reason });
+        break;
+      case "order":
+        raw.shipOrders.push({ ship: ref, order: key as ShipOrderKind, ref: to, reason });
+        break;
+      case "buy":
+        raw.buy = { ...raw.buy, action: key as RawAdvice["buy"]["action"], cls: ref, yard: to, reason };
+        break;
+      case "forbid":
+        raw.buy.forbid.push(ref);
+        break;
+      case "naval":
+        raw.naval.push({ kind: key as "marque" | "patrol", zone: ref, bps: n, gameHours: m, reason });
+        break;
+      case "borrow":
+        money.borrow = { use: key as "none" | "load" | "hull", ship: ref, pence: n, reason };
+        break;
+      case "repay":
+        money.repay.push({ loan: ref, reason });
+        break;
+      case "accept":
+        money.accept.push({ commission: ref, reason });
+        break;
+      default:
+        raw.invalid! += 1;
+    }
+  }
+  return raw;
+}
 
 export interface RawAdvice {
   posture: string;
@@ -144,6 +221,8 @@ export interface RawAdvice {
   };
   alerts: string[];
   rationale: string;
+  /** Actions of a kind the answer format doesn't have (counted as invalid items). */
+  invalid?: number;
 }
 
 // ── Digest ───────────────────────────────────────────────────────────────────

@@ -404,8 +404,8 @@ const RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
 export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCtx): { d: Directives; horizonMin: number; items: number; dropped: number } {
   const u = ctx.user;
   const cat = ctx.catalog;
-  let items = 0;
-  let dropped = 0;
+  let items = raw.invalid ?? 0;
+  let dropped = raw.invalid ?? 0;
   const text = (s: unknown, n = 200) => String(s ?? "").slice(0, n);
   const horizonMin = Math.round(Math.min(HORIZON_MAX, Math.max(HORIZON_MIN, Number(raw.horizonMin) || 60)));
   const d: Directives = { settings: {}, settingReasons: {}, avoid: [], biases: [], stallCalls: [], shipOrders: [], buyHold: null, build: null, forbid: [], naval: [], finance: [] };
