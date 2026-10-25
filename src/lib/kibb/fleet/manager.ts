@@ -1082,6 +1082,7 @@ export class FleetManager implements FleetHost {
   /** The fleet's calls on stalled expansion postings (by `port|good`) and when worked out (local ms; 0: stale). */
   private stakes = new Map<string, StallStake>();
   private stakesAt = 0;
+  private stakesBusy = false;
   /** Whether our own deliveries under the pace line are allowed into postings let lapse, as last seen (World.ownTrickleOk). */
   private trickleOk = false;
   /** Postings being let lapse (id → `port|good`): the call's hysteresis, saved. */
@@ -2993,7 +2994,18 @@ export class FleetManager implements FleetHost {
    * it what fits under the pace line (ShipAgent.campShut). The season ending first vetoes it as well.
    */
   private stallStakes(): Map<string, StallStake> {
-    if (Date.now() - this.stakesAt < STAKES_TTL_MS) return this.stakes;
+    // Working them out reads the capital charge, whose cash due checks each load against the stakes:
+    // inside that, the last ones stand (else the two recurse without end).
+    if (this.stakesBusy || Date.now() - this.stakesAt < STAKES_TTL_MS) return this.stakes;
+    this.stakesBusy = true;
+    try {
+      return this.computeStallStakes();
+    } finally {
+      this.stakesBusy = false;
+    }
+  }
+
+  private computeStallStakes(): Map<string, StallStake> {
     const w = this.world;
     const s = this.settings;
     const now = w.now();
