@@ -99,36 +99,7 @@ export interface ApiKey {
   updated_at: string;
 }
 
-export type ApiKeyScope = "read" | "fleet_navigate" | "fleet_cargo" | "market_spot" | "market_derivatives" | "infra_manage" | "treasury_remit" | "account_manage";
-
-/** `POST /v1/loan/borrow-backstop`. */
-export interface BackstopLoanRequest {
-  banking_region?: null | BankingRegion;
-  principal_pence: PositivePence;
-  ship_id: string;
-  /** `1..=30` game days. */
-  term_game_days: number;
-}
-
-/** What the Goldsmiths' Company would lend against a ship (`GET /v1/loan/backstop-quote`). */
-export interface BackstopQuote {
-  banking_region: BankingRegion;
-  daily_rate_bps: number;
-  lender_company_id: string;
-  lender_name: string;
-  /** Most it lends, in bps of the ship's rebuild value. */
-  loan_to_value_bps: number;
-  /** The most you may borrow now: the loan-to-value cap, its per-loan cap and what it holds. */
-  max_principal_pence: Pence;
-  max_term_game_days: number;
-  rate_ceiling_bps: number;
-  /** The lowest and highest daily rate any loan may carry. */
-  rate_floor_bps: number;
-  rebuild_value_pence: Pence;
-  /** Always `true`: the Goldsmiths claim whatever the ship does not cover. */
-  recourse: boolean;
-  ship_id: string;
-}
+export type ApiKeyScope = "read" | "fleet_navigate" | "fleet_cargo" | "market_spot" | "market_derivatives" | "infra_manage" | "treasury_remit" | "account_manage" | "underworld";
 
 /** A bank, as anyone sees it (`GET /v1/bank/list`, `GET /v1/bank/status`). */
 export interface BankResult {
@@ -142,7 +113,7 @@ export interface BankResult {
   insured: boolean;
   /** How much more it may lend or lock now. */
   lending_headroom_pence: Pence;
-  /** Principal and interest owed to it on its loans, and its credit-board offers' escrow. */
+  /** Principal and interest owed to it on its loans, and its standing quotes' escrow. */
   loans_out_pence: Pence;
   name: string;
   notice_game_hours: number;
@@ -169,55 +140,25 @@ export interface BankTermsRequest {
   notice_rate_bps: number;
 }
 
-export type BankingRegion = "channel" | "north_sea" | "baltic" | "iberia" | "caribbean" | "indian_ocean" | "east_indies";
+export type BankingRegion = "channel" | "north_sea" | "baltic" | "iberia" | "caribbean" | "indian_ocean" | "east_indies" | "america";
 
-export interface BoardEntryActionRequest {
-  /** A board offer or request id. */
-  entry_id: string;
-}
-
-/** A standing offer on the credit board. */
-export interface BoardOffer {
-  /** What it still has to lend (escrowed). */
-  available_pence: Pence;
-  banking_region: BankingRegion;
-  collateral_kind: CollateralKind;
-  created_at: string;
-  daily_rate_bps: number;
-  expires_at: string;
-  id: string;
-  lender_company_id: string;
-  lender_name: string;
-  /** Most it lends, in bps of the collateral's appraisal (`null` unsecured). */
-  max_ltv_bps?: number | null;
-  max_term_game_days: number;
-  min_principal_pence: Pence;
-  recourse: boolean;
-  /** `open`, `filled`, `withdrawn` or `lapsed`. */
-  status: string;
-}
-
-/** A standing request on the credit board. */
-export interface BoardRequest {
-  banking_region: BankingRegion;
-  borrower_company_id: string;
-  borrower_name: string;
-  collateral_commodity_id?: null | CommodityId;
-  collateral_kind: CollateralKind;
-  collateral_port_id?: null | PortId;
-  collateral_ship_id?: string | null;
-  collateral_tons?: number | null;
-  created_at: string;
-  expires_at: string;
-  id: string;
-  loan_id?: string | null;
-  max_daily_rate_bps: number;
-  principal_pence: Pence;
-  /** `false`: the borrower insists on non-recourse. */
-  recourse: boolean;
-  /** `open`, `funded`, `withdrawn` or `lapsed`. */
-  status: string;
-  term_game_days: number;
+/**
+ * A borrower's record as lenders see it on its loan requests: the loan half of its
+ * [`CreditReport`].
+ */
+export interface BorrowerRecord {
+  last_default_at?: string | null;
+  /**
+   * Loans it ever defaulted on, and of those the ones it walked away from and what their
+   * lenders lost.
+   */
+  loans_defaulted: number;
+  /** Loans it owes now (active or defaulted), and what is owed on them. */
+  loans_owed: number;
+  loans_repaid: number;
+  loans_walked_away: number;
+  owed_pence: Pence;
+  walked_away_pence: Pence;
 }
 
 /** One build material in a [`BuildQuoteResult`]. */
@@ -306,6 +247,10 @@ export interface CancelCharterResult {
   released_tons: Tons;
 }
 
+export interface CancelLicenceRequest {
+  contract_id: string;
+}
+
 export interface CancelOrderRequest {
   order_id: string;
 }
@@ -321,12 +266,36 @@ export interface CancelOrdersBatchRequest {
   order_ids: string[];
 }
 
+export interface CancelUnderworldOrderRequest {
+  order_id: string;
+}
+
+export interface CancelUnderworldOrderResult {
+  order_id: string;
+  port_id: PortId;
+  /** Tons that were still resting. */
+  released_quantity: number;
+  status: string;
+}
+
 /**
  * Map of commodity quantities (in metric `tons`) currently loaded in a ship's cargo hold.
  *
  * Invariant: all stored values are strictly positive (`> 0`); zeroed entries are removed automatically.
  */
 export type CargoManifest = Record<string, number>;
+
+/** A want carried to a cove by a ship that called at the wanting port. */
+export interface CarriedWantView {
+  /** Game hours since. */
+  age_game_hours: number;
+  commodity_id: CommodityId;
+  /** The multiple (bps of base) the crew saw quoted. */
+  multiple_bps: number;
+  /** When the crew saw it. */
+  observed_at: string;
+  port_id: PortId;
+}
 
 export interface ChangePassphraseRequest {
   current_passphrase: string;
@@ -381,7 +350,7 @@ export interface CommissionResult {
   status: ContractStatus;
 }
 
-export type CommodityCategory = "provisions" | "raw_inputs" | "industrial_naval" | "european_trade" | "colonial_bullion";
+export type CommodityCategory = "provisions" | "raw_inputs" | "industrial_naval" | "european_trade" | "colonial_bullion" | "contraband";
 
 export interface CommodityDef {
   base_price_pence: number;
@@ -463,6 +432,18 @@ export interface CompanyTradeFillResult {
   side: OrderSide;
 }
 
+/** A component you own, loose in your warehouse. */
+export interface ComponentItemView {
+  component_id: string;
+  created_at: string;
+  effects: string[];
+  grade: number;
+  item_id: string;
+  name: string;
+  port_id: PortId;
+  slot: Slot;
+}
+
 export interface Contract {
   carrier_company_id?: string | null;
   carrier_ship_id?: string | null;
@@ -493,6 +474,7 @@ export interface Contract {
 export type ContractListing = Contract & {
   funded_by?: null | CharterFunding;
   gossip?: null | CharterGossip;
+  licence?: null | LicenceTerms;
   /** Tons still to deliver (`quantity_required - quantity_delivered`). */
   remaining_quantity: Tons;
   reward_per_ton_pence?: null | Pence;
@@ -510,7 +492,7 @@ export type ContractListing = Contract & {
 export type ContractStatus = "open" | "active" | "completed" | "cancelled" | "defaulted";
 
 /** Category of maritime commercial contract on the contract board. */
-export type ContractType = "charter" | "freight" | "commission";
+export type ContractType = "charter" | "freight" | "commission" | "licence_offer" | "licence_request";
 
 export interface Convoy {
   admission: ConvoyAdmission;
@@ -638,6 +620,26 @@ export type ConvoyStatus = "forming" | "sailing" | "completed" | "cancelled";
 /** Who is told about a convoy and sees it listed. */
 export type ConvoyVisibility = "public" | "private";
 
+/** One good's underworld book at a cove. */
+export interface CoveBook {
+  /** Players' resting asks, best first (aggregated by price). */
+  asks: CoveBookLevel[];
+  /** Players' resting bids, best first (aggregated by price). */
+  bids: CoveBookLevel[];
+  commodity_id: CommodityId;
+  house_ask?: null | CoveBookLevel;
+}
+
+export interface CoveBookLevel {
+  price_pence: number;
+  quantity: number;
+}
+
+export interface CoveBookResult {
+  books: CoveBook[];
+  port_id: PortId;
+}
+
 export interface CreateApiKeyRequest {
   company_id?: string | null;
   handle?: string | null;
@@ -752,13 +754,14 @@ export type CreateInsurancePolicyResult = InsurancePolicy & {
   lloyds_premium_bps?: number | null;
 };
 
-/** `GET /v1/loan/board`: the open entries of one region. */
-export interface CreditBoard {
-  banking_region: BankingRegion;
-  /** Cheapest first. */
-  offers: BoardOffer[];
-  /** Dearest first. */
-  requests: BoardRequest[];
+export interface CreateLicenceContractRequest {
+  component_id: string;
+  /** 6..=1,440 (default 240). */
+  open_game_hours?: number | null;
+  price_basis: PriceBasis;
+  price_pence: PositivePence;
+  /** 1..=1,000 licence units (one unit makes one component). */
+  units: number;
 }
 
 /** A company's public credit record (`GET /v1/loan/credit`): what it owes and how it has paid. */
@@ -778,14 +781,23 @@ export interface CreditReport {
   /** Futures default claims it ever left unpaid at default, and those written off. */
   futures_claims_total: number;
   futures_claims_written_off: number;
+  last_conviction_at?: string | null;
   last_default_at?: string | null;
   /** Principal it has out to borrowers now (active loans as lender). */
   lent_outstanding_pence: Pence;
+  loan_walked_away_pence: Pence;
   loan_written_off_pence: Pence;
   /** Loans it ever defaulted on (whatever became of them since). */
   loans_defaulted: number;
   loans_repaid: number;
+  /** Loans it walked away from (`POST /v1/loan/default`), and what their lenders lost. */
+  loans_walked_away: number;
   loans_written_off: number;
+  /**
+   * Ships the Crown seized from it for smuggling (each forfeit with everything aboard), and the
+   * last.
+   */
+  smuggling_convictions: number;
 }
 
 export interface DeclareBankruptcyResult {
@@ -1135,6 +1147,9 @@ export interface ExpansionCharterProgress {
 
 /** One company's public standing on a tier's contribution leaderboard. */
 export interface ExpansionContributor {
+  bonus_pence?: null | Pence;
+  /** Admin API only: `bonus_pence` as a share of the bonus pool, in bps. */
+  bonus_share_bps?: number | null;
   company_name: string;
   /**
    * Share of the tier's contribution (tons valued at the tier's base rates), in bps. The
@@ -1173,7 +1188,10 @@ export interface ExpansionTierStatus {
   /** Unlocked its phase. */
   completed: boolean;
   completed_at?: string | null;
-  /** Split among the contributors pro rata by `share_bps` when the tier completes. */
+  /**
+   * Split among the contributors when the tier completes, by player with diminishing returns
+   * (pro rata to the square root of each player's contribution), so not by `share_bps`.
+   */
   completion_bonus_pence: Pence;
   /** Every contributor, largest share first. */
   contributors: ExpansionContributor[];
@@ -1207,15 +1225,34 @@ export interface FactorPortRequest {
   port_id: PortId;
 }
 
-/** `POST /v1/loan/fund-request`: lend a standing request at its rate. */
-export interface FundLoanRequestRequest {
-  request_id: string;
+export interface FitComponentRequest {
+  /** A component of yours lying in your warehouse at the yard where the ship is berthed. */
+  item_id: string;
+  ship_id: string;
+}
+
+export interface FitComponentResult {
+  /** Every component now fitted to the ship. */
+  components: FittedComponentView[];
+  fitted: FittedComponentView;
+  fitting_fee_pence: number;
+  ship_id: string;
+}
+
+/** A component fitted to a ship. */
+export interface FittedComponentView {
+  component_id: string;
+  effects: string[];
+  fitted_at: string;
+  grade: number;
+  name: string;
+  slot: Slot;
 }
 
 export interface FundPatrolRequest {
   /**
-   * Term in game hours (default `60`, clamped to `5..=1440`). The price is
-   * `2 Cr` per bps per game day of it ([`crate::math::PATROL_PENCE_PER_BPS_DAY`]).
+   * Term in game hours (default `60`, clamped to `5..=1440`). The price per bps per game day
+   * of it is set by the zone's recent traffic ([`quote_naval_patrol`]) and fixed at funding.
    */
   duration_game_hours?: number | null;
   sea_zone_id: SeaZoneId;
@@ -1262,6 +1299,18 @@ export interface GameCalendarDate {
   total_game_hours: number;
   /** In-game calendar year (starting at [`GAME_START_YEAR`] = `1700`). */
   year: number;
+}
+
+/** A Goldsmiths' instant quote (`GET /v1/loan/quote`), stored for 6 game hours. */
+export interface GoldsmithsQuote {
+  /** Most it lends, in bps of the ship's rebuild value. */
+  loan_to_value_bps: number;
+  /** The most you may borrow now: the loan-to-value cap, its per-loan cap and what it holds. */
+  max_principal_pence: Pence;
+  quote: LoanQuote;
+  rebuild_value_pence: Pence;
+  /** Always `true`: the Goldsmiths claim whatever the ship does not cover. */
+  recourse: boolean;
 }
 
 /**
@@ -1505,6 +1554,49 @@ export interface LetterOfMarque {
   updated_at: string;
 }
 
+export interface LicenceTakeRequest {
+  contract_id: string;
+  /** Units to take: 1..=what is left (`per_unit`), or exactly what is left (`total`). */
+  units: number;
+}
+
+/** A licence contract's design and price terms (`licence` on a contract listing). */
+export interface LicenceTerms {
+  /** The region the money moves in: the poster's home region. */
+  banking_region: BankingRegion;
+  component_id: string;
+  effects: string[];
+  grade: number;
+  make_labour_pence: number;
+  /**
+   * What building one component takes besides the licence unit: these materials in your
+   * warehouse at the yard, and the yard's labour.
+   */
+  make_materials: MaterialLine[];
+  name: string;
+  price_basis: PriceBasis;
+  /** As posted: a unit's price (`per_unit`) or the whole lot's (`total`). */
+  price_pence: number;
+  slot: Slot;
+}
+
+/** Licence units a company holds for one design. */
+export interface LicenceView {
+  component_id: string;
+  effects: string[];
+  grade: number;
+  make_labour_pence: number;
+  /** What building one component takes besides a unit: these materials at the yard, and labour. */
+  make_materials: MaterialLine[];
+  name: string;
+  /** `held` (units are needed to make it) or `public` (anyone may: units are moot). */
+  patent_status: string;
+  slot: Slot;
+  units_granted: number;
+  units_left: number;
+  units_used: number;
+}
+
 /** `POST /v1/ship-shares/list`. */
 export interface ListSharesRequest {
   /** Paid from the buyer's vault here into yours. */
@@ -1518,6 +1610,18 @@ export interface ListSharesRequest {
 export interface ListShipRequest {
   price_pence: PositivePence;
   ship_id: string;
+}
+
+/** A live want at the port you are at. */
+export interface LiveWantView {
+  commodity_id: CommodityId;
+  /**
+   * What the want pays now for the first ton ashore, as a multiple of the good's base price
+   * (bps: `40,000` = 4x). It fades with time and each ton run ashore walks it down.
+   */
+  multiple_bps: number;
+  /** Tons the want still takes. */
+  remaining_tons: number;
 }
 
 /**
@@ -1621,6 +1725,11 @@ export type LoadState = "ballast" | "part_laden" | "laden";
 export interface Loan {
   /** Interest accrued and not yet paid. */
   accrued_interest_pence: Pence;
+  /** Interest per 360 game days, in bps of the outstanding principal, fixed at approval. */
+  annual_rate_bps?: number | null;
+  arrears_due_by?: string | null;
+  /** What a fallen-due installment still lacks, and when the loan defaults if it is not paid. */
+  arrears_pence: Pence;
   /** Disbursed into and repaid from the vaults in this region. */
   banking_region: BankingRegion;
   borrower_company_id: string;
@@ -1635,39 +1744,148 @@ export interface Loan {
   collateral_status: CollateralStatus;
   collateral_tons?: number | null;
   /**
-   * The collateral's appraisal when offered (the ship's rebuild value; goods at the local Crown
-   * merchants' bid).
+   * The collateral's appraisal when lent (the ship's rebuild value; goods at the local Crown
+   * merchants' bid; a receivable's payout).
    */
   collateral_value_pence: Pence;
   created_at: string;
-  /** Interest per game day, in bps of the outstanding principal. */
+  /**
+   * A legacy loan's interest per game day, in bps of the outstanding principal (0 for a loan
+   * by quote).
+   */
   daily_rate_bps: number;
   defaulted_at?: string | null;
   disbursed_at?: string | null;
   /** A non-recourse loan's shortfall after its collateral, cancelled by its terms. */
   extinguished_pence: Pence;
+  foreclosure_surplus_owed_pence: Pence;
+  /**
+   * What a foreclosed ship's credit exceeded the debt by: paid by the lender to the borrower,
+   * and what of it the lender still owes (collected daily from its vaults).
+   */
+  foreclosure_surplus_paid_pence: Pence;
   id: string;
+  installment_pence?: null | Pence;
   interest_accrued_through?: string | null;
   interest_paid_pence: Pence;
   lender_company_id: string;
   matures_at?: string | null;
+  /**
+   * When the next payment falls due and roughly how much it is (interest accrues until it is
+   * paid): arrears within their day of grace, else the next installment, else everything owed
+   * at maturity. `null` once the loan is no longer active.
+   */
+  next_payment_due_at?: string | null;
+  next_payment_pence?: null | Pence;
+  /** When the quote it was made from expired (a legacy offer's lapse). */
   offer_expires_at: string;
   outstanding_principal_pence: Pence;
   /** What the borrower owes now: outstanding principal plus accrued interest. */
   owed_pence: Pence;
   principal_pence: Pence;
   principal_repaid_pence: Pence;
+  quote_id?: string | null;
+  /**
+   * `annual` (every loan by quote: `annual_rate_bps`) or `daily` (a loan made before loans by
+   * quote, running to maturity on its old terms: `daily_rate_bps`).
+   */
+  rate_basis: LoanRateBasis;
   /** Whether the lender may claim what its collateral did not cover. */
   recourse: boolean;
+  /** `balloon` (everything due at maturity) or `amortised` (installments every 10 game days). */
+  repayment: LoanRepayment;
+  /** The request and quote it was made from. */
+  request_id?: string | null;
   status: LoanStatus;
   term_game_days: number;
+  total_repayable_pence?: null | Pence;
   updated_at: string;
+  /**
+   * When the borrower walked away from it (`POST /v1/loan/default`): what its collateral left
+   * owed is then extinguished, never collected.
+   */
+  walked_away_at?: string | null;
   /** Written off by the borrower's receivership. */
   written_off_pence: Pence;
 }
 
 export interface LoanActionRequest {
   loan_id: string;
+}
+
+/** A quote: a lender's answer to a request, or a Goldsmiths' instant quote. */
+export interface LoanQuote {
+  /** Interest per 360 game days, in bps of the outstanding principal, fixed for the term. */
+  annual_rate_bps: number;
+  banking_region: BankingRegion;
+  borrower_company_id: string;
+  /** A Goldsmiths' quote's ship. */
+  collateral_ship_id?: string | null;
+  created_at: string;
+  expires_at: string;
+  id: string;
+  installment_pence?: null | Pence;
+  lender_company_id: string;
+  lender_name: string;
+  loan_id?: string | null;
+  principal_pence: Pence;
+  repayment: LoanRepayment;
+  /** The request it answers (`null`: a Goldsmiths' instant quote). */
+  request_id?: string | null;
+  /** `open`, `approved` (`loan_id`), `withdrawn` or `released`. */
+  status: string;
+  term_game_days: number;
+  /** What the borrower repays in all, paying on schedule. */
+  total_repayable_pence: Pence;
+}
+
+/**
+ * How a loan's rate is expressed: `annual` (bps per 360 game days, every loan by quote) or
+ * `daily` (bps per game day, the legacy offers made before loans by quote).
+ */
+export type LoanRateBasis = "daily" | "annual";
+
+/** How a loan is repaid. */
+export type LoanRepayment = "balloon" | "amortised";
+
+/** A request for quotes, as anyone sees it (`GET /v1/loan/requests`). */
+export interface LoanRequestView {
+  banking_region: BankingRegion;
+  borrower_company_id: string;
+  borrower_name: string;
+  /**
+   * How the borrower has paid its loans so far, walk-aways included (the full record:
+   * `GET /v1/loan/credit`).
+   */
+  borrower_record: BorrowerRecord;
+  collateral_commodity_id?: null | CommodityId;
+  collateral_contract_id?: string | null;
+  collateral_kind: CollateralKind;
+  collateral_port_id?: null | PortId;
+  collateral_ship_id?: string | null;
+  collateral_tons?: number | null;
+  created_at: string;
+  expires_at: string;
+  /**
+   * The Goldsmiths' annual rate for this term, and the lowest and highest annual rate a quote
+   * may carry (a tenth to three times it), in bps.
+   */
+  goldsmiths_rate_bps: number;
+  id: string;
+  loan_id?: string | null;
+  principal_pence: Pence;
+  /** Every quote on it if it is yours; otherwise only your own. */
+  quotes: LoanQuote[];
+  rate_ceiling_bps: number;
+  rate_floor_bps: number;
+  recourse: boolean;
+  repayment: LoanRepayment;
+  /**
+   * `open`, `funded` (a quote was approved: `loan_id`), `withdrawn` (the borrower's
+   * receivership) or `lapsed`.
+   */
+  status: string;
+  term_game_days: number;
 }
 
 /** Which side of its loans a company lists. */
@@ -1683,6 +1901,25 @@ export interface LoginRequest {
   passphrase: string;
   scopes?: ApiKeyScope[] | null;
   ttl_seconds?: number | null;
+}
+
+export interface MakeComponentRequest {
+  component_id: string;
+  /** A yard where your warehouse holds the materials. */
+  port_id: PortId;
+  /** 1..=10 (default 1). */
+  quantity?: number | null;
+}
+
+export interface MakeComponentResult {
+  items: ComponentItemView[];
+  labour_pence: number;
+  /** The materials taken from your warehouse. */
+  materials: MaterialLine[];
+}
+
+export interface MakePublicRequest {
+  component_id: string;
 }
 
 /**
@@ -1730,6 +1967,11 @@ export interface MarqueZonePrice {
   price_per_bps_day_pence: number;
   /** Game days of traffic read: [`MARQUE_TRAFFIC_WINDOW`], or the season so far if shorter. */
   window_game_days: number;
+}
+
+export interface MaterialLine {
+  commodity_id: CommodityId;
+  quantity: number;
 }
 
 export interface ModifyShipRequest {
@@ -1787,11 +2029,15 @@ export interface MonopolyResult {
 }
 
 export interface NavalPatrol {
+  /** The region whose vault paid for the patrol, where the prize court pays its prize money. */
+  banking_region: BankingRegion;
   /** What the sponsor paid the Crown. */
   cost_pence: PositivePence;
   created_at: string;
   expires_at: string;
   id: string;
+  /** Prize money paid to the sponsor so far from seizures of smugglers in the zone while in force. */
+  prize_earned_pence: Pence;
   sea_zone_id: SeaZoneId;
   sponsor_company_id: string;
   suppressed_piracy_bps: number;
@@ -1804,45 +2050,6 @@ export interface NavalPatrol {
  * Used for target lease capacities and inventory levels where zero is valid but negative values are not.
  */
 export type NonNegativeTons = number;
-
-/** `POST /v1/loan/offer`. */
-export interface OfferLoanRequest {
-  /**
-   * The region whose vaults the loan is paid into and repaid from; the principal is escrowed
-   * from your vault there now.
-   */
-  banking_region: BankingRegion;
-  /** The company the offer is made to (not yours). */
-  borrower_company_id: string;
-  /**
-   * `ship_lien` (with `ship_id`), `warehouse_goods` (with `port_id`, `commodity_id`, `tons`) or
-   * `unsecured`. `contract_receivable` is not yet offered.
-   */
-  collateral_kind: CollateralKind;
-  commodity_id?: null | CommodityId;
-  /** Reserved for contract receivables. */
-  contract_id?: string | null;
-  /**
-   * Interest per game day in bps of the outstanding principal, within a tenth to three times the
-   * Goldsmiths' backstop rate (`GET /v1/loan/backstop-quote`).
-   */
-  daily_rate_bps: number;
-  /** Game hours the offer stands (`1..=168`, default `24`). */
-  offer_game_hours?: number | null;
-  port_id?: null | PortId;
-  /** At least 100 Cr. */
-  principal_pence: PositivePence;
-  /**
-   * Whether you may claim what the collateral does not cover (default `true`; unsecured loans
-   * always are). A non-recourse loan may not lend more than its collateral's appraisal.
-   */
-  recourse?: boolean | null;
-  /** The borrower's ship to take a lien on. */
-  ship_id?: string | null;
-  /** `1..=60` game days from acceptance to maturity. */
-  term_game_days: number;
-  tons?: null | PositiveTons;
-}
 
 /** `POST /v1/venture/open`. */
 export interface OpenVentureRequest {
@@ -1880,6 +2087,47 @@ export interface OrderBookLevelResult {
 
 /** Side of an order on the Central Limit Order Book (CLOB). */
 export type OrderSide = "bid" | "ask";
+
+/** One of your patents, with what it costs you. */
+export type OwnPatentView = PatentView & {
+  /** Consecutive game days your home vault was overdrawn after patent upkeep. */
+  arrears_days: number;
+  upkeep_paid_pence: number;
+  /** Its upkeep a game day now, by its place on your player's ladder (0 once public). */
+  upkeep_per_game_day_pence: number;
+};
+
+/** A granted component on the public patent register. */
+export interface PatentView {
+  component_id: string;
+  /** Honest direction words for each modifier; never their sizes. */
+  effects: string[];
+  grade: number;
+  granted_at: string;
+  holder_company_id?: string | null;
+  holder_company_name?: string | null;
+  made_public_at?: string | null;
+  name: string;
+  public_reason?: string | null;
+  slot: Slot;
+  /** `held` or `public`. */
+  status: string;
+}
+
+/**
+ * What a Crown Naval Patrol in a zone costs now: the zone's price per bps per game day, set by
+ * its recent traffic, and the cost of the patrol asked for.
+ */
+export interface PatrolQuote {
+  /** What the patrol costs: the price x bps x game days, at least 100 Cr. */
+  cost_pence: number;
+  duration_game_hours: number;
+  /** The price per bps per game day (never under 2 Crowns). */
+  price_per_bps_day_pence: number;
+  sea_zone_id: SeaZoneId;
+  /** The clamped bps and term priced. */
+  suppressed_piracy_bps: number;
+}
 
 /**
  * Signed monetary amount denominated in pence (`100 pence = 1 Crown`).
@@ -1932,6 +2180,18 @@ export interface PlayerProfileResult {
   player: Player;
 }
 
+/** One slot and grade of the pool: how much is left to draw and how crowded it is. */
+export interface PoolEntry {
+  /** Components still to be drawn (neither granted nor reserved by a live project). */
+  free: number;
+  grade: number;
+  /** Whether the grade's phase has opened. */
+  released: boolean;
+  /** Live projects researching this slot and grade (a count, never names). */
+  researching: number;
+  slot: Slot;
+}
+
 /**
  * A port as this world knows it: fixed geography and facilities, its live customs rate, and the
  * goods it currently trades by role. Says *what* a port trades, never how much: stock levels and
@@ -1955,6 +2215,11 @@ export interface PortCatalogEntry {
   id: PortId;
   /** Goods it imports. */
   imports: CommodityId[];
+  /**
+   * A smugglers' cove: a small market for ships' stores, few berths, and no Resident Factors
+   * (`POST /v1/company/hire-factor` is refused there).
+   */
+  is_cove: boolean;
   is_hub: boolean;
   /** Goods its workshops make (from inputs it must have on hand). */
   manufactures: CommodityId[];
@@ -2082,24 +2347,6 @@ export type PositivePence = number;
  */
 export type PositiveTons = number;
 
-/** `POST /v1/loan/post-offer`. */
-export interface PostBoardOfferRequest {
-  /** Escrowed now from your vault in the region. */
-  available_pence: PositivePence;
-  banking_region: BankingRegion;
-  /** `ship_lien`, `warehouse_goods` or `unsecured`. */
-  collateral_kind: CollateralKind;
-  daily_rate_bps: number;
-  /** `1..=720`, default `72`. */
-  expires_in_game_hours?: number | null;
-  /** For secured offers: most it lends in bps of the pledge's appraisal (`1..=10000`). */
-  max_ltv_bps?: number | null;
-  max_term_game_days: number;
-  min_principal_pence?: null | PositivePence;
-  /** Default `true`; an unsecured offer always is. */
-  recourse?: boolean | null;
-}
-
 /** A player company's request for goods delivered at one of its warehouse ports. */
 export interface PostCharterRequest {
   commodity_id: CommodityId;
@@ -2136,22 +2383,38 @@ export interface PostEnvelopeRequest {
   report_port_ids?: PortId[] | null;
 }
 
-/** `POST /v1/loan/post-request` (and the borrower's half of `take-offer`). */
-export interface PostLoanRequestRequest {
+/** `POST /v1/loan/request`. */
+export interface PostLoanRequest {
+  /** The region whose vaults the loan is paid into and repaid from. */
   banking_region: BankingRegion;
+  /**
+   * `ship_lien` (with `ship_id`), `warehouse_goods` (with `port_id`, `commodity_id`, `tons`),
+   * `contract_receivable` (with `contract_id`) or `unsecured`.
+   */
   collateral_kind: CollateralKind;
   commodity_id?: null | CommodityId;
-  /** `1..=720`, default `72`. */
-  expires_in_game_hours?: number | null;
-  max_daily_rate_bps: number;
+  /** An accepted freight contract or commission you stand to be paid on. */
+  contract_id?: string | null;
+  /** Game hours the request stays open for quotes (`1..=72`, default `24`). */
+  open_game_hours?: number | null;
   port_id?: null | PortId;
+  /** At least 100 Cr. */
   principal_pence: PositivePence;
-  /** `false` asks for non-recourse (only a non-recourse offer meets it). Default `true`. */
+  /**
+   * `false` asks for non-recourse (the lender may then claim nothing beyond the pledge, and may
+   * lend at most its appraisal). Default `true`; an unsecured loan always is.
+   */
   recourse?: boolean | null;
+  /** `balloon` (everything at maturity) or `amortised` (installments every 10 game days). */
+  repayment: LoanRepayment;
   ship_id?: string | null;
+  /** `1..=360` game days from approval to maturity. */
   term_game_days: number;
   tons?: null | PositiveTons;
 }
+
+/** How a licence contract's price is meant. */
+export type PriceBasis = "per_unit" | "total";
 
 /** RFC 9457 / RFC 7807 HTTP Problem Details payload (`Content-Type: application/problem+json`). */
 export interface ProblemDetails {
@@ -2172,6 +2435,38 @@ export interface ProblemDetails {
   title: string;
   /** URI reference identifying the problem type (e.g. `"urn:tradewinds:error:conflict"`). */
   type: string;
+}
+
+/** A company's research project, as its owner sees it: never the drawn component. */
+export interface ProjectView {
+  abandon_reason?: string | null;
+  closed_at?: string | null;
+  company_id: string;
+  failed_reviews: number;
+  grade: number;
+  /** The granted component, once granted (`null` while the project runs). */
+  granted_component_id?: string | null;
+  project_id: string;
+  prototype_consumed: boolean;
+  /** The materials the prototype stage takes from your warehouse at any yard. */
+  prototype_materials: MaterialLine[];
+  prototype_port_id?: null | PortId;
+  slot: Slot;
+  /** 1 drawings, 2 prototype, 3 sea trials, 4 Admiralty board. */
+  stage: number;
+  stage_name: string;
+  stage_points: number;
+  stage_points_required: number;
+  start_fee_pence: number;
+  started_at: string;
+  /** `active`, `granted` or `abandoned`. */
+  status: string;
+  trial_ship_id?: string | null;
+  trial_ship_swap_available: boolean;
+  /** Consecutive game days the upkeep went unpaid; progress is paused meanwhile. */
+  unpaid_days: number;
+  upkeep_paid_pence: number;
+  upkeep_per_game_day_pence: number;
 }
 
 export interface ProvisionShipRequest {
@@ -2214,6 +2509,21 @@ export interface PublicCompanyProfile {
   leaderboard_rank?: number | null;
   /** Hall-of-fame titles, shown on the owner's flagship company only. */
   titles: HallOfFameTitle[];
+}
+
+/** `POST /v1/loan/approve`, `accept-quote` and `withdraw-quote`. */
+export interface QuoteActionRequest {
+  quote_id: string;
+}
+
+/** `POST /v1/loan/quote-request`. */
+export interface QuoteLoanRequest {
+  /**
+   * Interest per 360 game days in bps, within a tenth to three times the Goldsmiths' rate for
+   * the request's term (the request shows both bounds).
+   */
+  annual_rate_bps: number;
+  request_id: string;
 }
 
 export interface RecipeInput {
@@ -2260,6 +2570,22 @@ export interface RevokeApiKeyResult {
   revoked: boolean;
 }
 
+/** Your R&D standing: the live project (yours or a linked company's), and whether you may start one. */
+export interface RndStatus {
+  can_start: boolean;
+  cannot_start_reason?: string | null;
+  /** The game day your player's cooldown ends, if one is running. */
+  cooldown_ends_game_day?: number | null;
+  current_game_day: number;
+  entry_net_worth_pence: number;
+  player_net_worth_pence: number;
+  project?: null | ProjectView;
+  /** A live project held by another of your player's (or a linked) company. */
+  sibling_project_company_id?: string | null;
+  start_fee_pence: number;
+  upkeep_per_game_day_pence: number;
+}
+
 export interface RouteLeg {
   distance_nm: number;
   edge_class: ZoneClass;
@@ -2293,6 +2619,28 @@ export interface RoutePlanResult {
   ship_class: ShipClassId;
   to_port: PortId;
   total_distance_nm: number;
+}
+
+export interface RunAshoreRequest {
+  commodity_id: CommodityId;
+  quantity: PositiveTons;
+  /** Your ship, anchored in the roadstead of the wanting port. */
+  ship_id: string;
+}
+
+export interface RunAshoreResult {
+  commodity_id: CommodityId;
+  /**
+   * When the goods are ashore and paid for (`underworld_run_completed`), if the ship is still
+   * there.
+   */
+  completes_at: string;
+  port_id: PortId;
+  quantity: number;
+  run_id: string;
+  ship_id: string;
+  started_at: string;
+  status: string;
 }
 
 /** Which way a notice's ship was moving. */
@@ -2531,6 +2879,8 @@ export interface ShipResult {
   /** Cargo aboard (trade goods, provisions carried as goods included, and sealed freight). */
   cargo_manifest: CargoManifest;
   cargo_used_tons: Tons;
+  /** Components fitted to the hull, one per slot at most (`POST /v1/shipyard/fit-component`). */
+  components: FittedComponentView[];
   /** Cargo the ship can carry: the hold less mounted cannons (2 t each) and its stores. */
   effective_hold_capacity_tons: Tons;
   hold_capacity_tons: Tons;
@@ -2592,6 +2942,17 @@ export interface ShipWarehouseTransferResult {
 /** Execution state of an asynchronous simulation job in the event queue. */
 export type SimJobStatus = "pending" | "completed";
 
+/** A hull's system that takes one component. */
+export type Slot = "hull" | "sails" | "rigging" | "hold" | "armament" | "helm";
+
+export interface StartProjectRequest {
+  /** 1, 2 or 3; a grade opens with the world phase of the same number. */
+  grade: number;
+  slot: Slot;
+  /** The ship whose completed legs count in sea trials. */
+  trial_ship_id: string;
+}
+
 /** Where provisions moved into or out of a ship's stores come from or go to. */
 export type StoresCounterpart = "cargo" | "warehouse";
 
@@ -2634,16 +2995,8 @@ export interface StreamGap {
   reason: string;
 }
 
-/** `POST /v1/loan/take-offer`: borrow from a standing offer at its rate. */
-export interface TakeBoardOfferRequest {
-  commodity_id?: null | CommodityId;
-  offer_id: string;
-  port_id?: null | PortId;
-  principal_pence: PositivePence;
-  /** The pledge the offer's collateral kind needs. */
-  ship_id?: string | null;
-  term_game_days: number;
-  tons?: null | PositiveTons;
+export interface SwapTrialShipRequest {
+  trial_ship_id: string;
 }
 
 /** Execution time-in-force policy for a spot market order. */
@@ -2661,6 +3014,44 @@ export interface TopOfBookLevelResult {
 export interface TreasuryVaultsResult {
   company_id: string;
   vaults: VaultBalanceResult[];
+}
+
+export interface UnderworldOrderRequest {
+  commodity_id: CommodityId;
+  price_pence: PositivePence;
+  quantity: PositiveTons;
+  /** Your ship lying at the cove: it takes the goods bought and gives the goods sold. */
+  ship_id: string;
+  side: OrderSide;
+  time_in_force: TimeInForce;
+}
+
+export interface UnderworldOrderResult {
+  commodity_id: CommodityId;
+  filled_quantity: number;
+  /** The resting order (`gtc` with a remainder), if any. */
+  order_id?: string | null;
+  port_id: PortId;
+  requested_quantity: number;
+  resting_quantity: number;
+  ship_id: string;
+  side: OrderSide;
+  total_gross_pence: number;
+}
+
+/** One of your orders on a cove book. */
+export interface UnderworldOrderView {
+  cancel_reason?: string | null;
+  commodity_id: CommodityId;
+  created_at: string;
+  filled_quantity: number;
+  id: string;
+  port_id: PortId;
+  price_pence: number;
+  quantity: number;
+  ship_id: string;
+  side: string;
+  status: string;
 }
 
 export interface UnderwriteInsuranceBatchRequest {
@@ -2823,6 +3214,18 @@ export interface VoyageEstimate {
   legs: LegEstimate[];
   /** Speed of the leg under way. */
   speed_centiknots: number;
+}
+
+export interface WantsResult {
+  /**
+   * At a cove where you have a ship: the wants ships have carried in, the freshest per port and
+   * good.
+   */
+  board: CarriedWantView[];
+  is_cove: boolean;
+  port_id: PortId;
+  /** At an ordinary port where you have a ship or a factor: its live wants. */
+  wants: LiveWantView[];
 }
 
 export interface WarehouseInventory {

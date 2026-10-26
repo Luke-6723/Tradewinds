@@ -31,7 +31,7 @@ const RULES = `You are the strategist for a fleet autopilot in Tradewinds, a mul
 - The Crown's wealth levy: idle vault cash above 500,000 Cr (all regions together) pays 0.1% of the excess every game day (about 6% a real day). Money working isn't levied: loads, escrow, loans out, deposits, venture stakes, goods. While there is an excess the planner charges loads nothing for the cash they tie up; more ships (maxShips, autoBuy) are one way to put it to work.
 - Shipyards: a turnkey build buys each material off the yard port's ask book (players' asks and the NPC ladder, cheapest first; our own and linked asks, and asks over 2.5x the mid, are passed over), pays customs on every fill and a 15% markup on the NPC-sourced part only; byomBuilds saves that markup. A book that can't supply refuses the build. The packet (Phase 2, 16 kn, 16 t, can seal its dispatches) is a courier: the buyer never builds one.
 - Ships pledged to loans: a liened ship can't be listed, sold or pledged again until repaid; a defaulted loan's ship is arrested (it can't depart or join a convoy; cargo aboard is sold toward the debt). The autopilot parks an arrested ship until our loans show it free (state "arrested").
-- Loans: the Goldsmiths' Company lends against one of our ships (at most 40% of its rebuild value and 7,500 Cr a loan, 50 bps a game day, 1-30 game days, with recourse); each region's credit board holds players' standing offers and requests (5-150 bps a game day). Interest accrues daily; what is owed at maturity is taken from our vaults, and a default seizes the pledge and arrests the ship. Net worth subtracts what is owed, so borrowing never lifts us up the board. With leverage on, the autopilot borrows only to bridge a hull our own cash can't fund (against cash due from cargo at sea, at most half the hull) or a load at its source that cash limits, when the money earns at least minLoanReturnX times the interest over the term and pays back within half of it, from the cheapest board offer at or under the Goldsmiths' rate or else the Goldsmiths, with what is owed kept within maxDebtPct of net worth. What is owed is never spent on hulls, marques or lending, loads never spend what a repayment counts on, it is repaid early when cash isn't scarce, and always in full 2 game days before maturity (short: all new spending stops). No new loans in the season's last 12 hours, while one is overdue, or while our idle cash is on offer (it is taken back first). With idleCash on, vault cash above the levy's threshold (less 25,000 Cr) is lent on the credit board, secured by ship liens at 50% of value with recourse, just under the best rival rate and never under 10 bps, and taken back when the fleet needs it or we owe.
+- Loans by quote: a loan has a fixed annual rate (bps per 360 game days) for 1-360 game days, simple interest for the game time elapsed; repaid "balloon" (all at maturity) or "amortised" (installments every 10 game days; one missed is in arrears for a game day, then the whole loan defaults). Repaying early is free (interest to date only). The Goldsmiths' Company quotes at once against one of our ships (at most 40% of her rebuild value and 7,500 Cr a loan, with recourse) at 45% a year for terms up to 30 game days sliding to 30% at 360 (the digest lists it by term); players post requests for quotes and lenders quote on them (within a tenth to three times the Goldsmiths' rate for the term), the borrower approving one. A default hands a liened ship to the lender where she lies, credited at 80% of her rebuild value (a surplus over the debt is paid back to the borrower), and arrests her meanwhile; with recourse the rest is claimed from our vaults. An insured ship lost under a lien pays the lender first. Walking away (written off, a permanent mark on the credit record) is the owner's call only: the autopilot never does it. Net worth subtracts what is owed, so borrowing never lifts us up the board. With leverage on, the autopilot borrows only to bridge a hull our own cash can't fund (against cash due from cargo at sea, at most half the hull) or a load at its source that cash limits, when the money earns at least minLoanReturnX times the interest over the term and pays back within half of it, on the Goldsmiths' quote (balloon), with what is owed kept within maxDebtPct of net worth; it then asks player lenders for quotes and approves one that refinances the Goldsmiths' loan for less. What is owed (installments included) is never spent on hulls, marques or lending, loads never spend what a repayment counts on, it is repaid early when cash isn't scarce, and always in full 2 game days before maturity (short: all new spending stops). No new loans in the season's last 12 hours, while one is overdue or in arrears, or while our idle cash is quoted (it is taken back first). With idleCash on, spare cash the fleet hasn't needed for 20 game hours (beyond its loads, our loans and 25,000 Cr) is quoted on players' secured requests (ship liens or goods, with recourse, at most 60 game days) from borrowers with a clean credit record (no default, walk-away, write-off, bankruptcy or smuggling conviction), never our own companies, at 0.9x the Goldsmiths' rate for the term (never under 15% a year); the quote's principal is escrowed until the borrower approves another, it lapses, or the fleet needs the cash and it is withdrawn.
 - Piracy per sea zone (letters of marque raise it and pay their sponsor prize money from interceptions there, naval patrols lower it, corsair outbreaks are strong and long). Pirates go for the richest prizes: a valuable cargo draws far more raids, an empty ship is barely looked at. An interception carries the ship off, cargo and stores and all, in 5-10% of cases (fewer the more guns face it); otherwise it seizes 20-50% of every cargo stack and of the stores and lets the ship go. Guns make interceptions much rarer. The planner already prices this per lane (cargo at risk, and the hull at risk of capture), refits guns to it and stocks stores for a raid (the route's safe figure covers one storm only).
 - Storms: each leg rolls for the sea zone it ends in, at the zone's storm odds; worse for a hull below the zone's class (never sailed) and in storm season (game months 11 to 2, about 2 real days in every 6). A hit destroys a quarter of every cargo stack and of the stores. The planner already prices storms per lane (learned from our own voyages) and stocks stores for extra hits, so long Baltic and North Sea legs rank lower in storm season by themselves.
 - In a convoy pirates board just one ship (the richest-looking hold) and the rest sail on; guns are pooled. The autopilot forms convoys of its own ships bound the same way soon when the risk avoided outweighs the wait. Quays post news of public forming convoys (organizer, route, sailing up to 14 game days out, muster); rival intel counts them as low-confidence traffic until a listing or a sighting shows the convoy.
@@ -53,7 +53,7 @@ Your directives last for your horizon, then lapse. The autopilot carries them ou
 Answer with a list of actions, each {do, key, ref, to, n, m, reason}; a field an action doesn't use is "" (text) or 0 (number). Give every action a reason. The kinds of "do":
 - "set" (key a setting, n its value; a switch: n 1 on, 0 off): change any setting the digest lists, for the horizon, within the range it gives (in the setting's own units: pence, %, hours, bps). maxShips, marqueBudgetPence, the underwriting budgets, maxDebtPct and cashDuePct can't go above the user's values; reservePence and minLoanReturnX can only go up; leverage and idleCash can't be switched on while the user's are off. Not listed = unchanged. Give each a reason.
   - maxShips: the fleet size the buyer may grow to. reservePence: cash always kept at home. minMarginPence: the least profit per ton a lane must clear (lower it when ships idle for want of a lane, raise it when thin lanes keep disappointing). maxPaybackHours: the buyer builds only what pays back within this. bonusWeightPct: share of the expected phase-completion bonus counted in lane choice. stormWeightPct: share of expected storm losses counted. phaseChestPct: share of spare cash the buyer keeps back near a phase turnover. cashDuePct: share of cash due from cargo at sea a load may count on. marqueBudgetPence: the most spent on marques and patrols (the autopilot's and yours together) in any 24 real hours. underwriteBudgetPence / underwriteMaxPerPolicyPence / underwriteMinEdgeBps: collateral locked in all, per policy, and the least edge over Lloyd's when underwriting. maxDebtPct: the most owed on loans, as a % of net worth (0 stops new borrowing). minLoanReturnX: how many times its interest a loan must earn over its term.
-  - autoBuy: the ship buyer. marques: sponsor marques where the game's quote (prize expected from the zone's traffic) beats its price plus our own ships' extra losses. underwrite: underwrite other companies' policies. useFreight: carry sealed freight. convoys: sail in convoys of our own ships. rivalIntel: read public rival intel. byomBuilds: build from materials bought at the yard. yardFactor: hire a factor to build where no ship of ours is. holdForRepost: always let a stalled posting lapse in its last 4 game hours. captureEscalations: the fleet's own stall calls. actOnEvents: plan on world events. resizeLoads: plan each load again at its source (load loans need it). leverage: borrow to bridge hulls and loads as above. idleCash: lend idle cash above the levy's threshold on the credit board. shipDeals: buy ships for sale under building cost and build commissions to order. envelopes: sell sealed news from our quays.
+  - autoBuy: the ship buyer. marques: sponsor marques where the game's quote (prize expected from the zone's traffic) beats its price plus our own ships' extra losses. underwrite: underwrite other companies' policies. useFreight: carry sealed freight. convoys: sail in convoys of our own ships. rivalIntel: read public rival intel. byomBuilds: build from materials bought at the yard. yardFactor: hire a factor to build where no ship of ours is. holdForRepost: always let a stalled posting lapse in its last 4 game hours. captureEscalations: the fleet's own stall calls. actOnEvents: plan on world events. resizeLoads: plan each load again at its source (load loans need it). leverage: borrow to bridge hulls and loads as above. idleCash: quote spare cash on players' secured loan requests as above. shipDeals: buy ships for sale under building cost and build commissions to order. envelopes: sell sealed news from our quays.
 - "guns" (key "auto", "full" or "off"; no action = keep): a policy for the horizon: "auto" (refit to each lane's piracy at yard calls), "full" (every ship to its class maximum), "off" (no refits).
 - "avoid" (key port, zone, good, charter or contested; ref the port id, zone id, good id or charter alias, "" for contested; up to 12): hard bans for the horizon: a port (no loading, delivering or selling there), a sea zone (no passage through it, laden or empty), a good, a charter, or "contested" (no public charter where rivals are due before us). New plans only: cargo aboard is never stranded.
 - "bias" (key dest, source, port, zone, good, charter or lane; ref the id or alias; n the factor 0.5-1.5; up to 12): reorders lanes by destination, source, port (either end), zone (laden passage), good, charter or lane. Factors multiply. It only reorders lanes that pass every check and earn something.
@@ -336,20 +336,35 @@ export interface DigestInput {
   /** Royal monopolies in force (region, good; whether this company holds it; real ms left). */
   monopolies: Array<{ region: string; good: string; ours: boolean; leftMs: number }>;
   /**
-   * Loans (guide 3.13, pence): what we owe and the cap (maxDebtPct of net worth; null: worth not known), each loan we owe
-   * (rate bps a game day, real ms until it must be repaid in full, taken for a hull or a load), what borrowers owe us,
-   * our idle cash on the credit board, whether a repayment due is short, and the best rival offer per region read lately.
+   * Loans by quote (guide 3.13, pence; rates annual bps): what we owe and the cap (maxDebtPct of net worth; null: worth not
+   * known), each loan we owe (its rate, real ms until it must be repaid in full, taken for a hull or a load, its repayment,
+   * the next payment and any arrears), what borrowers owe us, our idle cash quoted on players' requests, our requests for
+   * quotes (to refinance a Goldsmiths' loan: quotes on each and the best, against the loan's rate), whether a repayment due
+   * is short, and the Goldsmiths' rate by term.
    */
   finance: {
     owed: number;
     cap: number | null;
     worth: number | null;
     /** `id`: aliased (D1, D2…) for a repay order, never shown. */
-    loans: Array<{ id: string; owed: number; rateBps: number; repayInMs: number | null; use: "hull" | "load" | null; defaulted: boolean }>;
+    loans: Array<{
+      id: string;
+      owed: number;
+      rateBps: number;
+      repayInMs: number | null;
+      use: "hull" | "load" | null;
+      defaulted: boolean;
+      repayment: "balloon" | "amortised";
+      nextPaymentInMs: number | null;
+      nextPaymentPence: number | null;
+      arrears: number;
+    }>;
     lentOut: number;
-    offered: number;
+    quoted: number;
+    quotes: Array<{ principal: number; rateBps: number; termDays: number }>;
+    requests: Array<{ principal: number; termDays: number; quotes: number; bestBps: number | null; refinancesBps: number | null }>;
     short: boolean;
-    board: Array<{ region: string; bestOfferBps: number | null; offers: number; requests: number }>;
+    goldsmiths: Array<{ days: number; bps: number }>;
   };
   /**
    * Ship deals and envelopes (guide 3.4, 3.11; pence): ships for sale at our quays as the buyer last saw them (against
@@ -380,6 +395,8 @@ export interface Aliases {
 const cr = (p: number) => `${Math.round(p / 100).toLocaleString("en-GB")} Cr`;
 const kcr = (p: number) => `${(p / 100_000).toFixed(1)}k Cr`;
 const pct = (bps: number) => `${(bps / 100).toFixed(1)}%`;
+/** An annual loan rate (bps per 360 game days) as "% a year". */
+const pctYr = (bps: number) => `${pct(bps)} a year`;
 
 /**
  * The digest for one call, and the aliases it used. Every line is derived from our own state or
@@ -482,16 +499,23 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
     `## Loans`,
     `owed ${cr(d.finance.owed)}${d.finance.cap !== null ? ` of a ${cr(d.finance.cap)} cap (maxDebtPct of net worth ~${cr(d.finance.worth ?? 0)})` : " (net worth not known yet: no new loans)"}` +
       `${d.finance.short ? "; a REPAYMENT DUE IS SHORT: no new loads, hulls, marques or lending until it is paid" : ""}` +
-      `${d.finance.lentOut > 0 ? `; borrowers owe us ${cr(d.finance.lentOut)}` : ""}${d.finance.offered > 0 ? `; ${cr(d.finance.offered)} of idle cash on the credit board` : ""}`,
+      `${d.finance.lentOut > 0 ? `; borrowers owe us ${cr(d.finance.lentOut)}` : ""}` +
+      `${d.finance.quoted > 0 ? `; ${cr(d.finance.quoted)} of idle cash quoted on ${d.finance.quotes.length} request${d.finance.quotes.length === 1 ? "" : "s"} (${d.finance.quotes.map((q) => `${cr(q.principal)} at ${pctYr(q.rateBps)} for ${q.termDays} game days`).join(", ")})` : ""}`,
     ...d.finance.loans.map((l, i) => {
       const alias = `D${i + 1}`;
       aliases.loans.set(alias, { id: l.id, owed: l.owed });
       loanAlias.set(l.id, alias);
-      return `- ${alias} owe ${cr(l.owed)} at ${l.rateBps} bps a game day${l.use ? ` (for a ${l.use})` : ""}${l.defaulted ? ", DEFAULTED" : l.repayInMs !== null ? `, repaid in full within ${realMin(l.repayInMs)}` : ""}`;
+      return (
+        `- ${alias} owe ${cr(l.owed)} at ${pctYr(l.rateBps)}, ${l.repayment}${l.use ? ` (for a ${l.use})` : ""}` +
+        `${l.defaulted ? ", DEFAULTED" : l.repayInMs !== null ? `, repaid in full within ${realMin(l.repayInMs)}` : ""}` +
+        `${l.arrears > 0 ? `, ${cr(l.arrears)} IN ARREARS (the whole loan defaults after a game day)` : l.nextPaymentInMs !== null && l.nextPaymentPence !== null && l.repayment === "amortised" ? `, next installment ~${cr(l.nextPaymentPence)} in ${realMin(l.nextPaymentInMs)}` : ""}`
+      );
     }),
-    ...(d.finance.board.length
-      ? [`credit boards read lately: ${d.finance.board.map((b) => `${b.region} ${b.bestOfferBps !== null ? `best offer ${b.bestOfferBps} bps` : "no offers"} (${b.offers} offers, ${b.requests} requests)`).join("; ")}`]
-      : []),
+    ...d.finance.requests.map(
+      (r) =>
+        `- our request for quotes: ${cr(r.principal)} for ${r.termDays} game days${r.refinancesBps !== null ? ` (to refinance a Goldsmiths' loan at ${pctYr(r.refinancesBps)})` : ""}: ${r.quotes ? `${r.quotes} quote${r.quotes === 1 ? "" : "s"}, best ${r.bestBps !== null ? pctYr(r.bestBps) : "?"}` : "no quote yet"}`,
+    ),
+    `Goldsmiths' rate by term: ${d.finance.goldsmiths.map((g) => `${g.days} days ${pctYr(g.bps)}`).join(", ")}`,
     `## Budgets (the user's ceilings)`,
     `marques+patrols in the last 24 h: ${b.navalSpent24h === null ? `not read yet, of ${cr(b.navalBudget)}` : `${cr(b.navalSpent24h)} of ${cr(b.navalBudget)} (${cr(Math.max(0, b.navalBudget - b.navalSpent24h))} left)`}; ` +
       `underwriting ${b.underwriteLocked === null ? "not read yet" : cr(b.underwriteLocked)} of ${cr(b.underwriteBudget)} locked; fleet ${b.fleet} of max ${d.user.maxShips}; ` +

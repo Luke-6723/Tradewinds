@@ -263,7 +263,7 @@ export class KibbClient {
       this.noteLimits(bucket, res);
 
       if (res.ok) {
-        // No Content (e.g. loan/withdraw-board-entry): nothing to parse.
+        // No Content: nothing to parse.
         if (res.status === 204) return undefined as T;
         try {
           return (await res.json()) as T;
@@ -463,6 +463,13 @@ export class KibbClient {
     this.get<S.MarqueQuote>("/v1/fleet/marque-quote", { sea_zone_id: seaZoneId, added_piracy_bps: addedBps, duration_game_hours: durationGameHours });
   /** Charged at the zone's quoted price, fixed for the term; `pricing` is the quote it was charged at. */
   issueMarque = (req: S.IssueMarqueRequest) => this.post<S.IssueMarqueResult>("/v1/fleet/issue-marque", req);
+  /**
+   * What `fundPatrol` would charge now for `suppressedBps` (clamped 50-1,500) over `durationGameHours` (default 60) in a zone: the
+   * zone's price per bps-day (never under 2 Cr, dearer where smugglers sail lately), fixed once funded.
+   */
+  patrolQuote = (seaZoneId: string, suppressedBps: number, durationGameHours?: number) =>
+    this.get<S.PatrolQuote>("/v1/fleet/patrol-quote", { sea_zone_id: seaZoneId, suppressed_piracy_bps: suppressedBps, duration_game_hours: durationGameHours });
+  /** Charged at the zone's quoted price (`patrolQuote`), fixed for the term. */
   fundPatrol = (req: S.FundPatrolRequest) => this.post<S.NavalPatrol>("/v1/fleet/fund-patrol", req);
   marques = (filter: { sea_zone_id?: string; cursor?: string; limit?: number } = {}) => this.get<S.LetterOfMarque[]>("/v1/fleet/marques", filter);
   patrols = (filter: { sea_zone_id?: string; cursor?: string; limit?: number } = {}) => this.get<S.NavalPatrol[]>("/v1/fleet/patrols", filter);
@@ -526,6 +533,20 @@ export class KibbClient {
   /** Builds an accepted commission at its yard as build-ship would and hands the ship to the buyer; `409` if turnkey can't be supplied. */
   deliverCommission = (contractId: string, name: string, buildMode: BuildMode = "turnkey_cash") =>
     this.post<S.DeliverCommissionResult>("/v1/contract/deliver-commission", { contract_id: contractId, name, build_mode: buildMode });
+
+  // Licence units for a patented design (guide 3.19): listed as `licence_offer` / `licence_request` contracts, no presence needed.
+  /** The holder sells units; buyers pay from their vault in the holder's home region. */
+  createLicenceOffer = (req: S.CreateLicenceContractRequest) => this.post<ContractListing>("/v1/contract/create-licence-offer", req);
+  /** A buyer asks for units: the price for every unit asked is escrowed from our home-region vault. */
+  createLicenceRequest = (req: S.CreateLicenceContractRequest) => this.post<ContractListing>("/v1/contract/create-licence-request", req);
+  /** `per_unit`: 1..what is left; `total`: exactly what is left. */
+  acceptLicenceOffer = (contractId: string, units: number) =>
+    this.post<ContractListing>("/v1/contract/accept-licence-offer", { contract_id: contractId, units });
+  /** The patent's holder fills a request, paid from its escrow. */
+  fillLicenceRequest = (contractId: string, units: number) =>
+    this.post<ContractListing>("/v1/contract/fill-licence-request", { contract_id: contractId, units });
+  /** Withdraws one of our licence contracts (a request's unfilled escrow refunded). */
+  cancelLicence = (contractId: string) => this.post<ContractListing>("/v1/contract/cancel-licence", { contract_id: contractId });
 
   // ── Futures and insurance ───────────────────────────────────────────────────
 
@@ -596,6 +617,37 @@ export class KibbClient {
   modifyShip = (shipId: string, cannons: number) =>
     this.post<ShipResult>("/v1/shipyard/modify-ship", { ship_id: shipId, target_cannons_count: cannons });
 
+  /**
+   * Fits a component lying in our warehouse at the yard where the ship is berthed (slot free, no open insurance): 4% of her
+   * rebuild value, and permanent (no removal or swap).
+   */
+  fitComponent = (shipId: string, itemId: string) => this.post<S.FitComponentResult>("/v1/shipyard/fit-component", { ship_id: shipId, item_id: itemId });
+
+  // ── R&D (guide 3.19) ────────────────────────────────────────────────────────
+
+  /** Whether our player may start a project now, and the live one (ours or a linked company's). */
+  rndStatus = () => this.get<S.RndStatus>("/v1/rnd/status");
+  /** Per slot and grade: designs still free and how many houses research it now (never the designs). */
+  rndPool = () => this.get<S.PoolEntry[]>("/v1/rnd/pool");
+  /** Starts a project on a slot and grade (the start fee from the home vault, never refunded); the design is drawn at random. */
+  startRnd = (req: S.StartProjectRequest) => this.post<S.ProjectView>("/v1/rnd/start", req);
+  /** Names another trial ship (once per project). */
+  swapTrialShip = (trialShipId: string) => this.post<S.ProjectView>("/v1/rnd/trial-ship", { trial_ship_id: trialShipId });
+  /** Gives the project up: nothing refunded, no cooldown. */
+  abandonRnd = () => this.post<S.ProjectView>("/v1/rnd/abandon");
+  /** The public patent register (`status`: `held` or `public`). */
+  patentRegister = (filter: { slot?: S.Slot; status?: string } = {}) => this.get<S.PatentView[]>("/v1/rnd/register", filter);
+  /** Our patents, with what each costs a game day. */
+  ownPatents = () => this.get<S.OwnPatentView[]>("/v1/rnd/patents");
+  /** Gives a patent up for good: its upkeep stops and anyone may make it. */
+  makePatentPublic = (componentId: string) => this.post<S.PatentView>("/v1/rnd/make-public", { component_id: componentId });
+  /** Our licence units by design (granted, used, left), with what making one takes. */
+  licences = () => this.get<S.LicenceView[]>("/v1/rnd/licences");
+  /** Makes 1-10 components at a yard from the materials in our warehouse there plus its labour (a licence unit each unless ours or public). */
+  makeComponents = (req: S.MakeComponentRequest) => this.post<S.MakeComponentResult>("/v1/rnd/make", req);
+  /** Components we made and haven't fitted, where they lie. */
+  components = () => this.get<S.ComponentItemView[]>("/v1/rnd/components");
+
   // ── Treasury ────────────────────────────────────────────────────────────────
 
   vaults = () => this.get<TreasuryVaults>("/v1/treasury/vaults");
@@ -607,42 +659,69 @@ export class KibbClient {
   ledger = (filter: { cursor?: string; limit?: number; banking_region?: BankingRegion; reason?: string } = {}) =>
     this.get<S.LedgerEntry[]>("/v1/treasury/ledger", filter);
 
-  // ── Loans ───────────────────────────────────────────────────────────────────
+  // ── Loans (by quote, guide 3.13.1-3.13.2) ───────────────────────────────────
 
-  /** Loans we made (`lender`) or owe (`borrower`), or both, newest first, with `owed_pence`. */
+  /**
+   * Loans we made (`lender`) or owe (`borrower`), or both, newest first: `owed_pence`, the fixed `annual_rate_bps`
+   * (`rate_basis: "daily"`: an older loan on `daily_rate_bps`), `total_repayable_pence` and the next payment due.
+   */
   loans = (filter: { role?: S.LoanRole; status?: S.LoanStatus; cursor?: string; limit?: number } = {}) =>
     this.get<S.Loan[]>("/v1/loan/list", filter);
   /** Every page of our loans (50 a page: the docs give this endpoint no maximum). */
   loanPages = (filter: { role?: S.LoanRole; status?: S.LoanStatus } = {}, maxPages = 10) =>
     pages((cursor) => this.loans({ ...filter, cursor, limit: 50 }), (l) => l.id, 50, maxPages);
-  /** Any company's public credit record. */
+  /** Any company's public credit record (defaults, walk-aways, smuggling convictions). */
   creditReport = (companyId: string) => this.get<S.CreditReport>("/v1/loan/credit", { company_id: companyId });
-  /** A region's credit board: standing offers (cheapest first) and requests (dearest first). */
-  creditBoard = (region: BankingRegion) => this.get<S.CreditBoard>("/v1/loan/board", { banking_region: region });
-  /** What the Goldsmiths' Company would lend against one of our ships (default region: home), and the rate floor and ceiling. */
-  backstopQuote = (shipId: string, region?: BankingRegion) =>
-    this.get<S.BackstopQuote>("/v1/loan/backstop-quote", { ship_id: shipId, banking_region: region });
-  /** Borrows from the Goldsmiths' Company against a lien on a ship (within `backstopQuote`, 1–30 game days, with recourse). */
-  borrowBackstop = (req: S.BackstopLoanRequest) => this.post<S.Loan>("/v1/loan/borrow-backstop", req);
-  /** A direct loan offer to another company; the principal is escrowed from our vault in that region. */
-  offerLoan = (req: S.OfferLoanRequest) => this.post<S.Loan>("/v1/loan/offer", req);
-  acceptLoan = (loanId: string) => this.post<S.Loan>("/v1/loan/accept", { loan_id: loanId });
-  declineLoan = (loanId: string) => this.post<S.Loan>("/v1/loan/decline", { loan_id: loanId });
-  /** Withdraws a direct loan offer we made. */
-  withdrawLoanOffer = (loanId: string) => this.post<S.Loan>("/v1/loan/withdraw", { loan_id: loanId });
-  /** Pays `amountPence` (omitted: everything owed) from our vault in the loan's region: interest to date first, then principal. */
+  /**
+   * The Goldsmiths' instant quote (default region: home) against a lien on one of our ships: at most 40% of its rebuild
+   * value and 7,500 Cr, 1-360 game days, with recourse. Stored for 6 game hours: take it with `acceptLoanQuote`. 400 over
+   * what it lends on the ship; 409 the ship is liened, listed or carries a venture.
+   */
+  loanQuote = (q: { principal_pence: number; term_game_days: number; repayment: S.LoanRepayment; ship_id: string; banking_region?: BankingRegion }) =>
+    this.get<S.GoldsmithsQuote>("/v1/loan/quote", q);
+  /** Takes a Goldsmiths' quote before it expires: the lien goes on and the principal lands in the quote's region. */
+  acceptLoanQuote = (quoteId: string) => this.post<S.Loan>("/v1/loan/accept-quote", { quote_id: quoteId });
+  /** Asks lenders for quotes, open 1-72 game hours (default 24). Nothing is escrowed; the pledge is checked now and at approval. */
+  postLoanRequest = (req: S.PostLoanRequest) => this.post<S.LoanRequestView>("/v1/loan/request", req);
+  /**
+   * Open requests (oldest first; `banking_region` narrows them) with their rate bounds and our own quotes on them; `mine`:
+   * our own requests of any status (newest first) with every quote. No cursor: at most `limit` (default 200) come back.
+   */
+  loanRequests = (filter: { banking_region?: BankingRegion; mine?: boolean; limit?: number } = {}) =>
+    this.get<S.LoanRequestView[]>("/v1/loan/requests", { limit: 200, ...filter });
+  /** Quotes a request at `annual_rate_bps` (within its bounds; never our own company's): the principal is escrowed from our vault in its region. */
+  quoteLoanRequest = (requestId: string, annualRateBps: number) =>
+    this.post<S.LoanQuote>("/v1/loan/quote-request", { request_id: requestId, annual_rate_bps: annualRateBps });
+  /** Takes back one of our quotes the borrower hasn't approved: its escrow returns to our vault. */
+  withdrawLoanQuote = (quoteId: string) => this.post<S.LoanQuote>("/v1/loan/withdraw-quote", { quote_id: quoteId });
+  /** Approves a quote on one of our requests: the loan is disbursed, every other quote released and the request closed. */
+  approveLoanQuote = (quoteId: string) => this.post<S.Loan>("/v1/loan/approve", { quote_id: quoteId });
+  /** Pays `amountPence` (omitted: everything owed) from our vault in the loan's region: arrears first, interest to date, then principal. */
   repayLoan = (loanId: string, amountPence?: number) =>
     this.post<S.Loan>("/v1/loan/repay", { loan_id: loanId, amount_pence: amountPence });
-  /** A standing offer on the credit board (escrows `available_pence`). */
-  postLoanOffer = (req: S.PostBoardOfferRequest) => this.post<S.BoardOffer>("/v1/loan/post-offer", req);
-  /** A loan request on the credit board. */
-  postLoanRequest = (req: S.PostLoanRequestRequest) => this.post<S.BoardRequest>("/v1/loan/post-request", req);
-  /** Borrows from a standing board offer at its rate, pledging what its collateral kind needs. */
-  takeLoanOffer = (req: S.TakeBoardOfferRequest) => this.post<S.Loan>("/v1/loan/take-offer", req);
-  /** Lends a standing board request. */
-  fundLoanRequest = (requestId: string) => this.post<S.Loan>("/v1/loan/fund-request", { request_id: requestId });
-  /** Takes one of our board offers (returning what it had left) or requests off the board. No body (204). */
-  withdrawBoardEntry = (entryId: string) => this.post<void>("/v1/loan/withdraw-board-entry", { entry_id: entryId });
+  /**
+   * Walks away from a loan we owe (guide 3.13.1): the lender takes the collateral and the rest is written off, permanently
+   * on our credit record. By hand only: the autopilot never calls it.
+   */
+  walkAwayFromLoan = (loanId: string) => this.post<S.Loan>("/v1/loan/default", { loan_id: loanId });
+
+  // ── The Free Trade (guide 3.18; scope `underworld`) ─────────────────────────
+
+  /** A cove's book (house ask, players' bids and asks), seen only from a ship of ours at the cove (`403 no_ship_at_cove`). */
+  underworldBook = (portId: string, commodityId?: string) =>
+    this.get<S.CoveBookResult>("/v1/underworld/book", { port_id: portId, commodity_id: commodityId });
+  /** Trades from our ship lying at the cove, ship to ship, paid vault to vault in the cove's region. */
+  underworldOrder = (req: S.UnderworldOrderRequest) => this.post<S.UnderworldOrderResult>("/v1/underworld/order", req);
+  underworldCancelOrder = (orderId: string) => this.post<S.CancelUnderworldOrderResult>("/v1/underworld/cancel-order", { order_id: orderId });
+  underworldOrders = (filter: { port_id?: string; open_only?: boolean; cursor?: string; limit?: number } = {}) =>
+    this.get<S.UnderworldOrderView[]>("/v1/underworld/orders", filter);
+  /** Every page of our cove orders (200 a page). */
+  underworldOrderPages = (filter: { port_id?: string; open_only?: boolean } = {}, maxPages = 10) =>
+    pages((cursor) => this.underworldOrders({ ...filter, cursor, limit: 200 }), (o) => o.id, 200, maxPages);
+  /** An ordinary port's live wants (a ship or factor there), or at a cove its board of wants carried in by ships. */
+  underworldWants = (portId: string) => this.get<S.WantsResult>("/v1/underworld/wants", { port_id: portId });
+  /** Runs goods ashore from our ship anchored in the roadstead of a port with a live want; priced when it completes. */
+  runAshore = (req: S.RunAshoreRequest) => this.post<S.RunAshoreResult>("/v1/underworld/run", req);
 
   // ── Banks ───────────────────────────────────────────────────────────────────
 

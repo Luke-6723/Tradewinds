@@ -29,11 +29,11 @@
  *   KIBB_RESIZE=0         don't size each load again at its source (and spend as before)
  *   KIBB_CASH_DUE         % of the cash our ships at sea are due to be paid that loads may count on (default 60; 0: cash in hand only)
  *   KIBB_WORLD_EVENTS=0   don't plan on world events' prices or on crisis charters not yet listed
- *   KIBB_LEVERAGE=0       never borrow (on by default: bridge a new ship or a load cash can't fund, when it clearly pays;
- *                         the key needs treasury_remit)
+ *   KIBB_LEVERAGE=0       never borrow (on by default: bridge a new ship or a load cash can't fund, when it clearly pays,
+ *                         on the Goldsmiths' instant quote, refinanced by a cheaper player quote; the key needs treasury_remit)
  *   KIBB_MAX_DEBT_PCT     most owed on loans, % of net worth (default 25)
  *   KIBB_MIN_LOAN_RETURN_X  a loan must earn this many times its interest over its term (default 2)
- *   KIBB_IDLE_CASH=0      don't lend vault cash above the wealth levy's 500,000 Cr threshold on the credit board
+ *   KIBB_IDLE_CASH=0      don't quote spare cash on players' secured loan requests (clean borrowers, never our own companies)
  *   KIBB_SHIP_DEALS=0     don't buy ships for sale under building cost, nor build commissions to order
  *   KIBB_ENVELOPES=0      don't sell sealed news (intelligence envelopes) from our quays
  *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY. Live it may set any

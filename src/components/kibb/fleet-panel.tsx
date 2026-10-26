@@ -320,22 +320,27 @@ function SettingsForm({
         </div>
         <label className="flex items-center gap-1.5 text-sm">
           <input type="checkbox" checked={d.idleCash} onChange={(e) => setD({ ...d, idleCash: e.target.checked })} />
-          Lend idle cash above the wealth levy&apos;s 500,000 Cr threshold on the credit board, secured by ship liens (on by default)
+          Lend spare cash the fleet doesn&apos;t need by quoting players&apos; secured loan requests (on by default)
         </label>
         <p className="text-muted-foreground text-xs">
           A loan is taken only for a new ship our own cash can&apos;t cover yet (against cash due from cargo at sea, at most half the
           ship&apos;s cost) or for a load at its source that cash limits (with re-sizing at the source on), when what it earns over the
-          loan&apos;s term is at least that multiple of its interest and it pays back within half the term. Lender: the cheapest standing
-          credit-board offer in that region (never one of your companies&apos;, never dearer than the Goldsmiths&apos; 50 bps a game day),
-          else the Goldsmiths&apos; Company against a lien on one of your ships that isn&apos;t insured, listed, in a convoy or already
-          pledged (at most 40% of its value and 7,500 Cr, with recourse; a default seizes the ship and arrests her). What is owed is
-          never spent on ships, marques, underwriting or lending, and loads never spend what a repayment counts on unless cash due lands
-          first; the autopilot&apos;s loans are repaid early when no ship waits for cash, and every loan in full 2 game days before it
-          matures (one of yours with a shorter term, half its term before; short then: all new spending stops until it is). No new loans
-          in the season&apos;s last 12 hours, while one is overdue, or while our idle cash is on offer. Idle cash above the threshold, less
-          25,000 Cr and anything the fleet needs, is offered at or just under the best rival rate (never under the levy&apos;s own 10 bps a
-          game day; loans of at most half the pledged ship&apos;s value, with recourse) and taken back when the fleet needs it (a load cut
-          to the cash there included) or we owe; a borrower that defaults hands us its pledged ship or goods. Lent cash isn&apos;t levied.
+          loan&apos;s term is at least that multiple of its interest and it pays back within half the term. Lender: the Goldsmiths&apos;
+          Company&apos;s instant quote (balloon; 45% a year for up to 30 game days, sliding to 30% at 360) against a lien on one of your
+          ships that isn&apos;t insured, listed, in a convoy or already pledged (at most 40% of its value and 7,500 Cr, with recourse; a
+          default hands the ship to the lender at 80% of its value and arrests her meanwhile). A request for quotes follows, pledging
+          another free ship: a player lender&apos;s quote cheaper than the Goldsmiths&apos; (never one of your companies&apos;) is approved
+          and repays the Goldsmiths&apos; loan at once. What is owed (installments included) is never spent on ships, marques,
+          underwriting or lending, and loads never spend what a repayment counts on unless cash due lands first; the autopilot&apos;s
+          loans are repaid early when no ship waits for cash, and every loan in full 2 game days before it matures (one of yours with a
+          shorter term, half its term before; an installment in arrears at once; short then: all new spending stops until it is). It
+          never walks away from a loan. No new loans in the season&apos;s last 12 hours, while one is overdue or in arrears, or while
+          idle cash is quoted. Idle cash: spare cash beyond the fleet&apos;s loads, your loans and 25,000 Cr that has had nothing to
+          fund for 20 game hours is quoted on players&apos; requests secured by a ship or goods, with recourse, for at most 60 game
+          days, from borrowers whose credit record is clean (no default, walk-away, write-off, bankruptcy or smuggling conviction),
+          never your own companies, at 0.9&times; the Goldsmiths&apos; rate for the term (never under 15% a year); quotes are taken
+          back when the fleet needs the cash (a load cut to the cash there included) or you owe; a borrower that defaults hands us its
+          pledged ship or goods.
           Off here is off for Claude too: it may switch either off, never on.
         </p>
       </div>
@@ -513,10 +518,10 @@ export function FleetPanel() {
               {st.finance.short ? ": REPAYMENT SHORT" : ""}
             </span>
           )}
-          {st?.finance && st.finance.offers.length > 0 && (
-            <span title="Idle cash above the wealth levy's threshold offered on the credit board, secured by ship liens">
+          {st?.finance && (st.finance.quotes ?? []).length > 0 && (
+            <span title="Spare cash quoted on players' secured loan requests (escrowed until the borrower approves one, the request lapses, or the fleet needs it back)">
               {" · "}
-              {fmtCr(st.finance.offers.reduce((n, o) => n + o.availablePence, 0))} offered on the credit board
+              {fmtCr((st.finance.quotes ?? []).reduce((n, q) => n + q.principalPence, 0))} quoted on loan requests
             </span>
           )}
           {st?.cash && st.cash.duePence > 0 && (
@@ -1014,11 +1019,20 @@ function ExpansionWatchView({ x }: { x: NonNullable<NonNullable<FleetView["state
   );
 }
 
-/** Leverage and idle cash: what we owe and the cap, each loan, loans we made, our credit-board offers. */
+/** A loan's rate: annual (loans by quote) or, for one made before them, bps a game day. */
+function loanRate(l: FinanceLoanRow): string {
+  return l.rateBasis === "daily" ? `${l.rateBps} bps/day` : `${(l.rateBps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%/yr`;
+}
+
+/** Leverage and idle cash: what we owe and the cap, each loan, loans we made, our quotes on requests and our own requests. */
 function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct: number; shipName: (id: string) => string }) {
   const lentOut = f.lent.reduce((n, l) => n + Math.max(0, l.owedPence), 0);
-  const offered = f.offers.reduce((n, o) => n + o.availablePence, 0);
+  // Absent from a server running code from before loans by quote.
+  const quotes = f.quotes ?? [];
+  const requests = (f.requests ?? []).filter((r) => r.status === "open");
+  const quoted = quotes.reduce((n, q) => n + q.principalPence, 0);
   const pledge = (l: FinanceLoanRow) => (l.shipId ? `lien on ${shipName(l.shipId)}` : l.collateral.replace(/_/g, " "));
+  const yr = (bps: number) => `${(bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%/yr`;
   return (
     <details className="text-sm">
       <summary className="cursor-pointer text-muted-foreground text-xs">
@@ -1028,7 +1042,8 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
         {` · interest paid ~${fmtCr(f.interestPaidPence)}`}
         {lentOut > 0 && ` · borrowers owe us ${fmtCr(lentOut)}`}
         {f.interestEarnedPence > 0 && ` · interest earned ~${fmtCr(f.interestEarnedPence)}`}
-        {offered > 0 && ` · ${fmtCr(offered)} on the credit board`}
+        {quoted > 0 && ` · ${fmtCr(quoted)} quoted on ${quotes.length} loan request${quotes.length === 1 ? "" : "s"}`}
+        {requests.length > 0 && ` · ${requests.length} request${requests.length === 1 ? "" : "s"} of ours for quotes`}
         {!f.leverage && " · leverage off"}
         {!f.idleCash && " · idle-cash lending off"}
       </summary>
@@ -1038,21 +1053,38 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
         </p>
       )}
       <p className="mt-2 text-muted-foreground text-xs">
-        {f.action}. Idle cash: {f.idle}.{f.pending > 0 ? ` ${f.pending} credit call${f.pending === 1 ? "" : "s"} with no answer, being looked for among our loans and offers (never sent again).` : ""}
+        {f.action}. Idle cash: {f.idle}.{f.pending > 0 ? ` ${f.pending} credit call${f.pending === 1 ? "" : "s"} with no answer, being looked for among our loans, quotes and requests (never sent again).` : ""}
         {f.checkedAt && ` Checked ${fmtAgo(f.checkedAt)}.`}
       </p>
       {f.borrowed.length > 0 && (
-        <Table head={["We owe", "Rate", "Repaid by", "For", "Pledge"]} className="mt-2">
+        <Table head={["We owe", "Rate", "Repaid by", "Next payment", "For", "Pledge"]} className="mt-2">
           {f.borrowed.map((l) => (
             <tr key={l.id} className="align-top">
               <td className="whitespace-nowrap tabular-nums">
                 {fmtCr(l.owedPence)}
-                <div className="text-muted-foreground text-xs">of {fmtCr(l.principalPence)} in {l.region.replace(/_/g, " ")}</div>
+                <div className="text-muted-foreground text-xs">
+                  of {fmtCr(l.principalPence)} in {l.region.replace(/_/g, " ")}
+                  {l.totalRepayablePence !== null && `; ${fmtCr(l.totalRepayablePence)} on schedule`}
+                </div>
               </td>
-              <td className="whitespace-nowrap tabular-nums">{l.rateBps} bps/day</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {loanRate(l)}
+                <div className="text-muted-foreground text-xs">{l.repayment}</div>
+              </td>
               <td className="whitespace-nowrap text-xs">
                 {l.status === "defaulted" ? <Badge variant="destructive" size="sm">defaulted</Badge> : l.repayBy ? fmtIn(l.repayBy) : "—"}
                 {l.maturesAt && <div className="text-muted-foreground">matures {fmtIn(l.maturesAt)}</div>}
+              </td>
+              <td className="whitespace-nowrap text-xs">
+                {l.arrearsPence > 0 ? (
+                  <Badge variant="destructive" size="sm">
+                    {fmtCr(l.arrearsPence)} in arrears
+                  </Badge>
+                ) : l.nextPaymentAt && l.nextPaymentPence !== null ? (
+                  `${fmtCr(l.nextPaymentPence)} ${fmtIn(l.nextPaymentAt)}`
+                ) : (
+                  "—"
+                )}
               </td>
               <td className="text-xs">{l.purpose ?? <span className="text-muted-foreground">taken by hand</span>}</td>
               <td className="text-xs">{pledge(l)}</td>
@@ -1066,7 +1098,7 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
             <tr key={l.id} className="align-top">
               <td className="whitespace-nowrap tabular-nums">{fmtCr(l.principalPence)}</td>
               <td className="whitespace-nowrap tabular-nums">{fmtCr(l.owedPence)}</td>
-              <td className="whitespace-nowrap tabular-nums">{l.rateBps} bps/day</td>
+              <td className="whitespace-nowrap tabular-nums">{loanRate(l)}</td>
               <td className="whitespace-nowrap text-xs">{l.maturesAt ? fmtIn(l.maturesAt) : "—"}</td>
               <td className="text-xs">{l.collateral.replace(/_/g, " ")}</td>
               <td className="text-xs">{l.status === "defaulted" ? <Badge variant="destructive" size="sm">defaulted: its pledge comes to us</Badge> : l.status}</td>
@@ -1074,22 +1106,39 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
           ))}
         </Table>
       )}
-      {f.offers.length > 0 && (
-        <Table head={["Our credit-board offer", "Left to lend", "Rate", "Lapses"]} className="mt-2">
-          {f.offers.map((o) => (
-            <tr key={o.id}>
-              <td className="text-xs">{o.region.replace(/_/g, " ")} · ship liens, ≤ 50% of value, with recourse</td>
-              <td className="whitespace-nowrap tabular-nums">{fmtCr(o.availablePence)}</td>
-              <td className="whitespace-nowrap tabular-nums">{o.rateBps} bps/day</td>
-              <td className="whitespace-nowrap text-xs">{o.expiresAt ? fmtIn(o.expiresAt) : "—"}</td>
+      {quotes.length > 0 && (
+        <Table head={["Our quote (idle cash)", "Escrowed", "Rate", "Term", "Lapses"]} className="mt-2">
+          {quotes.map((q) => (
+            <tr key={q.id}>
+              <td className="text-xs">{q.region.replace(/_/g, " ")} · secured, with recourse, a clean borrower</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(q.principalPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{yr(q.rateBps)}</td>
+              <td className="whitespace-nowrap text-xs">{q.termDays} game days</td>
+              <td className="whitespace-nowrap text-xs">{q.expiresAt ? fmtIn(q.expiresAt) : "—"}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {requests.length > 0 && (
+        <Table head={["Our request for quotes", "Principal", "Quotes", "Best", "Lapses"]} className="mt-2">
+          {requests.map((r) => (
+            <tr key={r.id}>
+              <td className="text-xs">
+                {r.region.replace(/_/g, " ")} · {r.termDays} game days{r.refinances ? " · to refinance a Goldsmiths' loan" : ""}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(r.principalPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{r.quotes}</td>
+              <td className="whitespace-nowrap tabular-nums">{r.bestBps !== null ? yr(r.bestBps) : "—"}</td>
+              <td className="whitespace-nowrap text-xs">{r.expiresAt ? fmtIn(r.expiresAt) : "—"}</td>
             </tr>
           ))}
         </Table>
       )}
       <p className="mt-2 text-muted-foreground text-xs">
-        Net worth for the cap is the hourly leaderboard&apos;s figure for this company while fresh, else our own estimate (vaults and escrow, ships
-        at the cheapest quote seen, goods at base, less what is owed). Interest accrues every game day on what is still owed; repaying early pays
-        interest only to date.
+        Rates are a year (360 game days), simple, fixed for the loan; a loan from before loans by quote keeps its rate a game day to maturity.
+        Net worth for the cap is the hourly leaderboard&apos;s figure for this company while fresh, else our own estimate (vaults and escrow,
+        ships at the cheapest quote seen, goods at base, less what is owed). Interest accrues every game day on what is still owed; repaying
+        early pays interest only to date.
       </p>
     </details>
   );

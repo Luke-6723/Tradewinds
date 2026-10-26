@@ -13,6 +13,7 @@ import {
   firstProblem,
   num,
   regionName,
+  useAppraisal,
   useCompanyDirectory,
   useCompanyNames,
   useFleetFinance,
@@ -78,9 +79,10 @@ function ListForm({
   const act = useAction<S.ShareListing>(onDone);
   const pick = options.find((o) => o.shipId === shipId);
   const at = region || homeRegion;
-  // Our own ship's rebuild value (from the Goldsmiths' quote) gives the price band; another company's isn't ours to quote.
-  const { data: quote } = usePoll(pick?.owned ? () => kibbGet<S.BackstopQuote>("/v1/loan/backstop-quote", { ship_id: shipId }) : null, 0, [shipId, pick?.owned]);
-  const sixtyFourth = quote && quote.ship_id === shipId ? quote.rebuild_value_pence / 64 : undefined;
+  // Our own ship's rebuild value (fitted components included, from a Goldsmiths' quote) gives the price band; another
+  // company's isn't ours to quote. A liened ship can't be quoted: no band is checked then (the game still checks it).
+  const { rebuild } = useAppraisal(pick?.owned ? shipId : null);
+  const sixtyFourth = rebuild !== undefined ? rebuild / 64 : undefined;
   const band = sixtyFourth !== undefined ? { min: Math.ceil(sixtyFourth * 0.5), max: Math.floor(sixtyFourth * 1.5) } : undefined;
   const n = num(count);
   const p = crToPence(price);

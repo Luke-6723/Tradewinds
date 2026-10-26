@@ -9,8 +9,11 @@ export type ZoneClass = "coastal" | "regional" | "oceanic";
 export type OrderSide = "bid" | "ask";
 export type TimeInForce = "ioc" | "gtc";
 export type PortVisibility = "none" | "storage" | "counting_house" | "quay";
-/** `commission`: a hull ordered at a yard (`ship_class`, `reward_pence` = the price), not freight. */
-export type ContractType = "charter" | "freight" | "commission";
+/**
+ * `commission`: a hull ordered at a yard (`ship_class`, `reward_pence` = the price), not freight. `licence_offer` /
+ * `licence_request`: licence units for a patented component (guide 3.19; `licence` on the listing), no port or goods.
+ */
+export type ContractType = "charter" | "freight" | "commission" | "licence_offer" | "licence_request";
 export type ContractStatus = "open" | "active" | "completed" | "cancelled" | "defaulted";
 /** Who pays a charter's deliveries: a world account, or (`issuer`) the player who posted it, from its escrow. */
 export type CharterFunding = "crown" | "mint" | "issuer";
@@ -22,7 +25,10 @@ export type BankingRegion =
   | "iberia"
   | "caribbean"
   | "indian_ocean"
-  | "east_indies";
+  | "east_indies"
+  /** The American colonies (Phase 2). */
+  | "america";
+/** `underworld`: everything under `/v1/underworld/*` (smuggling, guide 3.18); a trading key need not hold it. */
 export type ApiKeyScope =
   | "read"
   | "fleet_navigate"
@@ -31,7 +37,10 @@ export type ApiKeyScope =
   | "market_derivatives"
   | "infra_manage"
   | "treasury_remit"
-  | "account_manage";
+  | "account_manage"
+  | "underworld";
+/** `contraband` lives only aboard ships: never on a market book, in a warehouse, freight, a charter or a pledge (guide 3.18). */
+export type CommodityCategory = "provisions" | "raw_inputs" | "industrial_naval" | "european_trade" | "colonial_bullion" | "contraband";
 
 // ── Auth / player / company ───────────────────────────────────────────────────
 
@@ -156,6 +165,8 @@ export interface CatalogPort {
   phase: number;
   is_hub: boolean;
   has_shipyard: boolean;
+  /** A smugglers' cove (guide 3.12, 3.18): ships' stores only, few berths, no Resident Factor (`403 no_factor_at_cove`). Absent: not one. */
+  is_cove?: boolean;
   customs_bps: number;
   produces?: string[] | null;
   manufactures?: string[] | null;
@@ -165,7 +176,7 @@ export interface CatalogPort {
 export interface CatalogCommodity {
   id: string;
   name: string;
-  category: string;
+  category: CommodityCategory;
   base_price_pence: number;
 }
 
@@ -369,6 +380,8 @@ export interface ShipResult {
   cargo_manifest: Record<string, number>;
   stores: { provisions_tons: number; sea_days_remaining: number };
   route_legs: RouteLeg[];
+  /** Components fitted to the hull (guide 3.19): they raise its rebuild value. Absent from older answers. */
+  components?: S.FittedComponentView[];
   voyage?: {
     current_leg_idx: number;
     estimated_arrival_at: string;
@@ -520,6 +533,8 @@ export interface ContractListing {
   created_at?: string;
   /** The raw record (`charter_kind`, `funded_by`, …). */
   metadata?: Record<string, unknown> | null;
+  /** Licence contracts only: the design, its price terms and what making one takes. */
+  licence?: S.LicenceTerms | null;
 }
 
 export interface ContractListFilter {

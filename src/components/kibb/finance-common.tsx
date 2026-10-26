@@ -6,35 +6,36 @@ import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { KV, NativeSelect } from "@/components/kibb/bits";
-import { Field, GoodSelect, PortSelect, REGIONS, ShipSelect } from "@/components/kibb/pickers";
+import { Field, GoodSelect, PortSelect, ShipSelect } from "@/components/kibb/pickers";
 import { fetchAll } from "@/components/kibb/trade-common";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash, kibbGet } from "@/lib/kibb/browser";
 import { fmtCr, fmtDateTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
+import { creditBlemishes, dailyBasis, YEAR_DAYS } from "@/lib/kibb/fleet/finance";
 import type { FinanceReport } from "@/lib/kibb/fleet/manager";
 import type * as S from "@/lib/kibb/schema";
 import type { ShipResult } from "@/lib/kibb/types";
 
 // ── Rules (guide 3.13) ────────────────────────────────────────────────────────
 
-/** Loan bounds: at least 100 Cr; 5..=150 bps a game day (10%..=300% of the Goldsmiths' 50); terms 1..=60 game days. */
+/**
+ * Loans by quote (guide 3.13.1-3.13.2): at least 100 Cr, 1..=360 game days, a fixed annual rate (bps per 360 game days)
+ * within 10%..=300% of the Goldsmiths' rate for the term. The Goldsmiths: at most 40% of a ship's rebuild value and 7,500 Cr,
+ * 45% a year up to 30 game days sliding to 30% at 360, a quote standing 6 game hours. Requests stay open 1..=72 game hours
+ * (default 24); amortised installments fall every 10 game days; a foreclosed ship is credited at 80% of its rebuild value.
+ */
 export const LOAN = {
   minPrincipalPence: 10_000,
-  rateMinBps: 5,
-  rateMaxBps: 150,
-  goldsmithsRateBps: 50,
-  termMaxDays: 60,
-  goldsmithsTermMaxDays: 30,
+  termMaxDays: 360,
   goldsmithsMaxPence: 750_000,
   goldsmithsLtvBps: 4_000,
-  /** Direct offers stand 1..=168 game hours (default 24); board entries 1..=720 (default 72). */
-  offerHoursMax: 168,
-  offerHoursDefault: 24,
-  boardHoursMax: 720,
-  boardHoursDefault: 72,
-  ltvMaxBps: 10_000,
+  quoteGameHours: 6,
+  requestHoursMax: 72,
+  requestHoursDefault: 24,
+  installmentEveryDays: 10,
+  foreclosureCreditPct: 80,
 } as const;
 
 /** Banks: 10,000 Cr fee, 50,000 Cr of own funds after it, 20% reserve, rates 0..=50 bps a day, notice 1..=720 game hours. */
@@ -54,7 +55,7 @@ export const VENTURE = { shareMinBps: 2_500, shareMaxBps: 9_000, stampDutyBps: 2
 
 /** What a default does, in the guide's terms (3.13.1). */
 export const DEFAULT_WARNING =
-  "Not repaid by maturity, a loan defaults: a liened ship goes to the lender where it lies (credited at half its rebuild value) and is arrested until then (it can't depart or join a convoy, and your cargo left aboard is sold at half base price toward the debt); pledged goods move to the lender's warehouse; with recourse the rest is taken from your vaults daily. The default stays on your public credit record.";
+  "Not repaid by maturity (or an amortised installment unpaid a game day after it falls due), a loan defaults: a liened ship goes to the lender where it lies, credited at 80% of its rebuild value (the lender pays you any surplus over what you owe), and is arrested until then (it can't depart or join a convoy, and your cargo left aboard is sold at half base price toward the debt); pledged goods move to the lender's warehouse; with recourse the rest is taken from your vaults daily. The default stays on your public credit record.";
 
 /** Number input value → number; empty → NaN. */
 export const num = (v: string) => (v.trim() === "" ? Number.NaN : Number(v));
@@ -67,10 +68,28 @@ export function firstProblem(checks: Array<[boolean, string]>): string | null {
   return checks.find(([ok]) => !ok)?.[1] ?? null;
 }
 
-/** Simple interest on `principal` at `rateBps` a game day over `days` (the most a loan run to term costs). */
-export const interestFor = (principalPence: number, rateBps: number, days: number) => Math.ceil((principalPence * rateBps * days) / 10_000);
+/** Simple interest on `principal` at an annual `rateBps` (per 360 game days) over `days` (the most a loan run to term costs). */
+export const interestFor = (principalPence: number, annualBps: number, days: number) => Math.ceil((principalPence * annualBps * days) / (10_000 * YEAR_DAYS));
 
-/** "50 bps/day" with the 30-day equivalent as a tooltip. */
+/** An annual loan rate: "36%/yr", with the bps and its 30-day cost as a tooltip. */
+export function AnnualRateText({ bps }: { bps: number | null | undefined }) {
+  if (bps === null || bps === undefined) return <>—</>;
+  return (
+    <span
+      className="whitespace-nowrap tabular-nums"
+      title={`${bps} bps per 360 game days, simple; ${((bps * 30) / YEAR_DAYS / 100).toLocaleString("en-GB", { maximumFractionDigits: 2 })}% over 30 game days`}
+    >
+      {(bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%/yr
+    </span>
+  );
+}
+
+/** A loan's own rate: annual for every loan by quote, per game day for one made before them (`rate_basis: "daily"`). */
+export function LoanRateText({ loan }: { loan: Pick<S.Loan, "rate_basis" | "daily_rate_bps" | "annual_rate_bps"> }) {
+  return dailyBasis(loan) ? <RateText bps={loan.daily_rate_bps} /> : <AnnualRateText bps={loan.annual_rate_bps} />;
+}
+
+/** "50 bps/day" with the 30-day equivalent as a tooltip (bank rates, and loans made before loans by quote). */
 export function RateText({ bps }: { bps: number | null | undefined }) {
   if (bps === null || bps === undefined) return <>—</>;
   return (
@@ -157,23 +176,29 @@ export function useCompanyNames(): CompanyNames {
 }
 
 /**
- * Reads the public sources of company names every 5 minutes (every bank, every region's credit board, our own
- * companies) so loans, deposits and credit lookups can show names instead of ids.
+ * Reads the public sources of company names every 5 minutes (every bank, the open loan requests in every region, our own
+ * requests with the lenders who quoted on them, our own companies) so loans, deposits and credit lookups can show names.
  */
 export function useCompanyDirectory() {
   const { data: ours } = usePoll(() => dash.get<{ companies: Array<{ id: string; name: string }> }>("/api/kibb/companies"), 300_000);
   const { data: banks } = usePoll(() => kibbGet<S.BankResult[]>("/v1/bank/list"), 300_000);
-  const { data: boards } = usePoll(
-    () => Promise.all(REGIONS.map((r) => kibbGet<S.CreditBoard>("/v1/loan/board", { banking_region: r }).catch(() => null))),
+  const { data: requests } = usePoll(
+    () =>
+      Promise.all([
+        kibbGet<S.LoanRequestView[]>("/v1/loan/requests", { limit: 200 }).catch(() => null),
+        kibbGet<S.LoanRequestView[]>("/v1/loan/requests", { mine: true, limit: 50 }).catch(() => null),
+      ]),
     300_000,
   );
   useLearnCompanies([
     ...(ours?.companies ?? []).map((c) => [c.id, c.name] as [string, string]),
     ...(banks ?? []).map((b) => [b.company_id, b.name] as [string, string]),
-    ...(boards ?? []).flatMap((b) => [
-      ...(b?.offers ?? []).map((o) => [o.lender_company_id, o.lender_name] as [string, string]),
-      ...(b?.requests ?? []).map((q) => [q.borrower_company_id, q.borrower_name] as [string, string]),
-    ]),
+    ...(requests ?? []).flatMap((list) =>
+      (list ?? []).flatMap((r) => [
+        [r.borrower_company_id, r.borrower_name] as [string, string],
+        ...(r.quotes ?? []).map((q) => [q.lender_company_id, q.lender_name] as [string, string]),
+      ]),
+    ),
   ]);
 }
 
@@ -219,6 +244,26 @@ export function useShips() {
   return usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { limit: 200 }), 30_000);
 }
 
+/**
+ * One of our ships' rebuild value (guide 3.4: the class's cheapest turnkey quote, guns and fitted components included), as
+ * the Goldsmiths appraise her: a 100 Cr, 30-day instant quote carries it (stored for 6 game hours, never taken). It fails
+ * (409) for a ship liened, listed or carrying a venture, or one that can't carry even that: `rebuild` is then undefined.
+ */
+export function useAppraisal(shipId: string | null | undefined) {
+  const { data, error } = usePoll(
+    shipId
+      ? () =>
+          kibbGet<S.GoldsmithsQuote>("/v1/loan/quote", { principal_pence: LOAN.minPrincipalPence, term_game_days: 30, repayment: "balloon", ship_id: shipId }).then((q) => ({
+            shipId,
+            rebuild: q.rebuild_value_pence,
+          }))
+      : null,
+    0,
+    [shipId],
+  );
+  return { rebuild: data && data.shipId === shipId ? data.rebuild : undefined, error: shipId ? error : null };
+}
+
 export interface FleetFinance {
   /** The autopilot is enabled for this company. */
   running: boolean;
@@ -227,8 +272,10 @@ export interface FleetFinance {
   ships: Set<string>;
   /** What the autopilot took a loan for (it repays its own), or null when it isn't one of its loans. */
   purposeOf: (loanId: string) => string | null;
-  /** One of the autopilot's idle-cash offers on the credit board. */
-  isAutopilotOffer: (entryId: string) => boolean;
+  /** One of the autopilot's idle-cash quotes on a player's request. */
+  isAutopilotQuote: (quoteId: string) => boolean;
+  /** One of the autopilot's requests for quotes (posted to refinance a Goldsmiths' loan). */
+  isAutopilotRequest: (requestId: string) => boolean;
 }
 
 /** The fleet autopilot's view of our loans (guide 3.13 via its finance report), when it has one. */
@@ -241,7 +288,9 @@ export function useFleetFinance(): FleetFinance {
     finance,
     ships: new Set(running ? (data?.state?.agents ?? []).map((a) => a.shipId) : []),
     purposeOf: (id) => finance?.borrowed.find((r) => r.id === id)?.purpose ?? null,
-    isAutopilotOffer: (id) => !!finance?.offers.some((o) => o.id === id),
+    // Absent from a manager running code from before loans by quote.
+    isAutopilotQuote: (id) => !!finance?.quotes?.some((q) => q.id === id),
+    isAutopilotRequest: (id) => !!finance?.requests?.some((r) => r.id === id),
   };
 }
 
@@ -317,18 +366,28 @@ export function CollateralText({ loan, shipName }: { loan: S.Loan; shipName?: (i
   );
 }
 
-/** A company's public credit record (guide 3.13.7). */
+/**
+ * A company's public credit record (guide 3.13.7): "clean" as the autopilot's idle-cash lending reads it (no default ever,
+ * walk-away, write-off, open futures claim, bankruptcy or smuggling conviction).
+ */
 export function CreditRecordView({ report }: { report: S.CreditReport }) {
-  const defaults = report.loans_defaulted > 0 || report.defaulted_open_loans > 0;
-  const bad = defaults || !!report.bankrupt_at || report.futures_claims_open_pence > 0 || report.loans_written_off > 0;
+  const blemishes = creditBlemishes(report);
+  const walked = report.loans_walked_away ?? 0;
+  const convictions = report.smuggling_convictions ?? 0;
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-medium">{report.company_name}</span>
-        <Badge variant={bad ? "error" : "success"} size="sm">
-          {bad ? "blemished" : "clean"}
+        <Badge variant={blemishes.length ? "error" : "success"} size="sm" title={blemishes.join(", ") || undefined}>
+          {blemishes.length ? "blemished" : "clean"}
         </Badge>
         {report.bankrupt_at && <Badge variant="error" size="sm">bankrupt {fmtDateTime(report.bankrupt_at)}</Badge>}
+        {walked > 0 && <Badge variant="error" size="sm">walked away from {walked}</Badge>}
+        {convictions > 0 && (
+          <Badge variant="error" size="sm">
+            {convictions} smuggling conviction{convictions === 1 ? "" : "s"}
+          </Badge>
+        )}
       </div>
       <KV
         rows={[
@@ -336,8 +395,10 @@ export function CreditRecordView({ report }: { report: S.CreditReport }) {
           ["Defaulted, still owed", report.defaulted_open_loans ? `${fmtCr(report.defaulted_owed_pence)} on ${report.defaulted_open_loans}` : "none"],
           ["Loans repaid", report.loans_repaid],
           ["Loans defaulted (ever)", report.loans_defaulted],
+          ["Walked away from", walked ? `${walked} (${fmtCr(report.loan_walked_away_pence ?? 0)} their lenders lost)` : "none"],
           ["Written off", report.loans_written_off ? `${report.loans_written_off} (${fmtCr(report.loan_written_off_pence)})` : "none"],
           ["Last default", report.last_default_at ? fmtDateTime(report.last_default_at) : "never"],
+          ["Smuggling convictions", convictions ? `${convictions}${report.last_conviction_at ? `, the last ${fmtDateTime(report.last_conviction_at)}` : ""}` : "none"],
           ["Futures claims open", fmtCr(report.futures_claims_open_pence)],
           ["Futures claims (ever / written off)", `${report.futures_claims_total} / ${report.futures_claims_written_off}`],
           ["Lent out now", fmtCr(report.lent_outstanding_pence)],

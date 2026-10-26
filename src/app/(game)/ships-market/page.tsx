@@ -16,6 +16,7 @@ import {
   crToPence,
   firstProblem,
   regionName,
+  useAppraisal,
   useCompanyDirectory,
   usePledgedShips,
   useRegionOf,
@@ -62,9 +63,8 @@ function ListShipForm({
   const act = useAction<S.ShipListingResult | null>((r) => r && onDone());
   const ships = (presence.ships ?? []).filter((r) => r.ship.status !== "sunk");
   const r = ships.find((x) => x.ship.id === shipId);
-  // Her rebuild value (guns included), as the Goldsmiths appraise her: the price band is 50%..150% of it.
-  const { data: appraisal, error: appraisalError } = usePoll(shipId ? () => kibbGet<S.BackstopQuote>("/v1/loan/backstop-quote", { ship_id: shipId }) : null, 0, [shipId]);
-  const rebuild = appraisal && appraisal.ship_id === shipId ? appraisal.rebuild_value_pence : undefined;
+  // Her rebuild value (guns and fitted components included), as the Goldsmiths appraise her: the price band is 50%..150% of it.
+  const { rebuild, error: appraisalError } = useAppraisal(shipId);
   const band = rebuild !== undefined ? bandOf(rebuild) : undefined;
   // Without the appraisal, a turnkey quote at the yard she lies at (plus her guns) is at least her rebuild value: an upper bound.
   const yardHere = !!r && atPort(r) && !!catalog?.ports.find((p) => p.id === r.ship.current_port_id)?.has_shipyard;

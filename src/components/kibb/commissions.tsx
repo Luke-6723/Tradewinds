@@ -29,6 +29,7 @@ import {
   firstProblem,
   num,
   regionName,
+  useAppraisal,
   useCompanyDirectory,
   useRegionOf,
   useVaults,
@@ -368,10 +369,10 @@ function CreateCommission({ presence, vaults, deals, onDone }: { presence: Prese
   const classes = (catalog?.ship_classes ?? []).filter((c) => c.phase <= unlocked);
 
   // The hull's rebuild value (the class's cheapest turnkey quote at an open yard): exactly, from the Goldsmiths' appraisal of one of
-  // our own ships of the class less its guns; else this yard's own turnkey quote, which is at least the rebuild value.
-  const own = presence.ships?.find((r) => r.ship.ship_class === cls && r.ship.status !== "sunk");
-  const { data: appraisal } = usePoll(own ? () => kibbGet<S.BackstopQuote>("/v1/loan/backstop-quote", { ship_id: own.ship.id }) : null, 0, [own?.ship.id]);
-  const exact = own && appraisal?.ship_id === own.ship.id ? Math.max(0, appraisal.rebuild_value_pence - own.ship.cannons_count * GUN_PENCE) : null;
+  // our own ships of the class with no component fitted, less her guns; else this yard's own turnkey quote, at least the rebuild value.
+  const own = presence.ships?.find((r) => r.ship.ship_class === cls && r.ship.status !== "sunk" && !(r.components ?? []).length);
+  const { rebuild: ownRebuild } = useAppraisal(own?.ship.id);
+  const exact = own && ownRebuild !== undefined ? Math.max(0, ownRebuild - own.ship.cannons_count * GUN_PENCE) : null;
   const { quote: yardQuote } = useBuildQuote(yard, cls, "turnkey_cash", exact === null && presence.quay.has(yard));
   const upper = exact === null ? (yardQuote?.total_cost_pence ?? null) : null;
   const band = exact !== null ? bandOf(exact) : null;

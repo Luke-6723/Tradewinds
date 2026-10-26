@@ -9,7 +9,7 @@ import { useCatalog } from "@/hooks/use-catalog";
 import { fmtTons } from "@/lib/kibb/format";
 import type { BankingRegion, ShipResult } from "@/lib/kibb/types";
 
-export const REGIONS: BankingRegion[] = ["channel", "north_sea", "baltic", "iberia", "caribbean", "indian_ocean", "east_indies"];
+export const REGIONS: BankingRegion[] = ["channel", "north_sea", "baltic", "iberia", "caribbean", "america", "indian_ocean", "east_indies"];
 
 /** Label above a control. */
 export function Field({ label, children, className }: { label: ReactNode; children: ReactNode; className?: string }) {
