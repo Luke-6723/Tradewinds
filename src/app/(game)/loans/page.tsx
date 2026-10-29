@@ -17,6 +17,9 @@ import {
   CreditRecordView,
   DEFAULT_WARNING,
   EMPTY_PLEDGE,
+  GOLDSMITHS_DEFAULT_WARNING,
+  isGoldsmithsInstant,
+  WALK_AWAY_BAN_WARNING,
   type FleetFinance,
   LOAN,
   LoanRateText,
@@ -138,6 +141,7 @@ function RepayForm({ loan, cash, fleet, onDone, onClose }: { loan: S.Loan; cash:
   const all = amount.trim() === "";
   const pence = all ? loan.owed_pence : crToPence(amount);
   const purpose = fleet.purposeOf(loan.id);
+  const goldsmiths = isGoldsmithsInstant(loan);
   const why = all ? null : firstProblem([
     [pence > 0, "Enter an amount, or leave it empty to repay everything owed."],
     [pence <= loan.owed_pence, `Only ${fmtCr(loan.owed_pence, 2)} is owed.`],
@@ -154,9 +158,12 @@ function RepayForm({ loan, cash, fleet, onDone, onClose }: { loan: S.Loan; cash:
   }
 
   function walkAway() {
+    const terms = goldsmiths
+      ? `This is a Goldsmiths' instant loan. ${GOLDSMITHS_DEFAULT_WARNING} Walking away writes nothing off here: you keep owing the rest.`
+      : "The lender takes its collateral as at any default (a liened ship is arrested until it changes hands, credited at 80% of its rebuild value, any surplus paid to you); whatever that leaves owed is written off, recourse or not, and you keep your cash.";
     if (
       !confirm(
-        `Walk away from this loan (${fmtCr(loan.owed_pence, 2)} owed to ${names.label(loan.lender_company_id)})?\n\nThe lender takes its collateral as at any default (a liened ship is arrested until it changes hands); whatever that leaves owed is written off, recourse or not, and you keep your cash. It is PERMANENT on your public credit record (loans walked away from, and what the lender lost), shown to every lender on each request you post.`,
+        `Walk away from this loan (${fmtCr(loan.owed_pence, 2)} owed to ${names.label(loan.lender_company_id)})?\n\n${terms}\n\nIt is PERMANENT on your public credit record (loans walked away from, and what the lender lost), shown to every lender on each request you post. ${WALK_AWAY_BAN_WARNING}`,
       ) ||
       !confirm("Last check: walking away can't be undone. Walk away?")
     )
@@ -204,7 +211,13 @@ function RepayForm({ loan, cash, fleet, onDone, onClose }: { loan: S.Loan; cash:
       </p>
       <ErrorNote error={act.error ?? walk.error ?? why} />
       {act.result && <p className="text-sm">Done: {fmtCr(act.result.owed_pence, 2)} still owed ({act.result.status}).</p>}
-      {walk.result && <p className="text-sm">Walked away: the lender takes the collateral; the rest is written off.</p>}
+      {walk.result && (
+        <p className="text-sm">
+          {goldsmiths
+            ? "Walked away: the Goldsmiths take the ship at its break-up value (35% of rebuild, no surplus); the rest is still owed and collected from your vaults."
+            : "Walked away: the lender takes the collateral; the rest is written off."}
+        </p>
+      )}
       <div className="flex gap-2">
         <Button className="flex-1" disabled={!!why || act.busy} onClick={submit}>
           {act.busy ? "Repaying…" : all ? "Repay in full" : `Repay ${fmtCr(pence, 2)}`}
@@ -219,8 +232,10 @@ function RepayForm({ loan, cash, fleet, onDone, onClose }: { loan: S.Loan; cash:
             {walk.busy ? "Walking away…" : "Walk away from this loan…"}
           </Button>
           <p className="mt-1 text-muted-foreground text-xs">
-            Defaults by choice: the collateral goes to the lender and the rest is written off for good, at the cost of a permanent mark on your credit
-            record. The autopilot never does this.
+            {goldsmiths
+              ? "Defaults by choice on a Goldsmiths' instant loan: they take the ship at its break-up value (35% of rebuild, no surplus) and the rest stays owed, with a permanent mark on your credit record."
+              : "Defaults by choice: the collateral goes to the lender and the rest is written off for good, at the cost of a permanent mark on your credit record."}{" "}
+            The Goldsmiths then lend to none of your companies for a real day. The autopilot never does this.
           </p>
         </div>
       )}
@@ -305,6 +320,7 @@ function OwedPanel({
               maturity whatever is owed is taken, that region first.
             </p>
             <p>{DEFAULT_WARNING}</p>
+            <p>{GOLDSMITHS_DEFAULT_WARNING}</p>
           </div>
         )}
       </Panel>
@@ -491,7 +507,7 @@ function GoldsmithsPanel({
     const x = q.quote;
     if (
       !confirm(
-        `Borrow ${fmtCr(x.principal_pence)} from ${x.lender_name} in ${regionName(x.banking_region)} at ${pctText(x.annual_rate_bps)} for ${x.term_game_days} game days, ${x.repayment === "amortised" ? `amortised (${fmtCr(x.installment_pence ?? 0)} every ${LOAN.installmentEveryDays} game days)` : "balloon (all at maturity)"}: ${fmtCr(x.total_repayable_pence)} repaid in all, against a lien on ${ship?.ship.name ?? "this ship"}? With recourse: what the ship doesn't cover is claimed from your vaults.\n\n${DEFAULT_WARNING}`,
+        `Borrow ${fmtCr(x.principal_pence)} from ${x.lender_name} in ${regionName(x.banking_region)} at ${pctText(x.annual_rate_bps)} for ${x.term_game_days} game days, ${x.repayment === "amortised" ? `amortised (${fmtCr(x.installment_pence ?? 0)} every ${LOAN.installmentEveryDays} game days)` : "balloon (all at maturity)"}: ${fmtCr(x.total_repayable_pence)} repaid in all, against a lien on ${ship?.ship.name ?? "this ship"}? With recourse: what the ship doesn't cover is claimed from your vaults.\n\n${GOLDSMITHS_DEFAULT_WARNING}`,
       )
     )
       return;
@@ -560,7 +576,8 @@ function GoldsmithsPanel({
           One house per region lends against one of your ships at once: at most {LOAN.goldsmithsLtvBps / 100}% of her rebuild value and {fmtCr(LOAN.goldsmithsMaxPence)} a loan,
           always with recourse, at 45% a year for up to 30 game days sliding to 30% at 360. Dear on purpose: a player lender may quote less on a request. A quote
           stands {LOAN.quoteGameHours} game hours. A liened ship can still sail, but can&apos;t be listed, sold, pledged again or carry a venture until repaid; insured and lost,
-          the claim pays the lender first.
+          the claim pays the lender first. On a default they take her at only {LOAN.goldsmithsForeclosureCreditPct}% of her rebuild value (the break-up price), pay no
+          surplus, and the rest stays owed. After any walk-away (yours or a linked company&apos;s) they quote and lend nothing for a real day.
         </p>
       </div>
     </Panel>
@@ -988,7 +1005,12 @@ function LendTab({
                           {fleet.isAutopilotQuote(q.id) && " (autopilot)"}
                         </Button>
                       ))}
-                      {!own && mine.length === 0 && (
+                      {!own && mine.length === 0 && r.collateral_kind === "deposit" && (
+                        <span className="self-center text-muted-foreground text-xs" title="Secured by a bank deposit: only the bank holding it may quote (guide 3.13.2)">
+                          Bank only
+                        </span>
+                      )}
+                      {!own && mine.length === 0 && r.collateral_kind !== "deposit" && (
                         <Button
                           size="sm"
                           variant="outline"

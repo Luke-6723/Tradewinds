@@ -16,7 +16,7 @@ import {
   type FleetSettings,
   type FleetState,
 } from "./fleet/manager";
-import { KIBB_URL } from "./server";
+import { keyAllowsSmuggling, KIBB_URL } from "./server";
 import { getCompanyKey, getStoredFleet, listCompanyKeys, listStoredFleets, saveStoredFleet, STORE_DIR } from "./store";
 
 // globalThis keeps one registry across Next.js HMR and route bundles.
@@ -40,6 +40,8 @@ export interface FleetView {
   keyExpiresAt: string | null;
   /** The autopilot was enabled but couldn't be resumed when the server started. */
   resumeError: { at: string; error: string } | null;
+  /** The stored company key holds the `underworld` scope (smuggling allowed on the Underworld page; guide 3.18). */
+  smugglingAllowed: boolean;
 }
 
 /** Runs `fn` after any earlier change for this company has finished. */
@@ -77,6 +79,11 @@ async function start(companyId: string, settings: FleetSettings): Promise<void> 
     {
       onLog: ({ source, msg }) => console.log(`[fleet:${key.companyName}] ${source}: ${msg}`),
       carryOver: previous?.state,
+      // A seizure switched smuggling off (guide 3.18): saved off too, so the panel shows it and only the user turns it on again.
+      onSmugglingHalted: () =>
+        void updateFleet(companyId, { settings: { smuggling: false } }).catch((e) =>
+          console.error(`[fleet:${key.companyName}] saving smuggling off after the seizure failed: ${(e as Error).message}`),
+        ),
     },
   );
   fleets.set(companyId, manager);
@@ -98,6 +105,7 @@ export async function getFleetView(companyId: string): Promise<FleetView> {
     state: fleets.get(companyId)?.state ?? null,
     keyExpiresAt: key?.expiresAt ?? null,
     resumeError: resumeErrors.get(companyId) ?? null,
+    smugglingAllowed: keyAllowsSmuggling(key),
   };
 }
 

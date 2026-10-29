@@ -80,6 +80,8 @@ const ARREST_WAIT_MS       = 60_000;
 const ARREST_RECHECK_MS    = 5 * 60_000;
 /** A refusal that says the ship is under arrest (guide 3.13.1: a defaulted loan's pledge can't depart or join a convoy). */
 export const ARREST_RE     = /\barrest/i;
+/** A ship with contraband aboard in an ordinary port, kept from a berth trade: looks again this often (real ms). */
+const CONTRABAND_WAIT_MS   = 60_000;
 
 export interface FleetHost {
   readonly world: World;
@@ -151,6 +153,14 @@ export interface FleetHost {
    * Null: our loans couldn't be read. `fresh`: read them again now.
    */
   shipArrested(shipId: string, fresh?: boolean): Promise<boolean | null>;
+  /** Whether this ship smuggles for the fleet now (the smuggling mode took her: no lane, no convoy, no pledge; guide 3.18). */
+  isSmuggler(agent: ShipAgent): boolean;
+  /**
+   * The Free Trade (guide 3.18): her turn in port when she smuggles for the fleet, or (`adopt`) when contraband is aboard with
+   * nothing lawful and the smuggling mode may take her. A wait (real ms), or null: carry on as a lawful ship (with contraband
+   * still aboard, the hold in the roadstead).
+   */
+  smuggleTurn(agent: ShipAgent, r: ShipResult, adopt: boolean): Promise<number | null>;
 }
 
 /** What one ship's agent saves, so a restart resumes its lane, sell floors and record. */
@@ -281,6 +291,8 @@ export interface AgentState {
   arrested?: string;
   /** A packet holding its dispatches sealed (guide 3.11: it posts nothing to the boards it calls at). */
   dispatchesSealed?: boolean;
+  /** Smuggling for the fleet (guide 3.18; the smuggling mode's report says what she is about); absent: not. */
+  smuggler?: boolean;
 }
 
 /** One port call: what was done there, so nothing is repeated or mis-delivered. */
@@ -447,6 +459,7 @@ export class ShipAgent {
       nextTickAt: this.nextTickAt ? new Date(this.nextTickAt).toISOString() : null,
       ...(this.arrest ? { arrested: this.arrest.why } : {}),
       ...(s?.dispatches_sealed ? { dispatchesSealed: true } : {}),
+      ...(!this.gone && this.host.isSmuggler(this) ? { smuggler: true } : {}),
     };
   }
 
@@ -599,11 +612,20 @@ export class ShipAgent {
     this.host.persist(true);
   }
 
-  /** Tons of this good aboard that belong to us (not sealed freight). */
+  /**
+   * Tons of this good aboard that belong to us (not sealed freight) for lawful work: contraband counts none, as no
+   * market, charter or warehouse takes it (guide 3.18; contrabandAboard has it).
+   */
   ownTons(r: ShipResult, good: string): number {
+    if (this.host.world.isContraband(good)) return 0;
     let sealed = 0;
     for (const f of this.freight.values()) if (f.good === good) sealed += f.tons;
     return Math.max(0, (r.cargo_manifest[good] ?? 0) - sealed);
+  }
+
+  /** Contraband aboard (good, tons): ours alone (freight never carries it), worth its base in net worth but never sold lawfully. */
+  contrabandAboard(r: ShipResult): Array<[string, number]> {
+    return Object.entries(r.cargo_manifest).filter(([g, t]) => t > 0 && this.host.world.isContraband(g));
   }
 
   /** Tons of sealed freight aboard. */
@@ -959,7 +981,12 @@ export class ShipAgent {
     const cls = world.shipClass(this.shipClass);
     // The server's own leg estimates (laden speed, convoy pace) when given; else about the class speed.
     const speed = Math.round((cls?.base_speed_centiknots ?? 800) * 0.9);
-    const legs = r.voyage?.legs?.length ? r.voyage.legs : r.route_legs.slice(r.ship.current_leg_idx).map((l) => ({ ...l, speed_centiknots: speed }));
+    // Each leg's crossing class from route_legs (the voyage's estimates don't carry it): storms roll for the rougher water.
+    const edgeOf = (from: string, to: string, idx?: number) =>
+      (idx !== undefined && r.route_legs[idx]?.to_node === to ? r.route_legs[idx] : r.route_legs.find((l) => l.from_node === from && l.to_node === to))?.edge_class ?? null;
+    const legs = r.voyage?.legs?.length
+      ? r.voyage.legs.map((l) => ({ ...l, edge_class: edgeOf(l.from_node, l.to_node, l.leg_idx) }))
+      : r.route_legs.slice(r.ship.current_leg_idx).map((l) => ({ ...l, speed_centiknots: speed }));
     world.noteStormExposure(legs, cls?.hull_category ?? "coastal", world.now());
   }
 
@@ -1017,6 +1044,8 @@ export class ShipAgent {
     if (s.status === "sunk") return this.leaveFleet("has sunk");
     // Taken by pirates (a status the October patch may have added).
     if ((s.status as string) === "captured") return this.leaveFleet("was captured by pirates");
+    // Forfeit to the Crown for smuggling (guide 3.18: as if she sank), should the game list her so before she goes.
+    if ((s.status as string) === "seized") return this.leaveFleet("was seized by the Crown for smuggling");
     if (!this.freightSynced) await this.syncFreight();
     if (this.checkRestored && this.freightSynced) this.checkRestoredLane(r);
     for (const good of [...this.minSale.keys()]) if (this.ownTons(r, good) <= 0) this.minSale.delete(good);
@@ -1110,11 +1139,15 @@ export class ShipAgent {
     for (const good of Object.keys(r.cargo_manifest)) {
       const tons = this.ownTons(r, good);
       // Never an expected crisis charter (it isn't listed, so nothing could be delivered into it), nor one of our own player's.
-      const c = this.host.world.charters
-        .filter((x) => x.port === dest && x.good === good && !x.provisional && this.host.world.deliverable(x))
-        .sort((a, b) => b.payPerTon - a.payPerTon)[0];
+      // Contraband never (ownTons: none of it), nor a charter at a cove.
+      // Best by what the pay is worth to us (a Crown or Admiralty premium tapered, guide 3.7).
+      const w = this.host.world;
+      const worth = (x: (typeof w.charters)[number]) => w.charterPayValue(x, x.payPerTon, Math.min(tons, x.remaining));
+      const c = w.charters
+        .filter((x) => x.port === dest && x.good === good && !x.provisional && w.deliverable(x) && !w.isCove(x.port))
+        .sort((a, b) => worth(b) - worth(a))[0];
       if (tons <= 0 || !c) continue;
-      this.lane = cargoLane(good, r.route_legs[0]?.from_node ?? dest, dest, c.id, Math.min(tons, c.remaining), c.payPerTon);
+      this.lane = cargoLane(good, r.route_legs[0]?.from_node ?? dest, dest, c.id, Math.min(tons, c.remaining), Math.round(worth(c)));
       this.laneLoaded = this.lane.key;
       return;
     }
@@ -1173,9 +1206,24 @@ export class ShipAgent {
       if (wait !== null) return wait;
     }
 
+    // Contraband aboard in an ordinary port (guide 3.18: a ship lying there with it may be searched, berthed more than in the
+    // roadstead): off the berth as soon as the lock lets her (a free berth takes an arriving ship); nothing berths her again.
+    if (r.ship.status === "berthed" && !world.isCove(port) && this.contrabandAboard(r).length > 0 && !this.locked(r)) {
+      await this.park(r);
+      r = await this.reread();
+    }
+
     if (!stay.scouted) {
       stay.scouted = true;
       await this.scout(port);
+    }
+
+    // Smuggling for the fleet (the smuggling mode took her, guide 3.18): her turn comes from it, never lawful work meanwhile.
+    if (this.host.isSmuggler(this)) {
+      const wait = await this.host.smuggleTurn(this, r, false);
+      if (wait !== null) return wait;
+      // Let go: back to lawful work (anything still aboard is handled below as for any ship).
+      r = await this.reread();
     }
 
     // 1. Freight that ends here (works from the roadstead).
@@ -1368,6 +1416,25 @@ export class ShipAgent {
       const wait = await this.handleLeftover(r, good, stay);
       if (wait !== null) return wait;
     }
+    // Contraband aboard (bought by hand, or the smuggling mode's) is never offered on a market, which would refuse it
+    // (guide 3.18), and new lawful work would berth her with it aboard (a berthed ship is searched more). With the smuggling
+    // mode on, it takes her (nothing lawful is aboard by now): to a want, or back to a cove. Otherwise she holds it in the
+    // roadstead until it is run ashore or sold at a cove by hand.
+    const contraband = this.contrabandAboard(r);
+    if (contraband.length) {
+      const wait = await this.host.smuggleTurn(this, r, true);
+      if (wait !== null) return wait;
+      const what = contraband.map(([g, t]) => `${t} t ${g}`).join(", ");
+      this.logOnce(
+        `contraband:${port}:${what}`,
+        `holding ${what} (contraband) in the roadstead at ${port}: no lawful market takes it, and the smuggling mode isn't taking her; ` +
+          `${world.isCove(port) ? "a cove is never searched" : "a ship lying in port with contraband aboard may be searched (forfeit with everything aboard)"}: run it ashore where it is wanted, or sell it at a cove, from the Underworld page`,
+      );
+      if (this.lane && !this.loaded) this.host.releaseLane(this);
+      await this.park(r);
+      this.activity = `holding ${what} (contraband) at ${port}: no lawful market takes it`;
+      return HOLD_WAIT_GAME_MIN * world.gameMinuteMs;
+    }
     this.holds = 0;
 
     // An AI hold: no new work; it waits in the roadstead (counted idle by the tripwire).
@@ -1419,6 +1486,160 @@ export class ShipAgent {
   private async reread(): Promise<ShipResult> {
     this.last = await this.host.client.ship(this.shipId);
     return this.last;
+  }
+
+  // ── The Free Trade (guide 3.18): what the smuggling mode asks of her ───────
+
+  /**
+   * Contraband aboard in an ordinary port: no berth, stores, trade, refit or freight there (a ship lying in port with it may be
+   * searched, berthed more than in the roadstead; guide 3.18). Logged once per port and what was refused. A cove never bars.
+   */
+  private contrabandBarred(r: ShipResult, what: string): boolean {
+    const port = r.ship.current_port_id;
+    if (!port || this.host.world.isCove(port)) return false;
+    const aboard = this.contrabandAboard(r);
+    if (aboard.length === 0) return false;
+    this.logOnce(
+      `barred:${port}:${what}`,
+      `not ${what} at ${port}: ${aboard.map(([g, t]) => `${t} t ${g}`).join(", ")} (contraband) aboard, and a ship lying in an ordinary port with it may be searched (berthed more than in the roadstead): roadstead only`,
+    );
+    return true;
+  }
+
+  /** What she is doing, for the dashboard (the smuggling mode's turn says). */
+  setActivity(text: string): void {
+    this.activity = text;
+  }
+
+  /** Reads her afresh. */
+  refresh(): Promise<ShipResult> {
+    return this.reread();
+  }
+
+  /**
+   * Off the berth as soon as the lock lets her (contraband aboard in an ordinary port): a wait while the lock holds her, else
+   * null (she lies in the roadstead, moved there now if she was berthed).
+   */
+  async smugglerLeaveBerth(r: ShipResult): Promise<number | null> {
+    if (r.ship.status !== "berthed") return null;
+    if (this.locked(r)) {
+      const wait = Date.parse(r.ship.turnaround_unlocks_at!) - this.host.world.now();
+      this.logOnce(`berthed:${this.stay?.key ?? ""}`, `berthed on arrival at ${r.ship.current_port_id} (a free berth takes an arriving ship) with contraband aboard: to the roadstead as soon as the lock lets her`);
+      this.activity = `berthed with contraband aboard: to the roadstead in ${secs(wait)}`;
+      return Math.max(1_000, wait + 750);
+    }
+    await this.park(r);
+    return (await this.reread()).ship.status === "berthed" ? 5_000 : null;
+  }
+
+  /** In the roadstead (free of dues; from a berth only once the lock has passed). */
+  async smugglerPark(r: ShipResult): Promise<void> {
+    await this.park(r);
+  }
+
+  /** At a cove (never searched): to a berth, to stock stores there. A wait. */
+  async smugglerDock(r: ShipResult): Promise<number> {
+    return this.dockOrWait(r);
+  }
+
+  /** The stores a passage needs to be safe: the route's figure, or more if a departure last warned so. */
+  safeStoresFor(from: string, to: string, plan: RoutePlan): number {
+    return this.safeStores(from, to, plan);
+  }
+
+  /**
+   * Berthed at a cove: buys whole tons of stores up to `want` (a run may not stock up anywhere else with contraband aboard;
+   * the smuggling mode's own look-again interval paces a retry when the cove had too little). Returns the tons bought.
+   */
+  async smugglerStores(r: ShipResult, want: number): Promise<number> {
+    const stay = this.stay;
+    if (!stay) return 0;
+    const n = storesTons(r.stores.provisions_tons, want);
+    if (n <= 0) return 0;
+    return this.buyStores(r, stay, n);
+  }
+
+  /**
+   * Empty (nothing contraband aboard): to a cove for the smuggling mode as any ship sails (stores bought as usual, never in a
+   * convoy: the convoy check leaves smugglers out). A wait.
+   */
+  async sailForCove(r: ShipResult, cove: string): Promise<number> {
+    const stay = this.stay;
+    if (!stay) return POLL_MS;
+    return this.sailTo(r, cove, stay);
+  }
+
+  /**
+   * Sails for `dest` alone with contraband aboard, on the plan the smuggling mode checked (hull, patrols): never in a convoy
+   * (its consorts would share the search), stores as they are (bought at the cove; never in an ordinary port). A wait.
+   */
+  async smugglerDepart(r: ShipResult, dest: string, plan: RoutePlan): Promise<number> {
+    const { client, world } = this.host;
+    const port = r.ship.current_port_id ?? "?";
+    if (this.locked(r)) {
+      const wait = Date.parse(r.ship.turnaround_unlocks_at!) - world.now();
+      this.activity = `berth lock: leaving for ${dest} in ${secs(wait)}`;
+      return wait + 750;
+    }
+    try {
+      const res = await client.depart({ ship_id: this.shipId, dest_port_id: dest });
+      this.noteDues(port, res.berth_dues_pence);
+      for (const w of res.warnings) {
+        if (w.code === "stores_below_safe") {
+          world.noteSafeStores(port, dest, this.shipClass, w.safe_tons);
+          world.forgetRoute(port, dest, this.shipClass);
+        }
+        this.log(`depart warning ${w.code}: ${w.detail}`);
+      }
+      const eta = Date.parse(res.estimated_arrival_at);
+      const what = this.contrabandAboard(r).map(([g, t]) => `${t} t ${g}`).join(", ");
+      this.log(`sailing ${port} → ${dest}${what ? ` with ${what} (contraband)` : ""}, arrives in ${secs(eta - world.now())}`);
+      const sailed = res.route_legs ?? [];
+      if (sailed.length && (sailed.length !== plan.legs.length || sailed.some((l, i) => l.to_node !== plan.legs[i].to_node))) {
+        world.forgetRoute(port, dest, this.shipClass);
+        this.log(`WARNING: the server sailed ${port} → ${dest} by another route than the one checked for patrols: ${sailed.map((l) => l.to_node).join(" → ")}`);
+      }
+      this.activity = `sailing to ${dest}`;
+      this.stay = null;
+      this.last = {
+        ...r,
+        ship: { ...r.ship, status: "sailing", current_port_id: null, leg_arrives_at: res.estimated_arrival_at },
+        route_legs: res.route_legs ?? r.route_legs,
+        voyage: null,
+      };
+      return Math.min(Math.max(eta - world.now() + 1_500, 2_000), MAX_SAIL_SLEEP_MS);
+    } catch (e) {
+      soft(e);
+      if (isApiError(e, "conflict")) {
+        const m = /for (\d+)s more/.exec(e.detail);
+        this.activity = `depart refused: ${e.detail}`;
+        if (m) return (Number(m[1]) + 1) * 1_000;
+        if (ARREST_RE.test(e.detail)) {
+          this.noteArrest(e.detail);
+          return 1_000;
+        }
+        this.logOnce(`smuggle-depart:${port}>${dest}`, `depart to ${dest} refused: ${e.detail}`);
+        return 30_000;
+      }
+      if (isApiError(e, "insufficient_provisions")) {
+        world.forgetRoute(port, dest, this.shipClass);
+        const short = (e.body as { provisions_shortfall?: { buy_provisions_tons?: number } }).provisions_shortfall;
+        world.noteSafeStores(port, dest, this.shipClass, r.stores.provisions_tons + (short?.buy_provisions_tons ?? 1));
+        this.log(`depart to ${dest} refused, stores short: ${e.detail}`);
+        return 30_000;
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Seized by the Crown for smuggling (guide 3.18: the ship and everything aboard forfeit, as if she sank; the conviction
+   * on our public credit record): she leaves the fleet now.
+   */
+  noteSeized(why: string): void {
+    if (this.gone) return;
+    this.leaveFleet(why);
+    this.wake?.();
   }
 
   private locked(r: ShipResult): boolean {
@@ -1617,7 +1838,7 @@ export class ShipAgent {
    * Returns whether the guns changed.
    */
   private async refitGuns(r: ShipResult, stay: Stay): Promise<boolean> {
-    if (stay.traded.has("arm") || r.ship.status !== "berthed") return false;
+    if (stay.traded.has("arm") || r.ship.status !== "berthed" || this.contrabandBarred(r, "refitting")) return false;
     // The guns were chosen for the passage this cargo makes: don't change them under it.
     if (stay.traded.has("cargo") || (this.lane && this.laneLoaded === this.lane.key) || this.laneGoodsAboard(r) > 0) return false;
     const target = await this.host.gunTarget(this, r);
@@ -1663,6 +1884,13 @@ export class ShipAgent {
   private async loadAt(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
     if (stay.traded.has("cargo")) return this.sailTo(r, lane.dest, stay);
     const { world } = this.host;
+    // Nothing is loaded with contraband aboard in an ordinary port (guide 3.18: berth trades, searched there): the lane goes.
+    if (this.contrabandBarred(r, "loading")) {
+      if (!this.loaded) this.host.releaseLane(this);
+      await this.park(r);
+      this.activity = `contraband aboard: not loading at ${stay.port}`;
+      return CONTRABAND_WAIT_MS;
+    }
     // Insured since the plan (the user, from the dashboard): nothing goes aboard after a policy is written.
     const insured = await this.policyNow();
     if (insured !== null) return this.stopLoading(stay, insured);
@@ -2070,7 +2298,8 @@ export class ShipAgent {
           this.roomIn(c) > 0 &&
           !this.campShut(c, Math.min(deliverable(c.good), this.roomIn(c))),
       )
-      .sort((a, b) => b.payPerTon - a.payPerTon);
+      // The best-paying first, by what the pay is worth to us (a Crown or Admiralty premium tapered, guide 3.7).
+      .sort((a, b) => world.charterPayValue(b, b.payPerTon, deliverable(b.good)) - world.charterPayValue(a, a.payPerTon, deliverable(a.good)));
 
     // Several charters at once: one all-or-nothing batch call; on any refusal, one at a time below.
     // A posting being let lapse goes one at a time (its room under the line is checked just before).
@@ -2306,7 +2535,8 @@ export class ShipAgent {
   private roomIn(c: World["charters"][number]): number {
     if (c.remaining <= 0) return 0;
     const sale = this.loaded ? this.lane!.parts.find((p) => p.kind === "market" && p.good === c.good) : undefined;
-    if (sale && c.payPerTon < sale.pay) return 0;
+    // What the charter's pay is worth to us (a Crown or Admiralty premium tapered, guide 3.7) against the planned sale.
+    if (sale && this.host.world.charterPayValue(c, c.payPerTon, Math.min(sale.tons, c.remaining)) < sale.pay) return 0;
     return this.host.charterRoomFor(this, c.id, c.remaining);
   }
 
@@ -2320,6 +2550,8 @@ export class ShipAgent {
     }
     r.cargo_manifest[c.good] = (r.cargo_manifest[c.good] ?? 0) - res.delivered_quantity;
     world.noteOwnDelivery(c, res.delivered_quantity);
+    // Crown and Admiralty pay (never a player's charter) counts towards the premium taper (guide 3.7).
+    world.noteCharterPay(c, res.reward_paid_pence);
     this.host.persist(true);
     this.stats.deliveredTons += res.delivered_quantity;
     this.stats.rewardPence += res.reward_paid_pence;
@@ -2386,7 +2618,7 @@ export class ShipAgent {
   private async takeFreight(r: ShipResult, next: string, stay: Stay): Promise<void> {
     const { client, world, settings } = this.host;
     const port = stay.port;
-    if (!settings.useFreight || r.ship.status !== "berthed" || stay.traded.has("freight")) return;
+    if (!settings.useFreight || r.ship.status !== "berthed" || stay.traded.has("freight") || this.contrabandBarred(r, "taking freight")) return;
     // Insured (or unknown): sealed freight loaded after the policy voids it.
     if ((await this.policyNow()) !== null) return;
     stay.traded.add("freight");
@@ -2414,7 +2646,10 @@ export class ShipAgent {
     const sailsAt = Math.max(world.now(), Number.isFinite(lockEnds) ? lockEnds : 0);
     const sailMs = world.sailMs(plan.total_distance_nm, knots);
     const storm = world.stormRisk(plan, hull, knots, sailsAt, settings.stormWeightPct / 100);
-    const aboard = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0);
+    // Pirates take contraband like anything else: it counts toward the hold they are drawn to.
+    const aboard =
+      Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0) +
+      this.contrabandAboard(r).reduce((n, [g, t]) => n + t * world.basePrice(g), 0);
     const candidates = listings
       // Never lots any of our player's companies issued (same-player dealing is refused, guide 4.2).
       .filter((c) => c.origin_port_id === port && c.dest_port_id === next && !c.stale && !world.ownIssued({ issuer: c.issuer_company_id }))
@@ -2449,6 +2684,8 @@ export class ShipAgent {
   private async handleLeftover(r: ShipResult, good: string, stay: Stay): Promise<number | null> {
     const { world, client, settings } = this.host;
     const port = stay.port;
+    // Contraband is never offered on a market or to a charter (both refuse it, guide 3.18): atPort holds it.
+    if (world.isContraband(good)) return null;
     const tons = this.ownTons(r, good);
     const cls = world.shipClass(this.shipClass);
     const hull = cls?.hull_category ?? "coastal";
@@ -2472,7 +2709,7 @@ export class ShipAgent {
 
     let best: { c: (typeof world.charters)[number]; take: number; value: number } | null = null;
     for (const c of world.charters) {
-      if (c.good !== good || c.port === port || c.stale || c.remaining <= 0 || !world.isOpen(c.port) || !world.deliverable(c)) continue;
+      if (c.good !== good || c.port === port || c.stale || c.remaining <= 0 || !world.isOpen(c.port) || !world.deliverable(c) || world.isCove(c.port)) continue;
       const plan = await world.route(port, c.port, this.shipClass).catch(() => null);
       // Not where the AI's bans rule out (cargo aboard is never stranded: selling here, or holding, remains).
       if (!plan || !reachable(plan) || this.host.offLimits(c.port, plan, c.id)) continue;
@@ -2481,11 +2718,12 @@ export class ShipAgent {
       // Charters pay nothing after the season ends (guide 3.11).
       if (!world.beforeSeasonEnd(now + sailMs + 30 * world.gameMinuteMs)) continue;
       const take = Math.min(tons, c.remaining);
-      const value = take * (c.payPerTon - localBid - settings.minMarginPence) - (sailMs / 3_600_000) * this.ratePerHour;
+      // A Crown or Admiralty charter's premium is tapered by our recent charter earnings (guide 3.7).
+      const value = take * (world.charterPayValue(c, c.payPerTon, take) - localBid - settings.minMarginPence) - (sailMs / 3_600_000) * this.ratePerHour;
       if (value > 0 && (!best || value > best.value)) best = { c, take, value };
     }
     if (best) {
-      this.lane = cargoLane(good, port, best.c.port, best.c.id, best.take, best.c.payPerTon);
+      this.lane = cargoLane(good, port, best.c.port, best.c.id, best.take, Math.round(world.charterPayValue(best.c, best.c.payPerTon, best.take)));
       this.laneLoaded = this.lane.key;
       this.log(`carrying ${tons} t ${good} already aboard to ${best.c.title}`);
       return this.sailTo(r, best.c.port, stay);
@@ -2502,7 +2740,7 @@ export class ShipAgent {
     }
     // In the season's final hours goods held count at base in net worth (guide 3.11): never sold for less.
     if (world.seasonMode() === "final") floor = Math.max(floor, base);
-    if (localBid >= Math.max(base * 0.5, floor) && !refusedHere && !(await this.coverCut(port))) {
+    if (localBid >= Math.max(base * 0.5, floor) && !refusedHere && !this.contrabandBarred(r, `selling ${good}`) && !(await this.coverCut(port))) {
       if (r.ship.status !== "berthed") return this.dockOrWait(r);
       try {
         const res = await client.placeOrder({
@@ -2539,7 +2777,8 @@ export class ShipAgent {
     this.holds++;
     let market: { port: string; value: number } | null = null;
     for (const p of world.catalog.ports) {
-      if (p.id === port || !world.isOpen(p.id) || !world.trades(p.id, good)) continue;
+      // Lawful buyers only: never a cove's stores market (guide 3.18).
+      if (p.id === port || !world.isOpen(p.id) || p.is_cove || !world.trades(p.id, good)) continue;
       const plan = await world.route(port, p.id, this.shipClass).catch(() => null);
       if (!plan || !reachable(plan) || this.host.offLimits(p.id, plan)) continue;
       const sail = world.sailMs(plan.total_distance_nm, knots * 0.8);
@@ -2601,7 +2840,7 @@ export class ShipAgent {
    * caller puts back if the load falls through.
    */
   private async trimStores(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
-    if (stay.port === lane.dest) return 0;
+    if (stay.port === lane.dest || this.contrabandBarred(r, "trading stores")) return 0;
     const target = await this.storesTarget(lane.source, lane.dest, lane.source);
     let surplus = Math.floor(r.stores.provisions_tons - target);
     if (surplus < 1) return 0;
@@ -2679,6 +2918,7 @@ export class ShipAgent {
    */
   private async sellHere(port: string, good: string, tons: number, floor?: number): Promise<number> {
     const { client, world } = this.host;
+    if (this.last && this.contrabandBarred(this.last, `selling ${good}`)) return 0;
     // Tons of it aboard before the order, and its limit: what an order with no answer sold is told from the hold.
     let before: number | null = null;
     let limit = 0;
@@ -2727,7 +2967,7 @@ export class ShipAgent {
    */
   private async buyStores(r: ShipResult, stay: Stay, tons: number): Promise<number> {
     const { client, world } = this.host;
-    if (!(tons > 0) || r.ship.status !== "berthed") return 0;
+    if (!(tons > 0) || r.ship.status !== "berthed" || this.contrabandBarred(r, "buying stores")) return 0;
     const port = stay.port;
 
     // Stores take whole tons of hold: buy no more than the free space allows.
@@ -2842,6 +3082,12 @@ export class ShipAgent {
   // ── Moving ──────────────────────────────────────────────────────────────────
 
   private async dockOrWait(r: ShipResult): Promise<number> {
+    // Never berths with contraband aboard in an ordinary port (guide 3.18): she waits in the roadstead instead.
+    if (this.contrabandBarred(r, "berthing")) {
+      await this.park(r);
+      this.activity = `contraband aboard: in the roadstead at ${r.ship.current_port_id}, never berthing in an ordinary port with it`;
+      return CONTRABAND_WAIT_MS;
+    }
     if (r.ship.dock_queued_at) {
       this.activity = `queued for a berth at ${r.ship.current_port_id}`;
       return POLL_MS;
@@ -2911,6 +3157,36 @@ export class ShipAgent {
       return 5_000;
     }
     for (const f of sealed) delete f.blockedAt;
+
+    // Contraband aboard (bought by hand; the smuggling mode's own passages are checked there, guide 3.18): at sea only patrols
+    // search, in their zones, so no passage through a zone a patrol works (as last read; a zone not read counts as patrolled);
+    // and in an ordinary port no stores may be bought with it aboard, so none short of the passage's safe figure either. She
+    // waits in the roadstead instead (an unloaded lane goes), logged once, until it is run ashore or sold at a cove.
+    const contraband = this.contrabandAboard(r);
+    if (contraband.length) {
+      const zones = new Set<string>();
+      for (const n of [port, ...plan.legs.flatMap((l) => [l.from_node, l.to_node]), dest]) {
+        const z = world.hazardZone(n)?.id;
+        if (z) zones.add(z);
+      }
+      const patrols = [...zones].filter((z) => world.patrolBps.get(z) !== 0);
+      const safeHere = this.safeStores(port, dest, plan);
+      const short = !world.isCove(port) && r.stores.provisions_tons < safeHere;
+      if (patrols.length || short) {
+        const what = contraband.map(([g, t]) => `${t} t ${g}`).join(", ");
+        const why = patrols.length
+          ? `a patrol works ${patrols.join(", ")} on the route (or it isn't read yet), and a patrol searches contraband: forfeit with everything aboard`
+          : `${r.stores.provisions_tons.toFixed(2)} t of stores aboard, under the ${safeHere.toFixed(2)} t it needs, and none may be bought here with contraband aboard`;
+        this.logOnce(
+          `contraband-sail:${port}>${dest}:${patrols.join(",")}:${short}`,
+          `not sailing ${port} → ${dest} with ${what} (contraband) aboard: ${why}; waiting in the roadstead (run it ashore where it is wanted, or sell it at a cove, from the Underworld page)`,
+        );
+        if (this.lane && !this.loaded) this.host.releaseLane(this);
+        await this.park(r);
+        this.activity = `contraband aboard: not sailing for ${dest} (${patrols.length ? "a patrol on the route" : "stores short, none to be bought here"})`;
+        return HOLD_WAIT_GAME_MIN * world.gameMinuteMs;
+      }
+    }
 
     // Stores: aim for this leg plus the laden leg after a deadhead; never sail below this leg's safe figure.
     // Rule 7: they are bought once a stay, so a retry after the berth lock only departs; still under the safe

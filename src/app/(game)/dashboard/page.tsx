@@ -139,9 +139,9 @@ function ChartersPanel({
                 <span className="font-medium">Phase {tier.target_phase}: {tier.title}</span>
                 <span
                   className="text-muted-foreground text-xs"
-                  title="Split among everyone who delivered, by the square root of each player's tons at base prices (a player's companies pooled): the first tons earn the most. Estimates as the board stands now; each other company counted as its own player."
+                  title="Split among everyone who delivered, by the square root of each player's tons valued at base prices (a player's companies pooled): the first tons earn the most. The board's share is of the value delivered, not of the bonus. Estimates as the board stands now; each other company counted as its own player."
                 >
-                  bonus {fmtCr(tier.completion_bonus_pence)} split by √ of each player&apos;s tons
+                  bonus {fmtCr(tier.completion_bonus_pence)} split by √ of each player&apos;s tons at base value
                 </span>
               </div>
               <Progress value={tier.tons_delivered} max={tier.target_tons} />
@@ -155,7 +155,7 @@ function ChartersPanel({
                     .sort((a, b) => b.share_bps - a.share_bps)
                     .map((c) => (
                       <span key={c.company_name} className={ourNames.has(c.company_name) ? "font-medium" : "text-muted-foreground"}>
-                        {c.company_name} {(c.share_bps / 100).toFixed(1)}% of tons · ~{fmtCr(tier.completion_bonus_pence * (split.byCompany.get(c.company_name) ?? 0))}
+                        {c.company_name} {(c.share_bps / 100).toFixed(1)}% of value delivered · bonus ~{fmtCr(tier.completion_bonus_pence * (split.byCompany.get(c.company_name) ?? 0))}
                       </span>
                     ))}
                 </div>

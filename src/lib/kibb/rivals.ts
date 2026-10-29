@@ -254,7 +254,7 @@ export interface RivalIntelSnapshot {
 export const RAID_TAKE_PRIOR = 0.35;
 export const CAPTURE_PRIOR = 0.075;
 const PRIZE_OF_SEIZED = 0.5;
-const ADMIRALS_TENTH = 0.1;
+export const ADMIRALS_TENTH = 0.1;
 /** Assumed cut in interception odds per gun (the formula isn't published; as the planner assumes). */
 const GUN_DETERRENCE = 0.5;
 /** How full a hold is taken to be for each load state. */
@@ -1101,13 +1101,14 @@ export interface RivalAnalysis {
   voyages: RivalVoyage[];
 }
 
-/** Base value per ton of what a port ships out: the average of the goods it makes. */
+/** Base value per ton of what a port ships out: the average of the lawful goods it makes (contraband isn't trade cargo, guide 3.18). */
 function valuePerTon(catalog: Catalog, port: string): number {
   const p = catalog.ports.find((x) => x.id === port);
-  const goods = [...(p?.produces ?? []), ...(p?.manufactures ?? [])];
-  const prices = goods.map((g) => catalog.commodities.find((c) => c.id === g)?.base_price_pence ?? 0).filter((x) => x > 0);
+  const lawful = catalog.commodities.filter((c) => c.category !== "contraband");
+  const goods = p?.is_cove ? [] : [...(p?.produces ?? []), ...(p?.manufactures ?? [])];
+  const prices = goods.map((g) => lawful.find((c) => c.id === g)?.base_price_pence ?? 0).filter((x) => x > 0);
   if (prices.length) return prices.reduce((n, x) => n + x, 0) / prices.length;
-  const all = catalog.commodities.map((c) => c.base_price_pence).sort((a, b) => a - b);
+  const all = lawful.map((c) => c.base_price_pence).sort((a, b) => a - b);
   return all[Math.floor(all.length / 2)] ?? 20_000;
 }
 
@@ -1500,8 +1501,77 @@ export interface MarqueOption {
   floor?: boolean;
 }
 
-/** Patrol cost: 2 Cr per bps per game day (marques are priced by the game from each zone's traffic: `marque-quote`). */
-export const PATROL_PENCE_PER_BPS_DAY = 200;
+/**
+ * A patrol's price floor: 2 Cr per bps per game day (guide 3.5). The game prices each zone's patrols from its recent smuggling
+ * traffic (`patrol-quote`), never under this; where nobody smuggles, the floor. A patrol or marque costs 100 Cr at least.
+ */
+export const PATROL_FLOOR_PENCE_PER_BPS_DAY = 200;
+const NAVAL_MIN_COST_PENCE = 10_000;
+
+export interface PatrolOption {
+  bps: number;
+  /**
+   * Per game day, pence: smuggler prize money expected after the Admiral's tenth, the piracy it takes off our own ships there
+   * (cargo seized and ships taken), what it costs at `price`, and the profit.
+   */
+  prize: number;
+  relief: number;
+  cost: number;
+  profit: number;
+  /** Price per bps per game day the cost is at (pence): the zone's quote when `quoted`, else the 2 Cr floor. */
+  price: number;
+  quoted: boolean;
+}
+
+/**
+ * The patrol size that earns most per game day in a zone at `price` (pence per bps-day), up to `maxBps`. Prize money (guide 3.5):
+ * every smuggler seized at sea in the zone while it is in force pays half the base value of her and everything aboard (`pool`),
+ * split among the patrols in force pro rata by bps, less the Admiral's tenth (a seizure in port pays none). The seizures are
+ * taken at the rate seen there lately (`seizuresPerDay`), not to rise with ours (smugglers steer around patrols); with no patrol
+ * in force now, ours finds at most its share of the strength they were seized under (`seenBps`; unread: a 1,500-bps patrol's). Relief: it takes its bps off the
+ * zone's net piracy (never below none) for our own ships there (`ownRisk`: what they lose per unit of piracy a game day). Returns
+ * the best option even when it loses money (callers decide; the autopilot funds only on the game's quote).
+ */
+export function bestPatrol(zone: ZonePiracy & { net_piracy_bps: number }, m: PatrolModel & { price: number; maxBps: number; quoted?: boolean }): PatrolOption {
+  const others = zone.patrol_suppression_bps;
+  const top = Math.min(m.maxBps, 1_500, ZONE_MARQUE_CAP - others);
+  const none: PatrolOption = { bps: 0, prize: 0, relief: 0, cost: 0, profit: -1, price: m.price, quoted: !!m.quoted };
+  if (top < 50) return none;
+  let best: PatrolOption | null = null;
+  for (let bps = 50; bps <= top; bps += 50) {
+    const { prize, relief } = patrolValue(zone, m, bps);
+    const cost = Math.max(NAVAL_MIN_COST_PENCE, m.price * bps);
+    const profit = prize + relief - cost;
+    if (!best || profit > best.profit) {
+      best = { bps, prize: Math.round(prize), relief: Math.round(relief), cost: Math.round(cost), profit: Math.round(profit), price: m.price, quoted: !!m.quoted };
+    }
+  }
+  return best ?? none;
+}
+
+/** The patrol strength (bps) seizures are taken to have been made under when no zones read stamped them (patrolValue). */
+const PATROL_STRENGTH_PRIOR_BPS = 1_500;
+
+/** What a zone's patrol earns us is modelled on (bestPatrol): seizures at sea a game day there, each one's prize pool, the patrols they were seized under, our own ships' risk. */
+export interface PatrolModel {
+  seizuresPerDay: number;
+  pool: number;
+  seenBps: number | null;
+  ownRisk: number;
+}
+
+/** A patrol of `bps` in the zone per game day (bestPatrol's model): smuggler prize money after the tenth, and our own ships' piracy relief (pence). */
+export function patrolValue(zone: ZonePiracy & { net_piracy_bps: number }, m: PatrolModel, bps: number): { prize: number; relief: number } {
+  const others = zone.patrol_suppression_bps;
+  // No patrol in force now: ours finds its share of the strength the seizures were made under, or (that not read) of a
+  // PATROL_STRENGTH_PRIOR_BPS patrol, never all of them on a guess.
+  const seen = m.seenBps !== null && m.seenBps > 0 ? m.seenBps : Math.max(bps, PATROL_STRENGTH_PRIOR_BPS);
+  const strength = others > 0 ? 1 : Math.min(1, bps / seen);
+  const share = bps / Math.max(others + bps, 1);
+  const prize = m.seizuresPerDay * strength * m.pool * share * (1 - ADMIRALS_TENTH);
+  const relief = m.ownRisk * (Math.min(bps, Math.max(0, zone.net_piracy_bps)) / 10_000);
+  return { prize, relief };
+}
 
 /** Share of a passage's cargo seized per interception: all of it when the ship is taken, else the raid's take. */
 export const seizedShare = (take: number, capture: number) => capture + (1 - capture) * take;
@@ -1543,6 +1613,21 @@ export function bestMarque(
   return best!;
 }
 
+/**
+ * The auto-patrol's verdict on one zone (manager runMarques): smugglers seized at sea there lately (a game day) and the prize pool
+ * each is taken at (pence), our own ships' exposure there (what they lose per unit of piracy a game day), the best patrol (per game
+ * day), whether ours is in force, and why it is or isn't funded.
+ */
+export interface PatrolZoneVerdict {
+  zone: string;
+  seizuresPerDay: number;
+  pool: number;
+  ownRisk: number;
+  best: PatrolOption;
+  active: boolean;
+  verdict: string;
+}
+
 /** What `/api/kibb/rivals` returns. */
 export interface RivalsView {
   now: number;
@@ -1555,7 +1640,24 @@ export interface RivalsView {
   zones: Array<ZonePiracy & { sea_zone_id: string; name: string; phase: number; net_piracy_bps: number }>;
   verdicts: Array<{ zone: string; passages: number; laden: number; cargo: number; next?: ZoneTraffic["next"]; best: MarqueOption; active: boolean; verdict: string }>;
   marques: Array<{ id: string; sea_zone_id: string; added_piracy_bps: number; cost_pence: number; prize_earned_pence: number; created_at: string; expires_at: string }>;
-  report: { checkedAt: string; enabled: boolean; budgetPence: number; spentPence: number; prizePence: number; action: string } | null;
+  /** Our naval patrols (newest first), with the smuggler prize money each has earned. Absent from older servers. */
+  patrols?: Array<{ id: string; sea_zone_id: string; suppressed_piracy_bps: number; cost_pence: number; prize_earned_pence: number; created_at: string; expires_at: string }>;
+  /**
+   * The autopilot's last marque check, and its patrols beside it (guide 3.5): what the auto-patrol did or would do, the prize money
+   * our patrols have earned, and its verdict per zone (absent from older managers).
+   */
+  report: {
+    checkedAt: string;
+    enabled: boolean;
+    budgetPence: number;
+    spentPence: number;
+    prizePence: number;
+    action: string;
+    patrolSpentPence?: number;
+    patrolAction?: string;
+    patrolPrizePence?: number;
+    patrols?: PatrolZoneVerdict[];
+  } | null;
   settings: { marques: boolean; marqueBudgetPence: number; rivalIntel: boolean };
   profiles: RivalProfile[];
   /** Ours, for comparison: net worth, rank and earning per hour (leaderboard). */

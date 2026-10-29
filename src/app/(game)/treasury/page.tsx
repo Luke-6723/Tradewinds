@@ -13,12 +13,21 @@ import { kibbGet, kibbPost } from "@/lib/kibb/browser";
 import { fmtBps, fmtCr, fmtDateTime } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
 
-const regionName = (r: string) => r.replace("_", " ");
+const regionName = (r: string) => r.replace(/_/g, " ");
+
+/** Every region the API lists, in the usual order, any region not in REGIONS (a new one) after them: none is hidden. */
+function regionsIn(ids: Iterable<string>): string[] {
+  const order = (r: string) => {
+    const i = (REGIONS as string[]).indexOf(r);
+    return i < 0 ? REGIONS.length : i;
+  };
+  return [...new Set(ids)].filter(Boolean).sort((a, b) => order(a) - order(b) || a.localeCompare(b));
+}
 
 function VaultsPanel({ vaults }: { vaults: S.VaultBalanceResult[] | undefined }) {
   if (!vaults) return <Panel title="Vaults"><Loading /></Panel>;
   const by = (region: string, type: S.AccountType) => vaults.find((v) => v.banking_region === region && v.account_type === type)?.balance_pence ?? 0;
-  const regions = REGIONS.filter((r) => vaults.some((v) => v.banking_region === r));
+  const regions = regionsIn(vaults.map((v) => v.banking_region));
   const total = (type: S.AccountType) => vaults.filter((v) => v.account_type === type).reduce((n, v) => n + v.balance_pence, 0);
   return (
     <Panel title="Vaults">
@@ -55,7 +64,7 @@ function VaultsPanel({ vaults }: { vaults: S.VaultBalanceResult[] | undefined })
 
 function RatesPanel({ rates }: { rates: S.RegionalAchRateResult[] | undefined }) {
   if (!rates) return <Panel title="Remittance fees"><Loading /></Panel>;
-  const regions = REGIONS.filter((r) => rates.some((x) => x.from_region === r || x.to_region === r));
+  const regions = regionsIn(rates.flatMap((x) => [x.from_region, x.to_region]));
   const fee = (from: string, to: string) => rates.find((x) => x.from_region === from && x.to_region === to)?.fee_bps;
   return (
     <Panel title="Remittance fees (from row to column)">

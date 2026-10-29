@@ -15,8 +15,8 @@ import type * as S from "@/lib/kibb/schema";
 
 const FACTOR_FEE_PENCE = 75_000;
 const MAX_FACTORS = 12;
-/** The factor share of daily sprawl upkeep: 120 Cr × factors^1.3. */
-const factorUpkeep = (n: number) => (n > 0 ? Math.round(12_000 * n ** 1.3) : 0);
+/** The factor share of daily sprawl upkeep: 120 Cr × factors^1.25. */
+const factorUpkeep = (n: number) => (n > 0 ? Math.round(12_000 * n ** 1.25) : 0);
 
 function ProfilePanel({ profile }: { profile: S.CompanyProfileResult | undefined }) {
   const { portName } = useCatalog();
@@ -98,7 +98,9 @@ function SettingsPanel() {
 }
 
 function FactorsPanel({ onChange }: { onChange: () => void }) {
-  const { portName } = useCatalog();
+  const { catalog, portName } = useCatalog();
+  // No factor may be hired at a smugglers' cove (403 no_factor_at_cove, guide 3.12).
+  const isCove = (id: string) => !!catalog?.ports.find((p) => p.id === id)?.is_cove;
   const { data: factors, error, reload } = usePoll(() => kibbGet<string[]>("/v1/company/factors"), 60_000);
   const { data: clock } = usePoll(() => kibbGet<S.WorldClockResult>("/v1/world/clock"));
   const [port, setPort] = useState("");
@@ -162,7 +164,7 @@ function FactorsPanel({ onChange }: { onChange: () => void }) {
             onChange={setPort}
             placeholder="Choose a port…"
             maxPhase={clock?.unlocked_phase}
-            filter={(id) => !factors?.includes(id)}
+            filter={(id) => !factors?.includes(id) && !isCove(id)}
           />
         </Field>
         <KV
@@ -174,8 +176,8 @@ function FactorsPanel({ onChange }: { onChange: () => void }) {
         />
         <ErrorNote error={hire.error} />
         {hire.result && <p className="text-sm">Factor resident at {portName(hire.result.port_id)}.</p>}
-        <Button type="submit" size="sm" disabled={hire.busy || !port || full}>
-          {hire.busy ? "Hiring…" : full ? "Factor limit reached" : "Hire factor"}
+        <Button type="submit" size="sm" disabled={hire.busy || !port || full || isCove(port)}>
+          {hire.busy ? "Hiring…" : full ? "Factor limit reached" : isCove(port) ? "No factor at a cove" : "Hire factor"}
         </Button>
         <p className="text-muted-foreground text-xs">
           Upkeep is billed daily from the home vault with fleet sprawl. If it goes unpaid the bailiff dismisses every factor.

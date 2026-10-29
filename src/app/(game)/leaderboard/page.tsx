@@ -103,7 +103,7 @@ function ExpansionPanel() {
                 rows={[
                   ["Tons still needed", fmtTons(t.tons_remaining)],
                   ["Open charters still take", fmtTons(t.charter_capacity_tons)],
-                  ["Completion bonus (split by √ of each player's tons)", fmtCr(t.completion_bonus_pence)],
+                  ["Completion bonus (split by √ of each player's tons at base value, not by share)", fmtCr(t.completion_bonus_pence)],
                   ["Your bonus as it stands", `${(split.ours * 100).toFixed(1)}% · ~${fmtCr(t.completion_bonus_pence * split.ours)}`],
                   ["Sized for", `${t.active_companies} companies × ${fmtTons(t.tons_per_company)} (min ${fmtTons(t.min_tons)})`],
                 ]}
@@ -138,7 +138,7 @@ function ExpansionPanel() {
             {t.contributors.length === 0 ? (
               <Empty>No deliveries yet.</Empty>
             ) : (
-              <Table head={["Company", "Tons", "Share of value", "Bonus (est.)"]}>
+              <Table head={["Company", "Tons", "Share of value delivered", "Bonus (est., √ split)"]}>
                 {t.contributors.map((c) => {
                   const share = split.byCompany.get(c.company_name) ?? 0;
                   return (

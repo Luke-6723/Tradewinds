@@ -59,8 +59,8 @@ const CAPTURE_GUN_CUT = 0.25;
 const GUN_DETERRENCE = 0.5;
 /**
  * Storms (formula not published; the guide: each leg rolls for the zone it ends in, longer legs carry
- * more risk, worse for a hull below the zone's class and in game months 11-2; a hit destroys 25% of
- * every stack and a quarter of the stores). Priced like piracy: the catalog's base_storm_bps as odds
+ * more risk, worse for a hull below the leg's water (the rougher of the zone and the crossing) and in
+ * game months 11-2; a hit destroys a share of every stack and of the stores, light to heavy: `cargo_loss_pct`, `stores_loss_pct`). Priced like piracy: the catalog's base_storm_bps as odds
  * per game day at sea, times these priors, times what our own voyages have shown. Changing a prior
  * changes what the saved record means: rename `stormCells` in the snapshot if you do.
  */
@@ -69,11 +69,11 @@ const STORM_MONTHS = new Set([11, 12, 1, 2]);
 const STORM_RATE_PRIOR = 0.5;
 /** Storm season against the rest of the year before any are seen ("markedly worse"). A guess. */
 const STORM_SEASON_PRIOR = 2;
-/** Per class a hull is below the zone ("storm damage on most legs"); the planner never sails such water. */
+/** Per class a hull is below the leg's water ("storm damage on most legs"); the planner never sails such water. */
 const STORM_UNDERRATED = 4;
 /** Zone storm odds (bps) when the catalog gives none: about its class's catalog average. */
 const STORM_BPS_FALLBACK: Record<ZoneClass, number> = { coastal: 450, regional: 800, oceanic: 1400 };
-/** Share of every stack a hit destroys (the guide's 25%), refined from cargo_loss_pct. */
+/** Share of every stack a hit destroys (a prior: the guide used to say 25%), refined from cargo_loss_pct. */
 const STORM_TAKE_PRIOR = 0.25;
 const STORM_TAKE_PRIOR_N = 10;
 /** Chance a hit sinks a rated hull ("rarely sinks"; a guess), refined from our sinkings and rescues. */
@@ -86,10 +86,14 @@ const STORM_MULT_MAX = 5;
 /** A cell's record is halved past this many expected hits, so old evidence fades if the odds are retuned. */
 const STORM_CELL_CAP = 200;
 /**
- * A storm leaves 3/4 of the stores; a pirate raid that lets the ship go leaves at least half (it seizes
- * 20-50% of them). Stock for as many hits as are likelier than 2%, up to three, pirate raids first.
+ * A storm takes a varying share of the stores (guide 3.5: most light, a heavy one more; `stores_loss_pct`); the route's safe figure
+ * covers the worst storm. Each further storm is planned at a bound on its take: STORES_TAKE_PRIOR until STORES_TAKE_MIN_N storms
+ * are seen, then the 90th percentile of ours, never under STORES_TAKE_FLOOR. A pirate raid that lets the ship go leaves at least
+ * half (it seizes 20-50% of them). Stock for as many hits as are likelier than 2%, up to three, pirate raids first.
  */
-const STORM_STORES_LEFT = 0.75;
+const STORES_TAKE_PRIOR = 0.4;
+const STORES_TAKE_FLOOR = 0.25;
+const STORES_TAKE_MIN_N = 5;
 const PIRATE_STORES_LEFT = 0.5;
 const STORES_TAIL = 0.02;
 const STORES_MAX_HITS = 3;
@@ -105,7 +109,7 @@ function poissonTail(lambda: number, k: number): number {
   return Math.max(0, 1 - below);
 }
 
-/** Where a storm is learned: the season, and how the hull sits against the zone's class. */
+/** Where a storm is learned: the season, and how the hull sits against the leg's water (the rougher of zone and crossing). */
 type StormCell = `${"calm" | "storm"}|${"under" | "rated" | "above"}`;
 const stormCell = (stormy: boolean, margin: number): StormCell =>
   `${stormy ? "storm" : "calm"}|${margin < 0 ? "under" : margin === 0 ? "rated" : "above"}`;
@@ -238,6 +242,8 @@ export interface WorldSnapshot {
   /** Storm record per cell (season|hull vs zone): hits the prior model expected of our voyages, hits seen, sinkings (rescues count). */
   stormCells?: Array<[string, { exp: number; hits: number; sinks?: number }]>;
   stormTakes?: number[];
+  /** Share of the stores each storm took (`stores_loss_pct`), newest last. */
+  storeTakes?: number[];
   /** The 7-day event log was read once for storms (manager.bootstrapStorms). */
   stormBootstrapped?: boolean;
   /** World events of the last few game days, and what was learned from them (one sample per event). */
@@ -254,6 +260,26 @@ export interface WorldSnapshot {
   monopolies?: MonopolyInfo[];
   /** Charters the server refuses our deliveries to for good (403: our own player's or a linked company's); absent in older saves. */
   noDelivery?: string[];
+  /** Our Crown and Admiralty charter pay (server ms, pence), for the premium taper; absent in older saves. */
+  charterPay?: Array<[number, number]>;
+  /** Smugglers seized lately (public notices), and prize pools learned from our patrols' prize money; absent in older saves. */
+  seizures?: SeizureSeen[];
+  prizePools?: number[];
+}
+
+/**
+ * A smuggler the Crown seized, from the public `smuggler_seized` notice (guide 3.18): when (server ms), at sea in a zone or in
+ * port (a seizure in port pays no prize money), the prize pool when the notice gives what was seized (half the base value of
+ * the ship and everything aboard, pence; null: not given), and the zone's patrol bps from the first zones read after it, when that
+ * came within SEIZURE_STAMP_GAME_H (null: none did, e.g. a notice replayed after a restart, or not yet read).
+ */
+export interface SeizureSeen {
+  id: string;
+  at: number;
+  zone: string | null;
+  inPort: boolean;
+  pool: number | null;
+  patrolBps: number | null;
 }
 
 /** Ids of closed charters kept in a snapshot (the newest). */
@@ -275,6 +301,32 @@ const BID_SAMPLES_MAX = 200;
 const EVENT_LOOKBACK_GAME_DAYS = 11;
 /** One page of the feed; a full page may be cut short (links for older events are then kept). */
 const EVENT_PAGE = 200;
+/**
+ * The charter premium taper (guide 3.7): Crown and Admiralty charters always pay the goods' value (per ton the catalog base
+ * price, or the reward if lower); the premium above it is multiplied by √(50,000 Cr ÷ earnings) once our charter earnings
+ * over the last 10 game days (all our companies together, the delivery included) pass 50,000 Cr.
+ */
+export const TAPER_FREE_PENCE = 5_000_000;
+export const TAPER_WINDOW_GAME_DAYS = 10;
+/** Our charter pay entries kept (the newest): far more than 10 game days of deliveries. */
+const CHARTER_PAY_KEPT = 2_000;
+/**
+ * Every World's Crown and Admiralty charter pay in this process, by company: the taper counts all of a player's companies, so a
+ * sibling company's autopilot running here counts towards ours (one run by hand elsewhere can't be seen).
+ */
+const CHARTER_PAY_BY_COMPANY = new Map<string, Array<[at: number, pence: number]>>();
+/** Smugglers seized (public `smuggler_seized`) are modelled over this many game days, and kept a little longer. */
+export const SEIZURE_WINDOW_GAME_DAYS = 7;
+const SEIZURES_KEPT = 500;
+/** A seizure takes its zone's patrol bps from a zones read made at most this long after it (game hours); later, it stays unknown. */
+const SEIZURE_STAMP_GAME_H = 2;
+/** Prize pools learned from our own patrols' prize money (the newest). */
+const PRIZE_POOLS_KEPT = 20;
+
+const median = (xs: number[]) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+};
 /** A crisis charter stays open at least this long (game days: 10 in the Channel and North Sea, up to 20 elsewhere). */
 const CRISIS_OPEN_GAME_DAYS = 10;
 /** A non-public charter for the good posted this soon before a shortage began is still its crisis charter (game minutes). */
@@ -586,6 +638,13 @@ export class World {
   readonly vaultAccounts = new Map<string, BankingRegion>();
   /** Live net piracy per sea zone (bps): base + letters of marque − naval patrols. */
   piracy = new Map<string, number>();
+  /** Naval patrols' suppression per sea zone (bps, every company's together) as last read. */
+  patrolBps = new Map<string, number>();
+  /** Our Crown and Admiralty charter pay (server ms, pence), oldest first: the premium taper counts the last 10 game days. */
+  private charterPay: Array<[at: number, pence: number]> = [];
+  /** Smugglers seized lately (public notices), and prize pools learned from our own patrols' prize money (pence). */
+  private seizures: SeizureSeen[] = [];
+  private prizePools: number[] = [];
   /** Charters of the expansion tier in play (their deliveries earn a share of its completion bonus). */
   expansionCharters = new Set<string>();
   /** Tons the tier still needs; tons beyond that arrive after it completes and earn no bonus. */
@@ -627,6 +686,7 @@ export class World {
   /** Our own voyages' storm record per cell, and shares of cargo storms destroyed. */
   private stormCells = new Map<string, { exp: number; hits: number; sinks: number }>();
   private stormTakes: number[] = [];
+  private storeTakes: number[] = [];
   /** Learned multipliers on the prior storm odds per cell and fleet-wide (recomputed when the record changes; read per planned leg). */
   private stormMult = new Map<string, number>();
   private stormMultAll = 1;
@@ -698,6 +758,8 @@ export class World {
   private readonly safeSeen = new Map<string, number>();
   private routeSlots = 8;
   private portIndex: Map<string, CatalogPort> | null = null;
+  /** Contraband good ids, for the catalog object they were read from (a re-read builds them again). */
+  private contrabandOf: { catalog: Catalog; ids: Set<string> } | null = null;
   private readonly routeWaiters: Array<() => void> = [];
 
   constructor(readonly client: KibbClient) {}
@@ -756,6 +818,7 @@ export class World {
       captures: this.captures,
       stormCells: [...this.stormCells].map(([k, v]) => [k, { ...v }]),
       stormTakes: [...this.stormTakes],
+      storeTakes: [...this.storeTakes],
       stormBootstrapped: this.stormBootstrapped,
       events: this.events.slice(0, EVENT_PAGE),
       shockCal: { ...this.shockCal, shortageBid: [...this.shockCal.shortageBid], glutAsk: [...this.shockCal.glutAsk], crisisPay: [...this.shockCal.crisisPay] },
@@ -765,6 +828,9 @@ export class World {
       ownDelivered: [...this.ownDelivered],
       monopolies: this.monopolies.map((m) => ({ ...m })),
       noDelivery: [...this.noDelivery].slice(-SNAPSHOT_CLOSED),
+      charterPay: this.charterPay.map(([at, p]): [number, number] => [at, p]),
+      seizures: this.seizures.map((x) => ({ ...x })),
+      prizePools: [...this.prizePools],
     };
   }
 
@@ -792,6 +858,7 @@ export class World {
       if (Number.isFinite(v?.exp) && Number.isFinite(v?.hits)) this.stormCells.set(k, { exp: v.exp, hits: v.hits, sinks: v.sinks ?? 0 });
     }
     if (s.stormTakes) this.stormTakes = s.stormTakes.filter((x) => Number.isFinite(x)).slice(-100);
+    if (Array.isArray(s.storeTakes)) this.storeTakes = s.storeTakes.filter((x) => Number.isFinite(x) && x >= 0 && x <= 1).slice(-100);
     this.stormBootstrapped = s.stormBootstrapped ?? false;
     this.updateStormMult();
     if (s.events) {
@@ -822,6 +889,17 @@ export class World {
       this.monopolies = s.monopolies.filter((m) => m && typeof m.region === "string" && typeof m.good === "string" && Number.isFinite(m.expiresAt));
     }
     for (const id of s.noDelivery ?? []) if (typeof id === "string") this.noDelivery.add(id);
+    if (Array.isArray(s.charterPay)) {
+      this.charterPay = s.charterPay.filter((x) => Array.isArray(x) && Number.isFinite(x[0]) && Number.isFinite(x[1])).slice(-CHARTER_PAY_KEPT);
+      if (this.companyId) CHARTER_PAY_BY_COMPANY.set(this.companyId, this.charterPay);
+    }
+    if (Array.isArray(s.seizures)) {
+      this.seizures = s.seizures
+        .filter((x) => x && typeof x.id === "string" && Number.isFinite(x.at))
+        .map((x) => ({ id: x.id, at: x.at, zone: x.zone ?? null, inPort: !!x.inPort, pool: Number.isFinite(x.pool) ? x.pool : null, patrolBps: Number.isFinite(x.patrolBps) ? x.patrolBps : null }))
+        .slice(-SEIZURES_KEPT);
+    }
+    if (Array.isArray(s.prizePools)) this.prizePools = s.prizePools.filter((x) => Number.isFinite(x) && x > 0).slice(-PRIZE_POOLS_KEPT);
     this.updateBidHaircut();
   }
 
@@ -878,7 +956,9 @@ export class World {
     if (monopolies?.complete) this.setMonopolies(monopolies.items);
     if (zones) {
       this.piracy = new Map(zones.map((z) => [z.sea_zone_id, z.net_piracy_bps]));
+      this.patrolBps = new Map(zones.map((z) => [z.sea_zone_id, z.patrol_suppression_bps]));
       this.piracyAt = asked + this.skewMs;
+      this.stampSeizures(this.piracyAt);
     }
     if (Array.isArray(events)) this.noteEvents(events.map(toEvent).filter((e): e is WorldEventInfo => e !== null), events.length < EVENT_PAGE);
     if (expansion) {
@@ -1471,6 +1551,118 @@ export class World {
     return !this.ownIssued(c) && !this.noDelivery.has(c.id);
   }
 
+  // ── Charter premium taper (guide 3.7) ───────────────────────────────────────
+
+  /** A player's charter (`funded_by: "issuer"`, or an issuer named): paid from its escrow as posted, never tapered. */
+  static isPlayerCharter(c: { fundedBy?: CharterFunding | null; issuer?: string | null }): boolean {
+    return c.fundedBy === "issuer" || !!c.issuer;
+  }
+
+  /**
+   * Books the pay of one of our deliveries into a Crown or Admiralty charter (a player's charter isn't counted: its pay never
+   * tapers): the taper counts these over the last 10 game days.
+   */
+  noteCharterPay(c: { fundedBy?: CharterFunding | null; issuer?: string | null }, pence: number, at = this.now()): void {
+    if (World.isPlayerCharter(c) || !(pence > 0)) return;
+    this.charterPay.push([at, pence]);
+    const since = at - 2 * TAPER_WINDOW_GAME_DAYS * 24 * 60 * this.gameMinuteMs;
+    while (this.charterPay.length && (this.charterPay[0][0] < since || this.charterPay.length > CHARTER_PAY_KEPT)) this.charterPay.shift();
+    if (this.companyId) CHARTER_PAY_BY_COMPANY.set(this.companyId, this.charterPay);
+  }
+
+  /**
+   * Our Crown and Admiralty charter earnings over the last 10 game days (pence): this company's, and those of our player's other
+   * companies whose autopilot runs in this process (the taper counts them all together).
+   */
+  charterEarnings(now = this.now()): number {
+    if (this.companyId) CHARTER_PAY_BY_COMPANY.set(this.companyId, this.charterPay);
+    const since = now - TAPER_WINDOW_GAME_DAYS * 24 * 60 * this.gameMinuteMs;
+    const within = (log: Array<[number, number]>) => log.reduce((n, [at, p]) => (at >= since && at <= now ? n + p : n), 0);
+    let sum = within(this.charterPay);
+    for (const [id, log] of CHARTER_PAY_BY_COMPANY) if (id !== this.companyId && log !== this.charterPay && this.ourCompanyIds.has(id)) sum += within(log);
+    return sum;
+  }
+
+  /**
+   * The factor on a Crown or Admiralty charter's premium now: min(1, √(50,000 Cr ÷ earnings)), the earnings over the last 10
+   * game days with `extraPence` more (the delivery being weighed: the game counts it in). `earned`: charterEarnings() read once.
+   */
+  charterTaper(extraPence = 0, earned = this.charterEarnings()): number {
+    const total = earned + Math.max(0, extraPence);
+    return total <= TAPER_FREE_PENCE ? 1 : Math.sqrt(TAPER_FREE_PENCE / total);
+  }
+
+  /**
+   * What a charter's pay per ton is worth to us for `tons` delivered together: a player's charter pays as posted; a Crown or
+   * Admiralty charter pays the goods' value (the base price, or the pay if lower) in full and the premium above it tapered
+   * (charterTaper, this delivery's pay counted in). Expansion tons still count in full towards the tier and its bonus.
+   */
+  charterPayValue(c: { good: string; fundedBy?: CharterFunding | null; issuer?: string | null }, pay: number, tons: number, earned?: number): number {
+    if (World.isPlayerCharter(c) || !(pay > 0)) return pay;
+    const floor = Math.min(pay, this.basePrice(c.good));
+    if (pay <= floor) return pay;
+    return floor + (pay - floor) * this.charterTaper(pay * Math.max(0, tons), earned);
+  }
+
+  // ── Smugglers seized and patrol prize money (guide 3.5, 3.18) ───────────────
+
+  /**
+   * A smuggler the Crown seized (public notice). The zone's patrols come from the next zones read, if soon enough (stampSeizures):
+   * the last read came before her seizure (a patrol may have been funded since), and on a replay the current figure is too late.
+   */
+  noteSeizure(s: Omit<SeizureSeen, "patrolBps">): void {
+    if (this.seizures.some((x) => x.id === s.id)) return;
+    this.seizures.push({ ...s, patrolBps: null });
+    this.seizures.sort((a, b) => a.at - b.at);
+    const since = this.now() - 2 * SEIZURE_WINDOW_GAME_DAYS * 24 * 60 * this.gameMinuteMs;
+    while (this.seizures.length && (this.seizures[0].at < since || this.seizures.length > SEIZURES_KEPT)) this.seizures.shift();
+  }
+
+  /** Seizures still unstamped take their zone's patrol bps from a zones read made at `readAt` (server ms), within SEIZURE_STAMP_GAME_H after them. */
+  private stampSeizures(readAt: number): void {
+    const win = SEIZURE_STAMP_GAME_H * 60 * this.gameMinuteMs;
+    for (const x of this.seizures) {
+      if (x.patrolBps !== null || !x.zone || x.at > readAt || readAt - x.at > win) continue;
+      x.patrolBps = this.patrolBps.get(x.zone) ?? null;
+    }
+  }
+
+  /** A prize pool (half the base value of a seized smuggler and everything aboard, pence) worked out from our own prize money. */
+  notePrizePool(pool: number): void {
+    if (!(pool > 0)) return;
+    this.prizePools.push(pool);
+    if (this.prizePools.length > PRIZE_POOLS_KEPT) this.prizePools.shift();
+  }
+
+  /**
+   * Smugglers seized at sea in `zone` over the last 7 game days (a seizure in port pays no prize): how many a game day, the
+   * prize pool each is taken at (our own prize money's lesson first, else what the notices said was seized, else
+   * `fallbackPool`), and the zone's patrol bps when they were seized (null: not read then).
+   */
+  seizureModel(zone: string, fallbackPool: number, now = this.now()): { perDay: number; count: number; pool: number; patrolBps: number | null } {
+    const days = SEIZURE_WINDOW_GAME_DAYS;
+    const since = now - days * 24 * 60 * this.gameMinuteMs;
+    const seen = this.seizures.filter((x) => x.zone === zone && !x.inPort && x.at >= since);
+    const learned = this.prizePools.length ? median(this.prizePools) : null;
+    const told = seen.filter((x) => x.pool !== null).map((x) => x.pool!);
+    const pool = learned ?? (told.length ? told.reduce((a, b) => a + b, 0) / told.length : fallbackPool);
+    const bps = seen.filter((x) => x.patrolBps !== null && x.patrolBps > 0).map((x) => x.patrolBps!);
+    return { perDay: seen.length / days, count: seen.length, pool, patrolBps: bps.length ? bps.reduce((a, b) => a + b, 0) / bps.length : null };
+  }
+
+  /** Smugglers seized lately (at sea and in port) per zone, for the digest and the panel: [zone, at sea, in port] over the window. */
+  seizuresByZone(now = this.now()): Array<[zone: string, atSea: number, inPort: number]> {
+    const since = now - SEIZURE_WINDOW_GAME_DAYS * 24 * 60 * this.gameMinuteMs;
+    const out = new Map<string, [number, number]>();
+    for (const x of this.seizures) {
+      if (x.at < since || !x.zone) continue;
+      const c = out.get(x.zone) ?? [0, 0];
+      c[x.inPort ? 1 : 0]++;
+      out.set(x.zone, c);
+    }
+    return [...out].map(([z, [a, p]]) => [z, a, p]);
+  }
+
   /** The server refused our delivery to this charter (403): never planned or offered again; it leaves the list now. */
   refuseCharter(id: string): void {
     this.noDelivery.add(id);
@@ -1671,15 +1863,15 @@ export class World {
     return Math.min(1, Math.max(0, (e.expiresAt - at) / Math.max(1, e.expiresAt - e.startsAt)));
   }
 
-  /** A shortage of `good` at `port` is in effect and planned on. */
+  /** A shortage of `good` at `port` is in effect and planned on (lawful markets only: never contraband, never a cove's). */
   shortageAt(port: string, good: string): boolean {
-    const e = this.planOnEvents ? this.shock(port, good, "demand_shortage") : undefined;
+    const e = this.planOnEvents && this.trades(port, good) ? this.shock(port, good, "demand_shortage") : undefined;
     return !!e && this.inEffect(e);
   }
 
-  /** A glut of `good` at `port` is in effect and planned on. */
+  /** A glut of `good` at `port` is in effect and planned on (lawful markets only). */
   glutAt(port: string, good: string): boolean {
-    const e = this.planOnEvents ? this.shock(port, good, "supply_boom") : undefined;
+    const e = this.planOnEvents && this.trades(port, good) ? this.shock(port, good, "supply_boom") : undefined;
     return !!e && this.inEffect(e);
   }
 
@@ -1789,7 +1981,8 @@ export class World {
   private lookForCrisis(port: string, fresh: CharterInfo[]): void {
     const now = this.now();
     for (const e of this.events) {
-      if (e.type !== "demand_shortage" || e.port !== port || !e.good || this.crisisResolved.has(e.id)) continue;
+      // A cove's or contraband's shortage never has a lawful charter: not counted as one missed.
+      if (e.type !== "demand_shortage" || e.port !== port || !e.good || this.crisisResolved.has(e.id) || !this.trades(port, e.good)) continue;
       // Too soon after the news to say it isn't coming, or past when it would have closed anyway.
       if (now - e.startsAt < CRISIS_MATCH_SLACK_GAME_MIN * this.gameMinuteMs || now >= this.crisisCloses(e)) continue;
       const real = fresh.find((c) => this.isCrisisFor(c, e));
@@ -1810,7 +2003,17 @@ export class World {
   crisisDue(port: string, since: number): boolean {
     const now = this.now();
     const slack = CRISIS_MATCH_SLACK_GAME_MIN * this.gameMinuteMs;
-    return this.events.some((e) => e.type === "demand_shortage" && e.port === port && !!e.good && !this.crisisResolved.has(e.id) && e.startsAt + slack <= now && e.startsAt + slack > since && now < this.crisisCloses(e));
+    return this.events.some(
+      (e) =>
+        e.type === "demand_shortage" &&
+        e.port === port &&
+        !!e.good &&
+        this.trades(port, e.good) &&
+        !this.crisisResolved.has(e.id) &&
+        e.startsAt + slack <= now &&
+        e.startsAt + slack > since &&
+        now < this.crisisCloses(e),
+    );
   }
 
   /**
@@ -1831,7 +2034,8 @@ export class World {
       }
       const id = PROVISIONAL_PREFIX + e.id;
       const closes = this.crisisCloses(e);
-      if (!this.planOnEvents || closes <= now || this.closed.has(id) || !this.isOpen(e.port)) continue;
+      // Never a lawful charter at a cove or for contraband (charters refuse it, guide 3.18).
+      if (!this.planOnEvents || closes <= now || this.closed.has(id) || !this.isOpen(e.port) || !this.trades(e.port, e.good)) continue;
       const pay = Math.round(this.basePrice(e.good) * this.crisisPayRatio);
       if (pay <= 0) continue;
       out.push({
@@ -1944,39 +2148,64 @@ export class World {
     return (this.port(portId)?.phase ?? 99) <= this.unlockedPhase;
   }
 
-  /** Ports that produce or manufacture the good: where it is cheap. */
+  /**
+   * A contraband good (catalog category `contraband`, guide 3.18): it lives only aboard ships. Market books,
+   * warehouses, charters, freight and pledges refuse it, so no lawful plan ever buys, sells or carries it.
+   */
+  isContraband(good: string): boolean {
+    if (this.contrabandOf?.catalog !== this.catalog) {
+      this.contrabandOf = { catalog: this.catalog, ids: new Set((this.catalog?.commodities ?? []).filter((c) => c.category === "contraband").map((c) => c.id)) };
+    }
+    return this.contrabandOf.ids.has(good);
+  }
+
+  /**
+   * A smugglers' cove (catalog `is_cove`, guide 3.12/3.18): a small market for ships' stores with a few berths, no
+   * factor and never a home. Lawful lanes never load or land there; its book is the Underworld's.
+   */
+  isCove(portId: string): boolean {
+    return !!this.port(portId)?.is_cove;
+  }
+
+  /** Ports that produce or manufacture the good: where it is cheap. Never a cove, never contraband. */
   sourcesOf(good: string): string[] {
+    if (this.isContraband(good)) return [];
     return this.catalog.ports
-      .filter((p) => p.phase <= this.unlockedPhase && [...(p.produces ?? []), ...(p.manufactures ?? [])].includes(good))
+      .filter((p) => p.phase <= this.unlockedPhase && !p.is_cove && [...(p.produces ?? []), ...(p.manufactures ?? [])].includes(good))
       .map((p) => p.id);
   }
 
   /**
    * Ports to buy the good at: the open ports that make it, plus any open port trading it where an
    * ask has been seen lately or a glut there is planned on (an importer with a glut can undercut the
-   * producers).
+   * producers). Lawful trade only: no coves, no contraband.
    */
   sellersOf(good: string): string[] {
+    if (this.isContraband(good)) return [];
     const out = new Set(this.sourcesOf(good));
     for (const p of this.catalog.ports) {
-      if (p.phase <= this.unlockedPhase && this.trades(p.id, good) && (this.price(p.id, good)?.ask || this.glutAt(p.id, good))) out.add(p.id);
+      if (p.phase <= this.unlockedPhase && !p.is_cove && this.trades(p.id, good) && (this.price(p.id, good)?.ask || this.glutAt(p.id, good))) out.add(p.id);
     }
     return [...out];
   }
 
-  /** Goods on sale at a port: what it makes, plus anything with an ask seen there lately or a glut there. */
+  /** Goods on sale at a port: what it makes, plus anything with an ask seen there lately or a glut there. None at a cove. */
   goodsAt(portId: string): string[] {
     const p = this.port(portId);
-    if (!p) return [];
-    const out = new Set([...(p.produces ?? []), ...(p.manufactures ?? [])]);
+    if (!p || p.is_cove) return [];
+    const out = new Set([...(p.produces ?? []), ...(p.manufactures ?? [])].filter((g) => !this.isContraband(g)));
     for (const c of this.catalog.commodities) if (this.trades(portId, c.id) && (this.price(portId, c.id)?.ask || this.glutAt(portId, c.id))) out.add(c.id);
     return [...out];
   }
 
-  /** Whether the port has a market for the good at all. */
+  /**
+   * Whether the port has a lawful market for the good at all. Contraband never has one (guide 3.18); a cove's market
+   * is for ships' stores only (provisions).
+   */
   trades(portId: string, good: string): boolean {
     const p = this.port(portId);
-    if (!p) return false;
+    if (!p || this.isContraband(good)) return false;
+    if (p.is_cove) return good === "provisions";
     return good === "provisions" || [...(p.produces ?? []), ...(p.manufactures ?? []), ...(p.imports ?? [])].includes(good);
   }
 
@@ -2239,12 +2468,25 @@ export class World {
     return null;
   }
 
+  /**
+   * The water a leg's storms roll for (guide 3.3/3.5): the rougher of the zone it ends in (World.hazardZone) and the
+   * crossing itself (`edge_class`; unknown: the zone's alone).
+   */
+  legWater(node: string, edge?: ZoneClass | null): ZoneClass | undefined {
+    const zone = this.hazardZone(node)?.zone_class;
+    if (!zone) return edge ?? undefined;
+    return edge && (ZONE_RANK[edge] ?? -1) > (ZONE_RANK[zone] ?? -1) ? edge : zone;
+  }
+
   /** One leg's expected storm hits under the prior model (nothing learned), and the cell it counts in. */
-  private stormLeg(node: string, nm: number, knots: number, hull: ZoneClass, at: number): { hits: number; cell: StormCell } | null {
+  private stormLeg(node: string, edge: ZoneClass | null | undefined, nm: number, knots: number, hull: ZoneClass, at: number): { hits: number; cell: StormCell } | null {
     const zone = this.hazardZone(node);
     if (!zone) return null;
-    const bps = Number.isFinite(zone.base_storm_bps) ? zone.base_storm_bps! : STORM_BPS_FALLBACK[zone.zone_class] ?? STORM_BPS_FALLBACK.regional;
-    const margin = ZONE_RANK[hull] - (ZONE_RANK[zone.zone_class] ?? ZONE_RANK[hull]);
+    const water = this.legWater(node, edge) ?? zone.zone_class;
+    const zoneBps = Number.isFinite(zone.base_storm_bps) ? zone.base_storm_bps! : STORM_BPS_FALLBACK[zone.zone_class] ?? STORM_BPS_FALLBACK.regional;
+    // A crossing rougher than its zone: at least that water's own odds (the zone's figure is for its own class).
+    const bps = water === zone.zone_class ? zoneBps : Math.max(zoneBps, STORM_BPS_FALLBACK[water] ?? zoneBps);
+    const margin = ZONE_RANK[hull] - (ZONE_RANK[water] ?? ZONE_RANK[hull]);
     const stormy = this.stormSeasonAt(at);
     const factor = STORM_RATE_PRIOR * (margin < 0 ? STORM_UNDERRATED ** -margin : 1) * (stormy ? STORM_SEASON_PRIOR : 1);
     const days = this.sailMs(nm, knots) / (24 * 60 * this.gameMinuteMs);
@@ -2255,10 +2497,11 @@ export class World {
   /**
    * What storms are expected to cost a passage that sails at `sailsAt` (server ms). Each leg rolls for
    * the zone it ends in, at the zone's storm odds as a rate per game day at sea (so longer legs count
-   * for more), raised for a hull below the zone's class and in storm season (judged as the leg ends,
-   * so a voyage running into November counts it), then scaled by what our own voyages have shown.
+   * for more), raised for a hull below the leg's water (the rougher of the zone and the crossing, guide
+   * 3.5; legWater) and in storm season (judged as the leg ends, so a voyage running into November
+   * counts it), then scaled by what our own voyages have shown.
    * Unlike pirates, storms don't care what's aboard. Returns the expected hits (each destroys a share
-   * of every stack and a quarter of the stores), the expected share of the cargo lost (sinkings
+   * of every stack and of the stores), the expected share of the cargo lost (sinkings
    * included) and the chance of sinking. `weight`: the user's storm setting (1 = as learned).
    */
   stormRisk(plan: RoutePlan, hull: ZoneClass, knots: number, sailsAt: number, weight = 1): { hits: number; cargoShare: number; sink: number } {
@@ -2266,7 +2509,7 @@ export class World {
     let t = sailsAt;
     for (const l of plan.legs) {
       t += this.sailMs(l.distance_nm, knots);
-      const leg = this.stormLeg(l.to_node, l.distance_nm, knots, hull, t);
+      const leg = this.stormLeg(l.to_node, l.edge_class, l.distance_nm, knots, hull, t);
       if (leg) hits += Math.min(1, leg.hits * (this.stormMult.get(leg.cell) ?? this.stormMultAll));
     }
     hits *= Math.max(0, weight);
@@ -2278,10 +2521,11 @@ export class World {
   }
 
   /**
-   * Stores (tons) for a passage sailing at `sailsAt`. The route's safe figure covers one storm only (a
-   * quarter of the stores); a pirate raid that lets the ship go may seize half. Cover as many hits as the
-   * passage could plausibly take (likelier than 2%), up to three, as many of them raids as are plausible on
-   * their own (the worst case). Always at the learned odds: the user's storm weight doesn't apply.
+   * Stores (tons) for a passage sailing at `sailsAt`. The route's safe figure covers one storm only (the
+   * worst); each further storm takes up to stormStoresLeft's bound, and a pirate raid that lets the ship go may
+   * seize half. Cover as many hits as the passage could plausibly take (likelier than 2%), up to three, as many
+   * of them raids as are plausible on their own (the worst case). Always at the learned odds: the user's storm
+   * weight doesn't apply.
    */
   storesFor(plan: RoutePlan, hull: ZoneClass, guns: number, knots: number, cargoValue: number, sailsAt: number): number {
     const storms = this.stormRisk(plan, hull, knots, sailsAt).hits;
@@ -2291,18 +2535,29 @@ export class World {
     let kp = 0;
     while (kp < k && poissonTail(raids, kp + 1) > STORES_TAIL) kp++;
     if (kp === 0 && k === 1) return plan.safe_provisions_tons;
-    return Math.max(plan.safe_provisions_tons, plan.expected_provisions_tons / (PIRATE_STORES_LEFT ** kp * STORM_STORES_LEFT ** (k - kp)));
+    // The safe figure carries the first storm (the worst); the rest at the bound, the raids at half.
+    const ks = k - kp;
+    const need =
+      ks >= 1
+        ? plan.safe_provisions_tons / (PIRATE_STORES_LEFT ** kp * this.stormStoresLeft ** (ks - 1))
+        : plan.expected_provisions_tons / PIRATE_STORES_LEFT ** kp;
+    return Math.max(plan.safe_provisions_tons, need);
   }
 
   /**
    * One of our ships set out (or was first seen at sea): its legs' storm exposure under the prior
-   * model goes on the record, so passages without a storm teach as much as hits do.
+   * model goes on the record, so passages without a storm teach as much as hits do. `edge_class`: the
+   * crossing's own water where known (route_legs), the rougher of it and the zone counting.
    */
-  noteStormExposure(legs: Array<{ to_node: string; distance_nm: number; speed_centiknots: number; estimated_arrival_at?: string }>, hull: ZoneClass, at: number): void {
+  noteStormExposure(
+    legs: Array<{ to_node: string; distance_nm: number; speed_centiknots: number; estimated_arrival_at?: string; edge_class?: ZoneClass | null }>,
+    hull: ZoneClass,
+    at: number,
+  ): void {
     for (const l of legs) {
       // A leg without a speed would read as days at sea: left out rather than guessed.
       if (!(l.speed_centiknots > 0)) continue;
-      const leg = this.stormLeg(l.to_node, l.distance_nm, l.speed_centiknots / 100, hull, Date.parse(l.estimated_arrival_at ?? "") || at);
+      const leg = this.stormLeg(l.to_node, l.edge_class, l.distance_nm, l.speed_centiknots / 100, hull, Date.parse(l.estimated_arrival_at ?? "") || at);
       if (leg) this.stormCellOf(leg.cell).exp += leg.hits;
     }
     this.updateStormMult();
@@ -2310,18 +2565,35 @@ export class World {
 
   /**
    * One of our ships met a storm in `zone` (null: unknown) at server time `at`: the share of its cargo
-   * destroyed, or sunk (a convoy rescue counts as a storm that would have sunk it).
+   * destroyed, or sunk (a convoy rescue counts as a storm that would have sunk it). `edge`: the leg's
+   * crossing class where known, so the hit lands in the same cell as its exposure (the rougher water). `stores`: the share
+   * of the stores it took (`stores_loss_pct`), where known.
    */
-  noteStorm(zone: string | null, hull: ZoneClass, at: number, share: number | null, sunk: boolean): void {
-    const z = zone ? this.hazardZone(zone) : undefined;
-    const c = this.stormCellOf(stormCell(this.stormSeasonAt(at), z ? ZONE_RANK[hull] - (ZONE_RANK[z.zone_class] ?? ZONE_RANK[hull]) : 0));
+  noteStorm(zone: string | null, hull: ZoneClass, at: number, share: number | null, sunk: boolean, edge?: ZoneClass | null, stores?: number | null): void {
+    const water = zone ? this.legWater(zone, edge) : undefined;
+    const c = this.stormCellOf(stormCell(this.stormSeasonAt(at), water ? ZONE_RANK[hull] - (ZONE_RANK[water] ?? ZONE_RANK[hull]) : 0));
     c.hits++;
     if (sunk) c.sinks++;
     else if (share !== null && Number.isFinite(share) && share > 0 && share <= 1) {
       this.stormTakes.push(share);
       if (this.stormTakes.length > 100) this.stormTakes.shift();
     }
+    if (!sunk && stores != null && Number.isFinite(stores) && stores >= 0 && stores <= 1) {
+      this.storeTakes.push(stores);
+      if (this.storeTakes.length > 100) this.storeTakes.shift();
+    }
     this.updateStormMult();
+  }
+
+  /**
+   * Share of the stores a further storm is planned to leave: 1 − a bound on its take (STORES_TAKE_PRIOR until STORES_TAKE_MIN_N
+   * storms are seen, then the 90th percentile of ours, never under STORES_TAKE_FLOOR).
+   */
+  get stormStoresLeft(): number {
+    const t = [...this.storeTakes].sort((a, b) => a - b);
+    if (t.length < STORES_TAKE_MIN_N) return 1 - STORES_TAKE_PRIOR;
+    const q90 = t[Math.min(t.length - 1, Math.floor(0.9 * t.length))];
+    return 1 - Math.min(0.9, Math.max(STORES_TAKE_FLOOR, q90));
   }
 
   /** Share of every stack a storm destroys, learned from our hits (25% until some are seen). */
@@ -2593,6 +2865,8 @@ export class World {
    * that, and the tons it may still offer (playerLevel): bought first, the rest from the ladder.
    */
   estAsk(portId: string, good: string, at = this.now()): { ask: number; known: boolean; maxTons?: number; player?: { ask: number; tons: number } } | null {
+    // No lawful ask for contraband anywhere, nor for anything but stores at a cove (guide 3.18): never base × 1.05.
+    if (!this.trades(portId, good)) return null;
     const p = this.price(portId, good);
     // Under a royal monopoly another company holds here, the Crown's asks aren't ours: only players' resting asks
     // seen (the holder's among them, ours left out), and no more than they may still offer when we buy.
@@ -2655,20 +2929,36 @@ export class World {
     return n;
   }
 
-  /** Fleet sprawl upkeep per game day for this much coastal/regional hull tonnage. */
+  /** Fleet sprawl upkeep per game day for this many sprawl tons (sprawlTons: oceanic hulls count half). */
   sprawlPerDay(tons: number): number {
     return tons <= 40 ? 0 : Math.round(4_500 * Math.pow((tons - 40) / 100, 1.45));
   }
 
-  /** Resident Factors' share of the fleet bill (guide 3.9): 120 Cr × factors^1.3 a game day. */
-  factorUpkeepPerDay(n: number): number {
-    return n > 0 ? Math.round(12_000 * n ** 1.3) : 0;
+  /**
+   * The tonnage sprawl is billed on (guide 3.12): coastal and regional hull tonnage plus half the oceanic hull
+   * tonnage, the half rounded down.
+   */
+  sprawlTons(lowerTons: number, oceanicTons: number): number {
+    return Math.max(0, lowerTons) + Math.floor(Math.max(0, oceanicTons) / 2);
   }
 
-  /** Extra upkeep per real hour from adding `addTons` of hull to a fleet of `fleetTons`. */
-  upkeepDeltaPerHour(fleetTons: number, addTons: number, oceanic = false): number {
+  /** The hulls' share of the daily bill (guide 3.12): sprawl on sprawlTons, plus a flat 1 Cr per oceanic ton (pence a game day). */
+  hullUpkeepPerDay(lowerTons: number, oceanicTons: number): number {
+    return this.sprawlPerDay(this.sprawlTons(lowerTons, oceanicTons)) + 100 * Math.max(0, oceanicTons);
+  }
+
+  /** Resident Factors' share of the fleet bill (guide 3.12): 120 Cr × factors^1.25 a game day. */
+  factorUpkeepPerDay(n: number): number {
+    return n > 0 ? Math.round(12_000 * n ** 1.25) : 0;
+  }
+
+  /**
+   * Extra upkeep per real hour from adding `addTons` of hull (oceanic or not) to a fleet of `fleet.lower` coastal and
+   * regional tons and `fleet.oceanic` oceanic tons: an oceanic hull adds its flat 1 Cr/t and half its tons to sprawl.
+   */
+  upkeepDeltaPerHour(fleet: { lower: number; oceanic: number }, addTons: number, oceanic = false): number {
     const gameDaysPerHour = this.timeScale / 24;
-    const perDay = oceanic ? addTons * 100 : this.sprawlPerDay(fleetTons + addTons) - this.sprawlPerDay(fleetTons);
-    return perDay * gameDaysPerHour;
+    const after = oceanic ? this.hullUpkeepPerDay(fleet.lower, fleet.oceanic + addTons) : this.hullUpkeepPerDay(fleet.lower + addTons, fleet.oceanic);
+    return (after - this.hullUpkeepPerDay(fleet.lower, fleet.oceanic)) * gameDaysPerHour;
   }
 }

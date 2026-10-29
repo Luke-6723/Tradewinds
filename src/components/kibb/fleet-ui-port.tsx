@@ -17,12 +17,15 @@ import type * as S from "@/lib/kibb/schema";
 import type { PortDetail } from "@/lib/kibb/types";
 
 export function FactorPanel({ port, onChange }: { port: PortDetail; onChange: () => void }) {
+  const { catalog } = useCatalog();
   const { data: factors, reload } = usePoll(() => kibbGet<string[]>("/v1/company/factors"), 60_000);
   const act = useAction<S.FactorActionResult>(() => {
     void reload();
     onChange();
   });
   const has = factors?.includes(port.id) ?? false;
+  // No factor may be hired at a smugglers' cove (403 no_factor_at_cove, guide 3.12).
+  const cove = !!catalog?.ports.find((p) => p.id === port.id)?.is_cove;
 
   function hire() {
     if (!confirm(`Hire a Resident Factor at ${port.name} for 750 Cr, plus daily upkeep from your home vault?`)) return;
@@ -48,13 +51,15 @@ export function FactorPanel({ port, onChange }: { port: PortDetail; onChange: ()
         )}
         <p className="text-muted-foreground text-xs">
           A factor gives quay visibility without a ship: full book depth, gossip, local charters and freight, and lets you lease
-          warehouse space or quote ships. 750 Cr once, plus upkeep (120 Cr × factors^1.3 a game day, shared with the fleet bill).
+          warehouse space or quote ships. 750 Cr once, plus upkeep (120 Cr × factors^1.25 a game day, shared with the fleet bill).
         </p>
         <ErrorNote error={act.error} />
         {has ? (
           <Button size="sm" variant="outline" disabled={act.busy} onClick={dismiss}>
             Dismiss factor
           </Button>
+        ) : cove ? (
+          <p className="text-muted-foreground text-xs">A smugglers&apos; cove: no factor may be hired here. Its book is seen only from a ship lying at the cove.</p>
         ) : (
           <Button size="sm" disabled={act.busy || !factors || factors.length >= 12} onClick={hire}>
             Hire factor (750 Cr)

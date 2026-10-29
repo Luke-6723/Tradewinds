@@ -19,6 +19,11 @@ import type { InsurancePolicyListing } from "../schema";
 export interface UnderwriteRules {
   /** Our player's company ids: never our own policies. */
   ours: Set<string>;
+  /**
+   * Our own ships' ids (defence in depth beside `ours`): never written on, a smuggler of ours above all (guide 3.18: a
+   * seizure pays nothing, and a company never underwrites its own ship).
+   */
+  ourShips?: ReadonlySet<string>;
   /** Server time now (ms) and real ms per game minute. */
   now: number;
   gameMinuteMs: number;
@@ -113,6 +118,7 @@ export function judgePolicies(policies: InsurancePolicyListing[], rules: Underwr
     // Sinkings alone are a lower bound on the insured's loss rate (partial losses never show): this only refuses.
     const rec = edge !== null && edge >= rules.minEdgeBps ? rules.record?.(p) : undefined;
     if (rules.ours.has(p.insured_company_id)) row.verdict = "our own company";
+    else if (rules.ourShips?.has(p.ship_id)) row.verdict = "our own ship";
     else if (rules.held.has(p.id)) row.verdict = "we hold a slice";
     // The estimate is listed only while the policy is open for underwriting: without it, likely sailed.
     else if (!listed) row.verdict = ageGameHours > MAX_AGE_GAME_HOURS ? "too old: the ship has probably sailed" : "no Lloyd's estimate listed (sailed, or no route)";

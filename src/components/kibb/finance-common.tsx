@@ -24,7 +24,9 @@ import type { ShipResult } from "@/lib/kibb/types";
  * Loans by quote (guide 3.13.1-3.13.2): at least 100 Cr, 1..=360 game days, a fixed annual rate (bps per 360 game days)
  * within 10%..=300% of the Goldsmiths' rate for the term. The Goldsmiths: at most 40% of a ship's rebuild value and 7,500 Cr,
  * 45% a year up to 30 game days sliding to 30% at 360, a quote standing 6 game hours. Requests stay open 1..=72 game hours
- * (default 24); amortised installments fall every 10 game days; a foreclosed ship is credited at 80% of its rebuild value.
+ * (default 24); amortised installments fall every 10 game days; a foreclosed ship is credited at 80% of its rebuild value by a
+ * player lender or on a Goldsmiths' ship mortgage, but at only 35% (the break-up price, no surplus) on a Goldsmiths' instant
+ * loan. After any walk-away the Goldsmiths lend nothing for a real day (403 goldsmiths_walk_away_ban).
  */
 export const LOAN = {
   minPrincipalPence: 10_000,
@@ -36,6 +38,7 @@ export const LOAN = {
   requestHoursDefault: 24,
   installmentEveryDays: 10,
   foreclosureCreditPct: 80,
+  goldsmithsForeclosureCreditPct: 35,
 } as const;
 
 /** Banks: 10,000 Cr fee, 50,000 Cr of own funds after it, 20% reserve, rates 0..=50 bps a day, notice 1..=720 game hours. */
@@ -53,9 +56,23 @@ export const BANK = {
 /** Ventures: investors take 25%..=90% of the profit after 2% stamp duty; raise 1..=168 game hours (default 24); stakes ≥ 10 Cr. */
 export const VENTURE = { shareMinBps: 2_500, shareMaxBps: 9_000, stampDutyBps: 200, raiseHoursMax: 168, raiseHoursDefault: 24, minStakePence: 1_000 } as const;
 
-/** What a default does, in the guide's terms (3.13.1). */
+/** What a default does, in the guide's terms (3.13.1): a player lender's loan, or a Goldsmiths' ship mortgage. */
 export const DEFAULT_WARNING =
-  "Not repaid by maturity (or an amortised installment unpaid a game day after it falls due), a loan defaults: a liened ship goes to the lender where it lies, credited at 80% of its rebuild value (the lender pays you any surplus over what you owe), and is arrested until then (it can't depart or join a convoy, and your cargo left aboard is sold at half base price toward the debt); pledged goods move to the lender's warehouse; with recourse the rest is taken from your vaults daily. The default stays on your public credit record.";
+  "Not repaid by maturity (or an amortised installment unpaid a game day after it falls due), a loan defaults: a liened ship goes to the lender where it lies, credited at 80% of its rebuild value (the lender pays you any surplus over what you owe; on a player lender's loan or a Goldsmiths' ship mortgage, not on a Goldsmiths' instant loan), and is arrested until then (it can't depart or join a convoy, and your cargo left aboard is sold at half base price toward the debt); pledged goods move to the lender's warehouse; with recourse the rest is taken from your vaults daily. The default stays on your public credit record.";
+
+/** What a default (or a walk-away) does on a Goldsmiths' instant loan (guide 3.13.1): the break-up credit, no surplus, the rest owed. */
+export const GOLDSMITHS_DEFAULT_WARNING =
+  "On a Goldsmiths' instant loan a default (at maturity, a missed installment, walking away or bankruptcy) is harsher: they take the pledged ship credited only at what a yard would pay to break it up, 35% of its rebuild value, pay you no surplus, and whatever you owed above that is NOT written off: it stays owed with recourse and the bailiff takes it from your vaults (any region) until paid. A ship sunk or lost first credits nothing. The ship is arrested until they have it, and the default stays on your public credit record.";
+
+/**
+ * A Goldsmiths' instant loan (taken on their quote: no player's request behind it, not a ship mortgage), whose default credits
+ * the ship at its break-up value only (GOLDSMITHS_DEFAULT_WARNING).
+ */
+export const isGoldsmithsInstant = (l: Pick<S.Loan, "is_mortgage" | "request_id" | "quote_id">) => !l.is_mortgage && !l.request_id && !!l.quote_id;
+
+/** After any walk-away (any lender), the Goldsmiths lend nothing for a real day (guide 3.13.1: 403 goldsmiths_walk_away_ban). */
+export const WALK_AWAY_BAN_WARNING =
+  "After any walk-away, the Goldsmiths give no instant quote or loan to you, or to your own and linked companies, for one real day (the autopilot borrows nothing until then).";
 
 /** Number input value → number; empty → NaN. */
 export const num = (v: string) => (v.trim() === "" ? Number.NaN : Number(v));
@@ -341,6 +358,7 @@ export const COLLATERAL_LABEL: Record<S.CollateralKind, string> = {
   ship_lien: "Ship lien",
   warehouse_goods: "Warehouse goods",
   contract_receivable: "Contract receivable",
+  deposit: "Bank deposit",
   unsecured: "Unsecured",
 };
 
@@ -354,7 +372,9 @@ export function CollateralText({ loan, shipName }: { loan: S.Loan; shipName?: (i
         ? `${fmtTons(loan.collateral_tons ?? 0)} ${goodName(loan.collateral_commodity_id)} at ${portName(loan.collateral_port_id)}`
         : loan.collateral_kind === "contract_receivable"
           ? `Receivable on contract ${shortId(loan.collateral_contract_id)}`
-          : "Unsecured";
+          : loan.collateral_kind === "deposit"
+            ? `Bank deposit ${shortId(loan.collateral_deposit_id)} (set off against what is owed on a default)`
+            : "Unsecured";
   return (
     <span className="text-xs">
       {what}

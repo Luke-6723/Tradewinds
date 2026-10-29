@@ -16,18 +16,24 @@ import { fmtCr, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
 import type { BuildMode, BuildShipResult, CatalogShipClass, ShipResult, WorldClock } from "@/lib/kibb/types";
 
-/** Daily sprawl upkeep in pence for coastal and regional hull tonnage (the first 40 t are free). */
+/** Daily sprawl upkeep in pence for this many sprawl tons (the first 40 t are free). */
 function sprawlPerDay(tons: number): number {
   return tons <= 40 ? 0 : Math.round(4500 * ((tons - 40) / 100) ** 1.45);
 }
 
+/** The hulls' daily bill (guide 3.12): sprawl on coastal + regional tons plus half the oceanic tons (rounded down), plus 1 Cr per oceanic ton. */
+function hullUpkeep(lower: number, oceanic: number): number {
+  return sprawlPerDay(lower + Math.floor(oceanic / 2)) + 100 * oceanic;
+}
+
 /** Extra upkeep per game day the new hull adds to the fleet's bill, in pence. */
 function upkeepDelta(ships: ShipResult[], classes: CatalogShipClass[], cls: CatalogShipClass): number {
-  if (cls.hull_category === "oceanic") return cls.hold_capacity_tons * 100;
-  const tons = ships
-    .filter((r) => r.ship.status !== "sunk" && classes.find((c) => c.id === r.ship.ship_class)?.hull_category !== "oceanic")
-    .reduce((n, r) => n + r.hold_capacity_tons, 0);
-  return sprawlPerDay(tons + cls.hold_capacity_tons) - sprawlPerDay(tons);
+  const afloat = ships.filter((r) => r.ship.status !== "sunk");
+  const isOceanic = (r: ShipResult) => classes.find((c) => c.id === r.ship.ship_class)?.hull_category === "oceanic";
+  const lower = afloat.filter((r) => !isOceanic(r)).reduce((n, r) => n + r.hold_capacity_tons, 0);
+  const oceanic = afloat.filter(isOceanic).reduce((n, r) => n + r.hold_capacity_tons, 0);
+  const add = cls.hold_capacity_tons;
+  return cls.hull_category === "oceanic" ? hullUpkeep(lower, oceanic + add) - hullUpkeep(lower, oceanic) : hullUpkeep(lower + add, oceanic) - hullUpkeep(lower, oceanic);
 }
 
 function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void }) {
@@ -134,8 +140,9 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
           />
         )}
         <p className="text-muted-foreground text-xs">
-          New ships launch berthed with no guns (150 Cr each at a yard, 2 t of hold per gun) and no stores. Hulls beyond the first 40 t
-          of coastal and regional tonnage cost 45 Cr × ((t − 40)/100)^1.45 a game day between them; oceanic hulls 1 Cr per ton a day.
+          New ships launch berthed with no guns (150 Cr each at a yard, 2 t of hold per gun) and no stores. Sprawl upkeep is 45 Cr ×
+          ((t − 40)/100)^1.45 a game day, where t is your coastal and regional tonnage plus half your oceanic tonnage (rounded down);
+          oceanic hulls also pay 1 Cr per ton a day on top.
         </p>
       </div>
 

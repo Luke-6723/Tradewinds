@@ -58,11 +58,31 @@
  * Runs in-process in the Next.js server (fleet-registry.ts) or from the CLI (workers/kibb-fleet.ts).
  */
 
-import { fatalText, KibbClient, KIBB_DEFAULT_URL, isApiError, isFatalApiError, outcomeUnknown } from "../client";
-import { analyseRivals, bestMarque, classOfHull, pirateAttention, rivalProfiles, seizedShare, ZONE_MARQUE_CAP, zoneDays, type MarqueOption, type RivalAnalysis, type RivalDelivery, type ZoneTraffic } from "../rivals";
+import { fatalText, KibbClient, KIBB_DEFAULT_URL, isApiError, isFatalApiError, outcomeUnknown, type KibbApiError } from "../client";
+import {
+  ADMIRALS_TENTH,
+  analyseRivals,
+  bestMarque,
+  bestPatrol,
+  classOfHull,
+  PATROL_FLOOR_PENCE_PER_BPS_DAY,
+  patrolValue,
+  pirateAttention,
+  rivalProfiles,
+  seizedShare,
+  ZONE_MARQUE_CAP,
+  zoneDays,
+  type MarqueOption,
+  type PatrolOption,
+  type PatrolZoneVerdict,
+  type RivalAnalysis,
+  type RivalDelivery,
+  type ZoneTraffic,
+} from "../rivals";
 import type {
   ConvoyResult,
   ConvoyStatus,
+  CoveBookResult,
   CreditReport,
   EnvelopeCategory,
   EnvelopeDetail,
@@ -76,9 +96,11 @@ import type {
   LoanRequestView,
   MarqueQuote,
   NavalPatrol,
+  PatrolQuote,
   SeaZonePiracyResult,
   ShipListingResult,
   UnderwritingFigures,
+  WantsResult,
 } from "../schema";
 import {
   commissionCase,
@@ -126,6 +148,32 @@ import {
   REQUEST_OPEN_GAME_H,
 } from "./finance";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
+import {
+  ARRIVAL_BERTH_GAME_H,
+  ATTENTION_WINDOW_GAME_H,
+  attentionGapGameH,
+  BERTHED_FACTOR,
+  COVE_RESALE_SHARE,
+  EV_LOSS_X,
+  LIVE_WANT_MAX_AGE_GAME_H,
+  portHazard,
+  restoreModel,
+  RUN_MIN_MULTIPLE_BPS,
+  runGameHours,
+  runHazard,
+  seizureOdds,
+  SMUGGLE_DEFAULT_PENCE,
+  SMUGGLE_DEFAULT_TONS,
+  SMUGGLE_MAX_SHIPS,
+  SMUGGLE_MIN_FLEET,
+  SMUGGLE_STORES_DAYS,
+  smuggleCase,
+  WANT_LIFE_GAME_H,
+  WANT_MAX_AGE_GAME_H,
+  WANT_MIN_MULTIPLE_BPS,
+  wantValue,
+  type SeizureModel,
+} from "./smuggle";
 import type { StreamEvent } from "../schema";
 import type { BankingRegion, BuildMode, BuildQuote, CatalogShipClass, ContractListing, LeaderboardResult, PlaceOrderResult, RoutePlan, ShipResult } from "../types";
 import { ShipAgent, STORES_BUFFER_DAYS, type AgentSnapshot, type AgentState, type AgentStats, type ConvoyOutcome, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
@@ -138,7 +186,6 @@ import {
   laneBanned,
   NAVAL_BPS_MIN,
   NAVAL_TERM_MIN_H,
-  patrolCost,
   type FinanceOrder,
   type NavalOrder,
   type OrderCode,
@@ -149,7 +196,18 @@ import {
 import { acquireLease, type Lease } from "./lease";
 import { pickShipName } from "./names";
 import { HOLD_CAP_GAME_H, HOLD_MAX_GAME_H, rankLanes, REPOST_GRACE_GAME_MIN, type Lane, type PlanOptions, type Reservations, type ShipSpec, type StallStake } from "./planner";
-import { OWN_TRICKLE_CONFIRM, SEASON_ENDGAME_MS, World, type ExpansionWatch, type StormSummary, type TrickleSample, type WorldEventsReport, type WorldSnapshot } from "./world";
+import {
+  OWN_TRICKLE_CONFIRM,
+  SEASON_ENDGAME_MS,
+  TAPER_FREE_PENCE,
+  TAPER_WINDOW_GAME_DAYS,
+  World,
+  type ExpansionWatch,
+  type StormSummary,
+  type TrickleSample,
+  type WorldEventsReport,
+  type WorldSnapshot,
+} from "./world";
 
 // ── Settings & state ──────────────────────────────────────────────────────────
 
@@ -186,10 +244,11 @@ export interface FleetSettings {
   /**
    * Sponsor letters of marque automatically where the game's quote (prize money expected from the zone's
    * player traffic, after the Admiral's tenth) beats its price and our own ships' extra losses, in zones
-   * with rival traffic seen. Off by default.
+   * with rival traffic seen; and naval patrols where the smuggler prize money expected from the seizures
+   * seen there, plus the piracy taken off our own ships, beats the patrol's quote (runPatrols). Off by default.
    */
   marques: boolean;
-  /** Most spent on letters of marque in any 24 real hours (pence). */
+  /** Most spent on letters of marque and naval patrols (the autopilot's and the AI's) in any 24 real hours (pence). */
   marqueBudgetPence: number;
   /**
    * Underwrite other companies' voyage policies whose premium beats Lloyd's own expected-loss estimate
@@ -303,6 +362,22 @@ export interface FleetSettings {
    * stale ones withdrawn unsold; sales booked. Never buys any. On by default.
    */
   envelopes: boolean;
+  /**
+   * The Free Trade (guide 3.18). OFF by default; the user's "off" is a ceiling the AI can't lift; it needs the company key's
+   * `underworld` scope (allowed on the Underworld page). One dedicated ship at a time (the fastest fit one: never pledged,
+   * insured, listed, sharing her ownership, in a convoy, or with lawful cargo or sealed freight aboard; never the fleet's only
+   * ship) buys a small load of contraband at a cove on a fresh want (≤ a game day old, ≥ 3x base), sails it only through
+   * zones no patrol works (read again before departing), lies in the wanting port's roadstead (never berthed if she can help
+   * it) and runs it ashore at once; if the want is gone, on to the next live want, or back to a cove to sell on its book. Only
+   * when the expected gain is at least twice the expected loss (a conservative seizure model, learned from our own runs);
+   * runs are spaced for the Crown's attention. A seizure forfeits the ship and everything aboard (insurance pays nothing) and
+   * puts a conviction on our public credit record: the mode then switches itself off until it is turned on again.
+   */
+  smuggling: boolean;
+  /** Most tons of contraband one run buys. */
+  smuggleMaxTons: number;
+  /** Most one run spends on contraband (pence). */
+  smuggleMaxPence: number;
 }
 
 export type GunPolicy = "auto" | "full" | "off";
@@ -341,6 +416,9 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   idleCash: true,
   shipDeals: true,
   envelopes: true,
+  smuggling: false,
+  smuggleMaxTons: SMUGGLE_DEFAULT_TONS,
+  smuggleMaxPence: SMUGGLE_DEFAULT_PENCE,
   ai: "off",
   aiDailyCapUsd: 2,
   aiTotalCapUsd: 180,
@@ -402,6 +480,10 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   bool("idleCash");
   bool("shipDeals");
   bool("envelopes");
+  bool("smuggling");
+  num("smuggleMaxTons", 1, true);
+  if (out.smuggleMaxTons !== undefined && out.smuggleMaxTons > 500) throw new FleetSettingsError("smuggleMaxTons must be 1 to 500");
+  num("smuggleMaxPence", 0, true);
   if (patch.ai !== undefined) {
     if (!AI_MODES.includes(patch.ai)) throw new FleetSettingsError(`ai must be one of ${AI_MODES.join(", ")}`);
     out.ai = patch.ai;
@@ -475,6 +557,8 @@ export interface FleetState {
   finance?: FinanceReport | null;
   /** Ships for sale and commissions seen, ours being built, our envelopes (absent from older managers). */
   deals?: DealsReport | null;
+  /** The Free Trade: the smuggling mode, our smugglers, wants seen, runs, seizures (absent from older managers). */
+  smuggling?: SmuggleReport | null;
   /** The expansion tier as the autopilot sees it: pace, whether the buyer is keeping cash back, stalled charters. */
   expansion: ExpansionReport | null;
   /** Charge on cash a load ties up (per pence per real hour; 0 while cash isn't scarce). */
@@ -560,10 +644,17 @@ export interface CashReport {
   /** Auto-remit for bills (company settings, guide 3.9) as last read (only read, never changed); null: not read. */
   autoRemit: { on: boolean; reservePence: number } | null;
   /**
-   * The Crown's wealth levy (guide 3.12): idle vault cash above the threshold, and what it pays a game day (pence).
-   * While there is an excess, loads aren't charged for the cash they tie up. Absent in reports from older servers.
+   * The Crown's wealth levy (guide 3.12): net worth above the threshold, and what it pays a game day (pence), taken from
+   * cash. `worthPence` / `worthSource`: the net worth it is reckoned on (the leaderboard while fresh, else our estimate;
+   * absent from older managers). Absent in reports from older servers.
    */
-  levy?: { thresholdPence: number; excessPence: number; perDayPence: number };
+  levy?: { thresholdPence: number; excessPence: number; perDayPence: number; worthPence?: number | null; worthSource?: "leaderboard" | "estimate" | null };
+  /**
+   * The charter premium taper (guide 3.7): our Crown and Admiralty charter earnings over the last `windowGameDays` (all our
+   * companies the autopilot runs here), the threshold above which the premium tapers, and the factor on the premium now (1: none;
+   * a delivery's own pay lowers it further). Absent in reports from older servers.
+   */
+  charterTaper?: { earnedPence: number; thresholdPence: number; windowGameDays: number; factor: number };
 }
 
 export interface MarqueZoneReport {
@@ -699,6 +790,91 @@ export interface MarqueReport {
   prizePence: number;
   zones: MarqueZoneReport[];
   action: string;
+  /**
+   * The auto-patrol beside the marques (same switch, budget and gates; guide 3.5): smuggler prize money our patrols have earned
+   * (all listed), what it did or would do, and its verdict per zone. Absent in older reports.
+   */
+  patrolPrizePence?: number;
+  patrolAction?: string;
+  patrols?: PatrolZoneVerdict[];
+}
+
+/** One of our smuggling runs (guide 3.18) for the record. `at` is server ms (ISO in the report). */
+export interface SmuggleRunRec {
+  at: number;
+  ship: string;
+  /** Where the goods were bought (null: aboard already). */
+  cove: string | null;
+  port: string;
+  good: string;
+  tons: number;
+  costPence: number;
+  /** What landing or selling them paid (null: nothing yet, or no notice of it). */
+  proceedsPence: number | null;
+  /** under way | landed | landed (no notice; pay in the vault) | nothing landed | cancelled | sold at a cove | SEIZED */
+  outcome: string;
+  /** Odds of a seizure and expected gain when decided (null: goods the mode didn't buy). */
+  p: number | null;
+  gain: number | null;
+}
+
+/** The smuggling mode for the dashboard (guide 3.18). Times ISO. */
+export interface SmuggleReport {
+  /** The user's setting. */
+  enabled: boolean;
+  /** The company key holds the underworld scope. */
+  available: boolean;
+  /** Acting now (the setting in force, the scope, no halt). */
+  active: boolean;
+  /** "on", or why not. */
+  state: string;
+  /** The last pass's decision. */
+  action: string;
+  /** Switched off by a seizure until turned on again. */
+  halt: { at: string; why: string } | null;
+  maxTons: number;
+  maxPence: number;
+  ships: Array<{
+    shipId: string;
+    name: string;
+    purpose: "buy" | "run" | "sell";
+    dest: string | null;
+    want: { port: string; good: string; multipleBps: number } | null;
+    load: { good: string; tons: number; pence: number; cove: string } | null;
+    run: { port: string; good: string; tons: number; completesAt: string } | null;
+    odds: { p: number; gain: number; loss: number } | null;
+    since: string;
+    zones: string[];
+  }>;
+  wants: Array<{ port: string; good: string; multipleBps: number; ageGameH: number; remaining: number | null; source: "live" | "board"; via: string | null }>;
+  runs: Array<Omit<SmuggleRunRec, "at"> & { at: string }>;
+  stats: SmuggleStats & { convictions: number };
+  /** The seizure model: odds per run and per game hour in port (learned from the priors), how long a run takes, what it has seen. */
+  model: {
+    perRun: number;
+    perPortHour: number;
+    runGameH: number;
+    runs: number;
+    portHours: number;
+    seizedInPort: number;
+    seizedAtSea: number;
+    /** Odds a run ends in a seizure now. */
+    odds: number;
+    recentRuns: number;
+    nextRunAt: string | null;
+  };
+  /** inPort null: where she was taken isn't known (she vanished from the fleet and the last read couldn't tell). */
+  convictions: Array<{ at: string; ship: string; where: string; inPort: boolean | null }>;
+  log: Array<{ at: string; source: string; msg: string }>;
+}
+
+export interface SmuggleStats {
+  /** Runs ashore started. */
+  runs: number;
+  landedTons: number;
+  proceedsPence: number;
+  spentPence: number;
+  seizures: number;
 }
 
 /** Everything the manager saves (journal.ts) so a restart resumes where it left off. */
@@ -724,7 +900,8 @@ interface FleetSnapshot {
   /** Loads planned again at their source; absent in older saves. */
   resized?: ResizeStats;
   /** The daily bills as the ledger showed them (pence a game day; `at` server ms); absent: not measured yet. */
-  bills?: { rent: Array<[BankingRegion, number]>; upkeep: number; at: number };
+  /** `levy`: the wealth levy the ledger showed charged a game day (absent from older saves). */
+  bills?: { rent: Array<[BankingRegion, number]>; upkeep: number; levy?: number; at: number };
   /** Older saves only (the autopilot once set the auto-remit reserve): ignored, never written now. */
   autoRemitSet?: { at: string; pence: number };
   /** The last critical server announcement (`at` server ms); absent: none. */
@@ -744,6 +921,8 @@ interface FleetSnapshot {
     offers?: unknown[];
     interestPaidBefore?: number;
     interestEarnedBefore?: number;
+    /** The Goldsmiths lend nothing until then (server ms; 403 goldsmiths_walk_away_ban); absent in older saves. */
+    goldsmithsBanUntil?: number;
   };
   /** Commissions we took, our envelopes, posts with no answer, and what deals earned; absent in older saves. */
   deals?: {
@@ -752,6 +931,34 @@ interface FleetSnapshot {
     pendingEnvelopes?: PendingEnvelope[];
     stats?: Partial<DealStats>;
   };
+  /**
+   * The smuggling mode: the learned seizure model, our smugglers (what each is about), the runs, the Crown's attention, what
+   * it earned, the halt after a seizure and the convictions, the wants seen, its decisions; absent in older saves.
+   */
+  smuggle?: {
+    model?: Partial<SeizureModel>;
+    roles?: Array<[string, SmuggleRole]>;
+    runs?: SmuggleRunRec[];
+    runTimes?: number[];
+    stats?: Partial<SmuggleStats>;
+    halt?: { at: number; why: string } | null;
+    convictions?: Array<SeizureRec>;
+    /** Ids of our ships counted as seized (a notice and a guess never count one twice); absent in older saves. */
+    seized?: string[];
+    wants?: Array<[string, WantSeen]>;
+    log?: Array<{ at: string; source: string; msg: string }>;
+    scoutAt?: number;
+  };
+}
+
+/** One of our ships seized for smuggling: when, which, where (inPort null: not known), and whether it was inferred (no notice). */
+interface SeizureRec {
+  at: number;
+  ship: string;
+  where: string;
+  inPort: boolean | null;
+  id?: string;
+  guessed?: boolean;
 }
 
 /** Whether a turnkey quote's walk takes any material from players' asks (a commission's build passes over the buyer's). */
@@ -893,6 +1100,64 @@ interface OurRequest {
   bestBps: number | null;
 }
 
+/** A want for contraband seen (guide 3.18): live at a port where a ship of ours lay (with the tons it still takes), or on a cove's board. */
+interface WantSeen {
+  port: string;
+  good: string;
+  multipleBps: number;
+  /** Server ms it was seen at that multiple. */
+  at: number;
+  /** Tons it still takes (a live read only). */
+  remaining: number | null;
+  source: "live" | "board";
+  /** The cove whose board told it. */
+  via: string | null;
+}
+
+/** A ship smuggling for the fleet (guide 3.18; server ms). */
+interface SmuggleRole {
+  since: number;
+  /** "buy": bound for a cove to buy (or there); "run": goods aboard bound for a want; "sell": goods aboard, back to a cove. */
+  purpose: "buy" | "run" | "sell";
+  dest: string | null;
+  want: { port: string; good: string; multipleBps: number; seenAt: number } | null;
+  /** Sea zones of the passage planned or under way (no patrol of ours goes there); null: not known yet. */
+  zones: string[] | null;
+  /** The goods the mode bought for this run. */
+  load: { good: string; tons: number; pence: number; cove: string; at: number } | null;
+  /** A run ashore under way (`before`: tons of the good aboard when it started). */
+  run: { id: string; port: string; good: string; tons: number; startedAt: number; completesAt: number; before: number } | null;
+  /** Lying in an ordinary port with contraband aboard: the last look, berthed then, and the ms berthed and in the roadstead so far. */
+  lying: { port: string; lastAt: number; berthed: boolean; berthedMs: number; roadMs: number } | null;
+  /** Sailing with contraband aboard (a voyage for the model, counted when she arrives). */
+  voyage: boolean;
+  /** Waiting at a cove (for a want worth a run, or a bid) since. */
+  waitingSince: number | null;
+  /** The odds and the value test when the passage was decided. */
+  odds: { p: number; gain: number; loss: number } | null;
+}
+
+/** A run the mode might make (smuggle.ts): the want, the load, the route and its zones, stores, and the value test. */
+interface RunOption {
+  want: WantSeen;
+  tons: number;
+  plan: RoutePlan;
+  zones: string[];
+  /** Stores (t) the passage there and back needs, with the buffer. */
+  stores: number;
+  proceeds: number;
+  goods: number;
+  p: number;
+  shipValue: number;
+  /** Real hours from now until the goods are ashore. */
+  hours: number;
+  /** Odds the want still stands when she lands. */
+  survive: number;
+  gain: number;
+  loss: number;
+  ok: boolean;
+}
+
 /** How often the progress is saved even when nothing much happened (time use, prices). */
 const PERSIST_MS = 30_000;
 
@@ -902,6 +1167,8 @@ export interface FleetConfig {
   settings: FleetSettings;
   /** Directory for the per-company lease file; omit to skip the cross-process guard. */
   leaseDir?: string;
+  /** Clear the halt a seizure put on the smuggling mode (the CLI's KIBB_SMUGGLING=resume): the user re-enables it. */
+  resumeSmuggling?: boolean;
 }
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
@@ -953,7 +1220,7 @@ const BYOM_BLOCK_MS = 30 * 60_000;
 const HULL_PENCE_PER_TON = 25_000;
 /** Spare cash kept in every non-home region for berth dues and stores. */
 const REGION_FLOOR_PENCE = 20_000;
-/** The home reserve covers at least this many game days of fleet upkeep (and each region of its warehouse rent). */
+/** The home reserve covers at least this many game days of fleet upkeep and the wealth levy (and each region of its warehouse rent). */
 const UPKEEP_DAYS_RESERVED = 1.5;
 /** How often the ledger is read for what the daily bills really charge; how far back, in pages of 200. */
 const BILLS_CHECK_MS = 10 * 60_000;
@@ -965,6 +1232,8 @@ const BILLING_CLUSTER_MS = 60_000;
 const RENT_REASON = /(?:^|[_\s-])(?:rent|lease)|warehouse/i;
 const UPKEEP_REASON = /upkeep|sprawl|factor|salar/i;
 const ONE_OFF_REASON = /hire|setup|refund|release|bailiff|seiz|distress|sale|remit/i;
+/** The Crown's wealth levy (`crown_wealth_levy`, guide 3.12): its own bill, never taken for rent, upkeep or a one-off. */
+const LEVY_REASON = /levy/i;
 /** A refit must improve a load's expected profit by this share to be worth the berth call. */
 const REFIT_MIN_GAIN = 0.02;
 /** AI marques and patrols still to issue are looked at this often (one waiting for cash is tried again then). */
@@ -983,6 +1252,43 @@ const MARQUE_MIN_PENCE = 10_000;
 const MARQUE_QUOTE_ZONES = 6;
 /** A zone's last quoted marque price counts this long (real ms) for the AI's naval orders and digest. */
 const MARQUE_PRICE_TTL_MS = 30 * 60_000;
+/**
+ * Auto-patrols (guide 3.5), beside the marques on their switch, budget and gates: one game day at a time like them, the most
+ * promising few zones quoted per check (by our own estimate at the 2 Cr floor: a zone that doesn't pay even there isn't quoted).
+ */
+const PATROL_GAME_HOURS = 24;
+const PATROL_QUOTE_ZONES = 4;
+/**
+ * A seized smuggler's prize pool (half the base value of her and everything aboard) when neither the notices nor our own prize
+ * money have shown one: half the cheapest hull open now (the cargo, unknown, counted as nothing).
+ */
+const SMUGGLER_POOL_SHARE = 0.5;
+/** The smuggling mode's pass (guide 3.18), and live wants read where we lie: a few ports a pass, each at most this often. */
+const SMUGGLE_CHECK_MS = 60_000;
+const WANTS_READ_MS = 5 * 60_000;
+const WANTS_PORTS_PER_PASS = 4;
+/** Zones' patrols as read this recently stand for a route check (a departure always reads them afresh). */
+const SMUGGLE_ZONES_FRESH_MS = 3 * 60_000;
+/** Wants weighed per decision, and free ships weighed for a new run (fastest first). */
+const SMUGGLE_OPTIONS = 5;
+const SMUGGLE_CANDIDATES = 3;
+/** Buying at a cove: at most this far over the best ask (so only what is on the book at about that price). */
+const BUY_SLIP = 0.05;
+/** A new run is estimated with the goods at this multiple of base (the Underworld's price drifts around base). */
+const HOUSE_PRICE_GUESS = 1.1;
+/** At a cove: look again this often (game minutes); wait this long for a want worth a run (game hours), then let her go. */
+const COVE_RECHECK_GAME_MIN = 30;
+const COVE_WAIT_GAME_H = 6;
+/** A run ashore past its completes_at with no notice: waited this much longer (real ms) before the hold says what landed. */
+const RUN_GRACE_MS = 30_000;
+/** A smuggler holding where she is looks again this often (real ms). */
+const SMUGGLE_HOLD_MS = 60_000;
+/** An idle ship goes to read a cove's board at most once in this many game hours, and only to a cove this near (nm). */
+const SCOUT_GAP_GAME_H = 24;
+const SCOUT_MAX_NM = 600;
+/** Runs, decisions kept. */
+const SMUGGLE_RUNS_KEPT = 40;
+const SMUGGLE_LOG_KEEP = 40;
 /** How often the open insurance policies are judged. */
 const UNDERWRITE_CHECK_MS = 60_000;
 /** How often rival intel is gathered (presence ports' sailings, the public policy list, public convoys) and analysed. */
@@ -1007,10 +1313,11 @@ const PHASE_SOON_MS = 2 * 60 * 60 * 1000;
 /** Share of the fleet's own return on cash charged on what a load ties up, while cash is scarce. */
 const CAPITAL_CHARGE_WEIGHT = 0.5;
 /**
- * The Crown's wealth levy (guide 3.12): idle vault cash above 500,000 Cr across all regions pays 0.1% of the excess a
- * game day (about 6% a real day at 60x). Loans out, deposits, venture stakes, escrow and goods are exempt.
+ * The Crown's wealth levy (guide 3.12): a company's net worth (as the leaderboard counts it: cash, escrow, goods, hulls,
+ * loans, deposits, venture stakes) above 1,000,000 Cr pays 0.1% of the excess a game day, taken from cash (richest vault
+ * first, never below the threshold). Nothing escapes it by being put to work.
  */
-export const WEALTH_LEVY_THRESHOLD_PENCE = 50_000_000;
+export const WEALTH_LEVY_THRESHOLD_PENCE = 100_000_000;
 export const WEALTH_LEVY_BPS_PER_DAY = 10;
 /** Borrower loans (liens, arrests) are read again after this long (real ms), or at once after a loan event. */
 const LOANS_TTL_MS = 10 * 60_000;
@@ -1095,18 +1402,36 @@ function loadText(l: Lane): string {
 }
 
 /** A voyage_hazard event read as a storm (a convoy rescue is one that would have sunk the ship), or null. Shape not published. */
-function stormFrom(e: StreamEvent): { hazard: string; zone: string | null; at: number | null; share: number | null; sunk: boolean } | null {
+function stormFrom(e: StreamEvent): { hazard: string; zone: string | null; at: number | null; share: number | null; stores: number | null; sunk: boolean } | null {
   const p = (e.payload && typeof e.payload === "object" ? e.payload : {}) as Record<string, unknown>;
   const name = [p.hazard, p.kind, p.type].find((v): v is string => typeof v === "string");
   const hazard = (name ?? "hazard").toLowerCase();
   const rescued = hazard.includes("rescue");
   if (!hazard.includes("storm") && !rescued) return null;
   const loss = typeof p.cargo_loss_pct === "number" ? p.cargo_loss_pct / 100 : null;
-  return { hazard, zone: e.sea_zone_id ?? null, at: Date.parse(e.timestamp) || null, share: rescued ? null : loss, sunk: p.sunk === true || rescued };
+  // The share of the stores taken varies too (guide 3.5): learned for the stores planned against further storms.
+  const stores = typeof p.stores_loss_pct === "number" ? p.stores_loss_pct / 100 : null;
+  return { hazard, zone: e.sea_zone_id ?? null, at: Date.parse(e.timestamp) || null, share: rescued ? null : loss, stores: rescued ? null : stores, sunk: p.sunk === true || rescued };
 }
 
 /** Errors no retry will fix: wrong key, missing scopes, another process running this company. */
 class InitFatal extends Error {}
+
+/** The Goldsmiths' refusal for a real day after any walk-away by us or a linked company (guide 3.13.1). */
+const WALK_AWAY_BAN = "goldsmiths_walk_away_ban";
+
+/**
+ * When a goldsmiths_walk_away_ban ends (server ms): a time the refusal names (a field of its body, or the first timestamp in its
+ * detail), else a real day from `now`. One that can't be read, has passed, or lies past the rule's day is taken as a day from now.
+ */
+function walkAwayBanEnd(e: KibbApiError, now: number): number {
+  const day = 24 * 3_600_000;
+  const body = (typeof e.body === "object" && e.body ? e.body : {}) as unknown as Record<string, unknown>;
+  const named = ["until", "banned_until", "ban_until", "ban_ends_at", "lends_again_at", "retry_at", "available_at"].map((k) => body[k]).find((v): v is string => typeof v === "string");
+  const text = named ?? e.detail.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/)?.[0];
+  const t = text ? Date.parse(text) : Number.NaN;
+  return Number.isFinite(t) && t > now && t <= now + day + 3_600_000 ? t : now + day;
+}
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
@@ -1167,7 +1492,7 @@ export class FleetManager implements FleetHost {
   /** Resident Factors the company has (the user's too: all are billed), as last listed. */
   private factorCount = 0;
   /** The daily bills as the ledger last showed them (learnBills; saved). */
-  private bills: { rent: Map<BankingRegion, number>; upkeep: number; at: number | null } = { rent: new Map(), upkeep: 0, at: null };
+  private bills: { rent: Map<BankingRegion, number>; upkeep: number; levy: number; at: number | null } = { rent: new Map(), upkeep: 0, levy: 0, at: null };
   private lastBillsCheck = 0;
   private billReasonsLogged = false;
   /** Auto-remit for bills as last read (re-read with the bills; never changed by the autopilot); an unreadable read said once. */
@@ -1186,6 +1511,8 @@ export class FleetManager implements FleetHost {
   private ownNaval: { at: number; marques: LetterOfMarque[]; patrols: NavalPatrol[] } | null = null;
   /** Each zone's marque price per bps per game day (pence) as last quoted (local ms): the AI's naval orders and digest. */
   private readonly marquePrices = new Map<string, { price: number; at: number }>();
+  /** Zones' patrol prices per bps per game day as last quoted (`patrol-quote`, local ms). */
+  private readonly patrolPrices = new Map<string, { price: number; at: number }>();
   private factorPorts: string[] = [];
   private buyerOptions: DigestInput["buyerOptions"] = [];
   private logLines: FleetLogLine[] = [];
@@ -1233,6 +1560,8 @@ export class FleetManager implements FleetHost {
   private idleAction = "not checked yet";
   /** No new loan before this (local ms): a lender refused lately. A refused quote, request or approval waits too. */
   private borrowRetryAt = 0;
+  /** Server ms until which the Goldsmiths quote and lend nothing (guide 3.13.1: 403 goldsmiths_walk_away_ban after any walk-away). */
+  private goldsmithsBanUntil = 0;
   private idleRetryAt = 0;
   private refiRetryAt = 0;
   /** Loans whose repayment had no answer: left alone until then (local ms), read again first. */
@@ -1311,9 +1640,43 @@ export class FleetManager implements FleetHost {
   /** An event said charters or the phase changed: refresh the world soon, then wake idle ships. */
   private worldDirty = false;
 
+  // The Free Trade (guide 3.18): the smuggling mode.
+  /** The key holds `underworld` (whoami): without it the mode is unavailable. */
+  private canSmuggle = false;
+  /** Ships smuggling for the fleet (ship id → what she is about). Saved. */
+  private readonly smugglers = new Map<string, SmuggleRole>();
+  /** The learned seizure model (smuggle.ts). Saved. */
+  private smuggleModel: SeizureModel = restoreModel(null);
+  /** Our runs, newest last. Saved. */
+  private smuggleRuns: SmuggleRunRec[] = [];
+  /** Server ms our runs ashore started (the Crown's attention). Saved. */
+  private smuggleRunTimes: number[] = [];
+  private smuggleStats: SmuggleStats = { runs: 0, landedTons: 0, proceedsPence: 0, spentPence: 0, seizures: 0 };
+  /** After a seizure the mode stays off until the user turns it on again (CLI: KIBB_SMUGGLING=resume). Saved. */
+  private smuggleHalt: { at: number; why: string } | null = null;
+  /** Our ships seized for smuggling: each a conviction on our public credit record. Saved. */
+  private convictions: SeizureRec[] = [];
+  /** Our ships sold or broken up lately (ship_sold, ship_broken_up): gone for that reason, never counted as seized. */
+  private readonly leftFleet = new Set<string>();
+  /** Ships whose seizure is counted (a notice, or a smuggler gone with contraband aboard): once each. */
+  private readonly seizedNoted = new Set<string>();
+  /** Wants seen (`port|good`). Saved. */
+  private readonly wantsSeen = new Map<string, WantSeen>();
+  /** When each port's wants were last read (local ms). */
+  private readonly wantsReadAt = new Map<string, number>();
+  /** The mode's decisions, for the panel and the digest. Saved. */
+  private smuggleLog: Array<{ at: string; source: string; msg: string }> = [];
+  private smuggleAction = "not checked yet";
+  private lastSmuggleCheck = 0;
+  /** When an idle ship last went to read a cove's board (server ms). Saved. */
+  private lastScoutAt = 0;
+  private readonly resumeSmuggling: boolean;
+  /** Called when a seizure switches the mode off (the dashboard saves the setting off). */
+  private readonly onSmugglingHalted?: () => void;
+
   constructor(
     cfg: FleetConfig,
-    opts: { onLog?: (line: FleetLogLine) => void; carryOver?: Pick<FleetState, "log" | "purchases"> } = {},
+    opts: { onLog?: (line: FleetLogLine) => void; carryOver?: Pick<FleetState, "log" | "purchases">; onSmugglingHalted?: () => void } = {},
   ) {
     this.client = new KibbClient({ baseUrl: cfg.baseUrl ?? KIBB_DEFAULT_URL, apiKey: cfg.apiKey });
     this.world = new World(this.client);
@@ -1351,6 +1714,8 @@ export class FleetManager implements FleetHost {
     });
     this.leaseDir = cfg.leaseDir;
     this.onLog = opts.onLog;
+    this.onSmugglingHalted = opts.onSmugglingHalted;
+    this.resumeSmuggling = !!cfg.resumeSmuggling;
     if (opts.carryOver) {
       this.logLines = opts.carryOver.log.slice(-LOG_LIMIT);
       this.purchases = opts.carryOver.purchases.slice(-50);
@@ -1385,6 +1750,7 @@ export class FleetManager implements FleetHost {
       underwriting: this.underwriteReport ? { ...this.underwriteReport, market: this.lloydsMarket() } : null,
       finance: this.financeReport(),
       deals: this.dealsReport(),
+      smuggling: this.smuggleReport(),
       ai: this.advisor.report(),
       expansion: this.expansionReport(),
       capitalRate: this.capitalRate(),
@@ -1465,6 +1831,12 @@ export class FleetManager implements FleetHost {
     const prev = this.ownSettings;
     this.ownSettings = v;
     if (prev) this.advisor.settingsChanged(prev, v);
+    // Turned on again after a seizure switched it off: the user's call.
+    if (prev && !prev.smuggling && v.smuggling && this.smuggleHalt) {
+      this.smuggleNote("smuggling", `smuggling re-enabled by the user after the seizure (${this.smuggleHalt.why})`);
+      this.smuggleHalt = null;
+      this.persist(true);
+    }
     this.syncWorldFlags();
     this.stakesAt = 0;
   }
@@ -1509,6 +1881,8 @@ export class FleetManager implements FleetHost {
       navalSpent24h: this.navalSpent() ?? this.ownSettings.marqueBudgetPence,
       zoneBps,
       marquePrice: this.marquePriceMap(),
+      patrolPrice: this.patrolPriceMap(),
+      noPatrolZones: this.smugglingZones(),
       gameMinuteMs: w.gameMinuteMs,
     };
   }
@@ -1521,6 +1895,1453 @@ export class FleetManager implements FleetHost {
 
   private notePrice(q: MarqueQuote): void {
     this.marquePrices.set(q.sea_zone_id, { price: q.price_per_bps_day_pence, at: Date.now() });
+  }
+
+  /** Zones' patrol prices per bps per game day quoted lately (pence). */
+  private patrolPriceMap(): Map<string, number> {
+    const now = Date.now();
+    return new Map([...this.patrolPrices].filter(([, x]) => now - x.at < MARQUE_PRICE_TTL_MS).map(([z, x]) => [z, x.price]));
+  }
+
+  private notePatrolPrice(q: PatrolQuote): void {
+    this.patrolPrices.set(q.sea_zone_id, { price: q.price_per_bps_day_pence, at: Date.now() });
+  }
+
+  /**
+   * Sea zones no patrol of ours may go (guide 3.18: "sponsoring a patrol where your own ships smuggle always loses money": its
+   * search may take our own ship, which is forfeit with everything aboard, and the prize never covers her). Every zone a ship of
+   * ours with contraband aboard may pass: the rest of her route at sea, her lane's passage and her port's zone in port; and
+   * every zone our smuggling runs use (smugglingRouteZones). Null when that can't be told (a ship that hasn't reported yet, one
+   * with contraband aboard whose route isn't known: at sea with no legs left, holding a lane with no zones she isn't sailing, or
+   * lying in an ordinary port with no passage planned; or the runs' zones unknown): then no patrol at all.
+   */
+  private smugglingZones(): Set<string> | null {
+    const w = this.world;
+    const runs = this.smugglingRouteZones();
+    if (runs === null) return null;
+    const out = new Set(runs);
+    for (const a of this.agents.values()) {
+      if (a.gone) continue;
+      const r = a.last;
+      // A ship that hasn't reported yet may carry contraband.
+      if (!r) return null;
+      if (a.contrabandAboard(r).length === 0) continue;
+      // A node is a zone or a port (its own zone).
+      const add = (node: string | null | undefined) => {
+        const z = node ? w.hazardZone(node)?.id : undefined;
+        if (z) out.add(z);
+      };
+      if (r.ship.status === "sailing") {
+        const rest = r.route_legs.slice(r.ship.current_leg_idx);
+        if (rest.length === 0) return null;
+        for (const l of rest) {
+          add(l.from_node);
+          add(l.to_node);
+        }
+      } else {
+        if (!r.ship.current_port_id) return null;
+        add(r.ship.current_port_id);
+        // Lying in an ordinary port with no passage planned (a lane with zones, or a smuggler bound elsewhere): she may sail
+        // anywhere next (on to a want, back to a cove), and a patrol of ours on that way would strand her where she may be
+        // searched: no patrol anywhere until it is known. At a cove she is never searched, and the mode re-reads every zone
+        // before she sails.
+        const role = this.smugglers.get(a.shipId);
+        const planned = !!a.lane?.zones || (!!role?.dest && role.dest !== r.ship.current_port_id && role.zones !== null);
+        if (!w.isCove(r.ship.current_port_id) && !planned) return null;
+      }
+      // Her next passage, as planned. A lane with no zones (one for cargo already aboard, or saved before zones were kept) is
+      // known only while she sails it (the route above); otherwise her passage can't be told: no patrol anywhere.
+      const lane = a.lane;
+      if (lane) {
+        if (lane.zones) for (const z of lane.zones) out.add(z);
+        else if (!(r.ship.status === "sailing" && r.route_legs.at(-1)?.to_node === lane.dest)) return null;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The sea zones our smuggling runs cross or are about to (guide 3.18: a patrol of ours there would search our own ship), for
+   * smugglingZones: each smuggler's passage as planned or sailed (cove to the wanting port, on to a cove). Null when a smuggler
+   * is bound somewhere whose passage isn't known yet: then no patrol of ours goes anywhere.
+   */
+  private smugglingRouteZones(): Set<string> | null {
+    const out = new Set<string>();
+    for (const [id, role] of this.smugglers) {
+      const a = this.agents.get(id);
+      if (!a || a.gone) continue;
+      if (role.dest && role.zones === null) return null;
+      for (const z of role.zones ?? []) out.add(z);
+    }
+    return out;
+  }
+
+  // ── The Free Trade (guide 3.18) ─────────────────────────────────────────────
+
+  /** Whether the smuggling mode may act now: the setting in force (the user's "off" is a ceiling for the AI), the key's scope, no halt. */
+  private smugglingOn(): boolean {
+    return this.settings.smuggling && this.canSmuggle && !this.smuggleHalt;
+  }
+
+  /** Why the smuggling mode isn't acting (null: it is). */
+  private smugglingOff(): string | null {
+    if (!this.ownSettings.smuggling) return "off";
+    if (!this.canSmuggle) return "unavailable: the company key lacks the underworld scope (allow smuggling on the Underworld page)";
+    if (this.smuggleHalt) return `off since a seizure (${this.smuggleHalt.why}): turn it on again to resume`;
+    if (!this.settings.smuggling) return "switched off by the AI for its horizon";
+    return null;
+  }
+
+  /** Whether this ship smuggles for the fleet now (the mode took her). */
+  isSmuggler(agent: ShipAgent): boolean {
+    return this.smugglers.has(agent.shipId);
+  }
+
+  /** Whether the ship has contraband aboard as last read. */
+  private carriesContraband(a: ShipAgent | undefined): boolean {
+    const r = a?.last;
+    return !!a && !!r && a.contrabandAboard(r).length > 0;
+  }
+
+  /** Real ms in a game hour. */
+  private get gameHourMs(): number {
+    return 60 * this.world.gameMinuteMs;
+  }
+
+  /** A decision of the smuggling mode: logged (on the ship's line when it is hers) and kept for the panel and the digest. */
+  private smuggleNote(source: string, msg: string): void {
+    this.log(source, msg);
+    this.smuggleLog.push({ at: new Date().toISOString(), source, msg });
+    if (this.smuggleLog.length > SMUGGLE_LOG_KEEP) this.smuggleLog.splice(0, this.smuggleLog.length - SMUGGLE_LOG_KEEP);
+  }
+
+  /** smuggleNote once per key (a ship waiting on the same thing doesn't fill the log). */
+  private smuggleOnce(key: string, source: string, msg: string): void {
+    if (this.loggedOnce.has(key)) return;
+    this.loggedOnce.add(key);
+    if (this.loggedOnce.size > 200) this.loggedOnce.delete(this.loggedOnce.values().next().value!);
+    this.smuggleNote(source, msg);
+  }
+
+  /** The key no longer holds `underworld` (a 403 missing_scope): the mode is unavailable until it is allowed again. */
+  private loseSmugglingScope(): void {
+    if (!this.canSmuggle) return;
+    this.canSmuggle = false;
+    this.smuggleNote("smuggling", "the company key no longer holds the underworld scope: the smuggling mode is unavailable until smuggling is allowed again on the Underworld page");
+  }
+
+  /** Our runs ashore started within the Crown's attention window. */
+  private recentRuns(now = this.world.now()): number {
+    const since = now - ATTENTION_WINDOW_GAME_H * this.gameHourMs;
+    return this.smuggleRunTimes.filter((t) => t >= since).length;
+  }
+
+  /** Server ms from which the Crown's attention allows the next run (0: any time). */
+  private nextRunAt(now = this.world.now()): number {
+    const last = this.smuggleRunTimes.at(-1);
+    return last === undefined ? 0 : last + attentionGapGameH(this.recentRuns(now)) * this.gameHourMs;
+  }
+
+  /** Odds a run ends in a seizure now (smuggle.ts: per run, and the hours lying berthed and in the wanting port's roadstead). */
+  private seizureOddsNow(): number {
+    return seizureOdds(this.smuggleModel, { berthH: ARRIVAL_BERTH_GAME_H, roadH: runGameHours(this.smuggleModel) + 0.25, recent: this.recentRuns() });
+  }
+
+  /**
+   * Wants as the game told them (guide 3.18). At a port: every want live there now (with the tons it still takes; one missing
+   * from it is gone). At a cove: its board of wants carried in by ships, the freshest per port and good, by when seen.
+   */
+  private noteWants(res: WantsResult): void {
+    const w = this.world;
+    const now = w.now();
+    if (res.is_cove) {
+      for (const b of res.board ?? []) {
+        if (!w.isContraband(b.commodity_id) || w.isCove(b.port_id)) continue;
+        const at = Date.parse(b.observed_at);
+        const seenAt = Number.isFinite(at) ? at : now - b.age_game_hours * this.gameHourMs;
+        const key = `${b.port_id}|${b.commodity_id}`;
+        const had = this.wantsSeen.get(key);
+        if (had && had.at >= seenAt) continue;
+        this.wantsSeen.set(key, { port: b.port_id, good: b.commodity_id, multipleBps: b.multiple_bps, at: seenAt, remaining: null, source: "board", via: res.port_id });
+      }
+      return;
+    }
+    for (const [k, x] of this.wantsSeen) if (x.port === res.port_id) this.wantsSeen.delete(k);
+    for (const x of res.wants ?? []) {
+      if (!w.isContraband(x.commodity_id) || !(x.remaining_tons > 0)) continue;
+      this.wantsSeen.set(`${res.port_id}|${x.commodity_id}`, {
+        port: res.port_id,
+        good: x.commodity_id,
+        multipleBps: x.multiple_bps,
+        at: now,
+        remaining: x.remaining_tons,
+        source: "live",
+        via: null,
+      });
+    }
+  }
+
+  /** Reads a port's live wants or a cove's board (needs a ship there, or a factor at a port). Null: not seen. */
+  private async readWants(port: string): Promise<WantsResult | null> {
+    this.wantsReadAt.set(port, Date.now());
+    try {
+      const res = await this.client.underworldWants(port);
+      this.noteWants(res);
+      return res;
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      if (isApiError(e, "missing_scope")) this.loseSmugglingScope();
+      return null;
+    }
+  }
+
+  /** Wants older than any could still stand are forgotten. */
+  private pruneWants(): void {
+    const now = this.world.now();
+    for (const [k, x] of this.wantsSeen) if (now - x.at > WANT_LIFE_GAME_H * this.gameHourMs) this.wantsSeen.delete(k);
+  }
+
+  /** Wants seen fresh enough and rich enough, at open ordinary ports, best (multiple × base) first. */
+  private freshWants(o: { maxAgeGameH: number; minBps: number; goods?: ReadonlySet<string>; except?: string }): WantSeen[] {
+    const w = this.world;
+    const now = w.now();
+    return [...this.wantsSeen.values()]
+      .filter(
+        (x) =>
+          (now - x.at) / this.gameHourMs <= o.maxAgeGameH &&
+          x.multipleBps >= o.minBps &&
+          (!o.goods || o.goods.has(x.good)) &&
+          x.port !== o.except &&
+          w.isOpen(x.port) &&
+          !w.isCove(x.port) &&
+          (x.remaining === null || x.remaining > 0),
+      )
+      .sort((a, b) => b.multipleBps * w.basePrice(b.good) - a.multipleBps * w.basePrice(a.good));
+  }
+
+  /** Live wants where we lie (ships in ordinary ports, factors): a few ports a pass, each at most every WANTS_READ_MS. */
+  private async pollWants(): Promise<void> {
+    const w = this.world;
+    const ports = new Set<string>();
+    for (const a of this.agents.values()) {
+      const r = a.last;
+      const at = r && r.ship.status !== "sailing" ? r.ship.current_port_id : null;
+      if (!a.gone && at && !w.isCove(at)) ports.add(at);
+    }
+    for (const p of this.factorPorts) if (!w.isCove(p)) ports.add(p);
+    const due = [...ports].filter((p) => Date.now() - (this.wantsReadAt.get(p) ?? 0) > WANTS_READ_MS).slice(0, WANTS_PORTS_PER_PASS);
+    for (const p of due) {
+      await this.readWants(p);
+      if (!this.canSmuggle) return;
+    }
+  }
+
+  /** The sea zones a passage rolls in (each leg's end, and its ends' own zones). */
+  private routeZones(plan: { from_port?: string; to_port?: string; legs: Array<{ from_node: string; to_node: string }> }): string[] {
+    const w = this.world;
+    const out = new Set<string>();
+    const add = (n: string | undefined) => {
+      const z = n ? w.hazardZone(n)?.id : undefined;
+      if (z) out.add(z);
+    };
+    add(plan.from_port);
+    for (const l of plan.legs) {
+      add(l.from_node);
+      add(l.to_node);
+    }
+    add(plan.to_port);
+    return [...out];
+  }
+
+  /** Zones among these a patrol works now, as last read (one missing from the read counts: it can't be told). */
+  private patrolled(zones: string[]): string[] {
+    const st = this.zoneStatus;
+    const read = st && Date.now() - st.at < SMUGGLE_ZONES_FRESH_MS ? new Map(st.zones.map((z) => [z.sea_zone_id, z.patrol_suppression_bps])) : this.world.patrolBps;
+    return zones.filter((z) => {
+      const bps = read.get(z);
+      return bps === undefined || bps > 0;
+    });
+  }
+
+  /** Reads every zone's patrols now (before a departure with contraband aboard). False: couldn't. */
+  private async readZonesNow(): Promise<boolean> {
+    try {
+      const zones = await this.client.zones();
+      this.zoneStatus = { at: Date.now(), zones };
+      this.world.patrolBps = new Map(zones.map((z) => [z.sea_zone_id, z.patrol_suppression_bps]));
+      return true;
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return false;
+    }
+  }
+
+  /**
+   * A run from `from` to a want for `tons` costing `goods` (0: aboard already), setting out `extraMs` from now (the passage to
+   * the cove first): its route (rated for her hull, no patrol on it as last read), the stores it needs (there and back to
+   * `from`, plus a buffer: none may be bought in an ordinary port with contraband aboard), what it is expected to fetch, the
+   * odds of a seizure and the value test (smuggle.ts). A string says why there is none.
+   */
+  private async runOption(a: ShipAgent, r: ShipResult, from: string, want: WantSeen, tons: number, goods: number, extraMs = 0): Promise<RunOption | string> {
+    const w = this.world;
+    const cls = w.shipClass(a.shipClass);
+    const hull = cls?.hull_category ?? "coastal";
+    const route = (x: string, y: string) =>
+      w.route(x, y, a.shipClass).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+    const plan = await route(from, want.port);
+    if (!plan) return `no route ${from} → ${want.port}`;
+    if (!w.routeRated(plan, hull)) return `${from} → ${want.port} crosses water a ${hull} hull isn't rated for`;
+    const zones = this.routeZones(plan);
+    const patrols = this.patrolled(zones);
+    if (patrols.length) return `a patrol works ${patrols.join(", ")} on ${from} → ${want.port}`;
+    const back = await route(want.port, from);
+    const knots = ((cls?.base_speed_centiknots ?? 800) / 100) * 0.9;
+    const sailMs = w.sailMs(plan.total_distance_nm, knots);
+    const inPortMs = (ARRIVAL_BERTH_GAME_H + runGameHours(this.smuggleModel)) * this.gameHourMs;
+    const landAt = w.now() + extraMs + sailMs + inPortMs;
+    const v = wantValue({ basePence: w.basePrice(want.good), multipleBps: want.multipleBps, ageGameH: (landAt - want.at) / this.gameHourMs, tons, remaining: want.remaining });
+    const p = this.seizureOddsNow();
+    const shipValue = this.hullValue(a.shipClass) + r.ship.cannons_count * GUN_PRICE_PENCE;
+    const hours = (extraMs + sailMs + inPortMs) / 3_600_000;
+    const proceeds = v.perTon * tons;
+    const c = smuggleCase({ proceeds, goods, shipValue, p, timeCost: a.rate * hours });
+    const stores =
+      a.safeStoresFor(from, want.port, plan) + (back ? a.safeStoresFor(want.port, from, back) : a.safeStoresFor(from, want.port, plan)) + SMUGGLE_STORES_DAYS * plan.port_provisions_tons_per_day;
+    return { want, tons, plan, zones, stores, proceeds, goods, p, shipValue, hours, survive: v.survive, ...c };
+  }
+
+  /** A run option for the log: what, where, the want, the odds and the value test. */
+  private optionText(o: RunOption): string {
+    const age = (this.world.now() - o.want.at) / this.gameHourMs;
+    return (
+      `${o.tons} t ${o.want.good} for ${o.want.port} (want ${(o.want.multipleBps / 10_000).toFixed(1)}x base, seen ${age.toFixed(1)} game h ago` +
+      `${o.want.source === "board" ? ` on the ${o.want.via ?? "cove"} board` : " there by our ship"}${o.want.remaining !== null ? `, ${o.want.remaining} t wanted` : ""}): ` +
+      `~${cr(o.proceeds)} expected (${Math.round(o.survive * 100)}% it still stands)${o.goods ? ` for ${cr(o.goods)} of goods` : ""}, ` +
+      `odds of a seizure ${(o.p * 100).toFixed(1)}% on a ${cr(o.shipValue)} ship: expected gain ${cr(o.gain)} vs expected loss ${cr(o.loss)}` +
+      `${o.ok ? ` (passes: at least ${EV_LOSS_X}x)` : ` (fails: needs at least ${EV_LOSS_X}x)`}`
+    );
+  }
+
+  /**
+   * Why this ship may not smuggle (null: she may). Only a ship whose loss we accept (guide 3.18: forfeit with everything aboard,
+   * no insurance, a lien and shares lost): in port, nothing lawful aboard or loaded, no sealed freight, never pledged, insured,
+   * listed for sale, in a convoy, sharing her ownership, under arrest or under an AI order. Reads it can't make fail closed.
+   */
+  private async smugglerUnfit(a: ShipAgent, r: ShipResult): Promise<string | null> {
+    const w = this.world;
+    if (a.gone || a.arrested) return "she is arrested or gone";
+    if (r.ship.status === "sailing" || !r.ship.current_port_id) return "she is at sea";
+    if (r.ship.convoy_id) return "she is in a convoy";
+    if (a.sealedTons() > 0) return "sealed freight is aboard";
+    if (Object.entries(r.cargo_manifest).some(([g, t]) => t > 0 && !w.isContraband(g))) return "lawful cargo is aboard";
+    if (a.loaded) return "a loaded lane";
+    if (this.advisor.shipOrder(a.shipId)) return "an AI order is in force for her";
+    const pledges = await this.shipPledges(60_000);
+    if (!pledges) return "our loans couldn't be read";
+    if (pledges.liened.has(a.shipId)) return "she is pledged to a loan";
+    const listed = await this.client.shipListingPages({}, 5).catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!listed?.complete) return "our ship listings couldn't be read";
+    if (listed.items.some((x) => x.ship_id === a.shipId && x.status === "open")) return "she is listed for sale";
+    const shares = await this.client.shareListings(a.shipId).catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!shares) return "her ship shares couldn't be read";
+    if (shares.some((x) => x.ship_id === a.shipId && (x.status === "open" || x.status === "sold"))) return "shares in her are listed or held by others";
+    const policy = await a.insuredPolicy(60_000, true);
+    if (policy === undefined) return "her insurance couldn't be read";
+    if (policy) return "she is insured";
+    return null;
+  }
+
+  /** Takes a ship for smuggling: her lane goes, she takes her turns from the mode. */
+  private takeSmuggler(a: ShipAgent, purpose: SmuggleRole["purpose"], dest: string | null, want: WantSeen | null, zones: string[] | null, why: string): SmuggleRole {
+    const role: SmuggleRole = {
+      since: this.world.now(),
+      purpose,
+      dest,
+      want: want ? { port: want.port, good: want.good, multipleBps: want.multipleBps, seenAt: want.at } : null,
+      zones,
+      load: null,
+      run: null,
+      lying: null,
+      voyage: false,
+      waitingSince: null,
+      odds: null,
+    };
+    this.smugglers.set(a.shipId, role);
+    if (a.lane) this.releaseLane(a);
+    this.smuggleNote(a.name, `SMUGGLING: ${why}`);
+    this.persist(true);
+    a.nudge();
+    return role;
+  }
+
+  /** Lets a smuggler go back to lawful work. */
+  private releaseSmuggler(a: ShipAgent, why: string): void {
+    const role = this.smugglers.get(a.shipId);
+    if (!role) return;
+    this.endLying(role);
+    this.smugglers.delete(a.shipId);
+    this.smuggleNote(a.name, `no longer smuggling (${why}): back to lawful work`);
+    this.persist(true);
+    a.nudge();
+  }
+
+  /** Lying in an ordinary port with contraband aboard: the hours count for the model (a cove is never searched). */
+  private noteLying(role: SmuggleRole, r: ShipResult, port: string, carrying: boolean): void {
+    const now = this.world.now();
+    if (!carrying || this.world.isCove(port) || r.ship.status === "sailing") {
+      this.endLying(role);
+      return;
+    }
+    const berthed = r.ship.status === "berthed";
+    const l = role.lying;
+    if (!l || l.port !== port) {
+      this.endLying(role);
+      role.lying = { port, lastAt: now, berthed, berthedMs: 0, roadMs: 0 };
+      return;
+    }
+    const dt = Math.max(0, now - l.lastAt);
+    if (l.berthed) l.berthedMs += dt;
+    else l.roadMs += dt;
+    l.lastAt = now;
+    l.berthed = berthed;
+  }
+
+  /** She left the port (or the goods did): her hours there go into the model, berthed hours counted BERTHED_FACTOR times. */
+  private endLying(role: SmuggleRole): void {
+    const l = role.lying;
+    if (!l) return;
+    const dt = Math.max(0, this.world.now() - l.lastAt);
+    if (l.berthed) l.berthedMs += dt;
+    else l.roadMs += dt;
+    this.smuggleModel.portHours += (l.berthedMs * BERTHED_FACTOR + l.roadMs) / this.gameHourMs;
+    role.lying = null;
+    this.persist();
+  }
+
+  /** The newest record of this ship's run still under way (one is started for goods aboard the mode didn't buy). */
+  private runRec(a: ShipAgent, make?: { port: string; good: string; tons: number }): SmuggleRunRec | undefined {
+    const open = [...this.smuggleRuns].reverse().find((x) => x.ship === a.name && x.outcome === "under way");
+    if (open || !make) return open;
+    const rec: SmuggleRunRec = { at: this.world.now(), ship: a.name, cove: null, port: make.port, good: make.good, tons: make.tons, costPence: 0, proceedsPence: null, outcome: "under way", p: null, gain: null };
+    this.smuggleRuns.push(rec);
+    if (this.smuggleRuns.length > SMUGGLE_RUNS_KEPT) this.smuggleRuns.splice(0, this.smuggleRuns.length - SMUGGLE_RUNS_KEPT);
+    return rec;
+  }
+
+  /**
+   * Her turn in port (FleetHost.smuggleTurn). A ship not taken yet is taken only with `adopt`: contraband aboard, nothing lawful,
+   * the mode on and room for another smuggler, and she fit to risk. Null: carry on as a lawful ship.
+   */
+  async smuggleTurn(agent: ShipAgent, r: ShipResult, adopt: boolean): Promise<number | null> {
+    const port = r.ship.current_port_id;
+    if (!port || r.ship.status === "sailing" || agent.gone) return null;
+    const aboard = agent.contrabandAboard(r);
+    let role = this.smugglers.get(agent.shipId);
+    if (!role) {
+      if (!adopt || aboard.length === 0 || !this.smugglingOn() || this.smugglers.size >= SMUGGLE_MAX_SHIPS) return null;
+      const why = await this.smugglerUnfit(agent, r);
+      if (why) {
+        this.smuggleOnce(`unfit:${agent.shipId}:${why}`, agent.name, `the smuggling mode won't take her with contraband aboard: ${why}`);
+        return null;
+      }
+      role = this.takeSmuggler(agent, "sell", null, null, [], `contraband aboard (${aboard.map(([g, t]) => `${t} t ${g}`).join(", ")}): taking it to a want, or back to a cove`);
+    }
+    this.noteLying(role, r, port, aboard.length > 0);
+    if (role.voyage) {
+      // A passage with contraband aboard ended safely.
+      role.voyage = false;
+      this.smuggleModel.runs++;
+      this.persist();
+    }
+    if (!this.smugglingOn()) return this.smuggleOffTurn(agent, r, role, port);
+    // Something lawful came aboard, or she joined a convoy (by hand): she is let go at once.
+    if (agent.sealedTons() > 0 || r.ship.convoy_id || Object.entries(r.cargo_manifest).some(([g, t]) => t > 0 && !this.world.isContraband(g))) {
+      this.releaseSmuggler(agent, "lawful cargo, sealed freight or a convoy");
+      return null;
+    }
+    return this.world.isCove(port) ? this.coveTurn(agent, r, role, port) : this.portTurn(agent, r, role, port);
+  }
+
+  /**
+   * The mode is off (the user's setting, the AI's, a halt after a seizure, or the scope gone): nothing is bought and no new run
+   * starts. A run ashore under way here finishes (departing would cancel it). Goods still aboard, with the scope kept and nothing
+   * lawful aboard, the load is finished before she is let go (left in an ordinary port's roadstead, she may be searched): run
+   * ashore at a live want here, else taken to a cove clear of patrols and sold into a fair bid there (a cove is never searched;
+   * no want elsewhere is sailed for). Without the scope she is let go at once (contraband still aboard is held, logged).
+   */
+  private async smuggleOffTurn(a: ShipAgent, r: ShipResult, role: SmuggleRole, port: string): Promise<number | null> {
+    const now = this.world.now();
+    const run = role.run;
+    if (run && run.port === port && run.completesAt + RUN_GRACE_MS > now && a.contrabandAboard(r).length > 0) {
+      a.setActivity(`smuggling off: letting the run ashore at ${port} finish (departing would cancel it)`);
+      return Math.min(60_000, Math.max(2_000, run.completesAt - now + 2_000));
+    }
+    if (run) this.settleRun(a, role, r);
+    const off = this.smugglingOff() ?? "off";
+    const aboard = a.contrabandAboard(r);
+    const lawful = a.sealedTons() > 0 || !!r.ship.convoy_id || Object.entries(r.cargo_manifest).some(([g, t]) => t > 0 && !this.world.isContraband(g));
+    if (aboard.length && this.canSmuggle && !lawful) {
+      const what = aboard.map(([g, t]) => `${t} t ${g}`).join(", ");
+      this.smuggleOnce(
+        `off-finish:${a.shipId}:${off}`,
+        a.name,
+        `the smuggling mode is ${off}: nothing new is bought; finishing the ${what} aboard first (run ashore at a live want here, or taken to a cove clear of patrols and sold there), then back to lawful work`,
+      );
+      if (!this.world.isCove(port)) return this.portTurn(a, r, role, port, true);
+      const sold = await this.sellAtCove(a, r, role, port, aboard);
+      if (sold > 0) return 2_000;
+      role.waitingSince ??= now;
+      this.smuggleOnce(`off-cove:${a.shipId}:${port}:${what}`, a.name, `smuggling off: holding ${what} at ${port} (a cove is never searched) for a fair bid on its book; back to lawful work once it is sold`);
+      return this.holdTurn(a, r, `smuggling off: holding ${what} at ${port} for a fair bid`, COVE_RECHECK_GAME_MIN * this.world.gameMinuteMs);
+    }
+    this.releaseSmuggler(a, `the smuggling mode is ${off}`);
+    return null;
+  }
+
+  /** Waits where she is (in the roadstead). */
+  private async holdTurn(a: ShipAgent, r: ShipResult, text: string, ms = SMUGGLE_HOLD_MS): Promise<number> {
+    await a.smugglerPark(r);
+    a.setActivity(text);
+    return ms;
+  }
+
+  /**
+   * At a cove (never searched; guide 3.18): goods aboard go to the best fresh want (stores first), else to a fair bid on the
+   * book, else she waits here; empty, she buys for the best want that passes the value test (stores first, then the goods,
+   * within smuggleMaxTons and smuggleMaxPence), else waits a while for the board to change, then goes back to lawful work.
+   */
+  private async coveTurn(a: ShipAgent, r: ShipResult, role: SmuggleRole, cove: string): Promise<number | null> {
+    const w = this.world;
+    const now = w.now();
+    await this.readWants(cove);
+    if (!this.canSmuggle) return this.holdTurn(a, r, `smuggling: the key lost the underworld scope; holding at ${cove}`);
+    const aboard = a.contrabandAboard(r);
+    if (aboard.length) {
+      const pick = await this.bestCarry(a, r, cove, aboard);
+      if (pick) {
+        const st = await this.coveStores(a, r, cove, pick);
+        if ("wait" in st) return st.wait;
+        if (st.short) {
+          this.smuggleOnce(
+            `cove-stores:${a.shipId}:${cove}:${pick.want.port}`,
+            a.name,
+            `at ${cove}: ${st.r.stores.provisions_tons.toFixed(1)} t of stores, short of the ${this.runStores(pick).toFixed(1)} t the run to ${pick.want.port} and back needs (the cove had too few, or no cash for them): trying again shortly`,
+          );
+          return this.holdTurn(a, st.r, `smuggling: at ${cove}, short of stores for the run to ${pick.want.port}`, COVE_RECHECK_GAME_MIN * w.gameMinuteMs);
+        }
+        return this.sailRun(a, st.r, role, { dest: pick.want.port, want: pick.want, text: this.optionText(pick), odds: pick }, "run", cove);
+      }
+      const sold = await this.sellAtCove(a, r, role, cove, aboard);
+      if (sold > 0) return 2_000;
+      role.waitingSince ??= now;
+      const what = aboard.map(([g, t]) => `${t} t ${g}`).join(", ");
+      this.smuggleOnce(`cove-hold:${a.shipId}:${cove}:${what}`, a.name, `holding ${what} at ${cove} (a cove is never searched): no want worth the run and no fair bid on the book yet`);
+      return this.holdTurn(a, r, `smuggling: holding ${what} at ${cove} for a want worth the run, or a fair bid`, COVE_RECHECK_GAME_MIN * w.gameMinuteMs);
+    }
+    if (role.purpose !== "buy") {
+      this.releaseSmuggler(a, "the run is over");
+      return null;
+    }
+    const startAt = this.nextRunAt(now);
+    if (startAt > now) {
+      if (startAt - now > 2 * this.gameHourMs) {
+        this.releaseSmuggler(a, `the Crown's attention: no new run for ${((startAt - now) / this.gameHourMs).toFixed(0)} game hours`);
+        return null;
+      }
+      return this.holdTurn(a, r, `smuggling: at ${cove}, the next run waits for the Crown's attention to cool`, Math.max(2_000, startAt - now));
+    }
+    if (w.seasonMode() !== "normal") {
+      this.releaseSmuggler(a, "no new runs near the season's end");
+      return null;
+    }
+    const best = await this.bestBuy(a, r, cove);
+    if (typeof best === "string") {
+      role.waitingSince ??= now;
+      if (now - role.waitingSince > COVE_WAIT_GAME_H * this.gameHourMs) {
+        this.releaseSmuggler(a, `no run worth it from ${cove} after ${COVE_WAIT_GAME_H} game hours (${best})`);
+        return null;
+      }
+      this.smuggleOnce(`cove-wait:${a.shipId}:${cove}:${role.waitingSince}`, a.name, `at ${cove}: no run passes yet (${best}); waiting for the board to change (a cove is never searched)`);
+      return this.holdTurn(a, r, `smuggling: at ${cove}, waiting for a want worth a run`, COVE_RECHECK_GAME_MIN * w.gameMinuteMs);
+    }
+    // Stores for the whole run first (none may be bought in an ordinary port with contraband aboard), then the goods.
+    const st = await this.coveStores(a, r, cove, best.opt);
+    if ("wait" in st) return st.wait;
+    r = st.r;
+    if (st.short) {
+      this.releaseSmuggler(a, `short of the ${this.runStores(best.opt).toFixed(1)} t of stores the run needs at ${cove} (${r.stores.provisions_tons.toFixed(1)} t aboard): nothing bought`);
+      return null;
+    }
+    const room = Math.floor(r.effective_hold_capacity_tons - r.cargo_used_tons);
+    const tons = Math.min(best.opt.tons, room);
+    if (tons < 1) {
+      this.releaseSmuggler(a, `no hold room at ${cove} after her stores`);
+      return null;
+    }
+    // Fit still (a lien, a listing, shares or a policy may have come since she was taken): the goods go aboard only a ship whose
+    // loss we accept.
+    const unfit = await this.smugglerUnfit(a, r);
+    if (unfit) {
+      this.releaseSmuggler(a, `not fit to carry contraband now: ${unfit}; nothing bought`);
+      return null;
+    }
+    const got = await this.buyContraband(a, r, role, cove, best, tons);
+    if (got === null || got.filled <= 0) return this.holdTurn(a, r, `smuggling: at ${cove}, nothing bought yet`, COVE_RECHECK_GAME_MIN * w.gameMinuteMs);
+    r = await a.refresh();
+    // The run as bought (fewer tons may have filled), judged again on its own figures.
+    const opt = await this.runOption(a, r, cove, best.opt.want, got.filled, got.paid);
+    if (typeof opt === "string") return 1_000;
+    return this.sailRun(a, r, role, { dest: opt.want.port, want: opt.want, text: this.optionText(opt), odds: opt }, "run", cove);
+  }
+
+  /** The stores a run can't sail without: the passage there and the way back, without the buffer. */
+  private runStores(o: RunOption): number {
+    return o.stores - SMUGGLE_STORES_DAYS * o.plan.port_provisions_tons_per_day;
+  }
+
+  /**
+   * At a cove before a run: stores up to what it needs with the buffer (berthing at a cove is safe: never searched; a run may
+   * not stock up anywhere else with contraband aboard). A wait while she docks, else the ship as she stands and whether she is
+   * still short of the passages' own figures (then she can't make the run yet).
+   */
+  private async coveStores(a: ShipAgent, r: ShipResult, cove: string, o: RunOption): Promise<{ wait: number } | { r: ShipResult; short: boolean }> {
+    const short = (x: ShipResult) => x.stores.provisions_tons < this.runStores(o);
+    if (r.stores.provisions_tons >= o.stores) return { r, short: false };
+    if (r.ship.status !== "berthed") {
+      // Waiting in the queue for a berth only for the buffer isn't worth it once the passages are covered.
+      if (!short(r) && r.ship.dock_queued_at) return { r, short: false };
+      a.setActivity(`smuggling: docking at ${cove} for the run's stores`);
+      return { wait: await a.smugglerDock(r) };
+    }
+    const got = await a.smugglerStores(r, o.stores);
+    if (got > 0) this.log(a.name, `stores for the run: ${got} t at ${cove}`);
+    const now = await a.refresh();
+    return { r: now, short: short(now) };
+  }
+
+  /**
+   * The best run to buy for at this cove: fresh wants on the board (or seen live by our ships) at ≥ 3x base, for goods its book
+   * sells, small loads (smuggleMaxTons, smuggleMaxPence, the hold, what the want still takes), priced at the book's ask, through
+   * the value test. A string says why none.
+   */
+  private async bestBuy(a: ShipAgent, r: ShipResult, cove: string): Promise<{ opt: RunOption; good: string; limit: number } | string> {
+    const wants = this.freshWants({ maxAgeGameH: WANT_MAX_AGE_GAME_H, minBps: WANT_MIN_MULTIPLE_BPS }).slice(0, SMUGGLE_OPTIONS);
+    if (!wants.length) return `no fresh want of ${WANT_MIN_MULTIPLE_BPS / 10_000}x base or more on the board`;
+    let book: CoveBookResult;
+    try {
+      book = await this.client.underworldBook(cove);
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      if (isApiError(e, "missing_scope")) this.loseSmugglingScope();
+      return `the book at ${cove} couldn't be read (${(e as Error).message})`;
+    }
+    const s = this.settings;
+    // Stores still to buy here take hold room first.
+    const freeHold = Math.max(0, Math.floor(r.effective_hold_capacity_tons - r.cargo_used_tons));
+    let best: { opt: RunOption; good: string; limit: number } | null = null;
+    let why = "";
+    for (const want of wants) {
+      const b = book.books.find((x) => x.commodity_id === want.good);
+      const levels = [...(b?.house_ask ? [b.house_ask] : []), ...(b?.asks ?? [])].filter((l) => l.quantity > 0);
+      if (!levels.length) {
+        why = `${cove} sells no ${want.good} now`;
+        continue;
+      }
+      const ask = Math.min(...levels.map((l) => l.price_pence));
+      const limit = Math.floor(ask * (1 + BUY_SLIP));
+      const available = levels.filter((l) => l.price_pence <= limit).reduce((n, l) => n + l.quantity, 0);
+      const tons = Math.min(s.smuggleMaxTons, Math.floor(s.smuggleMaxPence / Math.max(1, limit)), available, freeHold, want.remaining ?? Infinity);
+      if (tons < 1) {
+        why = `${want.good} at ${cr(limit)}/t: smuggleMaxPence or the hold buys less than a ton`;
+        continue;
+      }
+      const opt = await this.runOption(a, r, cove, want, tons, tons * limit);
+      if (typeof opt === "string") {
+        why = opt;
+        continue;
+      }
+      if (!opt.ok) {
+        why = this.optionText(opt);
+        continue;
+      }
+      if (!best || opt.gain > best.opt.gain) best = { opt, good: want.good, limit };
+    }
+    return best ?? why;
+  }
+
+  /**
+   * The best want to carry goods already aboard to from here (they are a sunk cost: goods count 0): fresh (a board's ≤ a game
+   * day, our own sighting ≤ half a day), rich enough to run ashore, through the value test against the ship's risk and time.
+   * Away from a cove the stores aboard must already reach it (none may be bought with contraband aboard).
+   */
+  private async bestCarry(a: ShipAgent, r: ShipResult, from: string, aboard: Array<[string, number]>): Promise<RunOption | null> {
+    const w = this.world;
+    const tonsOf = new Map(aboard.map(([g, t]) => [g, Math.floor(t)]));
+    const wants = this.freshWants({ maxAgeGameH: WANT_MAX_AGE_GAME_H, minBps: RUN_MIN_MULTIPLE_BPS, goods: new Set(tonsOf.keys()), except: from })
+      .filter((x) => x.source === "board" || (w.now() - x.at) / this.gameHourMs <= LIVE_WANT_MAX_AGE_GAME_H)
+      .slice(0, SMUGGLE_OPTIONS);
+    let best: RunOption | null = null;
+    for (const want of wants) {
+      const tons = Math.min(tonsOf.get(want.good) ?? 0, want.remaining ?? Infinity);
+      if (tons < 1) continue;
+      const opt = await this.runOption(a, r, from, want, tons, 0);
+      if (typeof opt === "string" || !opt.ok) continue;
+      if (!w.isCove(from)) {
+        // No stores may be bought with contraband aboard: those aboard must reach the want and, should goods be left there (the
+        // want gone, or taken first), on to a cove clear of patrols, never stranding her in a port where she may be searched.
+        const back = await this.coveBackStores(a, want.port);
+        if (back === null || r.stores.provisions_tons < a.safeStoresFor(from, want.port, opt.plan) + back) continue;
+      }
+      if (!best || opt.gain > best.gain) best = opt;
+    }
+    return best;
+  }
+
+  /** The stores (t) the cheapest way from `from` to an open cove clear of patrols needs (a run's way back with goods left); null: none. */
+  private async coveBackStores(a: ShipAgent, from: string): Promise<number | null> {
+    const w = this.world;
+    const hull = w.shipClass(a.shipClass)?.hull_category ?? "coastal";
+    let best: number | null = null;
+    for (const p of w.catalog.ports) {
+      if (!p.is_cove || !w.isOpen(p.id) || p.id === from) continue;
+      const plan = await w.route(from, p.id, a.shipClass).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (!plan || !w.routeRated(plan, hull) || this.patrolled(this.routeZones(plan)).length) continue;
+      const need = a.safeStoresFor(from, p.id, plan);
+      if (best === null || need < best) best = need;
+    }
+    return best;
+  }
+
+  /** The nearest open cove she can reach clear of patrols on the stores aboard (to sell on the book, or wait). A string: none, why. */
+  private async nearestCove(a: ShipAgent, r: ShipResult, from: string): Promise<{ dest: string; text: string } | string> {
+    const w = this.world;
+    const hull = w.shipClass(a.shipClass)?.hull_category ?? "coastal";
+    let best: { dest: string; nm: number } | null = null;
+    let why = "no cove open";
+    for (const p of w.catalog.ports) {
+      if (!p.is_cove || !w.isOpen(p.id) || p.id === from) continue;
+      const plan = await w.route(from, p.id, a.shipClass).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (!plan || !w.routeRated(plan, hull)) {
+        why = `${p.id}: no rated route`;
+        continue;
+      }
+      const patrols = this.patrolled(this.routeZones(plan));
+      if (patrols.length) {
+        why = `${p.id}: a patrol works ${patrols.join(", ")}`;
+        continue;
+      }
+      if (r.stores.provisions_tons < a.safeStoresFor(from, p.id, plan)) {
+        why = `${p.id}: the stores aboard don't reach it`;
+        continue;
+      }
+      if (!best || plan.total_distance_nm < best.nm) best = { dest: p.id, nm: plan.total_distance_nm };
+    }
+    return best ? { dest: best.dest, text: `back to the cove at ${best.dest} (${Math.round(best.nm)} nm) to sell on the book or wait for a want` } : why;
+  }
+
+  /**
+   * Sails a smuggler on a passage: the plan as depart will sail it and every zone's patrols read afresh (guide 3.5/3.18: a patrol
+   * searches contraband in its zones): refused if any patrol now works the route, or the stores aboard don't make its safe
+   * figure. The decision is logged; the passage's zones go to the patrol hook at once.
+   */
+  private async sailRun(
+    a: ShipAgent,
+    r: ShipResult,
+    role: SmuggleRole,
+    x: { dest: string; want: WantSeen | null; text: string; odds: { p: number; gain: number; loss: number } | null },
+    purpose: SmuggleRole["purpose"],
+    from: string,
+  ): Promise<number> {
+    const w = this.world;
+    const hull = w.shipClass(a.shipClass)?.hull_category ?? "coastal";
+    const plan = await w.route(from, x.dest, a.shipClass, { maxAgeMs: 60_000 }).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!plan || !w.routeRated(plan, hull)) {
+      this.smuggleOnce(`sail-route:${a.shipId}:${from}>${x.dest}`, a.name, `smuggling: not sailing ${from} → ${x.dest}: no rated route now`);
+      return this.holdTurn(a, r, `smuggling: no rated route to ${x.dest}`);
+    }
+    if (!(await this.readZonesNow())) {
+      this.smuggleOnce(`sail-zones:${a.shipId}:${from}>${x.dest}`, a.name, `smuggling: not sailing ${from} → ${x.dest} yet: the zones' patrols couldn't be read`);
+      return this.holdTurn(a, r, `smuggling: waiting to read the zones' patrols before sailing for ${x.dest}`);
+    }
+    const zones = this.routeZones(plan);
+    const patrols = this.patrolled(zones);
+    if (patrols.length) {
+      this.smuggleNote(a.name, `smuggling: NOT sailing ${from} → ${x.dest}: a patrol now works ${patrols.join(", ")} on the route`);
+      return this.holdTurn(a, r, `smuggling: a patrol works the route to ${x.dest}`);
+    }
+    const carrying = a.contrabandAboard(r).length > 0;
+    const safe = a.safeStoresFor(from, x.dest, plan);
+    if (r.stores.provisions_tons < safe) {
+      this.smuggleOnce(
+        `sail-stores:${a.shipId}:${from}>${x.dest}`,
+        a.name,
+        `smuggling: not sailing ${from} → ${x.dest}: ${r.stores.provisions_tons.toFixed(2)} t of stores aboard, under the ${safe.toFixed(2)} t it needs${carrying && !w.isCove(from) ? ", and none may be bought here with contraband aboard" : ""}`,
+      );
+      return this.holdTurn(a, r, `smuggling: short of stores for ${x.dest}`);
+    }
+    // Still locked at the berth (a cove's: her stores or goods just bought): sails once it clears, decided again then.
+    const unlocks = r.ship.status === "berthed" && r.ship.turnaround_unlocks_at ? Date.parse(r.ship.turnaround_unlocks_at) - w.now() : 0;
+    if (unlocks > 0) {
+      a.setActivity(`smuggling: berth lock, then sailing for ${x.dest}`);
+      return unlocks + 750;
+    }
+    role.purpose = purpose;
+    role.dest = x.dest;
+    role.zones = zones;
+    role.want = x.want ? { port: x.want.port, good: x.want.good, multipleBps: x.want.multipleBps, seenAt: x.want.at } : null;
+    role.odds = x.odds ? { p: x.odds.p, gain: x.odds.gain, loss: x.odds.loss } : role.odds;
+    role.waitingSince = null;
+    this.endLying(role);
+    role.voyage = carrying;
+    this.smuggleNote(a.name, `smuggling: sailing ${from} → ${x.dest}: ${x.text}; the route is clear of patrols (${zones.join(", ") || "no zone"})`);
+    this.persist(true);
+    const wait = await a.smugglerDepart(r, x.dest, plan);
+    const sailed = a.last;
+    if (sailed?.ship.status === "sailing") role.zones = [...new Set([...zones, ...this.routeZones({ legs: sailed.route_legs })])];
+    else role.voyage = false;
+    return wait;
+  }
+
+  /** Cash for contraband (guide 3.18: paid vault to vault in the cove's region): never what loads, loans or a ship waiting for cash count on. */
+  private async smuggleCashBlock(cost: number): Promise<string | null> {
+    if ([...this.agents.values()].some((a) => a.waitingForCash)) return "a ship is waiting for cash";
+    if (this.debtShort) return "a loan repayment is short";
+    await this.world.refreshVaults();
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    if (this.spareCash() - committed - this.debtFence() < cost) return `no spare cash for ${cr(cost)} of goods`;
+    return null;
+  }
+
+  /**
+   * Buys the run's goods at the cove (IOC at most BUY_SLIP over the best ask, so only what is on the book at about that price),
+   * under the cash lock. Null: no cash or the mode went off; else what filled and what it cost. An order with no answer is told
+   * from the hold.
+   */
+  private async buyContraband(
+    a: ShipAgent,
+    r: ShipResult,
+    role: SmuggleRole,
+    cove: string,
+    best: { opt: RunOption; good: string; limit: number },
+    tons: number,
+  ): Promise<{ filled: number; paid: number } | null> {
+    const w = this.world;
+    const region = w.region(cove);
+    const cost = tons * best.limit;
+    return this.withCash(async () => {
+      if (this.stopRequested || this.paused || !this.smugglingOn()) return null;
+      const block = await this.smuggleCashBlock(cost);
+      if (block) {
+        this.smuggleOnce(`buy-cash:${a.shipId}:${block}`, a.name, `smuggling: not buying at ${cove}: ${block}`);
+        return null;
+      }
+      if ((await this.ensureCash(region, cost, { fresh: true })) < cost) {
+        this.smuggleOnce(`buy-region:${a.shipId}:${region}`, a.name, `smuggling: not buying at ${cove}: under ${cr(cost)} spare in ${region}`);
+        return null;
+      }
+      const before = r.cargo_manifest[best.good] ?? 0;
+      let filled = 0;
+      let paid = 0;
+      try {
+        const res = await this.client.underworldOrder({ ship_id: a.shipId, commodity_id: best.good, side: "bid", time_in_force: "ioc", price_pence: best.limit, quantity: tons });
+        filled = res.filled_quantity;
+        paid = res.total_gross_pence;
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        if (isApiError(e, "missing_scope")) {
+          this.loseSmugglingScope();
+          return null;
+        }
+        if (!outcomeUnknown(e)) {
+          this.smuggleNote(a.name, `smuggling: buying ${tons} t ${best.good} at ${cove} refused: ${(e as Error).message}`);
+          return { filled: 0, paid: 0 };
+        }
+        const after = await a.refresh().then(
+          (x) => x.cargo_manifest[best.good] ?? 0,
+          () => null,
+        );
+        if (after === null) throw e;
+        filled = Math.max(0, after - before);
+        paid = filled * best.limit;
+        void w.refreshVaults().catch(() => undefined);
+        this.smuggleNote(a.name, `smuggling: the buy at ${cove} had no answer (${(e as Error).message}); ${filled} t came aboard, booked at ${cr(best.limit)}/t`);
+      }
+      if (filled <= 0) {
+        this.smuggleNote(a.name, `smuggling: nothing filled buying ${best.good} at ${cove} at up to ${cr(best.limit)}/t`);
+        return { filled: 0, paid: 0 };
+      }
+      w.vaults.set(region, w.vault(region) - paid);
+      this.smuggleStats.spentPence += paid;
+      role.load = { good: best.good, tons: filled, pence: paid, cove, at: w.now() };
+      const rec: SmuggleRunRec = {
+        at: w.now(),
+        ship: a.name,
+        cove,
+        port: best.opt.want.port,
+        good: best.good,
+        tons: filled,
+        costPence: paid,
+        proceedsPence: null,
+        outcome: "under way",
+        p: best.opt.p,
+        gain: best.opt.gain,
+      };
+      this.smuggleRuns.push(rec);
+      if (this.smuggleRuns.length > SMUGGLE_RUNS_KEPT) this.smuggleRuns.splice(0, this.smuggleRuns.length - SMUGGLE_RUNS_KEPT);
+      this.smuggleNote(a.name, `smuggling: bought ${filled}/${tons} t ${best.good} at ${cove} for ${cr(paid)} (house and players' asks, at most ${cr(best.limit)}/t)`);
+      this.persist(true);
+      return { filled, paid };
+    });
+  }
+
+  /**
+   * Back at a cove with goods no want takes: sold into players' bids on the book at a fair price (what they cost, at least half
+   * their base; after waiting COVE_WAIT_GAME_H, a quarter of base). Returns tons sold.
+   */
+  private async sellAtCove(a: ShipAgent, r: ShipResult, role: SmuggleRole, cove: string, aboard: Array<[string, number]>): Promise<number> {
+    const w = this.world;
+    let book: CoveBookResult;
+    try {
+      book = await this.client.underworldBook(cove);
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      if (isApiError(e, "missing_scope")) this.loseSmugglingScope();
+      return 0;
+    }
+    const waited = role.waitingSince !== null && w.now() - role.waitingSince > COVE_WAIT_GAME_H * this.gameHourMs;
+    let sold = 0;
+    for (const [good, held] of aboard) {
+      const base = w.basePrice(good);
+      const cost = role.load?.good === good && role.load.tons > 0 ? role.load.pence / role.load.tons : 0;
+      const floor = Math.ceil(waited ? base * 0.25 : Math.max(cost, base * COVE_RESALE_SHARE));
+      const bids = (book.books.find((x) => x.commodity_id === good)?.bids ?? []).filter((l) => l.price_pence >= floor && l.quantity > 0);
+      const qty = Math.min(Math.floor(held), bids.reduce((n, l) => n + l.quantity, 0));
+      if (qty < 1) continue;
+      try {
+        const res = await this.client.underworldOrder({ ship_id: a.shipId, commodity_id: good, side: "ask", time_in_force: "ioc", price_pence: floor, quantity: qty });
+        if (res.filled_quantity <= 0) continue;
+        const region = w.region(cove);
+        w.vaults.set(region, w.vault(region) + res.total_gross_pence);
+        this.smuggleStats.proceedsPence += res.total_gross_pence;
+        sold += res.filled_quantity;
+        const rec = this.runRec(a, { port: cove, good, tons: res.filled_quantity });
+        if (rec) {
+          rec.proceedsPence = (rec.proceedsPence ?? 0) + res.total_gross_pence;
+          rec.outcome = "sold at a cove";
+        }
+        this.smuggleNote(a.name, `smuggling: sold ${res.filled_quantity} t ${good} at ${cove} into players' bids for ${cr(res.total_gross_pence)} (floor ${cr(floor)}/t)`);
+        this.cashArrived();
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        if (isApiError(e, "missing_scope")) this.loseSmugglingScope();
+        this.smuggleNote(a.name, `smuggling: selling ${good} at ${cove} refused: ${(e as Error).message}`);
+      }
+    }
+    if (sold > 0) this.persist(true);
+    return sold;
+  }
+
+  /**
+   * In an ordinary port (guide 3.18: a ship lying there with contraband aboard may be searched, berthed more than in the
+   * roadstead). Empty: on to the cove she was taken for, else let go. With goods aboard: off the berth as soon as the lock
+   * allows, a run ashore under way waited out, a live want here run ashore at once, else on to the next fresh want, else back to
+   * a cove; never lying here longer than that takes. `finishing` (the mode off): no want elsewhere is sailed for.
+   */
+  private async portTurn(a: ShipAgent, r: ShipResult, role: SmuggleRole, port: string, finishing = false): Promise<number | null> {
+    const w = this.world;
+    const now = w.now();
+    const aboard = a.contrabandAboard(r);
+    if (!aboard.length) {
+      if (role.run) this.settleRun(a, role, r);
+      if (role.purpose === "buy" && role.dest && w.isCove(role.dest) && w.seasonMode() === "normal") {
+        a.setActivity(`smuggling: bound for ${role.dest} to buy`);
+        return a.sailForCove(r, role.dest);
+      }
+      this.releaseSmuggler(a, "nothing aboard to run");
+      return null;
+    }
+    const leave = await a.smugglerLeaveBerth(r);
+    if (leave !== null) return leave;
+    r = a.last ?? r;
+    const run = role.run;
+    if (run && run.port === port) {
+      const left = run.completesAt - now;
+      if (left > -RUN_GRACE_MS) {
+        a.setActivity(`smuggling: running ${run.tons} t ${run.good} ashore at ${port}, done in ~${Math.max(0, Math.round(left / 1_000))}s`);
+        return Math.min(60_000, Math.max(2_000, left + 2_000));
+      }
+      // Past it and no notice came: what left the hold was landed.
+      this.settleRun(a, role, r);
+    }
+    const wants = await this.readWants(port);
+    if (!this.canSmuggle) return this.holdTurn(a, r, `smuggling: the key lost the underworld scope; holding at ${port}`);
+    if (wants && !wants.is_cove) {
+      const ranked = aboard
+        .map(([good, tons]) => ({ good, tons, want: wants.wants.find((x) => x.commodity_id === good && x.remaining_tons > 0) }))
+        .filter((x) => x.want && x.want.multiple_bps >= RUN_MIN_MULTIPLE_BPS)
+        .sort((x, y) => y.want!.multiple_bps * w.basePrice(y.good) - x.want!.multiple_bps * w.basePrice(x.good));
+      for (const x of ranked) {
+        const qty = Math.min(Math.floor(x.tons), x.want!.remaining_tons);
+        if (qty < 1) continue;
+        const started = await this.startRun(a, r, role, port, x.good, qty, x.want!.multiple_bps);
+        if (started !== null) return started;
+      }
+    }
+    const next = finishing ? null : await this.bestCarry(a, r, port, aboard);
+    if (next) return this.sailRun(a, r, role, { dest: next.want.port, want: next.want, text: this.optionText(next), odds: next }, "run", port);
+    const cove = await this.nearestCove(a, r, port);
+    if (typeof cove !== "string") return this.sailRun(a, r, role, { dest: cove.dest, want: null, text: cove.text, odds: null }, "sell", port);
+    this.smuggleOnce(
+      `stuck:${a.shipId}:${port}`,
+      a.name,
+      `WARNING: contraband aboard at ${port}, no want here for it, none worth sailing for, and no cove reachable clear of patrols (${cove}): holding in the roadstead, where she may be searched`,
+    );
+    return this.holdTurn(a, r, `smuggling: contraband aboard at ${port}, no way on clear of patrols: holding in the roadstead`);
+  }
+
+  /**
+   * Runs goods ashore here at once (guide 3.18: from the roadstead of a port with a live want; the first ashore takes the best of
+   * it; departing cancels it). A wait for it, or null when it didn't start (try the next good, or move on).
+   */
+  private async startRun(a: ShipAgent, r: ShipResult, role: SmuggleRole, port: string, good: string, qty: number, multipleBps: number): Promise<number | null> {
+    const w = this.world;
+    const now = w.now();
+    const before = r.cargo_manifest[good] ?? 0;
+    const guess = now + runGameHours(this.smuggleModel) * this.gameHourMs;
+    const begin = (id: string, startedAt: number, completesAt: number, tons: number) => {
+      role.run = { id, port, good, tons, startedAt, completesAt, before };
+      this.smuggleRunTimes.push(now);
+      if (this.smuggleRunTimes.length > 50) this.smuggleRunTimes.splice(0, this.smuggleRunTimes.length - 50);
+      this.smuggleStats.runs++;
+      const rec = this.runRec(a, { port, good, tons });
+      if (rec) rec.port = port;
+      this.persist(true);
+    };
+    try {
+      const res = await this.client.runAshore({ ship_id: a.shipId, commodity_id: good, quantity: qty });
+      const startedAt = Date.parse(res.started_at) || now;
+      const completesAt = Date.parse(res.completes_at) || guess;
+      begin(res.run_id, startedAt, completesAt, res.quantity || qty);
+      this.smuggleNote(
+        a.name,
+        `smuggling: running ${qty} t ${good} ashore at ${port} (want ${(multipleBps / 10_000).toFixed(1)}x base now): done in ~${((completesAt - now) / this.gameHourMs).toFixed(1)} game h; she lies in the roadstead meanwhile (departing would cancel it)`,
+      );
+      a.setActivity(`smuggling: running ${qty} t ${good} ashore at ${port}`);
+      return Math.min(60_000, Math.max(2_000, completesAt - now + 2_000));
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      if (isApiError(e, "missing_scope")) {
+        this.loseSmugglingScope();
+        return 60_000;
+      }
+      if (isApiError(e, "not_in_roadstead")) {
+        await a.smugglerPark(r);
+        return 2_000;
+      }
+      if (isApiError(e, "run_in_progress")) {
+        if (!role.run) begin("", now, guess, qty);
+        return 30_000;
+      }
+      if (isApiError(e, "no_want")) {
+        this.wantsSeen.delete(`${port}|${good}`);
+        return null;
+      }
+      if (outcomeUnknown(e)) {
+        begin("", now, guess, qty);
+        this.smuggleNote(a.name, `smuggling: running ${good} ashore at ${port} had no answer (${(e as Error).message}): taken as started, waited out`);
+        return 30_000;
+      }
+      this.smuggleNote(a.name, `smuggling: running ${good} ashore at ${port} refused: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** A run's end with no notice (the feed missed it): what left the hold was landed (its pay shows in the vault, read again). */
+  private settleRun(a: ShipAgent, role: SmuggleRole, r: ShipResult): void {
+    const run = role.run;
+    if (!run) return;
+    role.run = null;
+    const left = r.cargo_manifest[run.good] ?? 0;
+    const landed = Math.max(0, run.before - left);
+    const hours = (Math.min(this.world.now(), run.completesAt) - run.startedAt) / this.gameHourMs;
+    if (hours > 0) this.smuggleModel.runHours = [...this.smuggleModel.runHours, hours].slice(-20);
+    this.smuggleStats.landedTons += landed;
+    const rec = this.runRec(a);
+    if (rec) rec.outcome = landed > 0 ? "landed (no notice; pay in the vault)" : "nothing landed";
+    this.smuggleNote(a.name, `smuggling: the run at ${run.port} is over with no notice: ${landed} t ${run.good} left the hold`);
+    void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
+    this.persist(true);
+  }
+
+  /**
+   * The housekeeping pass: wants read where we lie, and (the mode on, the Crown's attention cool, the season normal, a fleet of
+   * two or more, no smuggler out) a new run when one passes the value test: the fastest fit ship goes to the cove that serves it.
+   */
+  private async runSmuggling(): Promise<void> {
+    const w = this.world;
+    const now = w.now();
+    this.pruneWants();
+    for (const [id, role] of [...this.smugglers]) {
+      const a = this.agents.get(id);
+      if (!a || a.gone) {
+        if (a) this.checkLostSmuggler(a);
+        this.smugglers.delete(id);
+        continue;
+      }
+      if (a.last?.ship.status === "sailing") this.endLying(role);
+    }
+    if (!this.ownSettings.smuggling || !this.canSmuggle) {
+      this.smuggleAction = this.smugglingOff() ?? "off";
+      return;
+    }
+    await this.pollWants();
+    const off = this.smugglingOff();
+    if (off) {
+      this.smuggleAction = off;
+      return;
+    }
+    if (w.seasonMode() !== "normal") {
+      this.smuggleAction = "no new runs near the season's end";
+      return;
+    }
+    if (this.smugglers.size >= SMUGGLE_MAX_SHIPS) {
+      this.smuggleAction = `${[...this.smugglers.keys()].map((id) => this.agents.get(id)?.name ?? id.slice(0, 8)).join(", ")} smuggling`;
+      return;
+    }
+    const fleet = [...this.agents.values()].filter((a) => !a.gone);
+    if (fleet.length < SMUGGLE_MIN_FLEET) {
+      this.smuggleAction = "the fleet's only ship is never spared for smuggling";
+      return;
+    }
+    const startAt = this.nextRunAt(now);
+    if (startAt > now) {
+      this.smuggleAction = `the Crown's attention (${this.recentRuns(now)} runs ashore in ${ATTENTION_WINDOW_GAME_H} game hours): the next run in ${((startAt - now) / this.gameHourMs).toFixed(1)} game hours`;
+      return;
+    }
+    await this.designateSmuggler(fleet);
+  }
+
+  /**
+   * A new run: for each free ship in port (nothing lawful aboard or loaded, no sealed freight, convoy, arrest or AI order), fastest
+   * first, each open cove and each fresh rich want, the run as estimated (goods at the book's usual price: base × HOUSE_PRICE_GUESS,
+   * the passage to the cove counted); the best that passes the value test is taken, if she is fit to risk. With no want known, an
+   * idle ship near a cove may go and read its board (at most once a game day).
+   */
+  private async designateSmuggler(fleet: ShipAgent[]): Promise<void> {
+    const w = this.world;
+    const s = this.settings;
+    const speed = (a: ShipAgent) => w.shipClass(a.shipClass)?.base_speed_centiknots ?? 0;
+    const free = fleet
+      .filter((a) => {
+        const r = a.last;
+        return (
+          !!r &&
+          r.ship.status !== "sailing" &&
+          !!r.ship.current_port_id &&
+          !a.arrested &&
+          !r.ship.convoy_id &&
+          !a.loaded &&
+          a.sealedTons() === 0 &&
+          !Object.entries(r.cargo_manifest).some(([g, t]) => t > 0 && !w.isContraband(g)) &&
+          !this.advisor.shipOrder(a.shipId)
+        );
+      })
+      .sort((x, y) => speed(y) - speed(x))
+      .slice(0, SMUGGLE_CANDIDATES);
+    if (!free.length) {
+      this.smuggleAction = "no ship free for a run (in port, empty, no lane loaded)";
+      return;
+    }
+    const coves = w.catalog.ports.filter((p) => p.is_cove && w.isOpen(p.id)).map((p) => p.id);
+    if (!coves.length) {
+      this.smuggleAction = "no cove open";
+      return;
+    }
+    const wants = this.freshWants({ maxAgeGameH: WANT_MAX_AGE_GAME_H, minBps: WANT_MIN_MULTIPLE_BPS }).slice(0, SMUGGLE_OPTIONS);
+    if (!wants.length) {
+      await this.scoutCove(free, coves);
+      return;
+    }
+    let why = "";
+    // Fastest first: the first fit ship with a run that passes takes it (her best run).
+    for (const a of free) {
+      let best: { cove: string; opt: RunOption } | null = null;
+      const r = a.last!;
+      const from = r.ship.current_port_id!;
+      const cls = w.shipClass(a.shipClass);
+      const hull = cls?.hull_category ?? "coastal";
+      const knots = ((cls?.base_speed_centiknots ?? 800) / 100) * 0.9;
+      for (const cove of coves) {
+        let toCoveMs = 0;
+        if (from !== cove) {
+          const p = await w.route(from, cove, a.shipClass).catch((e: unknown) => {
+            if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+            return null;
+          });
+          if (!p || !w.routeRated(p, hull)) continue;
+          toCoveMs = w.sailMs(p.total_distance_nm, knots) + 30 * w.gameMinuteMs;
+        }
+        for (const want of wants) {
+          const price = Math.ceil(w.basePrice(want.good) * HOUSE_PRICE_GUESS);
+          const tons = Math.min(s.smuggleMaxTons, Math.floor(s.smuggleMaxPence / Math.max(1, price)), Math.floor(r.effective_hold_capacity_tons - r.cargo_used_tons), want.remaining ?? Infinity);
+          if (tons < 1) {
+            why = `smuggleMaxPence buys less than a ton of ${want.good}`;
+            continue;
+          }
+          const opt = await this.runOption(a, r, cove, want, tons, tons * price, toCoveMs);
+          if (typeof opt === "string") {
+            why = opt;
+            continue;
+          }
+          if (!opt.ok) {
+            why = `${a.name} via ${cove}: ${this.optionText(opt)}`;
+            continue;
+          }
+          if (!best || opt.gain > best.opt.gain) best = { cove, opt };
+        }
+      }
+      if (!best) continue;
+      const unfit = await this.smugglerUnfit(a, r);
+      if (unfit) {
+        why = `${a.name} can't be risked: ${unfit}`;
+        this.smuggleOnce(`unfit:${a.shipId}:${unfit}`, "smuggling", `${a.name} would run ${this.optionText(best.opt)}, but ${unfit}: not taken`);
+        continue;
+      }
+      this.takeSmuggler(a, "buy", best.cove, best.opt.want, best.opt.zones, `taken for a run (the fastest fit ship): via the cove at ${best.cove}, ${this.optionText(best.opt)}`);
+      this.smuggleAction = `${a.name} bound for ${best.cove} to buy for ${best.opt.want.port}`;
+      return;
+    }
+    this.smuggleAction = `no run passes the value test: ${why || "no cove or want reachable"}`;
+    // Once per set of wants known (the figures move every pass).
+    this.smuggleOnce(`nobest:${wants.map((x) => `${x.port}|${x.good}|${x.at}`).join(",")}`, "smuggling", `no run taken: ${why || "no cove or want reachable"}`);
+  }
+
+  /** No want known (they are told only at coves, or seen where we lie): an idle ship (no lane pays) goes to the nearest cove to read its board. */
+  private async scoutCove(free: ShipAgent[], coves: string[]): Promise<void> {
+    const w = this.world;
+    const now = w.now();
+    this.smuggleAction = "no fresh want known (wants are told only at the coves, or seen where our ships lie)";
+    if (now - this.lastScoutAt < SCOUT_GAP_GAME_H * this.gameHourMs) return;
+    for (const a of free.filter((x) => x.idle)) {
+      const r = a.last!;
+      const from = r.ship.current_port_id!;
+      const hull = w.shipClass(a.shipClass)?.hull_category ?? "coastal";
+      let near: { cove: string; nm: number } | null = null;
+      for (const cove of coves) {
+        const p =
+          from === cove
+            ? { total_distance_nm: 0 }
+            : await w.route(from, cove, a.shipClass).then(
+                (x) => (w.routeRated(x, hull) ? x : null),
+                (e: unknown) => {
+                  if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+                  return null;
+                },
+              );
+        if (p && (!near || p.total_distance_nm < near.nm)) near = { cove, nm: p.total_distance_nm };
+      }
+      if (!near || near.nm > SCOUT_MAX_NM) continue;
+      const unfit = await this.smugglerUnfit(a, r);
+      if (unfit) continue;
+      this.lastScoutAt = now;
+      this.takeSmuggler(a, "buy", near.cove, null, [], `idle (no lane pays): to the cove at ${near.cove} (${Math.round(near.nm)} nm) to read its board of wants`);
+      this.smuggleAction = `${a.name} bound for ${near.cove} to read its board`;
+      return;
+    }
+  }
+
+  /**
+   * A smuggler gone from the fleet with no notice of why: with contraband aboard, neither sunk, taken by pirates, sold nor broken
+   * up, she was most likely seized (the ship_seized notice missed): counted so (once: by her id), which stops the mode until
+   * re-enabled (the safe way to be wrong). Placed at sea or in port only where her last read tells it (lastWhere).
+   */
+  private checkLostSmuggler(a: ShipAgent): void {
+    const r = a.last;
+    if (!r || this.seizedNoted.has(a.shipId) || this.capturesNoted.has(a.shipId) || this.leftFleet.has(a.shipId)) return;
+    const status = r.ship.status as string;
+    if (status === "sunk" || status === "captured" || a.contrabandAboard(r).length === 0) return;
+    const where = r.ship.current_port_id ?? r.route_legs[r.ship.current_leg_idx]?.to_node ?? null;
+    this.noteSeized(a, a.shipId, a.name, where, this.lastWhere(a), this.world.now(), true);
+  }
+
+  /**
+   * Where a ship of ours was, by her last read, for a seizure no notice placed: at sea while her passage was still under way, in an
+   * ordinary port when lying there; null when it can't be told (her arrival was due, or she lay at a cove, which is never
+   * searched: she sailed since).
+   */
+  private lastWhere(a: ShipAgent | undefined): boolean | null {
+    const r = a?.last;
+    if (!r) return null;
+    if (r.ship.status === "sailing") {
+      const eta = Date.parse(r.voyage?.estimated_arrival_at ?? "");
+      return Number.isFinite(eta) && eta < this.world.now() ? null : false;
+    }
+    const port = r.ship.current_port_id;
+    return port && !this.world.isCove(port) ? true : null;
+  }
+
+  /** A seizure's place in the model: in port, or at sea (a run that ended so); unknown counts in neither. `sign` -1 takes it back. */
+  private seizureSplit(inPort: boolean | null, sign: 1 | -1): void {
+    const m = this.smuggleModel;
+    if (inPort === true) m.seizedInPort = Math.max(0, m.seizedInPort + sign);
+    else if (inPort === false) {
+      m.seizedAtSea = Math.max(0, m.seizedAtSea + sign);
+      m.runs = Math.max(0, m.runs + sign);
+    }
+  }
+
+  /**
+   * One of our ships seized by the Crown for smuggling (guide 3.18): she and everything aboard are forfeit as if she sank (a lien,
+   * shares and a venture lost, insurance pays nothing), and the conviction goes on our public credit record. The model learns it,
+   * and the mode switches itself off until the user turns it on again.
+   */
+  private noteSeized(a: ShipAgent | undefined, id: string | null, ship: string, where: string | null, inPort: boolean | null, at: number, guessed = false): void {
+    const key = id ?? a?.shipId ?? null;
+    if (key && this.seizedNoted.has(key)) {
+      // Counted already (inferred when she vanished): the notice says where, and the model's split is set right.
+      const c = guessed ? undefined : this.convictions.find((x) => x.id === key && x.guessed);
+      if (c) {
+        if (inPort !== null && c.inPort !== inPort) {
+          this.seizureSplit(c.inPort, -1);
+          this.seizureSplit(inPort, 1);
+          c.inPort = inPort;
+        }
+        if (where) c.where = where;
+        c.guessed = false;
+        this.smuggleNote("smuggling", `the Crown's notice confirms the seizure of ${ship} ${inPort === null ? "" : inPort ? "in port" : "at sea"}${where ? ` at ${where}` : ""} (already counted)`);
+        this.persist(true);
+      }
+      return;
+    }
+    if (key) {
+      this.seizedNoted.add(key);
+      if (this.seizedNoted.size > 200) this.seizedNoted.delete(this.seizedNoted.values().next().value!);
+    }
+    const role = a ? this.smugglers.get(a.shipId) : undefined;
+    if (role) this.endLying(role);
+    if (a) this.smugglers.delete(a.shipId);
+    this.seizureSplit(inPort, 1);
+    this.smuggleStats.seizures++;
+    this.convictions.push({ at, ship, where: where ?? "?", inPort, ...(key ? { id: key } : {}), ...(guessed ? { guessed: true } : {}) });
+    if (this.convictions.length > 50) this.convictions.splice(0, this.convictions.length - 50);
+    const rec = a ? this.runRec(a) : undefined;
+    if (rec) rec.outcome = "SEIZED";
+    a?.noteSeized("was SEIZED by the Crown for smuggling: the ship and everything aboard are forfeit");
+    this.loansDirty = true;
+    this.financeDirty = true;
+    this.lastScan = 0;
+    const wasOn = this.ownSettings.smuggling && !this.smuggleHalt;
+    const place = inPort === null ? "(where not known)" : inPort ? "in port" : "at sea";
+    this.smuggleHalt ??= { at, why: `${ship} seized ${place}${where ? ` at ${where}` : ""}` };
+    this.smuggleNote(
+      "smuggling",
+      `SEIZED${guessed ? " (no notice came: she is gone from the fleet with contraband aboard)" : ""}: ${ship} ${place}${where ? ` at ${where}` : ""}: ` +
+        `the ship and everything aboard are forfeit, insurance pays nothing, and a smuggling conviction goes on our public credit record. ` +
+        `${wasOn ? "The smuggling mode switches itself off until you turn it on again." : "The smuggling mode stays off until you turn it on again."}`,
+    );
+    this.advisor.trigger("a ship was seized for smuggling");
+    this.persist(true);
+    if (wasOn) this.onSmugglingHalted?.();
+  }
+
+  /** A ship of ours left the fleet by sale or break-up (not seized). */
+  private noteLeftFleet(id: string): void {
+    this.leftFleet.add(id);
+    if (this.leftFleet.size > 100) this.leftFleet.delete(this.leftFleet.values().next().value!);
+  }
+
+  /** The smuggling mode's report for the dashboard. */
+  private smuggleReport(): SmuggleReport {
+    const w = this.world;
+    const now = w.now();
+    const m = this.smuggleModel;
+    const iso = (t: number) => new Date(t).toISOString();
+    const next = this.nextRunAt(now);
+    return {
+      enabled: this.ownSettings.smuggling,
+      available: this.canSmuggle,
+      active: this.smugglingOn(),
+      state: this.smugglingOff() ?? "on",
+      action: this.smuggleAction,
+      halt: this.smuggleHalt ? { at: iso(this.smuggleHalt.at), why: this.smuggleHalt.why } : null,
+      maxTons: this.settings.smuggleMaxTons,
+      maxPence: this.settings.smuggleMaxPence,
+      ships: [...this.smugglers].map(([id, s]) => ({
+        shipId: id,
+        name: this.agents.get(id)?.name ?? id.slice(0, 8),
+        purpose: s.purpose,
+        dest: s.dest,
+        want: s.want ? { port: s.want.port, good: s.want.good, multipleBps: s.want.multipleBps } : null,
+        load: s.load ? { good: s.load.good, tons: s.load.tons, pence: s.load.pence, cove: s.load.cove } : null,
+        run: s.run ? { port: s.run.port, good: s.run.good, tons: s.run.tons, completesAt: iso(s.run.completesAt) } : null,
+        odds: s.odds,
+        since: iso(s.since),
+        zones: s.zones ?? [],
+      })),
+      wants: this.freshWants({ maxAgeGameH: WANT_LIFE_GAME_H, minBps: 0 })
+        .slice(0, 20)
+        .map((x) => ({ port: x.port, good: x.good, multipleBps: x.multipleBps, ageGameH: Math.round(((now - x.at) / this.gameHourMs) * 10) / 10, remaining: x.remaining, source: x.source, via: x.via })),
+      runs: [...this.smuggleRuns].reverse().slice(0, 12).map((x) => ({ ...x, at: iso(x.at) })),
+      stats: { ...this.smuggleStats, convictions: this.convictions.length },
+      model: {
+        perRun: runHazard(m),
+        perPortHour: portHazard(m),
+        runGameH: runGameHours(m),
+        runs: m.runs,
+        portHours: Math.round(m.portHours * 10) / 10,
+        seizedInPort: m.seizedInPort,
+        seizedAtSea: m.seizedAtSea,
+        odds: this.seizureOddsNow(),
+        recentRuns: this.recentRuns(now),
+        nextRunAt: next > now ? iso(next) : null,
+      },
+      convictions: this.convictions.map((c) => ({ ...c, at: iso(c.at) })),
+      log: [...this.smuggleLog].reverse().slice(0, 25),
+    };
+  }
+
+  /** The mode for the AI (digest): its state, wants seen, our smugglers, runs and seizures. Nothing names a company. */
+  private digestSmuggling(now: number): DigestInput["smuggling"] {
+    const r = this.smuggleReport();
+    return {
+      state: r.state,
+      user: this.ownSettings.smuggling,
+      available: this.canSmuggle,
+      halted: !!this.smuggleHalt,
+      maxTons: this.ownSettings.smuggleMaxTons,
+      maxPence: this.ownSettings.smuggleMaxPence,
+      ships: r.ships.map((s) => ({ purpose: s.purpose, dest: s.dest, want: s.want ? `${s.want.good}@${s.want.port}` : null, running: !!s.run })),
+      wants: this.freshWants({ maxAgeGameH: WANT_MAX_AGE_GAME_H, minBps: 0 })
+        .slice(0, 8)
+        .map((x) => ({ port: x.port, good: x.good, x: x.multipleBps / 10_000, ageH: Math.round((now - x.at) / this.gameHourMs), remaining: x.remaining, source: x.source })),
+      runs: r.stats.runs,
+      landedTons: r.stats.landedTons,
+      proceeds: r.stats.proceedsPence,
+      spent: r.stats.spentPence,
+      seizures: r.stats.seizures,
+      convictions: r.stats.convictions,
+      odds: r.model.odds,
+      recentRuns: r.model.recentRuns,
+    };
   }
 
   /**
@@ -1554,6 +3375,7 @@ export class FleetManager implements FleetHost {
           : a.idle ? "idle"
           : a.held ? "held"
           : a.waitingForCash ? "waiting_cash"
+          : this.smugglers.has(a.shipId) ? "smuggling"
           : a.activity.startsWith("holding") ? "holding"
           : "working";
         return {
@@ -1612,8 +3434,10 @@ export class FleetManager implements FleetHost {
         committed,
         capitalRate: this.capitalRate(),
         due: this.cashReport().duePence,
-        levyExcess: this.idleExcess(),
+        levyExcess: this.levyExcess(),
         levyPerDay: this.levyPerDay(),
+        charterEarned: Math.round(w.charterEarnings(now)),
+        charterTaper: w.charterTaper(0, w.charterEarnings(now)),
       },
       user: this.ownSettings,
       canBuild: this.canBuild,
@@ -1632,7 +3456,7 @@ export class FleetManager implements FleetHost {
         fleet: [...this.agents.values()].filter((a) => !a.gone).length,
         homeFloor: home ? this.floorIn(home) : this.homeFloor(),
         reserve: this.settings.reservePence,
-        billsFloor: Math.ceil(UPKEEP_DAYS_RESERVED * this.upkeepPerDay()),
+        billsFloor: Math.ceil(UPKEEP_DAYS_RESERVED * (this.upkeepPerDay() + this.levyPerDay())),
       },
       rivals: this.rivalSummary,
       bidHaircutPerDay: w.bidHaircutPerDay,
@@ -1643,6 +3467,7 @@ export class FleetManager implements FleetHost {
         .map((m) => ({ region: m.region, good: m.good, ours: !!w.companyId && m.holderId === w.companyId, leftMs: m.expiresAt - now })),
       finance: this.digestFinance(now),
       deals: this.digestDeals(now),
+      smuggling: this.digestSmuggling(now),
     };
   }
 
@@ -1696,6 +3521,9 @@ export class FleetManager implements FleetHost {
     ];
     const out: DigestZone[] = [];
     const prices = this.marquePriceMap();
+    const patrolPrices = this.patrolPriceMap();
+    const seized = new Map(w.seizuresByZone(now).map(([z, atSea, inPort]) => [z, { atSea, inPort }]));
+    const smuggle = this.smugglingZones();
     for (const z of w.catalog.sea_zones) {
       if (z.phase > w.unlockedPhase) continue;
       const r = read.get(z.id);
@@ -1703,7 +3531,8 @@ export class FleetManager implements FleetHost {
       const net = r?.net_piracy_bps ?? w.piracy.get(z.id) ?? 0;
       const own = this.ownExposureSeen.get(z.id) ?? 0;
       const mine = ours(z.id);
-      if (net <= 0 && !t && own <= 0 && mine.length === 0) continue;
+      const s = seized.get(z.id) ?? null;
+      if (net <= 0 && !t && own <= 0 && mine.length === 0 && !s) continue;
       out.push({
         zone: z.id,
         net,
@@ -1712,6 +3541,9 @@ export class FleetManager implements FleetHost {
         ownExposure: Math.round(own),
         ours: mine,
         marquePrice: prices.get(z.id) ?? null,
+        patrolPrice: patrolPrices.get(z.id) ?? null,
+        seized: s,
+        noPatrol: smuggle === null || smuggle.has(z.id),
       });
     }
     const stake = (z: DigestZone) => z.ownExposure + (z.rivals?.cargo ?? 0);
@@ -1834,11 +3666,17 @@ export class FleetManager implements FleetHost {
       camping: [...this.campState],
       campShut: [...this.campShut],
       resized: { ...this.resized },
-      bills: this.bills.at !== null ? { rent: [...this.bills.rent], upkeep: this.bills.upkeep, at: this.bills.at } : undefined,
+      bills: this.bills.at !== null ? { rent: [...this.bills.rent], upkeep: this.bills.upkeep, levy: this.bills.levy || undefined, at: this.bills.at } : undefined,
       announcement: this.announcement ?? undefined,
       keyWarned: this.keyExpiresAt !== null && this.keyWarned.size ? { expiresAt: this.keyExpiresAt, marks: [...this.keyWarned] } : undefined,
       finance:
-        this.loanRecs.size || this.pendingCredit.length || this.ourQuotes.size || this.ourRequests.size || this.interestPaidBefore || this.interestEarnedBefore
+        this.loanRecs.size ||
+        this.pendingCredit.length ||
+        this.ourQuotes.size ||
+        this.ourRequests.size ||
+        this.interestPaidBefore ||
+        this.interestEarnedBefore ||
+        this.goldsmithsBanUntil > this.world.now()
           ? {
               recs: [...this.loanRecs],
               pending: [...this.pendingCredit],
@@ -1846,11 +3684,28 @@ export class FleetManager implements FleetHost {
               requests: [...this.ourRequests],
               interestPaidBefore: this.interestPaidBefore,
               interestEarnedBefore: this.interestEarnedBefore,
+              goldsmithsBanUntil: this.goldsmithsBanUntil > this.world.now() ? this.goldsmithsBanUntil : undefined,
             }
           : undefined,
       deals:
         this.commissionRecs.size || this.envelopeRecs.size || this.pendingEnvelopes.length || Object.values(this.dealStats).some((n) => n !== 0)
           ? { commissions: [...this.commissionRecs], envelopes: [...this.envelopeRecs], pendingEnvelopes: [...this.pendingEnvelopes], stats: { ...this.dealStats } }
+          : undefined,
+      smuggle:
+        this.smugglers.size || this.smuggleRuns.length || this.smuggleHalt || this.convictions.length || this.wantsSeen.size || this.smuggleModel.runs || this.smuggleModel.portHours
+          ? {
+              model: { ...this.smuggleModel, runHours: [...this.smuggleModel.runHours] },
+              roles: [...this.smugglers],
+              runs: this.smuggleRuns,
+              runTimes: this.smuggleRunTimes,
+              stats: { ...this.smuggleStats },
+              halt: this.smuggleHalt,
+              convictions: this.convictions,
+              seized: [...this.seizedNoted].slice(-100),
+              wants: [...this.wantsSeen],
+              log: this.smuggleLog,
+              scoutAt: this.lastScoutAt || undefined,
+            }
           : undefined,
     };
   }
@@ -1877,6 +3732,8 @@ export class FleetManager implements FleetHost {
       this.bills = {
         rent: new Map((s.bills.rent ?? []).filter(([, p]) => Number.isFinite(p) && p > 0)),
         upkeep: Number.isFinite(s.bills.upkeep) ? s.bills.upkeep : 0,
+        // Older saves didn't measure the levy: the formula alone until the ledger is read.
+        levy: Number.isFinite(s.bills.levy) ? s.bills.levy! : 0,
         at: s.bills.at ?? null,
       };
     }
@@ -1902,6 +3759,7 @@ export class FleetManager implements FleetHost {
       for (const [id, r] of f.requests ?? []) if (typeof id === "string" && r && typeof r.region === "string" && typeof r.replaces === "string") this.ourRequests.set(id, r);
       this.interestPaidBefore = Number.isFinite(f.interestPaidBefore) ? f.interestPaidBefore! : 0;
       this.interestEarnedBefore = Number.isFinite(f.interestEarnedBefore) ? f.interestEarnedBefore! : 0;
+      this.goldsmithsBanUntil = Number.isFinite(f.goldsmithsBanUntil) ? f.goldsmithsBanUntil! : 0;
     }
     // Commissions we took (one with no answer is still reconciled, never sent again), our envelopes, what deals earned.
     const dl = s.deals;
@@ -1913,6 +3771,31 @@ export class FleetManager implements FleetHost {
         const v = dl.stats?.[k];
         if (typeof v === "number" && Number.isFinite(v)) this.dealStats[k] = v;
       }
+    }
+    // The smuggling mode: its model, our smugglers mid-run (a ship no longer ours is dropped at the next pass), the record, the
+    // halt after a seizure, the wants seen.
+    const sm = s.smuggle;
+    if (sm) {
+      this.smuggleModel = restoreModel(sm.model);
+      for (const [id, r] of sm.roles ?? []) {
+        if (typeof id === "string" && r && (r.purpose === "buy" || r.purpose === "run" || r.purpose === "sell") && Number.isFinite(r.since)) {
+          this.smugglers.set(id, { ...r, voyage: !!r.voyage, lying: r.lying ?? null, run: r.run ?? null, load: r.load ?? null, odds: r.odds ?? null, waitingSince: r.waitingSince ?? null, zones: Array.isArray(r.zones) ? r.zones : null });
+        }
+      }
+      this.smuggleRuns = (sm.runs ?? []).filter((x) => x && typeof x.ship === "string" && Number.isFinite(x.at)).slice(-SMUGGLE_RUNS_KEPT);
+      this.smuggleRunTimes = (sm.runTimes ?? []).filter((t) => Number.isFinite(t)).slice(-50);
+      for (const k of Object.keys(this.smuggleStats) as (keyof SmuggleStats)[]) {
+        const v = sm.stats?.[k];
+        if (typeof v === "number" && Number.isFinite(v)) this.smuggleStats[k] = v;
+      }
+      const h = sm.halt;
+      if (h && Number.isFinite(h.at) && typeof h.why === "string") this.smuggleHalt = { at: h.at, why: h.why };
+      this.convictions = (sm.convictions ?? []).filter((c) => c && Number.isFinite(c.at) && typeof c.ship === "string").slice(-50);
+      for (const id of sm.seized ?? []) if (typeof id === "string") this.seizedNoted.add(id);
+      for (const c of this.convictions) if (typeof c.id === "string") this.seizedNoted.add(c.id);
+      for (const [k, x] of sm.wants ?? []) if (typeof k === "string" && x && typeof x.port === "string" && Number.isFinite(x.at) && Number.isFinite(x.multipleBps)) this.wantsSeen.set(k, x);
+      this.smuggleLog = (sm.log ?? []).filter((l) => l && typeof l.msg === "string").slice(-SMUGGLE_LOG_KEEP);
+      this.lastScoutAt = Number.isFinite(sm.scoutAt) ? sm.scoutAt! : 0;
     }
   }
 
@@ -1970,6 +3853,17 @@ export class FleetManager implements FleetHost {
     this.client.setApiKey(key);
     this.noteKey(who.expires_at);
     this.log("fleet", `now on a renewed company key${who.expires_at ? ` (expires ${who.expires_at})` : " (no expiry)"}`);
+    // Smuggling allowed or withdrawn on the Underworld page (guide 3.18: scope `underworld`).
+    const smuggle = who.scopes.includes("underworld");
+    if (smuggle !== this.canSmuggle) {
+      this.canSmuggle = smuggle;
+      this.smuggleNote(
+        "smuggling",
+        smuggle
+          ? `the company key now holds the underworld scope: the smuggling mode ${this.ownSettings.smuggling ? "may run" : "is available (off in the settings)"}`
+          : "the company key no longer holds the underworld scope: the smuggling mode is unavailable (no buying, no new runs)",
+      );
+    }
   }
 
   /** A call was refused with `503 world_paused`: wait on the clock from now on (housekeeping reads it every 30 s). */
@@ -2058,6 +3952,9 @@ export class FleetManager implements FleetHost {
     if (this.ownSettings.autoBuy && !this.canBuild) this.log("fleet", "key lacks infra_manage: automatic ship buying is off");
     this.canRemit = who.scopes.includes("treasury_remit");
     if (!this.canRemit) this.log("fleet", "key lacks treasury_remit: cash stays in the region it lands in");
+    // The Free Trade needs its own scope (guide 3.18), never on a key by default: allowed on the Underworld page.
+    this.canSmuggle = who.scopes.includes("underworld");
+    if (this.ownSettings.smuggling && !this.canSmuggle) this.log("fleet", "smuggling is on but the key lacks the underworld scope: the mode is unavailable (allow smuggling on the Underworld page)");
 
     let leaseNote: string | undefined;
     if (this.leaseDir && !this.lease) {
@@ -2092,11 +3989,16 @@ export class FleetManager implements FleetHost {
     }
     // After the restore (which brings back the saved log): the database lease couldn't be had at start.
     if (leaseNote) this.log("fleet", leaseNote);
+    if (this.smuggleHalt && this.resumeSmuggling && this.ownSettings.smuggling) {
+      this.smuggleNote("smuggling", `smuggling re-enabled at start (KIBB_SMUGGLING=resume) after the seizure (${this.smuggleHalt.why})`);
+      this.smuggleHalt = null;
+    } else if (this.smuggleHalt && this.ownSettings.smuggling) {
+      this.log("fleet", `smuggling stays off since the seizure (${this.smuggleHalt.why}): turn it off and on again (CLI: KIBB_SMUGGLING=resume) to resume`);
+    }
     this.progressSince ??= new Date().toISOString();
     await this.world.init();
     const profile = await this.client.companyProfile();
-    this.homeRegion = this.world.region(profile.company.home_port_id);
-    this.homePort = profile.company.home_port_id;
+    this.setHome(profile.company.home_port_id);
     this.companyName = profile.company.name;
     this.world.companyId = profile.company.id;
     this.trickleOk = this.world.ownTrickleOk;
@@ -2265,6 +4167,13 @@ export class FleetManager implements FleetHost {
         this.log("fleet", `underwriting check failed: ${(e as Error).message}`);
       });
     }
+    if (now - this.lastSmuggleCheck > SMUGGLE_CHECK_MS) {
+      this.lastSmuggleCheck = now;
+      await this.runSmuggling().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.log("fleet", `smuggling check failed: ${(e as Error).message}`);
+      });
+    }
   }
 
   private async scanShips(): Promise<void> {
@@ -2353,6 +4262,7 @@ export class FleetManager implements FleetHost {
         await a.stop();
       }
       if (a.gone && !a.running) {
+        this.checkLostSmuggler(a);
         this.retire(a);
         this.agents.delete(id);
         this.missingScans.delete(id);
@@ -2462,8 +4372,8 @@ export class FleetManager implements FleetHost {
    * per hour over the cash its current loads hold. 0 otherwise.
    */
   private capitalRate(except?: ShipAgent): number {
-    // Cash above the wealth levy's threshold costs the levy while it sits idle: spending it is free (guide 3.12).
-    if (this.idleExcess() > 0) return 0;
+    // The wealth levy is on net worth now (guide 3.12): cash put into loads or hulls is levied the same, so it never
+    // makes spending free.
     const others = [...this.agents.values()].filter((a) => a !== except);
     const lanes = others.map((a) => a.lane).filter((l): l is Lane => !!l && (l.capital ?? 0) > 0 && l.profitPerHour > 0);
     if (lanes.length === 0) return 0;
@@ -2719,8 +4629,11 @@ export class FleetManager implements FleetHost {
         const storm = agent && !captured ? stormFrom(e) : null;
         if (agent && storm) {
           const r = agent.last;
-          const zone = storm.zone ?? r?.route_legs[r.ship.current_leg_idx]?.to_node ?? null;
-          this.world.noteStorm(zone, this.world.shipClass(agent.shipClass)?.hull_category ?? "coastal", storm.at ?? this.world.now(), storm.share, storm.sunk);
+          const leg = r?.route_legs[r.ship.current_leg_idx];
+          const zone = storm.zone ?? leg?.to_node ?? null;
+          // The leg's crossing counts when the storm is in the zone it ends in (the rougher water, guide 3.5).
+          const edge = leg && zone && this.world.hazardZone(leg.to_node)?.id === this.world.hazardZone(zone)?.id ? leg.edge_class : null;
+          this.world.noteStorm(zone, this.world.shipClass(agent.shipClass)?.hull_category ?? "coastal", storm.at ?? this.world.now(), storm.share, storm.sunk, edge, storm.stores);
         }
         if ((p.sunk || captured) && agent) this.advisor.trigger("a ship was lost");
         agent?.nudge();
@@ -2961,7 +4874,22 @@ export class FleetManager implements FleetHost {
         // Seller and buyer: a ship we bought joins at the next scan; one of ours sold (listed by hand) leaves the fleet then.
         const seller = str("seller_company_id");
         const price = num("price_pence");
-        if (seller && this.isOurCompany(seller)) this.log("fleet", `a ship of ours was sold where she lay${price ? ` for ${cr(price)}` : ""} (listed by hand)`);
+        if (seller && this.isOurCompany(seller)) {
+          this.log("fleet", `a ship of ours was sold where she lay${price ? ` for ${cr(price)}` : ""} (listed by hand)`);
+          // Gone by sale: never taken for a seizure when she leaves the fleet.
+          const sold = str("ship_id");
+          if (sold) this.noteLeftFleet(sold);
+        }
+        this.lastScan = 0;
+        break;
+      }
+      case "ship_broken_up": {
+        // Ours (guide 3.4): sold to the yard for 35% of her rebuild value; she leaves the fleet at the next scan (never a seizure).
+        const id = str("ship_id");
+        if (id) this.noteLeftFleet(id);
+        const paid = num("payout_pence");
+        this.log(agent?.name ?? "fleet", `broken up at the yard${paid ? ` for ${cr(paid)}` : ""} (by hand)`);
+        if (paid) void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
         this.lastScan = 0;
         break;
       }
@@ -2973,6 +4901,14 @@ export class FleetManager implements FleetHost {
       case "crown_bailiff_upkeep_seizure":
         this.log("fleet", `BAILIFF: ${e.event_type.replace(/_/g, " ")} (a bill went unpaid; check the reserve)`);
         break;
+      case "home_port_relocated": {
+        // Ours (guide 3.12): upkeep, marques, patrols and the Goldsmiths' default region follow the new home from now on. The
+        // payload's shape isn't published: taken when it names a known port, and the profile is read again with the bills at once.
+        const port = str("new_home_port_id", "home_port_id", "to_port_id", "port_id");
+        if (port && this.world.port(port)) this.setHome(port);
+        this.lastBillsCheck = 0;
+        break;
+      }
       case "server_announcement": {
         const at = Date.parse(e.timestamp) || this.world.now();
         this.log("fleet", `server ${str("severity") ?? "notice"}: ${str("message") ?? ""}`);
@@ -2988,6 +4924,134 @@ export class FleetManager implements FleetHost {
       case "marque_prize_paid": {
         const amount = num("amount_pence") ?? num("bonus_pence") ?? num("payout_pence") ?? num("prize_pence");
         this.log("fleet", `${e.event_type.replace(/_/g, " ")}${amount ? `: ${cr(amount)}` : ""}`);
+        break;
+      }
+      case "smuggler_seized": {
+        // Public (guide 3.18): a smuggler taken, her name and where. At sea, the patrols in force in that zone share half the base
+        // value of her and everything aboard (guide 3.5); in port nobody does. The auto-patrol models each zone's prize money on
+        // these. What was seized isn't published: priced only when the notice gives it (shapes guessed defensively).
+        const at = Date.parse(e.timestamp) || this.world.now();
+        const port = e.port_id ?? str("port_id") ?? null;
+        const zone = e.sea_zone_id ?? str("sea_zone_id", "zone_id") ?? (port ? (this.world.port(port)?.sea_zone_id ?? null) : null);
+        const inPort = p.at_sea === true ? false : p.at_sea === false || p.in_port === true || str("location", "where") === "port" || !!port;
+        const pool = num("prize_pool_pence") ?? (() => {
+          const value = num("seized_value_pence") ?? num("base_value_pence") ?? num("value_pence");
+          if (value !== undefined) return value / 2;
+          const hull = num("hull_value_pence") ?? num("ship_value_pence");
+          const cls = str("ship_class", "ship_class_id", "class_id");
+          const ship = hull ?? (cls && this.world.shipClass(cls) ? this.hullValue(cls) : undefined);
+          return ship !== undefined ? (ship + (num("cargo_value_pence") ?? 0)) / 2 : undefined;
+        })();
+        this.world.noteSeizure({ id: e.id, at, zone, inPort, pool: pool !== undefined && pool > 0 ? pool : null });
+        // Never counted as ours from this public notice (ship names aren't unique across companies): our own seizure comes as
+        // ship_seized (by ship_id), or shows when she leaves the fleet (checkLostSmuggler). A ship of ours by that name carrying
+        // contraband: the fleet is read again at once.
+        const named = str("ship_name", "name");
+        if (named && [...this.agents.values()].some((a) => !a.gone && a.name === named && this.carriesContraband(a))) this.lastScan = 0;
+        // Our patrol in force there: prize money follows (patrol_prize_paid).
+        const ours = zone && !inPort ? this.ownNaval?.patrols.find((x) => x.sea_zone_id === zone && Date.parse(x.expires_at) > at) : undefined;
+        if (ours) this.log("fleet", `a smuggler${str("ship_name", "name") ? ` (${str("ship_name", "name")})` : ""} was seized at sea in ${zone}, where our patrol is in force: prize money should follow`);
+        break;
+      }
+      case "ship_seized": {
+        // Ours (guide 3.18): forfeit for smuggling, with everything aboard; the conviction goes on our public credit record.
+        const at = Date.parse(e.timestamp) || this.world.now();
+        // Sent to us alone: a ship of ours by its id (by name only within our own fleet, should the id be missing).
+        const named = str("ship_name", "name");
+        const byName = named ? [...this.agents.values()].filter((a) => a.name === named) : [];
+        const seized = (() => {
+          const sid = str("ship_id");
+          if (sid) return this.agents.get(sid);
+          return byName.length === 1 ? byName[0] : undefined;
+        })();
+        const sid = str("ship_id") ?? seized?.shipId ?? null;
+        const port = e.port_id ?? str("port_id") ?? null;
+        const zone = e.sea_zone_id ?? str("sea_zone_id") ?? null;
+        const told = p.at_sea === true ? false : p.at_sea === false || p.in_port === true || !!port ? true : null;
+        const inPort = told ?? this.lastWhere(seized);
+        this.noteSeized(seized, sid, named ?? seized?.name ?? "a ship of ours", port ?? zone, inPort, at);
+        break;
+      }
+      case "underworld_run_completed":
+      case "underworld_run_cancelled": {
+        // Ours (guide 3.18): a run ashore paid (into the port's region) or was cancelled by a departure (the goods stay aboard).
+        // The mode's own runs count in its record; one started by hand (the Underworld page) is booked and logged only.
+        const rid = str("run_id", "id");
+        const sid = str("ship_id") ?? (rid ? [...this.smugglers].find(([, x]) => x.run?.id === rid)?.[0] : undefined);
+        const ship = sid ? this.agents.get(sid) : undefined;
+        const role = sid ? this.smugglers.get(sid) : undefined;
+        const run = role?.run ?? null;
+        const port = e.port_id ?? str("port_id") ?? run?.port ?? null;
+        const good = str("commodity_id") ?? run?.good ?? "contraband";
+        if (e.event_type === "underworld_run_completed") {
+          const sold = num("sold_tons") ?? num("quantity") ?? 0;
+          const proceeds = num("proceeds_pence") ?? 0;
+          if (proceeds > 0 && port) {
+            const region = this.world.region(port);
+            this.world.vaults.set(region, this.world.vault(region) + proceeds);
+            this.cashArrived();
+          }
+          if (run) {
+            this.smuggleStats.landedTons += sold;
+            this.smuggleStats.proceedsPence += proceeds;
+            const rec = ship ? this.runRec(ship) : undefined;
+            if (rec) {
+              rec.proceedsPence = (rec.proceedsPence ?? 0) + proceeds;
+              rec.outcome = sold > 0 ? "landed" : "nothing landed";
+            }
+            const hours = (Math.max(run.startedAt, Math.min(Date.parse(e.timestamp) || this.world.now(), run.completesAt + RUN_GRACE_MS)) - run.startedAt) / this.gameHourMs;
+            if (hours > 0) this.smuggleModel.runHours = [...this.smuggleModel.runHours, hours].slice(-20);
+          }
+          this.smuggleNote(ship?.name ?? "smuggling", `ran ${sold} t ${good} ashore${port ? ` at ${port}` : ""} for ${cr(proceeds)}${sold > 0 ? ` (${cr(Math.round(proceeds / sold))}/t)` : ""}${run ? "" : " (a run started by hand)"}`);
+        } else {
+          const rec = run && ship ? this.runRec(ship) : undefined;
+          if (rec && rec.proceedsPence === null) rec.outcome = "cancelled";
+          this.smuggleNote(ship?.name ?? "smuggling", `the run ashore${port ? ` at ${port}` : ""} was cancelled (she departed first): the ${good} stays aboard`);
+        }
+        if (role) role.run = null;
+        this.persist(true);
+        ship?.nudge();
+        break;
+      }
+      case "underworld_order_filled": {
+        // Both parties to a cove fill (guide 3.18): a resting order of ours (placed by hand; the autopilot's are IOC) traded.
+        const sid = str("ship_id", "buyer_ship_id", "seller_ship_id");
+        const ship = sid ? this.agents.get(sid) : undefined;
+        const tons = num("filled_quantity") ?? num("quantity");
+        this.log(ship?.name ?? "fleet", `an underworld order filled at ${e.port_id ?? str("port_id") ?? "a cove"}${tons ? `: ${tons} t ${str("commodity_id") ?? ""}` : ""}`);
+        void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
+        ship?.nudge();
+        break;
+      }
+      case "patrol_prize_paid": {
+        // Ours (guide 3.5): a smuggler seized at sea in a zone while our patrol was in force pays us our share, by bps, of half
+        // her base value and everything aboard, less the Admiral's tenth, into the vault of the region the patrol was paid from.
+        const amount = num("prize_pence") ?? num("amount_pence") ?? num("payout_pence");
+        const tenth = num("admirals_tenth_pence");
+        const pid = str("patrol_id", "id");
+        const mine = pid ? this.ownNaval?.patrols.find((x) => x.id === pid) : undefined;
+        const zone = e.sea_zone_id ?? str("sea_zone_id") ?? mine?.sea_zone_id ?? null;
+        const named = str("banking_region");
+        const region = (named && this.world.vaults.has(named as BankingRegion) ? (named as BankingRegion) : null) ?? mine?.banking_region ?? null;
+        if (amount !== undefined && amount > 0) {
+          if (region) this.world.vaults.set(region, this.world.vault(region) + amount);
+          // Where it landed isn't known: the vaults are read again.
+          else void this.world.refreshVaults().catch(() => undefined);
+          if (mine) mine.prize_earned_pence = (mine.prize_earned_pence ?? 0) + amount;
+          this.cashArrived();
+        }
+        // What the seizure's pool was, from our share of it (our bps over every patrol's in the zone, as last read): the model's
+        // lesson on what a seized smuggler is worth.
+        const total = zone ? (this.zoneStatus?.zones.find((z) => z.sea_zone_id === zone)?.patrol_suppression_bps ?? this.world.patrolBps.get(zone)) : undefined;
+        if (amount && mine && total && total >= mine.suppressed_piracy_bps) {
+          const gross = tenth !== undefined ? amount + tenth : amount / (1 - ADMIRALS_TENTH);
+          this.world.notePrizePool((gross * total) / mine.suppressed_piracy_bps);
+        }
+        this.log(
+          "fleet",
+          `patrol prize money${zone ? ` in ${zone}` : ""}: ${amount !== undefined ? cr(amount) : "paid"}${tenth ? ` (after the Admiral's tenth of ${cr(tenth)})` : ""}${region ? ` into the ${region} vault` : ""}: a smuggler was seized there while our patrol was in force`,
+        );
+        this.persist();
         break;
       }
       case "insurance_claim_paid": {
@@ -3047,7 +5111,7 @@ export class FleetManager implements FleetHost {
     const exposures: Array<() => void> = [];
     // Each matched departure's time at sea, per ship: a storm counts only inside one, so hits and
     // exposure come from the same voyages (a convoy leg or payload we can't read drops out of both).
-    const voyages = new Map<string, Array<[number, number]>>();
+    const voyages = new Map<string, Array<[number, number, RoutePlan["legs"]]>>();
     const storms: Array<() => void> = [];
     let unmatched = 0;
     const names = new Map<string, number>();
@@ -3065,7 +5129,7 @@ export class FleetManager implements FleetHost {
       exposures.push(() => w.noteStormExposure(plan.legs.map((l) => ({ ...l, speed_centiknots: speed })), c?.hull_category ?? "coastal", at));
       const list = voyages.get(id) ?? [];
       // Slack for laden or convoy pace and roadstead waits.
-      list.push([at, at + w.sailMs(plan.total_distance_nm, speed / 100) * 1.5 + 60 * w.gameMinuteMs]);
+      list.push([at, at + w.sailMs(plan.total_distance_nm, speed / 100) * 1.5 + 60 * w.gameMinuteMs, plan.legs]);
       voyages.set(id, list);
     });
     const hazards =
@@ -3077,8 +5141,13 @@ export class FleetManager implements FleetHost {
         const cls = this.agents.get(id)?.shipClass;
         const s = stormFrom(e);
         const t = s?.at;
-        if (cls && s && t != null && voyages.get(id)?.some(([a, b]) => t >= a && t <= b)) storms.push(() => w.noteStorm(s.zone, w.shipClass(cls)?.hull_category ?? "coastal", t, s.share, s.sunk));
-        else if (s) unmatched++;
+        const voyage = cls && s && t != null ? voyages.get(id)?.find(([a, b]) => t >= a && t <= b) : undefined;
+        if (cls && s && t != null && voyage) {
+          // The crossing into the storm's zone (its exposure counted the rougher water too).
+          const z = s.zone ? w.hazardZone(s.zone)?.id : undefined;
+          const edge = z ? (voyage[2].find((l) => w.hazardZone(l.to_node)?.id === z)?.edge_class ?? null) : null;
+          storms.push(() => w.noteStorm(s.zone, w.shipClass(cls)?.hull_category ?? "coastal", t, s.share, s.sunk, edge, s.stores));
+        } else if (s) unmatched++;
       }));
     if (!hazards || this.stopRequested || w.stormBootstrapped) return;
     for (const f of [...exposures, ...storms]) f();
@@ -3153,6 +5222,8 @@ export class FleetManager implements FleetHost {
     const now = w.now();
     const gm = w.gameMinuteMs;
     const capRate = this.capitalRate();
+    // Our Crown and Admiralty charter earnings over the last 10 game days, for the premium taper (read once).
+    const earned = w.charterEarnings(now);
     const out = new Map<string, StallStake>();
     const shutOut = new Map<string, number>();
     for (const [key, x] of w.expansionWatch) {
@@ -3221,9 +5292,12 @@ export class FleetManager implements FleetHost {
       const tonsAfter = Math.min(repostTons, Math.max((flow * Math.min(w.postingWindowMs(key), tierLeft)) / 3_600_000, after, topTons - topBlocked));
       const call = this.advisor.stallCall(x.port, x.good);
       const p = call === "deliver" ? 0 : w.escalationOdds(x, now);
-      const uplift = Math.round((w.escalation.pay - 1) * x.rate);
       // The re-post takes no more than its own tons, held loads included (never loads a camp plans away).
-      const value = Math.round(p * uplift * Math.min(repostTons, tonsAfter + holdable));
+      const intoRepost = Math.min(repostTons, tonsAfter + holdable);
+      // The extra pay is premium over the goods' value: tapered by our charter earnings like any Admiralty pay (guide 3.7),
+      // the re-post's own delivery counted in.
+      const uplift = Math.round(w.charterPayValue(x, x.rate * w.escalation.pay, intoRepost, earned) - w.charterPayValue(x, x.rate, intoRepost, earned));
+      const value = Math.round(p * uplift * intoRepost);
       const perTon = marginTons > 0 ? margin / marginTons : top ? top.margin - top.bonus : DEFER_MARGIN_OF_PAY * x.rate;
       // Tons a camp shuts out. Once camped those lanes are re-planned and no longer show, so the figure
       // from before it began stands while loads could still land that early.
@@ -3234,10 +5308,11 @@ export class FleetManager implements FleetHost {
       const wasCamp = this.campState.has(x.id) || (prev?.id === x.id && prev.camp);
       const shut = wasCamp && x.expiresAt - now > capMs ? Math.max(shutNow, this.campShut.get(x.id) ?? 0) : shutNow;
       shutOut.set(x.id, shut);
-      // Loaded tons the smaller re-post can't take are sold off instead of paid this posting's rate.
-      const salvage = Math.min(x.rate, w.price(x.port, x.good)?.bid ?? w.basePrice(x.good));
+      // Loaded tons the smaller re-post can't take are sold off instead of paid this posting's rate (tapered).
       const spill = Math.max(0, Math.min(loadedBefore, x.remaining) - repostTons);
-      const cost = Math.round(holdCost + p * spill * (x.rate - salvage) + (flow * hoursLeft + shut) * DEFER_LOSS_SHARE * Math.max(0, perTon));
+      const paid = w.charterPayValue(x, x.rate, Math.max(1, Math.min(loadedBefore, x.remaining)), earned);
+      const salvage = Math.min(paid, w.price(x.port, x.good)?.bid ?? w.basePrice(x.good));
+      const cost = Math.round(holdCost + p * spill * (paid - salvage) + (flow * hoursLeft + shut) * DEFER_LOSS_SHARE * Math.max(0, perTon));
       // Vetoes first: "always hold" and AI "wait" never camp past them.
       const veto =
         call === "deliver" ? "AI call: deliver"
@@ -3342,6 +5417,8 @@ export class FleetManager implements FleetHost {
   }
 
   private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult, pin: { onlySource?: string; onlyDest?: string } = {}): Promise<Lane | null> {
+    // A smuggler does no lawful work (guide 3.18: her seizure must cost nothing but her).
+    if (this.smugglers.has(agent.shipId)) return null;
     const prev = agent.lane;
     const cash = this.loadCash(agent);
     const spec = this.specFor(agent, r);
@@ -3798,6 +5875,9 @@ export class FleetManager implements FleetHost {
     const alone = { kind: "alone" as const };
     const w = this.world;
     if (!this.settings.convoys || this.stopRequested) return alone;
+    // A smuggler, or a ship with contraband aboard, sails alone (guide 3.18: only she is searched, but a convoy would carry our
+    // lawful ships through her water and timetable, and her seizure must cost nothing more than her).
+    if (this.smugglers.has(agent.shipId) || agent.contrabandAboard(r).length > 0) return alone;
     const now = w.now();
     const speed = (cls: string) => (w.shipClass(cls)?.base_speed_centiknots ?? 800) / 100;
     const ourSpeed = speed(agent.shipClass);
@@ -3841,7 +5921,9 @@ export class FleetManager implements FleetHost {
     for (const c of forming) this.noteConvoy(c);
     const live = forming.map((c) => ({ c, departsAt: Date.parse(c.convoy.departs_at) })).filter(({ departsAt }) => departsAt - now > 10_000);
     if (live.length) {
-      const pick = live.filter(({ c }) => c.members.every((m) => alike(m.ship_class))).sort((a, b) => a.departsAt - b.departsAt)[0];
+      const pick = live
+        .filter(({ c }) => c.members.every((m) => alike(m.ship_class) && !this.smugglers.has(m.ship_id) && !this.carriesContraband(this.agents.get(m.ship_id))))
+        .sort((a, b) => a.departsAt - b.departsAt)[0];
       if (!pick) return alone;
       const n = Math.max(1, pick.c.members.length);
       // The members are ours: their cargo is known.
@@ -3883,6 +5965,7 @@ export class FleetManager implements FleetHost {
       const pr = a.last;
       const lane = a.lane;
       if (a === agent || a.gone || !pr || !lane || lane.source !== from || lane.dest !== dest || pr.ship.convoy_id || !alike(a.shipClass)) continue;
+      if (this.smugglers.has(a.shipId) || a.contrabandAboard(pr).length > 0) continue;
       const load = a.loaded ? 0 : baseLock + lane.tons * handling;
       let ready: number;
       if (pr.ship.status !== "sailing" && pr.ship.current_port_id === from) ready = now + load;
@@ -3941,18 +6024,25 @@ export class FleetManager implements FleetHost {
     return t;
   }
 
-  /** Daily fleet upkeep (pence per game day), optionally with an extra hull. */
+  /**
+   * Daily fleet upkeep (pence per game day), optionally with an extra hull: sprawl on coastal and regional tons plus half
+   * the oceanic tons, a flat 1 Cr per oceanic ton, and the factors (guide 3.12).
+   */
   private upkeepPerDay(extra?: { tons: number; oceanic: boolean }): number {
     const w = this.world;
-    const bill = (coastal: number, oceanic: number) => w.sprawlPerDay(coastal) + w.factorUpkeepPerDay(this.factorCount) + 100 * oceanic;
+    const bill = (lower: number, oceanic: number) => w.hullUpkeepPerDay(lower, oceanic) + w.factorUpkeepPerDay(this.factorCount);
     const now = bill(this.fleetTons(false), this.fleetTons(true));
     const withExtra = bill(this.fleetTons(false) + (extra && !extra.oceanic ? extra.tons : 0), this.fleetTons(true) + (extra?.oceanic ? extra.tons : 0));
-    // The formula (guide 3.9), or what the last billing passes charged if more, plus the extra hull.
+    // The formula, or what the last billing passes charged if more, plus the extra hull.
     return Math.max(withExtra, this.bills.upkeep + withExtra - now);
   }
 
+  /**
+   * Home's floor: the reserve, or 1.5 game days of the bills home pays. The wealth levy (guide 3.12) is taken from cash
+   * (the richest vault first, home as likely as any) every game day like upkeep, so a day and a half of it is kept too.
+   */
   private homeFloor(extra?: { tons: number; oceanic: boolean }): number {
-    return Math.max(this.settings.reservePence, Math.ceil(UPKEEP_DAYS_RESERVED * this.upkeepPerDay(extra)));
+    return Math.max(this.settings.reservePence, Math.ceil(UPKEEP_DAYS_RESERVED * (this.upkeepPerDay(extra) + this.levyPerDay())));
   }
 
   private floorIn(region: BankingRegion): number {
@@ -3962,16 +6052,21 @@ export class FleetManager implements FleetHost {
   }
 
   /**
-   * What the daily bills really charge (guide 3.9: warehouse rent per port from its region, sprawl and
-   * factors from home), learned from the ledger since the rates aren't published. A billing pass is a
-   * cluster of bill debits from our vaults; per region (upkeep: all regions, a short home is swept) the
-   * larger of the last two passes counts. The reason strings aren't published either: those seen are
+   * What the daily bills really charge (guide 3.12: warehouse rent per port from its region, sprawl and
+   * factors from home, the wealth levy from cash), learned from the ledger since the rates aren't published. A billing pass is a
+   * cluster of bill debits from our vaults; per region (upkeep and levy: all regions, a short home is swept, the levy
+   * takes the richest first) the larger of the last two passes counts. The reason strings aren't published either: those seen are
    * logged once, so the patterns can be checked. Nothing measured: the formula alone, as before.
    */
   private async learnBills(): Promise<void> {
     const w = this.world;
-    // The user may have changed them on the company page since.
+    // The user may have changed them on the company page since (auto-remit, or the home port: upkeep is billed there).
     await this.checkAutoRemit();
+    const profile = await this.client.companyProfile().catch((e) => {
+      if (this.isFatal(e)) throw e;
+      return null;
+    });
+    if (profile) this.setHome(profile.company.home_port_id);
     if (w.vaultAccounts.size === 0) await w.refreshVaults();
     const now = w.now();
     const since = now - BILLS_LOOKBACK_GAME_DAYS * 24 * 60 * w.gameMinuteMs;
@@ -3992,20 +6087,29 @@ export class FleetManager implements FleetHost {
     const oldest = Math.min(...entries.map((e) => Date.parse(e.created_at)).filter((t) => Number.isFinite(t)), now);
     const covered = complete || oldest <= now - 24 * 60 * w.gameMinuteMs;
 
-    const bills: Array<{ at: number; region: BankingRegion; pence: number; kind: "rent" | "upkeep" }> = [];
+    const bills: Array<{ at: number; region: BankingRegion; pence: number; kind: "rent" | "upkeep" | "levy" }> = [];
     const reasons = new Map<string, string>();
     for (const e of entries) {
       const at = Date.parse(e.created_at);
       // Out of one of our vaults to someone else (the debit side, as the treasury page reads it).
       const region = w.vaultAccounts.get(e.debit_account_id);
       if (!region || w.vaultAccounts.has(e.credit_account_id) || !(at >= since)) continue;
-      const kind = ONE_OFF_REASON.test(e.reason) ? null : RENT_REASON.test(e.reason) ? "rent" : UPKEEP_REASON.test(e.reason) ? "upkeep" : null;
+      // The levy first: `crown_wealth_levy` is neither rent nor upkeep, and no one-off.
+      const kind = LEVY_REASON.test(e.reason)
+        ? "levy"
+        : ONE_OFF_REASON.test(e.reason)
+          ? null
+          : RENT_REASON.test(e.reason)
+            ? "rent"
+            : UPKEEP_REASON.test(e.reason)
+              ? "upkeep"
+              : null;
       if (!reasons.has(e.reason)) reasons.set(e.reason, kind ?? "-");
       if (kind && e.amount_pence > 0) bills.push({ at, region, pence: e.amount_pence, kind });
     }
     if (!this.billReasonsLogged && reasons.size > 0) {
       this.billReasonsLogged = true;
-      this.log("fleet", `ledger reasons seen (taken as a daily bill: rent/upkeep): ${[...reasons].map(([r, k]) => `${r}${k === "-" ? "" : ` (${k})`}`).join(", ")}`);
+      this.log("fleet", `ledger reasons seen (taken as a daily bill: rent/upkeep/levy): ${[...reasons].map(([r, k]) => `${r}${k === "-" ? "" : ` (${k})`}`).join(", ")}`);
     }
 
     // Billing passes: entries within a minute of the one before.
@@ -4022,16 +6126,20 @@ export class FleetManager implements FleetHost {
     const rent = new Map<BankingRegion, number>();
     for (const region of new Set(bills.filter((b) => b.kind === "rent").map((b) => b.region))) rent.set(region, lastTwo((b) => b.kind === "rent" && b.region === region));
     const upkeep = lastTwo((b) => b.kind === "upkeep");
+    const levy = lastTwo((b) => b.kind === "levy");
     // Not back a whole game day (a busy ledger): what this read found, the rest as measured before.
     if (!covered) {
       for (const [r, p] of this.bills.rent) if (!rent.has(r)) rent.set(r, p);
     }
     const prev = this.bills;
-    this.bills = { rent, upkeep: covered || upkeep > 0 ? upkeep : prev.upkeep, at: now };
-    const total = (b: typeof prev) => b.upkeep + [...b.rent.values()].reduce((n, p) => n + p, 0);
+    this.bills = { rent, upkeep: covered || upkeep > 0 ? upkeep : prev.upkeep, levy: covered || levy > 0 ? levy : prev.levy, at: now };
+    const total = (b: typeof prev) => b.upkeep + b.levy + [...b.rent.values()].reduce((n, p) => n + p, 0);
     if (prev.at === null || Math.abs(total(this.bills) - total(prev)) >= Math.max(1_000, 0.1 * total(prev))) {
       const rents = [...rent].filter(([, p]) => p > 0).map(([r, p]) => `${r} ${cr(p)}`);
-      this.log("fleet", `daily bills from the ledger: upkeep ${cr(this.bills.upkeep)}${rents.length ? `, rent ${rents.join(", ")}` : ", no rent"}; home keeps ${cr(this.homeRegion ? this.floorIn(this.homeRegion) : this.homeFloor())}`);
+      this.log(
+        "fleet",
+        `daily bills from the ledger: upkeep ${cr(this.bills.upkeep)}${rents.length ? `, rent ${rents.join(", ")}` : ", no rent"}` +
+          `${this.bills.levy > 0 ? `, wealth levy ${cr(this.bills.levy)}` : ""}; home keeps ${cr(this.homeRegion ? this.floorIn(this.homeRegion) : this.homeFloor())}`);
     }
     this.persist();
   }
@@ -4042,6 +6150,16 @@ export class FleetManager implements FleetHost {
    * leave a covered bill unpaid (the bailiff seizes ships for unpaid upkeep). Home is kept at its floor from the
    * others instead (keepHomeFloor). Said when it changes; only a fatal error comes out.
    */
+  /** The home port (guide 3.12: upkeep, marques, patrols and R&D are paid from its region), set at start and after a move. */
+  private setHome(port: string): void {
+    const region = this.world.region(port);
+    if (port === this.homePort && region === this.homeRegion) return;
+    const was = this.homePort;
+    this.homePort = port;
+    this.homeRegion = region;
+    if (was !== null && was !== port) this.log("fleet", `home port moved from ${was} to ${port} (${this.homeRegion}): upkeep, marques and patrols are paid there from now on, and its floor is kept there`);
+  }
+
   private async checkAutoRemit(): Promise<void> {
     const s = await this.client.companySettings().catch((e) => {
       if (this.isFatal(e)) throw e;
@@ -4154,18 +6272,20 @@ export class FleetManager implements FleetHost {
   }
 
   /**
-   * Idle vault cash above the Crown's wealth-levy threshold (pence; guide 3.12): every region's vault together (escrow,
-   * loans out, deposits, stakes and goods are exempt), as last read. What idle-cash handling may put to work.
+   * Net worth above the Crown's wealth-levy threshold (pence; guide 3.12): the leaderboard's figure for this company while
+   * fresh, else our own estimate (refreshWorth, every finance pass); 0 while neither is known.
    */
-  idleExcess(): number {
-    let cash = 0;
-    for (const v of this.world.vaults.values()) cash += v;
-    return Math.max(0, cash - WEALTH_LEVY_THRESHOLD_PENCE);
+  levyExcess(): number {
+    return Math.max(0, (this.worth?.pence ?? 0) - WEALTH_LEVY_THRESHOLD_PENCE);
   }
 
-  /** The wealth levy the idle excess pays a game day (pence). */
+  /**
+   * The wealth levy a game day (pence): 0.1% of the excess, or what the ledger showed charged if more (our estimate of
+   * net worth runs low), at most the cash we hold (it is taken from cash only).
+   */
   levyPerDay(): number {
-    return Math.round((this.idleExcess() * WEALTH_LEVY_BPS_PER_DAY) / 10_000);
+    const levy = Math.max(Math.round((this.levyExcess() * WEALTH_LEVY_BPS_PER_DAY) / 10_000), this.bills.levy);
+    return Math.min(levy, Math.max(0, this.world.totalCash()));
   }
 
   // ── Loans (liens and arrests) ───────────────────────────────────────────────
@@ -4422,6 +6542,7 @@ export class FleetManager implements FleetHost {
     if (this.pendingCredit.some((p) => p.kind === "borrow" || p.kind === "approve")) return no("a loan call had no answer: reconciling it from our loans first");
     if (c.loans.filter((l) => l.status === "active").length >= MAX_ACTIVE_LOANS) return no(`we already owe on ${MAX_ACTIVE_LOANS} loans`);
     if (Date.now() < this.borrowRetryAt) return no("no lender fitted, or one refused, lately");
+    if (w.now() < this.goldsmithsBanUntil) return no(this.goldsmithsBanText());
     // Never borrowed while our own idle cash is quoted on a request: it is taken back first (runIdleCash, soon).
     if (this.ourQuotes.size > 0 || this.pendingCredit.some((p) => p.kind === "quote")) {
       this.financeDirty = true;
@@ -4432,6 +6553,27 @@ export class FleetManager implements FleetHost {
     const room = (this.worth.pence * s.maxDebtPct) / 100 - this.debtOwed();
     const pence = Math.floor(room / (1 + LOAN_INTEREST_HEADROOM));
     return pence >= LOAN_MIN_PRINCIPAL_PENCE ? { pence, room, why: null } : no(`what we owe is at the ${s.maxDebtPct}%-of-net-worth cap`);
+  }
+
+  /** Why no loan while the Goldsmiths' walk-away ban lasts. */
+  private goldsmithsBanText(): string {
+    return `the Goldsmiths lend nothing until ${new Date(this.goldsmithsBanUntil).toISOString()} (a walk-away by us or a linked company within the last real day)`;
+  }
+
+  /**
+   * 403 goldsmiths_walk_away_ban (guide 3.13.1): after any walk-away by us or one of our own or linked companies, the Goldsmiths
+   * quote and lend nothing for a real day. No borrowing until the time the refusal gives (else a real day from now), logged once
+   * a ban (a player lender's refinance of a loan we already owe isn't affected). Returns why, for the caller.
+   */
+  private noteGoldsmithsBan(e: unknown): string {
+    const now = this.world.now();
+    const until = isApiError(e) ? walkAwayBanEnd(e, now) : now + 24 * 3_600_000;
+    const known = this.goldsmithsBanUntil > now;
+    this.goldsmithsBanUntil = Math.max(this.goldsmithsBanUntil, until);
+    const why = this.goldsmithsBanText();
+    if (!known) this.log("fleet", `LEVERAGE: ${why}: no borrowing until then (refinancing a loan we owe through a player lender goes on)`);
+    this.persist();
+    return why;
   }
 
   /** A loan's case at the Goldsmiths' rate for the term its payback needs (the estimate before a quote: every ship gets that rate). */
@@ -4460,6 +6602,8 @@ export class FleetManager implements FleetHost {
     for (const a of this.agents.values()) {
       const r = a.last;
       if (a.gone || a.arrested || !r || r.ship.status === "sunk" || r.ship.convoy_id || pledges.liened.has(a.shipId) || forSale.has(a.shipId)) continue;
+      // Never a smuggler or a ship with contraband aboard: her seizure would take the lender's lien with her (guide 3.18).
+      if (this.smugglers.has(a.shipId) || a.contrabandAboard(r).length > 0) continue;
       if ((await a.insuredPolicy(60_000, true)) !== null) continue;
       const lane = a.lane;
       const risk = (lane ? (lane.piracyBps ?? 0) + (lane.stormBps ?? 0) : 0) + (r.ship.status === "sailing" ? 100 : 0);
@@ -4508,12 +6652,16 @@ export class FleetManager implements FleetHost {
     // Ships whose rebuild value (our estimate) carries the principal at the 40% cap first, each in order of risk.
     const ships = (await this.pledgeCandidates()).sort((a, b) => Number(b.value * GOLDSMITHS_LTV_BPS >= principal * 10_000) - Number(a.value * GOLDSMITHS_LTV_BPS >= principal * 10_000));
     let pick: { ship: ShipAgent; quote: GoldsmithsQuote } | null = null;
+    let banned: unknown = null;
     for (const x of ships.slice(0, 3)) {
-      // 400: more than the house lends against her; 409: she was liened, listed or carries a venture meanwhile.
+      // 400: more than the house lends against her; 409: she was liened, listed or carries a venture meanwhile; 403
+      // goldsmiths_walk_away_ban: no quote for anyone of ours for a real day after a walk-away.
       const q: GoldsmithsQuote | null = await this.client.loanQuote({ principal_pence: principal, term_game_days: term, repayment: "balloon", ship_id: x.agent.shipId, banking_region: need.region }).catch((e) => {
         if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        if (isApiError(e, WALK_AWAY_BAN)) banned = e;
         return null;
       });
+      if (banned) return { why: this.noteGoldsmithsBan(banned) };
       if (!q || q.quote.principal_pence !== principal || q.quote.term_game_days !== term || q.quote.banking_region !== need.region) continue;
       pick = { ship: x.agent, quote: q };
       break;
@@ -4577,6 +6725,7 @@ export class FleetManager implements FleetHost {
         this.log("fleet", `borrowing ${cr(principal)} from the Goldsmiths for ${need.purpose}: no answer (${msg}); looked for among our loans by its quote, never asked again`);
         return { why: "the loan call had no answer" };
       }
+      if (isApiError(e, WALK_AWAY_BAN)) return { why: this.noteGoldsmithsBan(e) };
       this.borrowRetryAt = Date.now() + BORROW_RETRY_MS;
       this.log("fleet", `borrowing ${cr(principal)} from the Goldsmiths for ${need.purpose} was refused: ${msg}`);
       return { why: `refused: ${msg}` };
@@ -4817,6 +6966,8 @@ export class FleetManager implements FleetHost {
       if (a.gone || !r || r.ship.status === "sunk") continue;
       n += this.hullValue(a.shipClass);
       for (const g of Object.keys(r.cargo_manifest)) n += a.ownTons(r, g) * w.basePrice(g);
+      // Contraband aboard counts at base in net worth (goods in holds, guide 3.17), though no lawful market takes it.
+      for (const [g, t] of a.contrabandAboard(r)) n += t * w.basePrice(g);
     }
     for (const wh of warehouses ?? []) for (const i of wh.inventory ?? []) n += i.quantity * w.basePrice(i.commodity_id);
     for (const l of this.loansCache?.loans ?? []) n -= Math.max(0, l.owed_pence);
@@ -5700,8 +7851,21 @@ export class FleetManager implements FleetHost {
         measuredAt: this.bills.at,
       },
       autoRemit: this.autoRemit ? { ...this.autoRemit } : null,
-      levy: { thresholdPence: WEALTH_LEVY_THRESHOLD_PENCE, excessPence: this.idleExcess(), perDayPence: this.levyPerDay() },
+      levy: {
+        thresholdPence: WEALTH_LEVY_THRESHOLD_PENCE,
+        excessPence: this.levyExcess(),
+        perDayPence: this.levyPerDay(),
+        worthPence: this.worth?.pence ?? null,
+        worthSource: this.worth?.source ?? null,
+      },
+      charterTaper: this.charterTaperReport(),
     };
+  }
+
+  /** The charter premium taper as it stands (guide 3.7): our Crown and Admiralty charter earnings over its window, and the factor now. */
+  private charterTaperReport(): NonNullable<CashReport["charterTaper"]> {
+    const earned = this.world.charterEarnings();
+    return { earnedPence: Math.round(earned), thresholdPence: TAPER_FREE_PENCE, windowGameDays: TAPER_WINDOW_GAME_DAYS, factor: this.world.charterTaper(0, earned) };
   }
 
   // ── Letters of marque ───────────────────────────────────────────────────────
@@ -5851,24 +8015,27 @@ export class FleetManager implements FleetHost {
    * each zone's player traffic (guide 3.5: 60% of the prize money expected after the Admiral's tenth), so
    * the most promising zones by our own estimate are quoted (`marque-quote`), and one is issued only when
    * the quoted prize beats the quoted cost plus our own ships' extra losses there; never in a zone a voyage
-   * we underwrite sails through (its claims would rise too), nor while our slices can't be read in full.
+   * we underwrite sails through (its claims would rise too), nor while our slices can't be read in full, nor
+   * where our patrol is in force. Then the auto-patrol (runPatrols), on the same switch, budget and gates.
    */
   private async runMarques(): Promise<void> {
     const { world, client, settings } = this;
     if (!this.rivalAnalysis || Date.now() - this.rivalAnalysis.at > RIVAL_ANALYSIS_MAX_AGE_MS) await this.runRivals();
     const analysis = this.rivalAnalysis;
-    if (!analysis) return;
     const now = world.now();
     const [zones, ours, patrols] = await Promise.all([client.zones(), this.recentMarques(now), this.recentPatrols(now)]);
     this.zoneStatus = { at: Date.now(), zones };
     this.ownNaval = { at: Date.now(), marques: ours, patrols };
-    // One budget for the marques and the AI's patrols alike.
+    // One budget for the marques and the patrols alike.
     const day = (x: { created_at: string }) => now - Date.parse(x.created_at) < 24 * 3_600_000;
     const patrolSpent = patrols.filter(day).reduce((n, p) => n + p.cost_pence, 0);
     const spent = ours.filter(day).reduce((n, m) => n + m.cost_pence, 0) + patrolSpent;
     const prize = ours.reduce((n, m) => n + m.prize_earned_pence, 0);
     const active = new Set(ours.filter((m) => Date.parse(m.expires_at) > now).map((m) => m.sea_zone_id));
-    const traffic = analysis.zones;
+    // A marque where our own patrol is in force would pay to undo what we paid for.
+    const patrolled = new Set(patrols.filter((p) => Date.parse(p.expires_at) > now).map((p) => p.sea_zone_id));
+    // No rival analysis (its read failed): no marque this pass, the patrols still weighed.
+    const traffic = analysis?.zones ?? [];
     const own = await this.ownExposure();
     this.ownExposureSeen = new Map([...own].map(([z, x]) => [z, x.exposure]));
     // A marque raises the claims on the voyages we underwrite too: none where one of them sails (unknown: none at all).
@@ -5892,6 +8059,8 @@ export class FleetManager implements FleetHost {
         : null;
       const verdict = active.has(t.zone)
         ? "our marque is in force"
+        : patrolled.has(t.zone)
+          ? "our patrol is in force (a marque would work against it)"
         : insured
           ? insured
           : best.bps === 0
@@ -5929,6 +8098,8 @@ export class FleetManager implements FleetHost {
     const pick = rows.find((r) => r.verdict === "pays");
     const cost = pick?.best.cost ?? 0;
     let action = rows.length === 0 ? "no rival traffic seen yet" : "no zone pays";
+    // What a marque issued now spent (the patrols below see it in the budget).
+    let marqueSpent = 0;
     // Our own exposure is only known once every ship has reported in.
     const unready = [...this.agents.values()].some((a) => !a.last);
     if (pick && !settings.marques) action = `off: would sponsor ${pick.best.bps} bps in ${pick.zone} for ${cr(cost)} (~${cr(pick.best.profit)} a game day)`;
@@ -5957,6 +8128,8 @@ export class FleetManager implements FleetHost {
           const m = await client.issueMarque({ sea_zone_id: pick.zone, added_piracy_bps: q.added_piracy_bps, duration_game_hours: MARQUE_GAME_HOURS });
           const region = m.banking_region ?? home;
           world.vaults.set(region, world.vault(region) - m.cost_pence);
+          marqueSpent = m.cost_pence;
+          active.add(pick.zone);
           const expect = m.pricing?.expected_net_prize_pence ?? q.expected_net_prize_pence;
           this.log("fleet", `letter of marque: +${m.added_piracy_bps} bps in ${pick.zone} for ${cr(m.cost_pence)} (the game expects ~${cr(expect)} prize after the Admiral's tenth, if traffic holds)`);
           this.worldDirty = true;
@@ -5973,16 +8146,203 @@ export class FleetManager implements FleetHost {
         return `marque not issued: ${(e as Error).message}`;
       });
     }
+    // The auto-patrol on the same switch, budget (what the marque just spent included) and gates.
+    const patrol = await this.runPatrols({ zones, marqueZones: active, patrols, own, spent: spent + marqueSpent, unready }).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return { rows: [] as PatrolZoneVerdict[], action: `patrol check failed: ${(e as Error).message}`, spent: 0 };
+    });
     this.marqueReport = {
       checkedAt: new Date().toISOString(),
       enabled: settings.marques,
       budgetPence: settings.marqueBudgetPence,
-      spentPence: spent,
-      patrolSpentPence: patrolSpent,
+      spentPence: spent + marqueSpent + patrol.spent,
+      patrolSpentPence: patrolSpent + patrol.spent,
       prizePence: prize,
       zones: rows,
       action,
+      patrolPrizePence: patrols.reduce((n, p) => n + (p.prize_earned_pence ?? 0), 0),
+      patrolAction: patrol.action,
+      patrols: patrol.rows,
     };
+  }
+
+  /**
+   * Auto-patrols (guide 3.5), on the marques' switch, budget and gates (the season, every ship reported, spare cash after the
+   * fleet's loads and our loans, never by remitting; paused worlds never get here). A patrol earns two ways: prize money from the
+   * smugglers the Crown seizes at sea in its zone while it is in force (half the base value of the ship and everything aboard,
+   * split among the patrols in force pro rata by bps, less the Admiral's tenth; a seizure in port pays none), modelled from the
+   * public `smuggler_seized` notices over the last 7 game days and our own prize money (World.seizureModel); and the piracy it
+   * takes off our own ships' passages there (ownExposure's risk per unit of piracy × the bps it suppresses). The game prices
+   * patrols per zone from their recent smuggling traffic, never under 2 Cr a bps-day: the zones that pay by our estimate even at
+   * that floor are quoted (`patrol-quote`, the most promising few), each sized to what the budget has left at its price, and the
+   * best is funded for one game day when its expected prize and relief beat the quoted cost, priced and judged again just before.
+   * Never in a zone our own ships carry contraband through or our smuggling runs use (guide 3.18: a patrol there always loses
+   * money), nor anywhere while that can't be told (smugglingZones); never where our marque is in force (it would cut that
+   * marque's prize), nor where one of our patrols already is. Returns the verdicts, what it did or would do, and what it spent.
+   */
+  private async runPatrols(x: {
+    zones: SeaZonePiracyResult[];
+    marqueZones: Set<string>;
+    patrols: NavalPatrol[];
+    own: Map<string, { exposure: number; risk: number }>;
+    spent: number;
+    unready: boolean;
+  }): Promise<{ rows: PatrolZoneVerdict[]; action: string; spent: number }> {
+    const { world, client, settings } = this;
+    const now = world.now();
+    const days = PATROL_GAME_HOURS / 24;
+    const active = new Set(x.patrols.filter((p) => Date.parse(p.expires_at) > now).map((p) => p.sea_zone_id));
+    const smuggle = this.smugglingZones();
+    const fallbackPool = this.smugglerPoolFallback();
+    const left = Math.max(0, settings.marqueBudgetPence - x.spent);
+    // Budget spent: still judged and quoted (as big as the zone allows), so the dry run shows what would pay.
+    const budget = left >= MARQUE_MIN_PENCE ? left : Infinity;
+    const fitsAt = (price: number) => (Number.isFinite(budget) ? Math.floor(budget / (Math.max(price, 1) * days) / 50) * 50 : 1_500);
+    const modelOf = (zone: string) => {
+      const m = world.seizureModel(zone, fallbackPool, now);
+      return { seizuresPerDay: m.perDay, pool: m.pool, seenBps: m.patrolBps, ownRisk: x.own.get(zone)?.risk ?? 0, count: m.count };
+    };
+
+    const rows: PatrolZoneVerdict[] = [];
+    for (const z of x.zones) {
+      if (z.phase > world.unlockedPhase) continue;
+      const m = modelOf(z.sea_zone_id);
+      // Nothing to gain: no smuggler seized at sea there lately, and no piracy of ours to take off.
+      if (m.count === 0 && (m.ownRisk <= 0 || z.net_piracy_bps <= 0) && !active.has(z.sea_zone_id)) continue;
+      // Our own estimate at the 2 Cr floor: the game's price is never lower, so a zone that doesn't pay there never will. Per game
+      // day, as the term is one.
+      const best = bestPatrol(z, { ...m, price: PATROL_FLOOR_PENCE_PER_BPS_DAY, maxBps: fitsAt(PATROL_FLOOR_PENCE_PER_BPS_DAY) });
+      const verdict = active.has(z.sea_zone_id)
+        ? "our patrol is in force"
+        : x.marqueZones.has(z.sea_zone_id)
+          ? "our marque is in force (a patrol would cut its prize)"
+          : smuggle === null
+            ? "where our ships carry contraband can't be told yet (no patrol anywhere)"
+            : smuggle.has(z.sea_zone_id)
+              ? "a ship of ours carries contraband through it (a patrol here always loses)"
+              : best.bps === 0
+                ? ZONE_MARQUE_CAP - z.patrol_suppression_bps < NAVAL_BPS_MIN
+                  ? "the zone's patrols are at their cap"
+                  : `budget: 50 bps costs more than the ${cr(left)} left`
+                : best.profit <= 0
+                  ? `doesn't pay even at the 2 Cr floor: ~${cr(best.prize)} prize + ~${cr(best.relief)} off our losses vs ${cr(best.cost)} a game day`
+                  : "";
+      rows.push({ zone: z.sea_zone_id, seizuresPerDay: m.seizuresPerDay, pool: Math.round(m.pool), ownRisk: Math.round(m.ownRisk), best, active: active.has(z.sea_zone_id), verdict });
+    }
+    // The game's price for the most promising few, each sized again at it to what the budget has left.
+    const open = rows.filter((r) => r.verdict === "").sort((a, b) => b.best.profit - a.best.profit);
+    for (const r of open.slice(PATROL_QUOTE_ZONES)) r.verdict = "not quoted: other zones look better";
+    for (const r of open.slice(0, PATROL_QUOTE_ZONES)) {
+      const z = x.zones.find((y) => y.sea_zone_id === r.zone)!;
+      const q = await (async (): Promise<PatrolOption | string> => {
+        // A zone's price per bps-day doesn't depend on the size: quoted at our estimate's, re-sized at it, quoted again if that moved.
+        let pq = await client.patrolQuote(r.zone, r.best.bps, PATROL_GAME_HOURS);
+        this.notePatrolPrice(pq);
+        const best = bestPatrol(z, { ...modelOf(r.zone), price: pq.price_per_bps_day_pence, maxBps: fitsAt(pq.price_per_bps_day_pence), quoted: true });
+        if (best.bps < NAVAL_BPS_MIN) return `budget: 50 bps here costs more than the ${cr(left)} left`;
+        if (best.bps !== pq.suppressed_piracy_bps) {
+          pq = await client.patrolQuote(r.zone, best.bps, PATROL_GAME_HOURS);
+          this.notePatrolPrice(pq);
+        }
+        if (pq.cost_pence > budget) return `budget: ${pq.suppressed_piracy_bps} bps costs ${cr(pq.cost_pence)}, more than the ${cr(left)} left`;
+        // The term is one game day (PATROL_GAME_HOURS): judged on the quote's own cost.
+        const v = patrolValue(z, modelOf(r.zone), pq.suppressed_piracy_bps);
+        const [prize, relief] = [Math.round(v.prize * days), Math.round(v.relief * days)];
+        return { bps: pq.suppressed_piracy_bps, prize, relief, cost: pq.cost_pence, profit: prize + relief - pq.cost_pence, price: pq.price_per_bps_day_pence, quoted: true };
+      })().catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return `quote failed: ${(e as Error).message}`;
+      });
+      if (typeof q === "string") {
+        r.verdict = q;
+        continue;
+      }
+      r.best = q;
+      r.verdict =
+        q.profit <= 0
+          ? `doesn't pay at the zone's price (${(q.price / 100).toFixed(2)} Cr a bps-day): ~${cr(q.prize)} prize + ~${cr(q.relief)} off our losses vs ${cr(q.cost)} a game day`
+          : "pays";
+    }
+    rows.sort((a, b) => Number(b.best.quoted) - Number(a.best.quoted) || b.best.profit - a.best.profit);
+
+    const pick = rows.find((r) => r.verdict === "pays");
+    let spentNow = 0;
+    let action = rows.length === 0 ? "no smuggler seized at sea lately and no piracy of ours to take off" : "no zone pays";
+    if (pick && !settings.marques) action = `off: would fund a ${pick.best.bps} bps patrol in ${pick.zone} for ${cr(pick.best.cost)} (~${cr(pick.best.profit)} a game day)`;
+    else if (pick && world.seasonMode() !== "normal") action = `the season ends in ~${Math.round(world.seasonLeftMs() / 3_600_000)} h: no new patrols`;
+    else if (pick && x.unready) action = "waiting for every ship to report before weighing our own losses";
+    else if (pick && x.spent + pick.best.cost > settings.marqueBudgetPence) action = `budget: ${cr(x.spent)} of ${cr(settings.marqueBudgetPence)} spent in the last 24 h`;
+    else if (pick) {
+      action = await this.withCash(async () => {
+        // Anything may have changed while waiting for the lock: the setting, a stop, contraband taken aboard.
+        if (this.stopRequested || !this.settings.marques) return "cancelled: auto-marques were turned off";
+        const sm = this.smugglingZones();
+        if (sm === null || sm.has(pick.zone)) return "cancelled: a ship of ours may carry contraband through the zone";
+        // fund-patrol charges the quote as it stands then: priced again, and judged again on it.
+        const q = await client.patrolQuote(pick.zone, pick.best.bps, PATROL_GAME_HOURS);
+        this.notePatrolPrice(q);
+        const z = x.zones.find((y) => y.sea_zone_id === pick.zone)!;
+        const v = patrolValue(z, modelOf(pick.zone), q.suppressed_piracy_bps);
+        const gain = (v.prize + v.relief) * days;
+        if (gain - q.cost_pence <= 0) return `no longer pays at ${cr(q.cost_pence)} (~${cr(v.prize * days)} prize + ~${cr(v.relief * days)} off our losses)`;
+        if (x.spent + q.cost_pence > this.settings.marqueBudgetPence) return `budget: ${cr(x.spent)} of ${cr(this.settings.marqueBudgetPence)} spent in the last 24 h`;
+        const short = await this.navalCashBlock(q.cost_pence, "patrol");
+        if (short) return short;
+        try {
+          const p = await client.fundPatrol({ sea_zone_id: pick.zone, suppressed_piracy_bps: q.suppressed_piracy_bps, duration_game_hours: PATROL_GAME_HOURS });
+          const region = p.banking_region ?? this.homeRegion ?? "channel";
+          world.vaults.set(region, world.vault(region) - p.cost_pence);
+          spentNow = p.cost_pence;
+          // Counted in the budget at once (the next read lists it).
+          this.ownNaval?.patrols.unshift(p);
+          this.log(
+            "fleet",
+            `naval patrol: −${p.suppressed_piracy_bps} bps in ${pick.zone} for ${cr(p.cost_pence)} (${(q.price_per_bps_day_pence / 100).toFixed(2)} Cr a bps-day; ` +
+              `expected ~${cr(v.prize * days)} smuggler prize after the Admiral's tenth and ~${cr(v.relief * days)} off our own ships' losses)`,
+          );
+          // Zone piracy (and so lanes and refits) changed.
+          this.worldDirty = true;
+          pick.active = true;
+          pick.verdict = "our patrol is in force";
+          return `funded a ${p.suppressed_piracy_bps} bps patrol in ${pick.zone} for ${cr(p.cost_pence)}`;
+        } catch (e) {
+          if (this.isFatal(e)) throw e;
+          // A call with no answer may have been charged: it counts as spent until the next read shows it or not.
+          if (outcomeUnknown(e)) spentNow = q.cost_pence;
+          this.log("fleet", `naval patrol in ${pick.zone} refused: ${(e as Error).message}`);
+          return `patrol refused: ${(e as Error).message}`;
+        }
+      }).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return `patrol not funded: ${(e as Error).message}`;
+      });
+    }
+    return { rows, action, spent: spentNow };
+  }
+
+  /**
+   * Why a naval spend of `cost` (pence) can't come out of spare cash now, or null: never what the fleet's loads need or our loans
+   * will take to repay (the debt fence), never below the home floor, never by remitting. Reads the vaults; call under the cash lock.
+   */
+  private async navalCashBlock(cost: number, what: string): Promise<string | null> {
+    if ([...this.agents.values()].some((a) => a.waitingForCash)) return `a ship is waiting for cash: no ${what}`;
+    if (this.debtShort) return `a loan repayment is short: no ${what}`;
+    await this.world.refreshVaults();
+    const home = this.homeRegion ?? "channel";
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    if (this.spareCash() - committed - this.debtFence() < cost || this.world.vault(home) - this.floorIn(home) < cost) return `no spare cash for a ${cr(cost)} ${what}`;
+    return null;
+  }
+
+  /**
+   * A seized smuggler's prize pool (pence) when neither the notices nor our own prize money have shown one: half the base value of
+   * the cheapest hull open now, her cargo (unknown) counted as nothing: a floor, not a guess at the average.
+   */
+  private smugglerPoolFallback(): number {
+    const w = this.world;
+    const hulls = w.catalog.ship_classes.filter((c) => c.phase <= w.unlockedPhase).map((c) => this.hullValue(c.id));
+    return hulls.length ? SMUGGLER_POOL_SHARE * Math.min(...hulls) : 0;
   }
 
   /**
@@ -6033,9 +8393,11 @@ export class FleetManager implements FleetHost {
   }
 
   /**
-   * The AI's marques and patrols (live only). Each is checked against its zone (open, that side under its cap),
-   * the season, the horizon left (the term is cut to it) and what the marque budget has left over the last 24 h
-   * (our marques and patrols together), then issued under the cash lock from spare cash after the fleet's loads,
+   * The AI's marques and patrols (live only). Each is checked against its zone (open, that side under its cap; a marque
+   * never where a voyage we underwrite sails, a patrol never where a ship of ours carries contraband), the season, the
+   * horizon left (the term is cut to it), priced by the game's quote for the zone (`marque-quote` / `patrol-quote`) and
+   * checked against what the marque budget has left over the last 24 h (our marques and patrols together, cut in 50 bps
+   * steps to fit), then issued under the cash lock from spare cash after the fleet's loads,
    * never by remitting. It is saved as being sent before the call; one whose call had no answer is never sent
    * again, only looked for among ours (and taken as not issued once AI_NAVAL_SETTLE_MS has passed).
    */
@@ -6049,8 +8411,10 @@ export class FleetManager implements FleetHost {
       this.ownNaval = { at: Date.now(), marques, patrols };
       let spent = this.navalSpent() ?? 0;
       const claimed = new Set<string>();
-      // As runMarques: no marque where a voyage we underwrite sails (unreadable book: none at all).
+      // As runMarques: no marque where a voyage we underwrite sails (unreadable book: none at all), and no patrol where a ship of
+      // ours carries contraband (unknown: none at all).
       const book = this.advisor.pendingNaval().some((o) => o.kind === "marque" && o.status !== "unknown") ? await this.underwrittenZones() : undefined;
+      const smuggle = this.smugglingZones();
       for (const o of this.advisor.pendingNaval()) {
         const label = `AI ${o.kind} (${o.bps} bps in ${o.zone})`;
         if (o.status === "unknown") {
@@ -6085,22 +8449,32 @@ export class FleetManager implements FleetHost {
         else if (hours < NAVAL_TERM_MIN_H) this.advisor.noteNaval(o.id, { status: "lapsed", code: "horizon" });
         else if (o.kind === "marque" && (book === null || book?.has(o.zone)))
           refuse("underwritten", book === null ? "our underwriting slices couldn't be read in full" : "a voyage we underwrite sails through the zone");
-        else if (o.kind === "patrol") {
-          const cost = patrolCost(o.bps, hours);
-          if (spent + cost > budget) refuse("budget", `${cr(spent)} of the ${cr(budget)} budget spent in the last 24 h`);
-          else spent += await this.issueNaval(o, o.bps, hours, cost, label);
-        } else {
-          // The game prices a marque from the zone's traffic: quoted now and checked against the budget on that
-          // price, cut in 50 bps steps to what it has left (issue-marque then charges its own quote at that moment).
-          let q: MarqueQuote | null = null;
-          try {
-            q = await client.marqueQuote(o.zone, o.bps, hours);
-            this.notePrice(q);
-            const fits = Math.floor((budget - spent) / (Math.max(q.price_per_bps_day_pence, 0.1) * (hours / 24)) / 50) * 50;
-            if (q.cost_pence > budget - spent && fits >= NAVAL_BPS_MIN && fits < q.added_piracy_bps) {
-              q = await client.marqueQuote(o.zone, fits, hours);
-              this.notePrice(q);
+        else if (o.kind === "patrol" && smuggle === null) {
+          // Not known yet (a ship hasn't reported, say): tried again on a later pass.
+          this.advisor.noteNaval(o.id, { status: "pending", code: "zone" });
+          this.logOnceFor(`naval|${o.id}|smuggle`, "fleet", `${label}: waiting, where our ships carry contraband can't be told yet`);
+        } else if (o.kind === "patrol" && smuggle?.has(o.zone))
+          // Guide 3.18: a patrol where our own ships smuggle always loses money (its search may take our ship).
+          refuse("zone", "a ship of ours carries contraband through the zone");
+        else {
+          // The game prices both from the zone's traffic (a marque from its player passages, a patrol from its smuggling, never
+          // under 2 Cr a bps-day): quoted now and checked against the budget on that price, cut in 50 bps steps to what it has
+          // left (issue-marque / fund-patrol then charge their own quote at that moment).
+          const quote = async (bps: number): Promise<{ bps: number; cost: number; price: number }> => {
+            if (o.kind === "marque") {
+              const m = await client.marqueQuote(o.zone, bps, hours);
+              this.notePrice(m);
+              return { bps: m.added_piracy_bps, cost: m.cost_pence, price: m.price_per_bps_day_pence };
             }
+            const p = await client.patrolQuote(o.zone, bps, hours);
+            this.notePatrolPrice(p);
+            return { bps: p.suppressed_piracy_bps, cost: p.cost_pence, price: p.price_per_bps_day_pence };
+          };
+          let q: { bps: number; cost: number; price: number } | null = null;
+          try {
+            q = await quote(o.bps);
+            const fits = Math.floor((budget - spent) / (Math.max(q.price, 0.1) * (hours / 24)) / 50) * 50;
+            if (q.cost > budget - spent && fits >= NAVAL_BPS_MIN && fits < q.bps) q = await quote(fits);
           } catch (e) {
             if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
             // A transient failure is tried again on the next pass; a refusal ends it.
@@ -6108,14 +8482,14 @@ export class FleetManager implements FleetHost {
               this.advisor.noteNaval(o.id, { status: "pending", code: "server" });
               continue;
             }
-            refuse("server", `the marque couldn't be priced: ${(e as Error).message}`);
+            refuse("server", `the ${o.kind} couldn't be priced: ${(e as Error).message}`);
             continue;
           }
-          if (spent + q.cost_pence > budget) refuse("budget", `${q.added_piracy_bps} bps costs ${cr(q.cost_pence)} at the zone's price; ${cr(spent)} of the ${cr(budget)} budget spent in the last 24 h`);
+          if (spent + q.cost > budget) refuse("budget", `${q.bps} bps costs ${cr(q.cost)} at the zone's price; ${cr(spent)} of the ${cr(budget)} budget spent in the last 24 h`);
           else {
-            if (q.added_piracy_bps !== o.bps) this.log("fleet", `${label}: cut to ${q.added_piracy_bps} bps, what the budget left covers at the zone's price`);
-            this.advisor.noteNaval(o.id, { bps: q.added_piracy_bps, costPence: q.cost_pence });
-            spent += await this.issueNaval(o, q.added_piracy_bps, hours, q.cost_pence, label);
+            if (q.bps !== o.bps) this.log("fleet", `${label}: cut to ${q.bps} bps, what the budget left covers at the zone's price`);
+            this.advisor.noteNaval(o.id, { bps: q.bps, costPence: q.cost });
+            spent += await this.issueNaval(o, q.bps, hours, q.cost, label);
           }
         }
       }
@@ -6146,6 +8520,20 @@ export class FleetManager implements FleetHost {
       let committed = 0;
       for (const a of this.agents.values()) committed += this.committedBy(a);
       if (this.spareCash() - committed - this.debtFence() < cost || world.vault(home) - this.floorIn(home) < cost) return wait(`no spare ${cr(cost)} at home after the fleet's loads and our loans`);
+      // A patrol: where our ships carry contraband may have changed while this waited (guide 3.18: its search may take our own ship).
+      if (o.kind === "patrol") {
+        const smuggle = this.smugglingZones();
+        if (smuggle === null) {
+          this.advisor.noteNaval(o.id, { status: "pending", code: "zone" });
+          this.logOnceFor(`naval|${o.id}|smuggle`, "fleet", `${label}: waiting, where our ships carry contraband can't be told yet`);
+          return 0;
+        }
+        if (smuggle.has(o.zone)) {
+          this.advisor.noteNaval(o.id, { status: "refused", code: "zone", note: "a ship of ours carries contraband through the zone" });
+          this.log("fleet", `${label} refused: a ship of ours carries contraband through the zone`);
+          return 0;
+        }
+      }
       // Saved, and written, before the call: after a crash it is never sent twice.
       this.advisor.noteNaval(o.id, { status: "issuing", sentAt: world.now(), bps, gameHours: hours, costPence: cost, code: undefined });
       await this.journal?.flush();
@@ -6158,8 +8546,9 @@ export class FleetManager implements FleetHost {
           const m = await client.issueMarque({ sea_zone_id: o.zone, added_piracy_bps: bps, duration_game_hours: hours });
           [id, paid, region] = [m.id, m.cost_pence, m.banking_region ?? home];
         } else {
+          // Charged at the zone's quote as it stands now, fixed for the term.
           const p = await client.fundPatrol({ sea_zone_id: o.zone, suppressed_piracy_bps: bps, duration_game_hours: hours });
-          [id, paid] = [p.id, p.cost_pence];
+          [id, paid, region] = [p.id, p.cost_pence, p.banking_region ?? home];
         }
         world.vaults.set(region, world.vault(region) - paid);
         this.advisor.noteNaval(o.id, { status: "issued", issuedId: id, costPence: paid });
@@ -6275,6 +8664,7 @@ export class FleetManager implements FleetHost {
     }
     const rows = judgePolicies([...open, ...active], {
       ours: this.ourCompanyIds,
+      ourShips: new Set(this.agents.keys()),
       now: world.now(),
       gameMinuteMs: world.gameMinuteMs,
       budgetPence: settings.underwriteBudgetPence,
@@ -6466,7 +8856,8 @@ export class FleetManager implements FleetHost {
   /** The open shipyard nearest the fleet's work, for a factor to build at; null if none. */
   private factorYard(): string | null {
     const { world } = this;
-    const yards = world.catalog.ports.filter((p) => p.has_shipyard && world.isOpen(p.id));
+    // Never a cove: no factor may be hired there (403 no_factor_at_cove, guide 3.12).
+    const yards = world.catalog.ports.filter((p) => p.has_shipyard && world.isOpen(p.id) && !p.is_cove);
     if (yards.length === 0) return null;
     // Where the fleet's lanes start (or end) earns a yard its weight; the home port and hubs break ties.
     const score = new Map<string, number>(yards.map((p) => [p.id, (p.id === this.homePort ? 2 : 0) + (p.is_hub ? 1 : 0)]));
@@ -6484,6 +8875,11 @@ export class FleetManager implements FleetHost {
   /** Hires a factor at `yard` for a build (fee from that yard's region). False if it couldn't. */
   private async hireTempFactor(yard: string): Promise<boolean> {
     const { world } = this;
+    // A cove takes no factor (403 no_factor_at_cove, guide 3.12): never asked, whatever chose it (an AI build order too).
+    if (world.isCove(yard)) {
+      this.logOnceFor(`factor-cove|${yard}`, "fleet", `not hiring a factor at ${yard}: no factor may be hired at a smugglers' cove`);
+      return false;
+    }
     const region = world.region(yard);
     const hired = await this.withCash(async () => {
       if (this.stopRequested || !this.settings.yardFactor) return false;
@@ -6773,7 +9169,8 @@ export class FleetManager implements FleetHost {
       }
       if (typeof first === "string") return first;
       const lane = first;
-      const upkeepPerHour = world.upkeepDeltaPerHour(this.fleetTons(oceanic), cls.hold_capacity_tons, oceanic);
+      // An oceanic hull adds half its tons to sprawl as well as its flat 1 Cr/t (guide 3.12): both tonnages count.
+      const upkeepPerHour = world.upkeepDeltaPerHour({ lower: this.fleetTons(false), oceanic: this.fleetTons(true) }, cls.hold_capacity_tons, oceanic);
       const net = lane.profitPerHour - upkeepPerHour;
       if (net <= 0) return "upkeep eats the profit";
       if (cost / net > seasonHours) return "can't pay back before the season ends";
@@ -7086,14 +9483,17 @@ export class FleetManager implements FleetHost {
 
   // ── Ship deals ──────────────────────────────────────────────────────────────
 
-  /** Ports where we have quay presence now, as last seen: a ship of ours berthed or in the roadstead there, or a factor. */
+  /**
+   * Ports where we have quay presence now, as last seen: a ship of ours berthed or in the roadstead there, or a factor.
+   * Never a smugglers' cove: its book and board are the Underworld's (guide 3.18), not for listings or envelopes.
+   */
   private quayPorts(): string[] {
     const out = new Set<string>(this.factorPorts);
     for (const a of this.agents.values()) {
       const s = a.last?.ship;
       if (!a.gone && s && s.status !== "sailing" && s.status !== "sunk" && s.current_port_id) out.add(s.current_port_id);
     }
-    return [...out].filter((p) => this.world.isOpen(p));
+    return [...out].filter((p) => this.world.isOpen(p) && !this.world.isCove(p));
   }
 
   /**
@@ -7195,6 +9595,7 @@ export class FleetManager implements FleetHost {
   /** The status code for why no loan may be asked for now (leverageRoom's reason). */
   private levCode(why: string): OrderCode {
     if (why.includes("treasury_remit")) return "scope";
+    if (why.includes("Goldsmiths lend nothing")) return "no_lender";
     if (why.includes("is off")) return "switched_off";
     if (why.includes("season")) return "season";
     return "debt_cap";

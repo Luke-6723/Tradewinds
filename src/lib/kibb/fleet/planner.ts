@@ -194,7 +194,7 @@ export interface StallStake {
   p: number;
   /** Rival first deliveries into its stalled postings per game day (its record, pooled). */
   rivalPerDay: number;
-  /** Extra pay per ton on the re-post (pence). */
+  /** Extra pay per ton on the re-post (pence), as the premium taper leaves it (guide 3.7). */
   uplift: number;
   /** Our tons landing before the lapse, and those expected into the re-post. */
   tonsBefore: number;
@@ -295,6 +295,8 @@ interface Ctx {
   bonusTons: number;
   /** Base value (pence) our other ships are bound to deliver into the tier: the bonus split counts it as ours already. */
   bonusExtra: number;
+  /** Our Crown and Admiralty charter earnings over the last 10 game days (pence), read once for the premium taper (World.charterTaper). */
+  charterEarned: number;
   /** Plannable charters by `port|good`. */
   charters: Map<string, CharterInfo[]>;
   /** Goods each port wants: charters for them there, or a recent bid. */
@@ -320,6 +322,8 @@ const rate = (profit: number, ms: number) => (profit * 3_600_000) / Math.max(ms,
  */
 function expectedBid(ctx: Ctx, port: string, good: string, at = ctx.now): number | null {
   const { world } = ctx;
+  // Lawful buyers only (guide 3.18): no bid for contraband, and a cove's stores market is never a lane's buyer.
+  if (world.isCove(port) || !world.trades(port, good)) return null;
   const obs = world.price(port, good);
   let bid: number | null = null;
   const age = obs ? Math.max(0, ctx.now - obs.at) : Infinity;
@@ -394,12 +398,17 @@ function renewing(ctx: Ctx, c: CharterInfo): boolean {
   return world.tierEtaMs === null || ctx.now + world.tierEtaMs > lapse;
 }
 
-/** Expected cash per ton for a charter landing at `at`: its pay if open, else what the goods fetch at its port. */
-function charterCash(ctx: Ctx, c: CharterInfo, pay = c.payPerTon, at = ctx.now): number {
+/**
+ * Expected cash per ton for a charter landing at `at`: its pay if open (`pay`, terms' re-post pay included), else what the goods
+ * fetch at its port. A Crown or Admiralty charter's premium over the goods' value is tapered (guide 3.7) by our charter earnings
+ * over the last 10 game days with this load's own pay (`tons` of it) counted in; a player's charter pays as posted.
+ */
+function charterCash(ctx: Ctx, c: CharterInfo, pay = c.payPerTon, at = ctx.now, tons = 1): number {
+  const paid = ctx.world.charterPayValue(c, pay, tons, ctx.charterEarned);
   const t = trust(ctx, c);
-  if (t >= 1) return pay;
+  if (t >= 1) return paid;
   const salvage = expectedBid(ctx, c.port, c.good, at) ?? ctx.world.basePrice(c.good) * SALVAGE_OF_BASE;
-  return t * pay + (1 - t) * Math.min(salvage, pay);
+  return t * paid + (1 - t) * Math.min(salvage, paid);
 }
 
 /**
@@ -465,6 +474,7 @@ const bestAsk = (est: AskEst) => Math.min(est.ask, est.player?.ask ?? Infinity);
  * out, its tons marked down for the news' age at `at`), or null.
  */
 function playerBid(ctx: Ctx, port: string, good: string, bid: number | null, at: number): { price: number; tons: number } | null {
+  if (ctx.world.isCove(port) || !ctx.world.trades(port, good)) return null;
   const lvl = ctx.world.playerLevel(port, good, "bid", at);
   return lvl && lvl.price > (bid ?? 0) ? lvl : null;
 }
@@ -484,14 +494,15 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   // Re-posted charters outlive their expiry; the rest must still be open when the load lands.
   let usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
   const t = new Map(usable.map((c) => [c.id, terms(ctx, c, a.arriveAt)]));
-  const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay, a.arriveAt);
+  const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, askFor(est, reserved, a.room)).cash, 1));
+  const cap = Math.min(a.room, cashTons, offered(est, reserved));
+  // The premium taper counts the delivery itself: about what this part could put into the charter.
+  const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay, a.arriveAt, Math.max(1, Math.min(cap, t.get(c.id)!.remaining)));
   // The bonus per ton is ranked at about the tons this part can put into the tier (the split's returns diminish).
   const refTons = Math.max(1, Math.min(a.room, a.bonusTons > 0 ? a.bonusTons : a.room));
   const value = (c: CharterInfo) => cashOf(c) + charterBonus(ctx, c, refTons, a.bonusExtra);
   usable.sort((x, y) => value(y) - value(x));
 
-  const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, askFor(est, reserved, a.room)).cash, 1));
-  const cap = Math.min(a.room, cashTons, offered(est, reserved));
   // Rivals due at the port before we land: what they likely deliver of this good goes to the best-paying
   // charters first, counted once across them; laden ones of unknown cargo take a share of each public
   // charter's room, and of a crisis charter expected from public news (it can be raced too).
@@ -657,6 +668,8 @@ type Primary = { kind: "charter"; good: string; charters: CharterInfo[] } | { ki
 
 async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, primary: Primary, cheap: boolean): Promise<Leg | null> {
   const { world, ship, opts } = ctx;
+  // Lawful lanes never load or land at a smugglers' cove, nor carry contraband (guide 3.18); a ship may sail from one.
+  if (world.isCove(source) || world.isCove(dest) || (primary.kind !== "freight" && world.isContraband(primary.good))) return null;
   let out: RoutePlan, dead: RoutePlan | null;
   try {
     [out, dead] = await Promise.all([
@@ -878,9 +891,10 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   // in a shortage or glut of it (tried on top of the best few, never in place of one: the shock may
   // fade before a ship gets there).
   for (const c of world.catalog.commodities) {
-    if (bans?.goods.has(c.id)) continue;
+    // Contraband has no lawful market anywhere; a cove buys nothing for a lane (guide 3.18).
+    if (bans?.goods.has(c.id) || world.isContraband(c.id)) continue;
     const bids = world.catalog.ports
-      .filter((p) => world.isOpen(p.id) && world.trades(p.id, c.id) && portOk(p.id))
+      .filter((p) => world.isOpen(p.id) && !p.is_cove && world.trades(p.id, c.id) && portOk(p.id))
       .filter((p) => !onlyDest || p.id === onlyDest)
       .map((p) => {
         // A players' resting bid in the news above the buyers' counts too (marketPart sells into it up to its tons).
@@ -962,6 +976,7 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     gameDayMs: 24 * 60 * world.gameMinuteMs,
     bonusTons: Math.max(0, world.expansionTonsLeft - reservedExpansion),
     bonusExtra,
+    charterEarned: world.charterEarnings(),
     charters: new Map(),
     wanted: new Map(),
     legs: new Map(),
@@ -975,15 +990,18 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
   for (const c of world.charters) {
     // Never our own player's charters (their deliveries are refused).
     if (!world.isOpen(c.port) || c.remaining <= 0 || (c.stale && trust(ctx, c) <= GOSSIP_TRUST_MIN) || !world.deliverable(c)) continue;
+    // Charters refuse contraband, and lawful lanes never land at a cove (guide 3.18).
+    if (world.isCove(c.port) || world.isContraband(c.good)) continue;
     if (bans && (bans.ports.has(c.port) || bans.goods.has(c.good) || bans.charters.has(world.currentId(c.id)))) continue;
     const k = `${c.port}|${c.good}`;
     ctx.charters.set(k, [...(ctx.charters.get(k) ?? []), c]);
     want(c.port, c.good);
   }
   for (const p of world.catalog.ports) {
-    if (!world.isOpen(p.id)) continue;
+    // A cove wants nothing a lawful lane brings; contraband is wanted only by the Underworld (expectedBid: null).
+    if (!world.isOpen(p.id) || p.is_cove) continue;
     for (const g of [...(p.imports ?? []), ...(p.produces ?? []), ...(p.manufactures ?? []), "provisions"]) {
-      if (expectedBid(ctx, p.id, g) !== null) want(p.id, g);
+      if (!world.isContraband(g) && expectedBid(ctx, p.id, g) !== null) want(p.id, g);
     }
   }
 

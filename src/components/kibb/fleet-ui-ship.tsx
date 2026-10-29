@@ -199,8 +199,9 @@ export function StoresPanel({ r, blocked, onDone }: Props) {
           </>
         )}
         <p className="text-muted-foreground text-xs">
-          Stores are whole tons of hold (0.3 t takes a ton). Crews eat at half the sea rate in port. A storm destroys a quarter of the
-          stores and pirates who let the ship go seize up to half; the safe figure covers one storm only, so stock above it on pirate water.
+          Stores are whole tons of hold (0.3 t takes a ton). Crews eat at half the sea rate in port. A storm destroys a share of the
+          stores (most take little, a heavy one much more) and pirates who let the ship go seize up to half; the safe figure covers the
+          worst storm on one leg only, so stock above it on long or pirate water.
         </p>
       </div>
     </Panel>

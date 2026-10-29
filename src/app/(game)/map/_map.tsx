@@ -10,7 +10,7 @@ import Link from "next/link";
 import L from "leaflet";
 import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { NODE_COORDS, legPath, rivalFix, seaLanes, shipFix, type LatLng, type ShipFix } from "@/lib/kibb/geo";
+import { coordOf, legPath, placeCatalog, rivalFix, seaLanes, shipFix, type LatLng, type ShipFix } from "@/lib/kibb/geo";
 import { fmtAgo, fmtBps, fmtCr, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type { RivalShip } from "@/lib/kibb/rivals";
 import type { Catalog, SeaZoneStatus, ShipResult, ShipStatus } from "@/lib/kibb/types";
@@ -104,9 +104,20 @@ export default function KibbMap({
   }, [catalog]);
   const visible = (id: string) => showLocked || (phaseOf.get(id) ?? 99) <= unlockedPhase;
 
+  // Nodes the coordinates table doesn't know (new ports, zones and coves) are placed from the catalog first.
+  useMemo(() => placeCatalog(catalog), [catalog]);
+  const zoneIds = useMemo(() => new Set(catalog.sea_zones.map((z) => z.id)), [catalog]);
+  // Zone-to-zone legs our ships' routes show: passages the fixed lane list may not have (a new phase's).
+  const seenKey = ships
+    .flatMap((r) => r.route_legs)
+    .filter((l) => zoneIds.has(l.from_node) && zoneIds.has(l.to_node))
+    .map((l) => `${l.from_node}|${l.to_node}`)
+    .sort()
+    .join(",");
   const lanes = useMemo(
-    () => seaLanes(catalog.ports).map(([a, b]) => ({ a, b, path: legPath(a, b) })),
-    [catalog],
+    () =>
+      seaLanes(catalog.ports, seenKey ? seenKey.split(",").map((k) => k.split("|") as [string, string]) : []).map(([a, b]) => ({ a, b, path: legPath(a, b) })),
+    [catalog, seenKey],
   );
 
   const fixes = ships
@@ -127,7 +138,7 @@ export default function KibbMap({
   const bounds = useMemo(
     () =>
       L.latLngBounds(
-        catalog.ports.filter((p) => p.phase <= unlockedPhase).map((p) => NODE_COORDS[p.id]).filter(Boolean),
+        catalog.ports.filter((p) => p.phase <= unlockedPhase).map((p) => coordOf(p.id)).filter((c): c is LatLng => !!c),
       ),
     [catalog, unlockedPhase],
   );
@@ -153,7 +164,8 @@ export default function KibbMap({
       />
 
       {lanes
-        .filter((l) => visible(l.a) && visible(l.b) && l.path.length > 1)
+        // Only between nodes the catalog has (a guessed lane on an id it doesn't use isn't drawn, even with locked ones shown).
+        .filter((l) => phaseOf.has(l.a) && phaseOf.has(l.b) && visible(l.a) && visible(l.b) && l.path.length > 1)
         .map((l) => (
           <Polyline
             key={`${l.a}|${l.b}`}
@@ -163,12 +175,12 @@ export default function KibbMap({
           />
         ))}
 
-      {catalog.sea_zones.filter((z) => visible(z.id) && NODE_COORDS[z.id]).map((z) => {
+      {catalog.sea_zones.filter((z) => visible(z.id) && coordOf(z.id)).map((z) => {
         const p = piracy.get(z.id);
         return (
           <CircleMarker
             key={z.id}
-            center={NODE_COORDS[z.id]}
+            center={coordOf(z.id)!}
             radius={3}
             pathOptions={{ color: "#94a3b8", fillColor: "#94a3b8", fillOpacity: 0.5, weight: 0 }}
           >
@@ -189,16 +201,16 @@ export default function KibbMap({
         );
       })}
 
-      {catalog.ports.filter((p) => visible(p.id) && NODE_COORDS[p.id]).map((p) => {
+      {catalog.ports.filter((p) => visible(p.id) && coordOf(p.id)).map((p) => {
         const locked = p.phase > unlockedPhase;
         const mine = shipsAt.has(p.id);
         const color = locked ? "#475569" : mine ? "#4ade80" : "#e2e8f0";
         return (
           <CircleMarker
             key={p.id}
-            center={NODE_COORDS[p.id]}
-            radius={p.is_hub ? 6 : 4}
-            pathOptions={{ color: "#0b1220", weight: 1.5, fillColor: color, fillOpacity: locked ? 0.6 : 0.95 }}
+            center={coordOf(p.id)!}
+            radius={p.is_hub ? 6 : p.is_cove ? 3 : 4}
+            pathOptions={{ color: p.is_cove ? "#f472b6" : "#0b1220", weight: 1.5, fillColor: color, fillOpacity: locked ? 0.6 : 0.95 }}
           >
             <Tooltip direction="right" offset={[6, 0]}>
               <span className="font-medium">{p.name}</span>
@@ -211,6 +223,7 @@ export default function KibbMap({
                   {p.banking_region.replace(/_/g, " ")} · phase {p.phase}
                   {p.is_hub && " · hub"}
                   {p.has_shipyard && " · shipyard"}
+                  {p.is_cove && " · smugglers' cove"}
                 </div>
                 {!!(p.produces?.length || p.manufactures?.length) && (
                   <div>Makes {[...(p.produces ?? []), ...(p.manufactures ?? [])].map(goodName).join(", ")}</div>

@@ -308,24 +308,44 @@ export interface ExpansionCharterProgress {
   expires_at?: string | null;
   /** Tons delivered to this charter across all its postings. */
   tons_delivered_total?: number;
+  /** Delivered share of this charter's cap, in bps (spec; absent from older servers). */
+  progress_bps?: number;
 }
 
 export interface ExpansionTier {
   target_phase: number;
   title: string;
   completed: boolean;
+  completed_at?: string | null;
+  /** Split among the contributors at completion by player, pro rata to the square root of each one's contribution: not by `share_bps`. */
   completion_bonus_pence: number;
   target_tons: number;
+  /** `tons_per_company` per active trading company, at least `min_tons` (spec; absent from older servers). */
+  tons_per_company?: number;
+  min_tons?: number;
   tons_delivered: number;
   tons_remaining: number;
   progress_bps: number;
   active_companies: number;
+  /** Tons the open charters still accept, combined (spec; absent from older servers). */
+  charter_capacity_tons?: number;
   charters: ExpansionCharterProgress[];
-  /**
-   * Share of the tier so far by company: tons, and share of base value delivered. Not the share of the bonus:
-   * that splits by the square root of each player's base-valued tons (across the player's companies).
-   */
-  contributors?: Array<{ company_name: string; tons: number; share_bps: number }>;
+  /** Every contributor, largest share first (ExpansionContributor). */
+  contributors?: ExpansionContributor[];
+}
+
+/**
+ * One company on a tier's contribution board: tons delivered, and `share_bps`, its share of the tier's contribution (tons valued
+ * at the tier's base rates). Not the share of the bonus: that splits by the square root of each player's base-valued tons (across
+ * the player's companies), so a large contributor's share of the bonus is smaller. `bonus_pence` / `bonus_share_bps` come from
+ * the admin API only (null or absent in public answers).
+ */
+export interface ExpansionContributor {
+  company_name: string;
+  tons: number;
+  share_bps: number;
+  bonus_pence?: number | null;
+  bonus_share_bps?: number | null;
 }
 
 export interface ExpansionStatus {

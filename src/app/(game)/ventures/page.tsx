@@ -538,7 +538,7 @@ export default function VenturesPage() {
                 The ship sails alone, only to the declared port, before the raise deadline. There the merchant sells and settles (automatic a game day after arrival;
                 leftovers go into the bids at no less than half the Crown merchants&apos; bid). It can&apos;t sail again before settling.
               </p>
-              <p>Stakes are exempt from the wealth levy.</p>
+              <p>Stakes count in your net worth, so the wealth levy (net worth over 1,000,000 Cr) applies to them as to cash.</p>
             </div>
           </Panel>
         </div>

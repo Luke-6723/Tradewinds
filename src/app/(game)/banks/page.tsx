@@ -141,7 +141,7 @@ function DepositForm({ bank, own, vaults, onDone }: { bank: S.BankResult; own: b
       </Checkbox>
       <CashLine region={region} cash={cash} need={a} />
       <p className="text-muted-foreground text-xs">
-        Interest is credited daily. Deposits are exempt from the wealth levy. {bank.insured
+        Interest is credited daily. Deposits count in your net worth, so the wealth levy applies to them as to cash. {bank.insured
           ? `The Crown's cover is at most ${fmtCr(BANK.insuredCoverPence)} per player, capped per bank, only on deposits ${BANK.insuredAfterDays}+ game days old, and never for a depositor that defaulted on a loan from this bank.`
           : "Uninsured: a failed bank pays depositors pro rata as its loans come in, after secured lenders."}
       </p>

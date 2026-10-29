@@ -51,9 +51,16 @@ export function PortSelect({ value, onChange, placeholder, disabled, className, 
   );
 }
 
-export function GoodSelect({ value, onChange, placeholder, disabled, className, only }: Base & { only?: string[] }) {
+/**
+ * Goods by name. Contraband (guide 3.18: no market, warehouse, charter, freight, future or pledge takes it) is left out
+ * unless `contraband` is "include" (the Underworld page: every good) or "only" (contraband alone).
+ */
+export function GoodSelect({ value, onChange, placeholder, disabled, className, only, contraband = "exclude" }: Base & { only?: string[]; contraband?: "exclude" | "include" | "only" }) {
   const { catalog } = useCatalog();
-  const goods = (catalog?.commodities ?? []).filter((c) => !only || only.includes(c.id)).sort((a, b) => a.name.localeCompare(b.name));
+  const goods = (catalog?.commodities ?? [])
+    .filter((c) => !only || only.includes(c.id))
+    .filter((c) => (contraband === "include" ? true : (c.category === "contraband") === (contraband === "only")))
+    .sort((a, b) => a.name.localeCompare(b.name));
   return (
     <NativeSelect value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled} className={className}>
       {placeholder !== undefined && <option value="">{placeholder}</option>}

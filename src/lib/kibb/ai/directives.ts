@@ -4,8 +4,8 @@
  * in force) and the manager (the settings overlay and its hard floors).
  *
  * Ranges (the user's decisions): every setting in its full valid range, with hard floors: max ships, the
- * marque and underwriting budgets, the debt cap and the cash due counted on never above the user's values,
- * leverage and idle-cash lending only ever switched off (the user's "off" is a ceiling), the home reserve and a
+ * marque and underwriting budgets, the debt cap, the cash due counted on and the smuggling loads never above the user's
+ * values, leverage, idle-cash lending and smuggling only ever switched off (the user's "off" is a ceiling), the home reserve and a
  * loan's required return only ever raised, and the AI's own settings not even nameable (they are not in the
  * schema's enum). Money orders (borrow for a load or a hull, repay a loan early, build a commission to order) refer
  * only to what the digest listed and are carried out through the autopilot's own checks.
@@ -14,7 +14,7 @@
 import type { FleetSettings, GunPolicy } from "../fleet/manager";
 import type { Bans, Lane } from "../fleet/planner";
 import type { Catalog, ZoneClass } from "../types";
-import { PATROL_PENCE_PER_BPS_DAY, ZONE_MARQUE_CAP } from "../rivals";
+import { PATROL_FLOOR_PENCE_PER_BPS_DAY, ZONE_MARQUE_CAP } from "../rivals";
 import { LOAN_MIN_PRINCIPAL_PENCE } from "../fleet/finance";
 import type { Aliases, RawAdvice } from "./digest";
 
@@ -61,6 +61,8 @@ export const NUMBER_KEYS = [
   "cashDuePct",
   "maxDebtPct",
   "minLoanReturnX",
+  "smuggleMaxTons",
+  "smuggleMaxPence",
 ] as const satisfies readonly KeysOfType<FleetSettings, number>[];
 export const SWITCH_KEYS = [
   "autoBuy",
@@ -79,9 +81,10 @@ export const SWITCH_KEYS = [
   "idleCash",
   "shipDeals",
   "envelopes",
+  "smuggling",
 ] as const satisfies readonly KeysOfType<FleetSettings, boolean>[];
 /** Risky switches the user's "off" is a ceiling for: the AI may only turn them off. */
-export const CEILING_SWITCHES = ["leverage", "idleCash"] as const satisfies readonly SwitchKey[];
+export const CEILING_SWITCHES = ["leverage", "idleCash", "smuggling"] as const satisfies readonly SwitchKey[];
 /** Never the AI's: its mode, caps, model, effort and cadence. */
 export const AI_KEYS = ["ai", "aiDailyCapUsd", "aiTotalCapUsd", "aiModel", "aiEffort", "aiIntervalMin"] as const satisfies readonly (keyof FleetSettings)[];
 
@@ -117,6 +120,9 @@ const RANGES: Record<NumberKey, (v: number) => { min: number; max: number; int: 
   maxDebtPct: (v) => ({ min: 0, max: Math.max(0, v), int: false }),
   // Only ever stricter than the user's: up to 4x.
   minLoanReturnX: (v) => ({ min: v, max: Math.max(v, 4 * v), int: false }),
+  // Ceilings: a smuggling run never buys more, nor spends more, than the user allows (guide 3.18).
+  smuggleMaxTons: (v) => ({ min: 1, max: Math.max(1, v), int: true }),
+  smuggleMaxPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
 };
 
 export function aiRange(k: NumberKey, user: FleetSettings): { min: number; max: number; int: boolean } {
@@ -151,7 +157,7 @@ export function enforceFloors(own: FleetSettings, eff: FleetSettings, caps: { ca
     w[k] = Number.isFinite(v) ? clampTo(k, v, own) : own[k];
   }
   for (const k of SWITCH_KEYS) if (typeof out[k] !== "boolean") w[k] = own[k];
-  // Borrowing and lending stay off while the user's are off.
+  // Borrowing, lending and smuggling stay off while the user's are off.
   for (const k of CEILING_SWITCHES) if (!own[k]) out[k] = false;
   if (!GUNS.includes(out.guns)) out.guns = own.guns;
   // One extra class comes only through a build order, never this list.
@@ -255,7 +261,10 @@ export interface NavalOrder {
   zone: string;
   bps: number;
   gameHours: number;
-  /** Expected cost (pence): a patrol's formula, a marque at its zone's last quoted price (0: not quoted yet, priced when issued); the game's own once issued. */
+  /**
+   * Expected cost (pence): a patrol at its zone's last quoted price (else the 2 Cr floor), a marque at its zone's last quoted price
+   * (0: not quoted yet); both priced again when issued; the game's own once issued.
+   */
   costPence: number;
   reason: string;
   status: NavalStatus;
@@ -360,12 +369,15 @@ export function laneBanned(l: Lane, b: Bans, currentId: (id: string) => string):
   );
 }
 
-/** What a patrol costs (guide: 2 Cr per bps per game day of the term, 100 Cr at least). */
-export function patrolCost(bps: number, gameHours: number): number {
-  return marqueCost(PATROL_PENCE_PER_BPS_DAY, bps, gameHours);
+/**
+ * What a patrol costs (guide 3.5): its zone's price per bps per game day (`patrol-quote`: set by the zone's recent smuggling
+ * traffic; never under 2 Cr, the default when the zone wasn't quoted) over the term, 100 Cr at least.
+ */
+export function patrolCost(bps: number, gameHours: number, pricePerBpsDay = PATROL_FLOOR_PENCE_PER_BPS_DAY): number {
+  return marqueCost(Math.max(PATROL_FLOOR_PENCE_PER_BPS_DAY, pricePerBpsDay), bps, gameHours);
 }
 
-/** A marque at its zone's quoted price per bps per game day (`marque-quote`: set by the zone's traffic), 100 Cr at least. */
+/** A marque (or patrol) at its zone's quoted price per bps per game day (`marque-quote`: set by the zone's traffic), 100 Cr at least. */
 export function marqueCost(pricePerBpsDay: number, bps: number, gameHours: number): number {
   return Math.max(NAVAL_MIN_PENCE, Math.ceil(pricePerBpsDay * bps * (gameHours / 24)));
 }
@@ -391,6 +403,13 @@ export interface ValidateCtx {
   zoneBps: Map<string, { marque: number; patrol: number }>;
   /** A marque's price per bps per game day (pence) in each zone, from the last quotes read; a zone not quoted is priced when issued. */
   marquePrice: Map<string, number>;
+  /** A patrol's price per bps per game day (pence) in each zone, from the last `patrol-quote`s read; a zone not quoted counts at the 2 Cr floor and is priced when issued. */
+  patrolPrice: Map<string, number>;
+  /**
+   * Zones no patrol of ours may go (guide 3.18: where our own ships carry contraband, a patrol's search may take them, and its prize
+   * never covers her); null: they can't be told, so no patrol at all.
+   */
+  noPatrolZones: Set<string> | null;
   gameMinuteMs: number;
 }
 
@@ -416,6 +435,9 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
   const isPort = (id: string) => cat.ports.some((p) => p.id === id);
   const isZone = (id: string) => cat.sea_zones.some((z) => z.id === id);
   const isGood = (id: string) => cat.commodities.some((c) => c.id === id);
+  // Lawful work only (guide 3.18): no lane loads or lands at a cove or carries contraband, so neither is worth a bias or an order.
+  const isCove = (id: string) => !!cat.ports.find((p) => p.id === id)?.is_cove;
+  const isContraband = (id: string) => cat.commodities.find((c) => c.id === id)?.category === "contraband";
 
   // Numbers and switches: one of each key, within its range; only real changes kept.
   const seen = new Set<string>();
@@ -479,13 +501,13 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
     let ref: string | undefined;
     let label = "";
     if (b.match === "dest" || b.match === "source" || b.match === "port") {
-      if (isPort(b.ref) && ctx.isOpen(b.ref) && !portOff(b.ref)) ref = b.ref;
+      if (isPort(b.ref) && ctx.isOpen(b.ref) && !portOff(b.ref) && !isCove(b.ref)) ref = b.ref;
       label = `${b.match === "dest" ? "to" : b.match === "source" ? "from" : "at"} ${b.ref}`;
     } else if (b.match === "zone") {
       if (isZone(b.ref) && !bans?.zones.has(b.ref)) ref = b.ref;
       label = `through ${b.ref}`;
     } else if (b.match === "good") {
-      if (isGood(b.ref) && !bans?.goods.has(b.ref)) ref = b.ref;
+      if (isGood(b.ref) && !bans?.goods.has(b.ref) && !isContraband(b.ref)) ref = b.ref;
       label = b.ref;
     } else if (b.match === "charter") {
       const c = aliases.charters.get(b.ref);
@@ -534,7 +556,7 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
       } else if (o.order === "port") {
         // A quick hull check (the port's own waters); the whole route is checked when it sails.
         const z = ctx.hazardZone(o.ref);
-        if (isPort(o.ref) && ctx.isOpen(o.ref) && !portOff(o.ref) && z && RANK[z.zone_class] <= RANK[ship.hull]) [ref, label] = [o.ref, o.ref];
+        if (isPort(o.ref) && ctx.isOpen(o.ref) && !portOff(o.ref) && !isCove(o.ref) && z && RANK[z.zone_class] <= RANK[ship.hull]) [ref, label] = [o.ref, o.ref];
       } else if (o.order === "hold") {
         if (holds > 0) {
           holds--;
@@ -571,9 +593,11 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
   }
 
   // Naval: an open zone each, under the zone's cap, within the horizon and what the marque budget has left
-  // over the last 24 h (reduced in 50 bps steps to what fits). A patrol costs 2 Cr a bps-day; a marque its
-  // zone's quoted price (traffic-set): one not quoted yet is sized and checked on its quote when issued
-  // (manager runAiNaval). Issued ones can't be withdrawn.
+  // over the last 24 h (reduced in 50 bps steps to what fits). Both are priced by the game per zone: a marque
+  // from its player traffic, a patrol from its smuggling traffic (never under 2 Cr a bps-day, the floor counted
+  // where it wasn't quoted lately); a marque not quoted yet is sized and checked on its quote when issued, and
+  // both are quoted again then (manager runAiNaval). No patrol where our own ships carry contraband (or while
+  // that can't be told). Issued ones can't be withdrawn.
   const budget = Math.min(u.marqueBudgetPence, d.settings.marqueBudgetPence ?? u.marqueBudgetPence);
   let room = budget - ctx.navalSpent24h;
   const maxH = Math.min(NAVAL_TERM_MAX_H, Math.floor((horizonMin * 60_000) / (60 * ctx.gameMinuteMs)));
@@ -586,10 +610,15 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
       dropped++;
       continue;
     }
+    // A patrol where our own ships carry contraband always loses (guide 3.18).
+    if (kind === "patrol" && (ctx.noPatrolZones === null || ctx.noPatrolZones.has(z.id))) {
+      dropped++;
+      continue;
+    }
     const hours = Math.min(maxH, Math.max(NAVAL_TERM_MIN_H, Math.round(Number(n.gameHours) || NAVAL_TERM_MIN_H)));
     const live = ctx.zoneBps.get(z.id);
     const capLeft = ZONE_MARQUE_CAP - (kind === "marque" ? (live?.marque ?? 0) : (live?.patrol ?? 0));
-    const price = kind === "patrol" ? PATROL_PENCE_PER_BPS_DAY : (ctx.marquePrice.get(z.id) ?? null);
+    const price = kind === "patrol" ? Math.max(PATROL_FLOOR_PENCE_PER_BPS_DAY, ctx.patrolPrice.get(z.id) ?? 0) : (ctx.marquePrice.get(z.id) ?? null);
     const fits = price === null ? NAVAL_BPS_MAX : Math.floor(room / (Math.max(price, 0.1) * (hours / 24)) / 50) * 50;
     const bps = Math.min(NAVAL_BPS_MAX, capLeft, fits, Math.max(NAVAL_BPS_MIN, Math.round(asked)));
     const cost = price === null ? 0 : marqueCost(price, bps, hours);

@@ -9,6 +9,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { FleetSettings } from "./fleet/manager";
+import type { ApiKeyScope } from "./types";
 
 export const STORE_DIR = process.env.KIBB_STORE_DIR ?? path.join(process.cwd(), ".kibb");
 const STORE_FILE = path.join(STORE_DIR, "store.json");
@@ -20,6 +21,12 @@ export interface StoredCompanyKey {
   keyId: string;
   expiresAt: string | null;
   savedAt: string;
+  /**
+   * The scopes the key holds (as minted, or as whoami last said). `underworld` is there only once the owner allowed
+   * smuggling on the Underworld page, and renewals keep it until it is withdrawn there. Absent in older stores: read
+   * from whoami at the next reuse (until then, taken as the base set without it).
+   */
+  scopes?: ApiKeyScope[];
 }
 
 export interface StoredFleet {

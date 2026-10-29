@@ -16,7 +16,7 @@ import { dash } from "@/lib/kibb/browser";
 import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
-import type { DealsReport, FinanceLoanRow, FinanceReport, FleetSettings, GunPolicy } from "@/lib/kibb/fleet/manager";
+import type { DealsReport, FinanceLoanRow, FinanceReport, FleetSettings, GunPolicy, SmuggleReport } from "@/lib/kibb/fleet/manager";
 import type { Lane } from "@/lib/kibb/fleet/planner";
 
 const TIME_PARTS: Array<{ key: keyof TimeUse; label: string; className: string }> = [
@@ -47,11 +47,14 @@ function TimeBar({ t }: { t: TimeUse }) {
 function SettingsForm({
   settings,
   busy,
+  smugglingAllowed,
   onSave,
   onCancel,
 }: {
   settings: FleetSettings;
   busy: boolean;
+  /** The company key holds the underworld scope (allowed on the Underworld page). */
+  smugglingAllowed: boolean;
   /** Only the fields that changed. */
   onSave: (patch: Partial<FleetSettings>) => void;
   onCancel: () => void;
@@ -78,6 +81,15 @@ function SettingsForm({
           Object.entries(out).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(initial[k as keyof FleetSettings])),
         ) as Partial<FleetSettings>;
         if (patch.underwrite && !confirm(`Let the autopilot underwrite other companies' voyages, locking up to ${fmtCr(d.underwriteBudgetPence)} of collateral?`)) return;
+        if (
+          patch.smuggling &&
+          !confirm(
+            "Turn on smuggling? One of your ships will run contraband. If she is seized, the ship and EVERYTHING aboard are forfeit, " +
+              "insurance pays NOTHING, a lien on her is lost to its lender, and a smuggling conviction goes on the company's PUBLIC credit " +
+              `record for good (lenders see it). Each run buys at most ${d.smuggleMaxTons} t and ${fmtCr(d.smuggleMaxPence)} of goods. Continue?`,
+          )
+        )
+          return;
         onSave(patch);
       }}
     >
@@ -328,7 +340,9 @@ function SettingsForm({
           loan&apos;s term is at least that multiple of its interest and it pays back within half the term. Lender: the Goldsmiths&apos;
           Company&apos;s instant quote (balloon; 45% a year for up to 30 game days, sliding to 30% at 360) against a lien on one of your
           ships that isn&apos;t insured, listed, in a convoy or already pledged (at most 40% of its value and 7,500 Cr, with recourse; a
-          default hands the ship to the lender at 80% of its value and arrests her meanwhile). A request for quotes follows, pledging
+          default hands the ship to the Goldsmiths credited at only 35% of its rebuild value, the break-up price, with no surplus, and
+          the rest still owed; she is arrested meanwhile). After any walk-away (any lender, any of your companies) the Goldsmiths lend
+          nothing for a real day: the autopilot borrows nothing until then. A request for quotes follows, pledging
           another free ship: a player lender&apos;s quote cheaper than the Goldsmiths&apos; (never one of your companies&apos;) is approved
           and repays the Goldsmiths&apos; loan at once. What is owed (installments included) is never spent on ships, marques,
           underwriting or lending, and loads never spend what a repayment counts on unless cash due lands first; the autopilot&apos;s
@@ -342,6 +356,74 @@ function SettingsForm({
           back when the fleet needs the cash (a load cut to the cash there included) or you owe; a borrower that defaults hands us its
           pledged ship or goods.
           Off here is off for Claude too: it may switch either off, never on.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-destructive/50 bg-destructive/5 p-3">
+        <label className="flex items-center gap-1.5 font-medium text-sm">
+          <input
+            type="checkbox"
+            checked={d.smuggling}
+            disabled={!smugglingAllowed && !d.smuggling}
+            onChange={(e) => setD({ ...d, smuggling: e.target.checked })}
+          />
+          Smuggling (the Free Trade): run small loads of contraband with one dedicated ship (OFF by default)
+        </label>
+        {initial.smuggling && !d.smuggling && (
+          <p className="font-medium text-destructive text-xs">
+            Turning it off stops new buying and new runs at once, but a smuggler with contraband already aboard isn&apos;t left in a port where she
+            may be searched: she finishes that load first (runs it ashore at a live want where she lies, or sails to a cove clear of patrols and
+            sells it there, holding at the cove for a fair bid), then goes back to lawful work. If the key loses the underworld scope she can do
+            neither and holds the goods in the roadstead, where she may be searched: sell or run them by hand from the Underworld page.
+          </p>
+        )}
+        {!smugglingAllowed && (
+          <p className="text-destructive text-xs">
+            Unavailable: the company key doesn&apos;t hold the underworld scope. Allow smuggling on the{" "}
+            <Link href="/underworld" className="underline">
+              Underworld page
+            </Link>{" "}
+            first.
+          </p>
+        )}
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="space-y-1">
+            <Label>Most tons a run buys</Label>
+            <Input
+              type="number"
+              min={1}
+              max={500}
+              disabled={!d.smuggling}
+              value={d.smuggleMaxTons}
+              onChange={(e) => setD({ ...d, smuggleMaxTons: Math.min(500, Math.max(1, Math.floor(Number(e.target.value) || 1))) })}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label>Most a run spends on goods (Cr)</Label>
+            <Input
+              type="number"
+              min={0}
+              disabled={!d.smuggling}
+              value={d.smuggleMaxPence / 100}
+              onChange={(e) => setD({ ...d, smuggleMaxPence: Math.max(0, Math.round(Number(e.target.value) * 100) || 0) })}
+            />
+          </div>
+        </div>
+        <p className="font-medium text-destructive text-xs">
+          A seized ship is forfeit with everything aboard, exactly as if she sank: insurance pays nothing (Lloyd&apos;s never covers a ship carrying
+          contraband), a lender&apos;s lien on her is lost, shares in her are worthless, and a smuggling conviction goes on the company&apos;s public
+          credit record for good (lenders read it). The mode switches itself off after a seizure until you turn it on again.
+        </p>
+        <p className="text-muted-foreground text-xs">
+          One ship at a time, never the fleet&apos;s only one: the fastest that isn&apos;t pledged, insured, listed for sale, sharing her ownership, in a
+          convoy, under an AI order or carrying lawful cargo or sealed freight. She buys at a smugglers&apos; cove for a want fresh on its board (at most
+          a game day old, 3&times; base or more), sails only through sea zones no patrol works (read again just before she departs: at sea only patrols
+          search), never berths in an ordinary port with the goods aboard (a free berth takes her on arrival: she leaves it the moment its lock
+          lets her; the roadstead is searched less), runs them ashore at once, and if the want is gone carries on to the next fresh one or back to a
+          cove to sell on its book. A run is made only when the expected gain is at least twice the expected loss (ship and goods) on a cautious
+          seizure model that learns from our own runs, and runs are spaced so the Crown&apos;s attention cools. Every decision is in the log. No patrol of
+          ours is ever funded where our smugglers sail, nor anywhere while a ship with contraband aboard lies in an ordinary port with no passage
+          planned. Switched off (by you, Claude or a seizure), nothing new is bought, and a load already aboard is finished first (run ashore here,
+          or sold at a cove clear of patrols). Off here is off for Claude too: it may switch it off or lower the limits, never more.
         </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -502,9 +584,22 @@ export function FleetPanel() {
           {st?.cash?.levy && st.cash.levy.excessPence > 0 && (
             <span
               className="text-warning-foreground"
-              title={`The Crown's wealth levy: idle vault cash above ${fmtCr(st.cash.levy.thresholdPence)} (all regions together) pays 0.1% of the excess every game day, about 6% a real day. Money working isn't levied: loads, escrow, loans out, deposits and venture stakes. While there is an excess, loads aren't charged for the cash they tie up.`}
+              title={`The Crown's wealth levy: net worth (as the leaderboard counts it: cash, escrow, goods, hulls, loans, deposits and venture stakes) above ${fmtCr(st.cash.levy.thresholdPence)} pays 0.1% of the excess every game day, about 6% a real day, taken from cash (the richest vault first, never below the threshold). Putting money to work doesn't avoid it. The home floor keeps 1.5 days of it.${
+                st.cash.levy.worthPence != null
+                  ? ` Net worth ${fmtCr(st.cash.levy.worthPence)} (${st.cash.levy.worthSource === "leaderboard" ? "the hourly leaderboard" : "our own estimate"}).`
+                  : ""
+              }`}
             >
-              {" · "}wealth levy ~{fmtCr(st.cash.levy.perDayPence)}/game day on {fmtCr(st.cash.levy.excessPence)} idle above {fmtCr(st.cash.levy.thresholdPence)}
+              {" · "}wealth levy ~{fmtCr(st.cash.levy.perDayPence)}/game day on {fmtCr(st.cash.levy.excessPence)} of net worth above {fmtCr(st.cash.levy.thresholdPence)}
+            </span>
+          )}
+          {st?.cash?.charterTaper && st.cash.charterTaper.earnedPence > 0 && (
+            <span
+              className={st.cash.charterTaper.factor < 1 ? "text-warning-foreground" : undefined}
+              title={`The charter premium taper (guide 3.7): Crown and Admiralty charters (not players' charters) always pay the goods' value (per ton the catalog base price, or the reward if lower); the premium above that is multiplied by √(${fmtCr(st.cash.charterTaper.thresholdPence)} ÷ earnings) once our charter earnings over the last ${st.cash.charterTaper.windowGameDays} game days (all our companies together, the delivery included) pass ${fmtCr(st.cash.charterTaper.thresholdPence)}. Lanes, leftovers and stall holds value Crown pay that way, each load's own pay counted in. Tons still count in full towards expansion charters and their completion bonus.`}
+            >
+              {" · "}Crown charter pay {fmtCr(st.cash.charterTaper.earnedPence)} in {st.cash.charterTaper.windowGameDays} game days
+              {st.cash.charterTaper.factor < 1 ? `: premium ×${st.cash.charterTaper.factor.toFixed(2)}` : `: premium in full (tapers past ${fmtCr(st.cash.charterTaper.thresholdPence)})`}
             </span>
           )}
           {st?.finance && st.finance.debtPence > 0 && (
@@ -532,9 +627,9 @@ export function FleetPanel() {
           )}
           {st?.cash?.bills && (
             <span
-              title={`Billed every game day: fleet upkeep (sprawl, factors, oceanic hulls; what the ledger shows was charged when more) and warehouse rent per region${
+              title={`Billed every game day: fleet upkeep (sprawl on coastal and regional tons plus half the oceanic tons, factors, 1 Cr per oceanic ton; what the ledger shows was charged when more) and warehouse rent per region${
                 st.cash.bills.rent.length ? ` (${st.cash.bills.rent.map(([r, p]) => `${r} ${fmtCr(p)}`).join(", ")})` : ""
-              }. The home region keeps 1.5 days of upkeep (or the reserve setting, if more) and every region 1.5 days of its rent; stores to sail safely may dip into that. ${
+              }. The home region keeps 1.5 days of upkeep and the wealth levy (or the reserve setting, if more) and every region 1.5 days of its rent; stores to sail safely may dip into that. ${
                 st.cash.bills.measuredAt ? `Ledger read ${fmtAgo(new Date(st.cash.bills.measuredAt).toISOString())}.` : "Not read from the ledger yet."
               }${
                 st.cash.autoRemit
@@ -600,6 +695,7 @@ export function FleetPanel() {
           <SettingsForm
             settings={view.settings}
             busy={busy}
+            smugglingAllowed={(managerUp ? st?.smuggling?.available : undefined) ?? view.smugglingAllowed ?? false}
             onCancel={() => setEditing(false)}
             onSave={async (s) => {
               if (await send({ settings: s })) setEditing(false);
@@ -660,6 +756,11 @@ export function FleetPanel() {
                     {a.dispatchesSealed && (
                       <Badge variant="outline" size="sm" title="Dispatches sealed: this packet posts nothing to the coffee-house boards it calls at, so its news stays ours">
                         sealed
+                      </Badge>
+                    )}
+                    {a.smuggler && (
+                      <Badge variant="destructive" size="sm" title="Smuggling for the fleet (the Free Trade): no lawful work while she does; if seized she is forfeit with everything aboard">
+                        smuggling
                       </Badge>
                     )}
                   </td>
@@ -742,6 +843,10 @@ export function FleetPanel() {
         {st?.finance && <FinanceView f={st.finance} maxDebtPct={view.settings.maxDebtPct} shipName={(id) => agents.find((a) => a.shipId === id)?.name ?? id.slice(0, 8)} />}
 
         {st?.deals && <DealsView d={st.deals} />}
+
+        {st?.smuggling && (st.smuggling.enabled || st.smuggling.ships.length > 0 || st.smuggling.stats.seizures > 0 || st.smuggling.runs.length > 0) && (
+          <SmugglingView m={st.smuggling} shipName={(id) => agents.find((a) => a.shipId === id)?.name ?? id.slice(0, 8)} />
+        )}
 
         <div className="grid items-start gap-5 xl:grid-cols-5">
           <div className="space-y-1.5 xl:col-span-3">
@@ -1140,6 +1245,118 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
         ships at the cheapest quote seen, goods at base, less what is owed). Interest accrues every game day on what is still owed; repaying
         early pays interest only to date.
       </p>
+    </details>
+  );
+}
+
+/** The Free Trade (guide 3.18): the smuggling mode's state, our smugglers, wants seen, runs, seizures and the seizure model. */
+function SmugglingView({ m, shipName }: { m: SmuggleReport; shipName: (id: string) => string }) {
+  const { portName, goodName } = useCatalog();
+  const pctOf = (x: number) => `${(x * 100).toLocaleString("en-GB", { maximumFractionDigits: 2 })}%`;
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Smuggling: {m.active ? "on" : m.state}
+        {m.ships.length > 0 && ` · ${m.ships.map((s) => s.name).join(", ")} smuggling`}
+        {` · ${m.stats.runs} run${m.stats.runs === 1 ? "" : "s"} ashore, ${fmtTons(m.stats.landedTons)} landed for ${fmtCr(m.stats.proceedsPence)} (goods ${fmtCr(m.stats.spentPence)})`}
+        {m.stats.seizures > 0 && <span className="text-destructive">{` · ${m.stats.seizures} SEIZED, ${m.stats.convictions} conviction${m.stats.convictions === 1 ? "" : "s"} on our record`}</span>}
+      </summary>
+      {m.halt && (
+        <p className="mt-2 rounded-md bg-destructive/10 px-3 py-2 text-destructive text-xs">
+          Switched off after a seizure ({m.halt.why}, {fmtDateTime(m.halt.at)}): it stays off until you turn it on again in the settings.
+        </p>
+      )}
+      {!m.available && (
+        <p className="mt-2 text-muted-foreground text-xs">
+          The company key doesn&apos;t hold the underworld scope: allow smuggling on the{" "}
+          <Link href="/underworld" className="underline">
+            Underworld page
+          </Link>
+          .
+        </p>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        {m.action}. Odds a run ends in a seizure now ~{pctOf(m.model.odds)} ({pctOf(m.model.perRun)} a run, {pctOf(m.model.perPortHour)} a game hour lying in
+        an ordinary port&apos;s roadstead, berthed hours counted 3&times;; a run ashore takes ~{m.model.runGameH.toFixed(1)} game h), learned from {m.model.runs} voyage
+        {m.model.runs === 1 ? "" : "s"} and {m.model.portHours} game hours in port ({m.model.seizedAtSea + m.model.seizedInPort} seized). {m.model.recentRuns} run
+        {m.model.recentRuns === 1 ? "" : "s"} ashore lately{m.model.nextRunAt ? `; the Crown's attention allows the next ${fmtIn(m.model.nextRunAt)}` : ""}. A run buys at most{" "}
+        {fmtTons(m.maxTons)} and {fmtCr(m.maxPence)}.
+      </p>
+      {m.ships.length > 0 && (
+        <Table head={["Ship", "About", "Bound for", "Goods", "Odds / gain"]} className="mt-2">
+          {m.ships.map((s) => (
+            <tr key={s.shipId} className="align-top">
+              <td className="whitespace-nowrap">{shipName(s.shipId)}</td>
+              <td className="text-xs">
+                {s.purpose === "buy" ? "to buy at a cove" : s.purpose === "run" ? "running goods to a want" : "back to a cove"}
+                {s.run && (
+                  <div className="text-muted-foreground">
+                    running {fmtTons(s.run.tons)} {goodName(s.run.good)} ashore at {portName(s.run.port)}, done {fmtIn(s.run.completesAt)}
+                  </div>
+                )}
+              </td>
+              <td className="text-xs">
+                {s.dest ? portName(s.dest) : "—"}
+                {s.want && (
+                  <div className="text-muted-foreground">
+                    want: {goodName(s.want.good)} at {portName(s.want.port)} ({(s.want.multipleBps / 10_000).toFixed(1)}&times;)
+                  </div>
+                )}
+              </td>
+              <td className="whitespace-nowrap text-xs">{s.load ? `${fmtTons(s.load.tons)} ${goodName(s.load.good)} for ${fmtCr(s.load.pence)}` : "—"}</td>
+              <td className="whitespace-nowrap text-xs">{s.odds ? `${pctOf(s.odds.p)} · ${fmtCr(s.odds.gain)} vs ${fmtCr(s.odds.loss)}` : "—"}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {m.wants.length > 0 && (
+        <Table head={["Want", "Multiple", "Seen", "Tons", "From"]} className="mt-2">
+          {m.wants.map((x) => (
+            <tr key={`${x.port}|${x.good}`}>
+              <td className="text-xs">
+                {goodName(x.good)} at {portName(x.port)}
+              </td>
+              <td className="tabular-nums">{(x.multipleBps / 10_000).toFixed(1)}&times;</td>
+              <td className="whitespace-nowrap text-xs">{x.ageGameH} game h ago</td>
+              <td className="tabular-nums">{x.remaining ?? "—"}</td>
+              <td className="text-xs">{x.source === "live" ? "our ship there" : `the ${x.via ? portName(x.via) : "cove"} board`}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {m.runs.length > 0 && (
+        <Table head={["Run", "Goods", "Cost", "Paid", "Outcome"]} className="mt-2">
+          {m.runs.map((x, i) => (
+            <tr key={`${x.at}-${i}`} className="align-top">
+              <td className="text-xs">
+                {x.ship}: {x.cove ? `${portName(x.cove)} → ` : ""}
+                {portName(x.port)}
+                <div className="text-muted-foreground">{fmtDateTime(x.at)}</div>
+              </td>
+              <td className="whitespace-nowrap text-xs">
+                {fmtTons(x.tons)} {goodName(x.good)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.costPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{x.proceedsPence === null ? "—" : fmtCr(x.proceedsPence)}</td>
+              <td className={`text-xs ${x.outcome === "SEIZED" ? "text-destructive" : ""}`}>{x.outcome}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {m.convictions.length > 0 && (
+        <p className="mt-2 text-destructive text-xs">
+          Seized (each a conviction on our public credit record): {m.convictions.map((c) => `${c.ship} ${c.inPort === null ? "(where not known)" : c.inPort ? "in port" : "at sea"} at ${c.where} (${fmtDateTime(c.at)})`).join("; ")}
+        </p>
+      )}
+      {m.log.length > 0 && (
+        <div className="mt-2 max-h-48 overflow-y-auto rounded-lg bg-muted/40 p-2 font-mono text-xs leading-relaxed">
+          {m.log.map((l, i) => (
+            <div key={`${l.at}-${i}`}>
+              <span className="text-muted-foreground">{fmtTime(l.at)}</span> <span className="text-primary">{l.source}</span> {l.msg}
+            </div>
+          ))}
+        </div>
+      )}
     </details>
   );
 }

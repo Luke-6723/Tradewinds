@@ -19,6 +19,7 @@ import {
   LayoutDashboardIcon,
   MailIcon,
   MapIcon,
+  MoonIcon,
   PieChartIcon,
   PiggyBankIcon,
   SailboatIcon,
@@ -56,6 +57,7 @@ const nav = [
       { href: "/monopolies", label: "Monopolies", icon: CrownIcon },
       { href: "/contracts", label: "Contracts", icon: ScrollTextIcon },
       { href: "/warehouses", label: "Warehouses", icon: WarehouseIcon },
+      { href: "/underworld", label: "Underworld", icon: MoonIcon },
     ],
   },
   {

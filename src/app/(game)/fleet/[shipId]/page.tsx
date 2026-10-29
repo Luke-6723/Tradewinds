@@ -63,9 +63,11 @@ function DepartForm({
     // The policy's port stays listed while the clock loads, so a defaulted destination always shows.
     .filter((p) => p.id !== from && (p.phase <= (clock?.unlocked_phase ?? 1) || p.id === policy?.dest_port_id))
     .sort((a, b) => a.name.localeCompare(b.name));
-  // A leg is rated when the hull covers both the lane and the sea zone it ends in (hazards roll there).
+  // A leg is rated when the hull covers both the lane and the sea zone it ends in (hazards roll there; the last leg ends
+  // at the port, whose own zone counts): the rougher of the two (guide 3.3/3.5).
   const legClass = (l: RoutePlan["legs"][number]): ZoneClass => {
-    const zone = catalog?.sea_zones.find((z) => z.id === l.to_node)?.zone_class;
+    const zoneId = catalog?.sea_zones.some((z) => z.id === l.to_node) ? l.to_node : catalog?.ports.find((p) => p.id === l.to_node)?.sea_zone_id;
+    const zone = catalog?.sea_zones.find((z) => z.id === zoneId)?.zone_class;
     return zone && HULL_RANK[zone] > HULL_RANK[l.edge_class] ? zone : l.edge_class;
   };
   const unrated = plan?.legs.filter((l) => HULL_RANK[legClass(l)] > HULL_RANK[hull]) ?? [];

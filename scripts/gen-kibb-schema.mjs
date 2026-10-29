@@ -65,7 +65,9 @@ for (const name of Object.keys(schemas).sort()) {
   const s = schemas[name];
   const body = ts(s);
   out += doc(s.description, "");
-  out += body.startsWith("{\n") ? `export interface ${name} ${body}\n\n` : `export type ${name} = ${body};\n\n`;
+  // A plain object is an interface; anything else (a union of objects included) a type alias.
+  const plainObject = body.startsWith("{\n") && body.endsWith("}") && !/\n\} \| /.test(body);
+  out += plainObject ? `export interface ${name} ${body}\n\n` : `export type ${name} = ${body};\n\n`;
 }
 writeFileSync(join(root, "src/lib/kibb/schema.ts"), out);
 console.log(`wrote ${Object.keys(schemas).length} schemas to src/lib/kibb/schema.ts`);

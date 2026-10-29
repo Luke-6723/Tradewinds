@@ -19,7 +19,8 @@ const QUOTED_ZONES = 6;
  * otherwise a one-shot look (sailings at the ports where we have presence, plus whatever the
  * autopilot collected, and with rival intel the public policy list). Their estimated whereabouts,
  * rival traffic per sea zone, the expansion charters rivals feed, and letters of marque: the
- * autopilot's last verdicts (or a fresh estimate when it isn't running) and our own marques.
+ * autopilot's last verdicts (or a fresh estimate when it isn't running) and our own marques; and our
+ * patrols with their prize money, beside the autopilot's patrol verdicts.
  */
 export async function GET(req: NextRequest) {
   let companyId: string | null;
@@ -38,7 +39,7 @@ export async function GET(req: NextRequest) {
       throw e;
     });
     const clockAsked = Date.now();
-    const [catalog, clock, profile, player, ships, factors, zones, marques, view] = await Promise.all([
+    const [catalog, clock, profile, player, ships, factors, zones, marques, patrols, view] = await Promise.all([
       g.__kibbRivalCatalog,
       client.clock(),
       client.companyProfile(),
@@ -47,6 +48,8 @@ export async function GET(req: NextRequest) {
       client.factors().catch(() => [] as string[]),
       client.zones(),
       client.marques({ limit: 200 }),
+      // Our patrols beside our marques (one naval budget), with their smuggler prize money.
+      client.patrols({ limit: 200 }).catch(() => undefined),
       getFleetView(companyId),
     ]);
     // The server clock, carried forward to the end of this (slow) request.
@@ -180,6 +183,7 @@ export async function GET(req: NextRequest) {
       zones,
       verdicts,
       marques,
+      patrols,
       report: fleet.report,
       settings: { marques: view.settings.marques, marqueBudgetPence: view.settings.marqueBudgetPence, rivalIntel: intelOn },
       profiles: rivalProfiles(tracker, analysis, now),

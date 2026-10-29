@@ -58,7 +58,7 @@ function MarqueSettings({ view, onDone }: { view: RivalsView; onDone: () => void
   const dirty = enabled !== view.settings.marques || budget !== view.settings.marqueBudgetPence;
 
   function save() {
-    if (enabled && !view.settings.marques && !confirm(`Let the autopilot sponsor letters of marque, up to ${fmtCr(budget)} in any 24 hours?`)) return;
+    if (enabled && !view.settings.marques && !confirm(`Let the autopilot sponsor letters of marque and naval patrols, up to ${fmtCr(budget)} in any 24 hours?`)) return;
     // Only what changed, so nothing else in the fleet settings is overwritten.
     const settings: Record<string, unknown> = {};
     if (enabled !== view.settings.marques) settings.marques = enabled;
@@ -70,7 +70,7 @@ function MarqueSettings({ view, onDone }: { view: RivalsView; onDone: () => void
     <div className="space-y-3">
       <label className="flex items-center gap-2 text-sm">
         <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-        Sponsor letters of marque automatically when they pay
+        Sponsor letters of marque and naval patrols automatically when they pay
       </label>
       <div className="flex flex-wrap items-end gap-2">
         <div className="w-full space-y-1 sm:w-48">
@@ -87,7 +87,11 @@ function MarqueSettings({ view, onDone }: { view: RivalsView; onDone: () => void
         Admiral&apos;s tenth. The game prices it per zone from the last 7 game days of player traffic (60% of the prize it expects). The
         autopilot quotes the zones with rival traffic seen and sponsors one, for a game day at a time, only where the quoted prize beats
         the quoted cost plus your own ships&apos; extra losses (cargo seized and ships taken), and never past the budget. Your lanes already
-        price the zone&apos;s piracy, so your ships steer around it when that is cheaper.
+        price the zone&apos;s piracy, so your ships steer around it when that is cheaper. Patrols share the switch and the budget: the game
+        prices one per zone from its recent smuggling traffic (never under 2 Cr a bps-day), and it pays its sponsors half the base value
+        of every smuggler seized at sea in the zone and everything aboard, split by bps, less the Admiral&apos;s tenth. The autopilot funds
+        one for a game day where the prize expected from the seizures seen there lately, plus the piracy it takes off your own ships,
+        beats the quote; never where your own ships carry contraband (a patrol there always loses) or your marque is in force.
       </p>
     </div>
   );
@@ -114,8 +118,10 @@ export default function RivalsPage() {
   const zoneClass = (id: string) => catalog?.sea_zones.find((z) => z.id === id)?.zone_class ?? "";
   const companies = new Map<string, RivalShip[]>();
   for (const r of view?.rivals ?? []) companies.set(r.company, [...(companies.get(r.company) ?? []), r]);
-  const prize = (view?.marques ?? []).reduce((n, m) => n + m.prize_earned_pence, 0);
-  const spent = (view?.marques ?? []).reduce((n, m) => n + m.cost_pence, 0);
+  // Our naval spend and prize money: marques and patrols together (one budget).
+  const naval = [...(view?.marques ?? []), ...(view?.patrols ?? [])];
+  const prize = naval.reduce((n, m) => n + (m.prize_earned_pence ?? 0), 0);
+  const spent = naval.reduce((n, m) => n + m.cost_pence, 0);
   const leader = (view?.profiles ?? []).find((p) => p.earnPerHour !== null && p.rank !== null);
 
   return (
@@ -159,7 +165,7 @@ export default function RivalsPage() {
               sub={`you: ${view.you?.earnPerHour != null ? `${fmtCr(view.you.earnPerHour)}/h` : "—"}`}
             />
             <StatTile
-              label="Auto-marques"
+              label="Auto-marques and patrols"
               icon={<SwordsIcon className="size-4" />}
               value={view.settings.marques ? "On" : "Off"}
               sub={`prize ${fmtCr(prize)} on ${fmtCr(spent)} spent`}
@@ -297,15 +303,16 @@ export default function RivalsPage() {
               </p>
             </Panel>
 
-            <Panel title="Letters of marque">
+            <Panel title="Letters of marque and patrols">
               <div className="space-y-4">
                 <MarqueSettings view={view} onDone={() => void reload()} />
                 <KV
                   rows={[
                     ["Autopilot", view.autopilot],
                     ["Last check", view.report ? fmtAgo(view.report.checkedAt) : "—"],
-                    ["Outcome", view.report?.action ?? (view.autopilot === "running" ? "first check within 5 minutes" : "checks run while the autopilot runs")],
-                    ["Spent, last 24 h", view.report ? `${fmtCr(view.report.spentPence)} of ${fmtCr(view.report.budgetPence)}` : "—"],
+                    ["Marques", view.report?.action ?? (view.autopilot === "running" ? "first check within 5 minutes" : "checks run while the autopilot runs")],
+                    ["Patrols", view.report?.patrolAction ?? "—"],
+                    ["Spent, last 24 h", view.report ? `${fmtCr(view.report.spentPence)} of ${fmtCr(view.report.budgetPence)}${view.report.patrolSpentPence ? ` (patrols ${fmtCr(view.report.patrolSpentPence)})` : ""}` : "—"],
                   ]}
                 />
                 {view.marques.length > 0 && (
@@ -317,6 +324,19 @@ export default function RivalsPage() {
                         <td className="tabular-nums">{fmtCr(m.cost_pence)}</td>
                         <td className={`tabular-nums ${m.prize_earned_pence >= m.cost_pence ? "text-success-foreground" : ""}`}>{fmtCr(m.prize_earned_pence)}</td>
                         <td className="text-muted-foreground text-xs">{Date.parse(m.expires_at) > Date.now() ? fmtIn(m.expires_at) : fmtDateTime(m.expires_at)}</td>
+                      </tr>
+                    ))}
+                  </Table>
+                )}
+                {(view.patrols ?? []).length > 0 && (
+                  <Table head={["Zone", "Suppressed", "Cost", "Prize", "Ends"]}>
+                    {(view.patrols ?? []).map((p) => (
+                      <tr key={p.id}>
+                        <td className="text-xs">{zoneName(p.sea_zone_id)} <span className="text-muted-foreground">(patrol)</span></td>
+                        <td className="tabular-nums">−{fmtBps(p.suppressed_piracy_bps)}</td>
+                        <td className="tabular-nums">{fmtCr(p.cost_pence)}</td>
+                        <td className={`tabular-nums ${(p.prize_earned_pence ?? 0) >= p.cost_pence ? "text-success-foreground" : ""}`}>{fmtCr(p.prize_earned_pence ?? 0)}</td>
+                        <td className="text-muted-foreground text-xs">{Date.parse(p.expires_at) > Date.now() ? fmtIn(p.expires_at) : fmtDateTime(p.expires_at)}</td>
                       </tr>
                     ))}
                   </Table>
@@ -413,6 +433,43 @@ export default function RivalsPage() {
               wasn&apos;t quoted.
             </p>
           </Panel>
+
+          {(view.report?.patrols ?? []).length > 0 && (
+            <Panel title="Smugglers and patrols by sea zone">
+              <Table head={["Zone", "Piracy now", "Seized at sea", "Prize pool each", "Our losses / piracy", "Best patrol", "Prize", "Off our losses", "Cost", "Verdict"]}>
+                {(view.report?.patrols ?? []).map((v) => {
+                  const z = view.zones.find((x) => x.sea_zone_id === v.zone);
+                  return (
+                    <tr key={v.zone} className="align-top">
+                      <td>
+                        <div className="font-medium text-sm">{zoneName(v.zone)}</div>
+                        <div className="text-muted-foreground text-xs capitalize">{zoneClass(v.zone)}</div>
+                      </td>
+                      <td className="tabular-nums">{z ? fmtBps(z.net_piracy_bps) : "—"}</td>
+                      <td className="tabular-nums">{v.seizuresPerDay.toFixed(2)}</td>
+                      <td className="whitespace-nowrap tabular-nums">{fmtCr(v.pool)}</td>
+                      <td className="whitespace-nowrap tabular-nums">{fmtCr(v.ownRisk)}</td>
+                      <td className="tabular-nums">{v.best.bps ? `−${fmtBps(v.best.bps)}` : "—"}</td>
+                      <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.prize)}</td>
+                      <td className="whitespace-nowrap tabular-nums">{fmtCr(v.best.relief)}</td>
+                      <td className="whitespace-nowrap tabular-nums">
+                        {v.best.quoted ? fmtCr(v.best.cost) : <span className="text-muted-foreground" title="At the 2 Cr floor (not quoted)">≥{fmtCr(v.best.cost)}</span>}
+                      </td>
+                      <td className={`text-xs ${v.verdict === "pays" ? "text-success-foreground" : "text-muted-foreground"}`}>{v.verdict}</td>
+                    </tr>
+                  );
+                })}
+              </Table>
+              <p className="mt-3 text-muted-foreground text-xs">
+                Per game day. Seized at sea: smugglers the Crown took at sea in the zone a game day over the last 7 game days (the public
+                notices; a seizure in port pays no prize). The prize court pays half the base value of the ship and everything aboard, split
+                among the patrols in force by bps, less the Admiral&apos;s tenth; the pool each is taken at is what our own prize money has shown,
+                else what the notices said was seized, else half the cheapest hull (a floor). Seizures are taken not to rise with our patrol.
+                Off our losses: what our own ships there lose per unit of piracy a game day × the bps it suppresses. Cost: the game&apos;s
+                patrol quote for one game day, or our estimate at the 2 Cr floor where not quoted.
+              </p>
+            </Panel>
+          )}
         </>
       )}
     </div>

@@ -30,12 +30,22 @@
  *   KIBB_CASH_DUE         % of the cash our ships at sea are due to be paid that loads may count on (default 60; 0: cash in hand only)
  *   KIBB_WORLD_EVENTS=0   don't plan on world events' prices or on crisis charters not yet listed
  *   KIBB_LEVERAGE=0       never borrow (on by default: bridge a new ship or a load cash can't fund, when it clearly pays,
- *                         on the Goldsmiths' instant quote, refinanced by a cheaper player quote; the key needs treasury_remit)
+ *                         on the Goldsmiths' instant quote, refinanced by a cheaper player quote; the key needs treasury_remit.
+ *                         A default on a Goldsmiths' instant loan takes the ship at 35% of her rebuild value, no surplus,
+ *                         the rest still owed; after any walk-away they lend nothing for a real day, nor does the autopilot)
  *   KIBB_MAX_DEBT_PCT     most owed on loans, % of net worth (default 25)
  *   KIBB_MIN_LOAN_RETURN_X  a loan must earn this many times its interest over its term (default 2)
  *   KIBB_IDLE_CASH=0      don't quote spare cash on players' secured loan requests (clean borrowers, never our own companies)
  *   KIBB_SHIP_DEALS=0     don't buy ships for sale under building cost, nor build commissions to order
  *   KIBB_ENVELOPES=0      don't sell sealed news (intelligence envelopes) from our quays
+ *   KIBB_SMUGGLING=1      (1|true|resume on, 0|false off; any other value stops the CLI with an error)
+ *                         the Free Trade (off by default; RISKY): one dedicated ship runs small loads of contraband from a
+ *                         cove to a fresh want, only through zones no patrol works and only when the expected gain is twice
+ *                         the expected loss. A seizure forfeits the ship and everything aboard (insurance pays nothing) and
+ *                         puts a smuggling conviction on the company's public credit record; the mode then stays off until
+ *                         restarted with KIBB_SMUGGLING=resume. Needs a key holding the `underworld` scope (mint one with it).
+ *   KIBB_SMUGGLE_MAX_TONS most tons one smuggling run buys (default 5)
+ *   KIBB_SMUGGLE_MAX_CR   most one smuggling run spends on contraband (default 3000)
  *   KIBB_AI               AI support (Claude): off (default) | shadow | live; needs ANTHROPIC_API_KEY. Live it may set any
  *                         setting but its own within your ceilings (KIBB_MAX_SHIPS and the marque and underwriting budgets
  *                         never exceeded, KIBB_RESERVE_CR only raised), ban ports/zones/goods/charters, order single ships,
@@ -57,6 +67,15 @@ import { STORE_DIR } from "@/lib/kibb/store";
 
 const env = process.env;
 const cr = (v: string) => Math.round(Number(v) * 100);
+
+/** KIBB_SMUGGLING is risky: only 1/true/resume turn it on and 0/false off; anything else (a typo) is refused, never read as on. */
+function smugglingEnv(v: string | undefined): boolean | undefined {
+  if (v === undefined || v.trim() === "") return undefined;
+  const x = v.trim().toLowerCase();
+  if (x === "1" || x === "true" || x === "resume") return true;
+  if (x === "0" || x === "false") return false;
+  throw new Error(`KIBB_SMUGGLING must be 1, true or resume (on) or 0, false (off), not "${v}"`);
+}
 
 let settings: FleetSettings;
 try {
@@ -89,6 +108,9 @@ try {
       idleCash: env.KIBB_IDLE_CASH ? env.KIBB_IDLE_CASH !== "0" : undefined,
       shipDeals: env.KIBB_SHIP_DEALS ? env.KIBB_SHIP_DEALS !== "0" : undefined,
       envelopes: env.KIBB_ENVELOPES ? env.KIBB_ENVELOPES !== "0" : undefined,
+      smuggling: smugglingEnv(env.KIBB_SMUGGLING),
+      smuggleMaxTons: env.KIBB_SMUGGLE_MAX_TONS ? Number(env.KIBB_SMUGGLE_MAX_TONS) : undefined,
+      smuggleMaxPence: env.KIBB_SMUGGLE_MAX_CR ? cr(env.KIBB_SMUGGLE_MAX_CR) : undefined,
       ai: env.KIBB_AI ? (env.KIBB_AI as FleetSettings["ai"]) : undefined,
       aiDailyCapUsd: env.KIBB_AI_DAILY_USD ? Number(env.KIBB_AI_DAILY_USD) : undefined,
       aiTotalCapUsd: env.KIBB_AI_TOTAL_USD ? Number(env.KIBB_AI_TOTAL_USD) : undefined,
@@ -104,7 +126,7 @@ try {
 
 // Same lease directory as the dashboard, so the two never run one company at once.
 const manager = new FleetManager(
-  { apiKey: env.KIBB_API_KEY ?? "", baseUrl: env.KIBB_API_URL, settings, leaseDir: STORE_DIR },
+  { apiKey: env.KIBB_API_KEY ?? "", baseUrl: env.KIBB_API_URL, settings, leaseDir: STORE_DIR, resumeSmuggling: env.KIBB_SMUGGLING?.trim().toLowerCase() === "resume" },
   { onLog: ({ at, source, msg }) => console.log(`${at} [${source}] ${msg}`) },
 );
 
