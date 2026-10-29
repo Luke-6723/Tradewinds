@@ -270,7 +270,15 @@ export default function DashboardPage() {
           label="Leaderboard"
           icon={<CrownIcon className="size-4" />}
           value={board?.you ? `#${board.you.rank}` : "Unranked"}
-          sub={board?.you ? `net worth ${fmtCr(board.you.net_worth_pence)}` : board ? `${board.ranked_players} ranked · hourly refresh` : undefined}
+          sub={
+            board?.you
+              ? `net worth ${fmtCr(board.you.net_worth_pence)}${
+                  board.rising?.you ? ` · rising #${board.rising.you.rank} (${board.rising.you.growth_bps < 0 ? "−" : "+"}${(Math.abs(board.rising.you.growth_bps) / 100).toFixed(1)}% in 7 days)` : ""
+                }`
+              : board
+                ? `${board.ranked_players} ranked · hourly refresh`
+                : undefined
+          }
         />
       </div>
 

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Empty, ErrorNote, KV, Loading, PageHeader, Panel, Progress, Table } from "@/components/kibb/bits";
 import { useOurCompanyNames } from "@/components/kibb/naval-common";
 import { useAction } from "@/hooks/use-action";
@@ -26,6 +27,50 @@ function Titles({ titles }: { titles: S.HallOfFameTitle[] }) {
   );
 }
 
+/** Growth over the rising board's window: "+12.5%" (10,000 bps = doubled), "−3%" for a loss. */
+const growthText = (bps: number) => `${bps < 0 ? "−" : "+"}${fmtBps(Math.abs(bps))}`;
+
+const signedCr = (pence: number) => `${pence < 0 ? "−" : "+"}${fmtCr(Math.abs(pence))}`;
+
+/** The rising board (guide 3.17): growth over the last 7 real days, all of a player's companies added together. Display only. */
+function RisingBoard({ board }: { board: S.LeaderboardResult }) {
+  const { portName } = useCatalog();
+  const rising = board.rising;
+  const you = rising?.you;
+  return (
+    <div>
+      {you && (
+        <p className="mb-3 rounded-md bg-primary/10 px-3 py-2 text-sm">
+          You rank <strong>#{you.rank}</strong> on the rising board with {you.company_name}: {growthText(you.growth_bps)} ({signedCr(you.gained_pence)}) since{" "}
+          {fmtDateTime(you.window_start_at)}
+          {!you.is_calling_company && " (your best company, not this one)"}.
+        </p>
+      )}
+      {!rising || rising.entries.length === 0 ? (
+        <Empty>No one is ranked on the rising board yet: a player first appears one hourly refresh after their first snapshot.</Empty>
+      ) : (
+        <Table head={["#", "Company", "Home", "Growth", "Gained", "Since"]}>
+          {rising.entries.map((e) => (
+            <tr key={e.rank} className={you && you.rank === e.rank ? "bg-primary/5 font-medium" : undefined}>
+              <td className="tabular-nums">{e.rank}</td>
+              <td>{e.company_name}</td>
+              <td className="text-muted-foreground">{portName(e.home_port_id)}</td>
+              <td className={`tabular-nums ${e.growth_bps < 0 ? "text-destructive" : ""}`}>{growthText(e.growth_bps)}</td>
+              <td className="tabular-nums">{signedCr(e.gained_pence)}</td>
+              <td className="whitespace-nowrap text-muted-foreground text-xs">{fmtDateTime(e.window_start_at)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-3 text-muted-foreground text-xs">
+        Ranks players by how much their wealth grew over the last 7 real days, all their companies added together (moving money between them is not growth), as a
+        share of what they had at the start of their window, or of 100,000 Cr if they had less. Founding a company inside the window is not growth; borrowing never
+        helps. {rising?.ranked_players ?? 0} ranked. Display only: no titles or rewards. Recomputed hourly with the main board.
+      </p>
+    </div>
+  );
+}
+
 function BoardPanel() {
   const { portName } = useCatalog();
   const { data: board, error } = usePoll(() => kibbGet<S.LeaderboardResult>("/v1/world/leaderboard"), 300_000);
@@ -41,34 +86,45 @@ function BoardPanel() {
         </span>
       }
     >
-      {you && (
-        <p className="mb-3 rounded-md bg-primary/10 px-3 py-2 text-sm">
-          You rank <strong>#{you.rank}</strong> with {you.company_name} at {fmtCr(you.net_worth_pence)}
-          {!you.is_calling_company && " (your best company, not this one)"}.
-        </p>
-      )}
-      {board.entries.length === 0 ? (
-        <Empty>No one ranked yet.</Empty>
-      ) : (
-        <Table head={["#", "Company", "Home", "Net worth"]}>
-          {board.entries.map((e) => (
-            <tr key={e.rank} className={you && you.rank === e.rank ? "bg-primary/5 font-medium" : undefined}>
-              <td className="tabular-nums">{e.rank}</td>
-              <td>
-                {e.company_name} <Titles titles={e.titles} />
-              </td>
-              <td className="text-muted-foreground">{portName(e.home_port_id)}</td>
-              <td className="tabular-nums">{fmtCr(e.net_worth_pence)}</td>
-            </tr>
-          ))}
-        </Table>
-      )}
-      <p className="mt-3 text-muted-foreground text-xs">
-        Net worth: cash and escrow in every region, goods you own at catalog base prices (less freight carried for others), hulls afloat at build value
-        (each outside holder&apos;s 64ths count for the holder, not the owner), minus what you owe on loans (principal and interest), plus what you are owed on
-        active loans you made, your bank deposits (a bank&apos;s deposits count against it) and your capital in open ventures (a venture&apos;s cargo counts for its
-        investors). Borrowing never lifts you up the board. Each player ranks once, by their best company; bankrupt companies never rank. Recomputed hourly.
-      </p>
+      <Tabs defaultValue="worth">
+        <TabsList>
+          <TabsTab value="worth">Net worth</TabsTab>
+          <TabsTab value="rising">Rising (7 days)</TabsTab>
+        </TabsList>
+        <TabsPanel value="rising" className="pt-2">
+          <RisingBoard board={board} />
+        </TabsPanel>
+        <TabsPanel value="worth" className="pt-2">
+          {you && (
+            <p className="mb-3 rounded-md bg-primary/10 px-3 py-2 text-sm">
+              You rank <strong>#{you.rank}</strong> with {you.company_name} at {fmtCr(you.net_worth_pence)}
+              {!you.is_calling_company && " (your best company, not this one)"}.
+            </p>
+          )}
+          {board.entries.length === 0 ? (
+            <Empty>No one ranked yet.</Empty>
+          ) : (
+            <Table head={["#", "Company", "Home", "Net worth"]}>
+              {board.entries.map((e) => (
+                <tr key={e.rank} className={you && you.rank === e.rank ? "bg-primary/5 font-medium" : undefined}>
+                  <td className="tabular-nums">{e.rank}</td>
+                  <td>
+                    {e.company_name} <Titles titles={e.titles} />
+                  </td>
+                  <td className="text-muted-foreground">{portName(e.home_port_id)}</td>
+                  <td className="tabular-nums">{fmtCr(e.net_worth_pence)}</td>
+                </tr>
+              ))}
+            </Table>
+          )}
+          <p className="mt-3 text-muted-foreground text-xs">
+            Net worth: cash and escrow in every region, goods you own at catalog base prices (less freight carried for others), hulls afloat at build value
+            (each outside holder&apos;s 64ths count for the holder, not the owner), minus what you owe on loans (principal and interest), plus what you are owed on
+            active loans you made, your bank deposits (a bank&apos;s deposits count against it) and your capital in open ventures (a venture&apos;s cargo counts for its
+            investors). Borrowing never lifts you up the board. Each player ranks once, by their best company; bankrupt companies never rank. Recomputed hourly.
+          </p>
+        </TabsPanel>
+      </Tabs>
     </Panel>
   );
 }
@@ -260,7 +316,7 @@ function LookupPanel() {
 export default function LeaderboardPage() {
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
-      <PageHeader title="Leaderboard" subtitle="Season standings, theatre expansion and past champions." />
+      <PageHeader title="Leaderboard" subtitle="Season standings, the rising board, theatre expansion and past champions." />
       <div className="grid items-start gap-4 xl:grid-cols-3">
         <BoardPanel />
         <div className="space-y-4 xl:col-span-2">

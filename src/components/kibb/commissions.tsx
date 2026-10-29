@@ -18,6 +18,7 @@ import {
   pctOf,
   useDeals,
   usePresence,
+  yardDiscountText,
   type DealsView,
   type Presence,
 } from "@/components/kibb/deals-common";
@@ -363,19 +364,31 @@ function CreateCommission({ presence, vaults, deals, onDone }: { presence: Prese
   const [price, setPrice] = useState("");
   const [collateral, setCollateral] = useState("");
   const [hours, setHours] = useState(String(COMMISSION.deadlineDefaultH));
+  const [unlisted, setUnlisted] = useState(false);
   // Resolves to null when the confirmation is declined.
   const act = useAction<S.Contract | null>((r) => r && onDone());
   const region = regionOf(yard);
   const classes = (catalog?.ship_classes ?? []).filter((c) => c.phase <= unlocked);
 
-  // The hull's rebuild value (the class's cheapest turnkey quote at an open yard): exactly, from the Goldsmiths' appraisal of one of
-  // our own ships of the class with no component fitted, less her guns; else this yard's own turnkey quote, at least the rebuild value.
+  // The hull's rebuild value (the class's cheapest current Crown list price at an open yard, at full labour and markup whatever
+  // the discount yards charge): exactly, from the Goldsmiths' appraisal of one of our own ships of the class with no component
+  // fitted, less her guns; else a rough upper bound from a turnkey quote at a full-price yard where we have presence (this
+  // one, or another). Never a discount yard's quote (Lisbon, Boston, Havana): it is below the rebuild value.
   const own = presence.ships?.find((r) => r.ship.ship_class === cls && r.ship.status !== "sunk" && !(r.components ?? []).length);
   const { rebuild: ownRebuild } = useAppraisal(own?.ship.id);
   const exact = own && ownRebuild !== undefined ? Math.max(0, ownRebuild - own.ship.cannons_count * GUN_PENCE) : null;
-  const { quote: yardQuote } = useBuildQuote(yard, cls, "turnkey_cash", exact === null && presence.quay.has(yard));
-  const upper = exact === null ? (yardQuote?.total_cost_pence ?? null) : null;
+  const fullPrice = (id: string) => {
+    const port = catalog?.ports.find((x) => x.id === id);
+    return !!port?.has_shipyard && !port.yard_discount && port.phase <= unlocked;
+  };
+  const boundYard = presence.quay.has(yard) && fullPrice(yard) ? yard : ([...presence.quay].find(fullPrice) ?? "");
+  const { quote: yardQuote } = useBuildQuote(boundYard, cls, "turnkey_cash", exact === null && !!boundYard);
+  const upper = exact === null && yardQuote && !yardQuote.yard_discount ? (yardQuote.total_cost_pence ?? null) : null;
+  // A bound from above only when the quote's whole walk came off the NPC ladder: players' asks under it make the build cheaper than
+  // the Crown list price (guide 3.4: a yard where players sell materials builds cheaper), so 150% of it is then only a warning.
+  const hardUpper = upper !== null && !!yardQuote && yardQuote.materials_pence === yardQuote.npc_materials_pence;
   const band = exact !== null ? bandOf(exact) : null;
+  const discountHere = catalog?.ports.find((x) => x.id === yard)?.yard_discount ?? null;
 
   const p = crToPence(price);
   const col = collateral.trim() === "" ? 0 : crToPence(collateral);
@@ -386,19 +399,20 @@ function CreateCommission({ presence, vaults, deals, onDone }: { presence: Prese
     [!!cls, "Choose the hull class."],
     [p > 0, "Enter the price."],
     [!band || (p >= band.min && p <= band.max), `The price must lie within ${fmtCr(band?.min)} – ${fmtCr(band?.max)} (50%–150% of the hull's rebuild value).`],
-    [upper === null || p <= Math.floor(upper * 1.5), `Over 150% of ${portName(yard)}'s own turnkey quote (${fmtCr(upper)}), so over 150% of the rebuild value too: it would be refused.`],
+    [!hardUpper || p <= Math.floor(upper! * 1.5), `Over 150% of ${portName(boundYard)}'s turnkey quote (${fmtCr(upper)}), so likely over 150% of the rebuild value too: it would be refused.`],
     [Number.isFinite(col) && col >= 0, "Enter the collateral (0 for none)."],
     [!(p > 0) || col <= Math.floor(p * COMMISSION.collateralMaxShare), `The builder's collateral is at most 25% of the price (${fmtCr(Math.floor((p || 0) * COMMISSION.collateralMaxShare))}).`],
     [Number.isInteger(h) && h >= COMMISSION.deadlineMinH && h <= COMMISSION.deadlineMaxH, "The deadline is 6..1440 game hours."],
     [cash === undefined || cash >= p, `The price is escrowed from your ${regionName(region)} vault, which holds only ${fmtCr(cash)}.`],
   ]);
   const lowVsUpper = upper !== null && p > 0 && p < Math.ceil(upper * 0.5);
+  const highVsUpper = upper !== null && !hardUpper && p > Math.floor(upper * 1.5);
 
   function submit() {
     void act.run(async () => {
       if (
         !confirm(
-          `Commission a ${shipClassName(cls)} at ${portName(yard)} for ${fmtCr(p)}, escrowed now from your ${regionName(region)} vault?\n\nThe builder puts up ${fmtCr(col)} of collateral; deadline ${fmtGameHours(h)} (${realTime(h * 60, timeScale)}). Builders with quay presence at the yard see it. Untaken by the deadline, the price is refunded; taken and not delivered, you get the price back plus the builder's collateral. You can withdraw it while nobody has taken it. The ship is delivered to you berthed at ${portName(yard)}.${deals.running ? "\n\nThe fleet autopilot is running: it takes command of every ship of yours, the new one included." : ""}`,
+          `Commission a ${shipClassName(cls)} at ${portName(yard)} for ${fmtCr(p)}, escrowed now from your ${regionName(region)} vault?\n\nThe builder puts up ${fmtCr(col)} of collateral; deadline ${fmtGameHours(h)} (${realTime(h * 60, timeScale)}). Builders with quay presence at the yard see it${unlisted ? " (unlisted: not posted on the Exchange)" : ", and it is posted on the Exchange"}. Untaken by the deadline, the price is refunded; taken and not delivered, you get the price back plus the builder's collateral. You can withdraw it while nobody has taken it. The ship is delivered to you berthed at ${portName(yard)}.${deals.running ? "\n\nThe fleet autopilot is running: it takes command of every ship of yours, the new one included." : ""}`,
         )
       )
         return null;
@@ -408,6 +422,7 @@ function CreateCommission({ presence, vaults, deals, onDone }: { presence: Prese
         price_pence: p,
         collateral_pence: col,
         deadline_game_hours: h,
+        ...(unlisted ? { unlisted: true } : {}),
       });
     });
   }
@@ -452,22 +467,38 @@ function CreateCommission({ presence, vaults, deals, onDone }: { presence: Prese
               exact !== null
                 ? `${fmtCr(exact)} (appraisal of your ${own?.ship.name})`
                 : upper !== null
-                  ? `at most ${fmtCr(upper)} (${portName(yard)}'s turnkey quote)`
-                  : yard && !presence.quay.has(yard)
-                    ? "not known: no presence at this yard to quote it"
+                  ? `about ${fmtCr(upper)}${hardUpper ? " at most" : ""} (${portName(boundYard)}'s turnkey quote)`
+                  : !boundYard
+                    ? "not known: no presence at a full-price yard to quote it"
                     : "…",
             ],
-            ["Allowed price", band ? `${fmtCr(band.min)} – ${fmtCr(band.max)}` : upper !== null ? `at most ${fmtCr(Math.floor(upper * 1.5))}` : "50%–150% of it, checked by the game"],
+            ["Allowed price", band ? `${fmtCr(band.min)} – ${fmtCr(band.max)}` : hardUpper ? `at most ${fmtCr(Math.floor(upper! * 1.5))}` : "50%–150% of it, checked by the game"],
             ["Price vs rebuild", exact !== null && p > 0 ? pctOf(p, exact) : "—"],
             ["Deadline", Number.isFinite(h) ? `${fmtGameHours(h)} (${realTime(h * 60, timeScale)})` : "—"],
           ]}
         />
       )}
-      {lowVsUpper && (
+      {discountHere && (
+        <p className="text-muted-foreground text-xs">
+          {portName(yard)} is a discount yard ({yardDiscountText(discountHere)}): the builder pays less here, but the hull&apos;s rebuild value, and so the price band,
+          is the full Crown list price.
+        </p>
+      )}
+      {highVsUpper && (
         <WarnBox>
-          Under 50% of this yard&apos;s quote. The game checks the band against the class&apos;s cheapest open yard, which may be lower than here, but a price this low may be refused.
+          Over 150% of {portName(boundYard)}&apos;s quote. Players&apos; asks made part of that quote, so the class&apos;s Crown list price (the rebuild value) may be
+          higher, but a price this high may be refused.
         </WarnBox>
       )}
+      {lowVsUpper && (
+        <WarnBox>
+          Under 50% of {portName(boundYard)}&apos;s quote. The game checks the band against the class&apos;s cheapest list price at an open yard, which may be lower, but a
+          price this low may be refused.
+        </WarnBox>
+      )}
+      <Checkbox checked={unlisted} onChange={setUnlisted}>
+        <span className="text-xs">Unlisted: keep it off the Exchange, so only companies with quay presence at the yard see it</span>
+      </Checkbox>
       <CashLine region={region} cash={cash} need={p > 0 ? p : undefined} />
       <ErrorNote error={act.error ?? (yard || cls || price ? why : null)} />
       {act.result && (
@@ -675,8 +706,8 @@ export function CommissionsView() {
         </Panel>
         <WarnBox tone="info">
           <p>
-            A commission is a hull built to order. The buyer escrows the price (50%–150% of the hull&apos;s rebuild value) and needs no presence; builders with quay
-            presence at the yard see it.
+            A commission is a hull built to order. The buyer escrows the price (50%–150% of the hull&apos;s rebuild value, the full Crown list price even at a
+            discount yard) and needs no presence; builders with quay presence at the yard see it, and so does everyone on the Exchange unless it is unlisted.
           </p>
           <p>
             A builder accepts (escrowing the collateral, at most 25% of the price), then delivers before the deadline: the ship is built there exactly as a

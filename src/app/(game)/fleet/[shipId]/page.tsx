@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
 import { usePledgedShips } from "@/components/kibb/finance-common";
-import { ContractsPanel, ConvoysPanel, GunsPanel, InsurancePanel, OwnershipPanel, StoresPanel, WarehousePanel } from "@/components/kibb/fleet-ui-ship";
+import { ContractsPanel, ConvoysPanel, GunsPanel, InsurancePanel, OwnershipPanel, PassengersPanel, StoresPanel, WarehousePanel } from "@/components/kibb/fleet-ui-ship";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
 import { dash, kibbGet, kibbPost } from "@/lib/kibb/browser";
@@ -200,7 +200,7 @@ export default function ShipPage() {
         badges={
           <>
             <ShipStatusBadge status={s.status} />
-            {arrested ? <Badge variant="error">arrested</Badge> : lien ? <Badge variant="warning">liened</Badge> : null}
+            {arrested ? <Badge variant="error">arrested</Badge> : lien ? <Badge variant="warning">{lien.is_mortgage ? "mortgaged" : "liened"}</Badge> : null}
             {s.dispatches_sealed && <Badge variant="outline">dispatches sealed</Badge>}
           </>
         }
@@ -250,7 +250,8 @@ export default function ShipPage() {
           <KV
             rows={[
               ["Capacity", fmtTons(r.hold_capacity_tons)],
-              ["After guns and stores", fmtTons(r.effective_hold_capacity_tons)],
+              ["After guns, stores and passengers", fmtTons(r.effective_hold_capacity_tons)],
+              ...(s.passenger_hold_tons > 0 ? ([["Passengers take", fmtTons(s.passenger_hold_tons)]] as Array<[string, string]>) : []),
               ["Cargo aboard", fmtTons(r.cargo_used_tons)],
             ]}
           />
@@ -329,11 +330,14 @@ export default function ShipPage() {
       )}
 
       <div className="grid items-start gap-4 lg:grid-cols-2">
-        <ContractsPanel r={r} blocked={blocked} onDone={done} />
+        <div className="space-y-4">
+          <ContractsPanel r={r} blocked={blocked} onDone={done} />
+          <PassengersPanel r={r} blocked={blocked} onDone={done} />
+        </div>
         <div className="space-y-4">
           <WarehousePanel r={r} blocked={blocked} onDone={done} />
           <GunsPanel r={r} blocked={blocked} onDone={done} insured={insured} />
-          <OwnershipPanel r={r} insured={insured} lien={lien} liensKnown={pledges.known} onDone={done} />
+          <OwnershipPanel r={r} insured={insured} lien={lien} liensKnown={pledges.known} blocked={blocked} onDone={done} />
         </div>
       </div>
 

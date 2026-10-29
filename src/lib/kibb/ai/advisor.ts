@@ -5,8 +5,9 @@
  * any setting but its own for the horizon (within ranges, spend ceilings the user's, the reserve only
  * raised), bans and a bias on lanes, per-charter stall calls, orders to single ships (a lane, a
  * charter, a port, hold, release), the buyer (hold, one build, classes forbidden), marques or
- * patrols within the marque budget, and money orders (borrow for a load or a hull, repay a loan early,
- * build a commission to order) through the autopilot's own checks.
+ * patrols within the marque budget, money orders (borrow for a load or a hull, repay a loan early,
+ * build a commission to order) and housekeeping orders (break up a ship, move the home port) through the
+ * autopilot's own checks.
  *
  * Off by default. In "shadow" mode it advises and logs but changes nothing; in "live" the directives
  * apply until their horizon lapses. Every check in the autopilot still runs: settings are clamped
@@ -33,6 +34,7 @@ import {
   BIAS_MAX,
   BIAS_MIN,
   bansOf,
+  isHousekeeping,
   normalizeActive,
   OVERRIDE_KEYS,
   sameSetting,
@@ -116,7 +118,7 @@ export interface AiDecision {
   naval?: NavalOrder[];
   /** Marques and patrols it issued (pence): they run their term even after it is cleared. */
   navalSpentPence?: number;
-  /** Money orders (borrow, repay, accept a commission) and what became of them. */
+  /** Money orders (borrow, repay, accept a commission), housekeeping orders (break up, move home) and what became of them. */
   finance?: FinanceOrder[];
 }
 
@@ -200,7 +202,8 @@ function memory(d: AiDecision): string {
     return [...n].map(([s, k]) => `${k} ${s}`).join(", ");
   };
   const naval = d.naval ?? [];
-  const money = d.finance ?? [];
+  const money = (d.finance ?? []).filter((o) => !isHousekeeping(o));
+  const house = (d.finance ?? []).filter(isHousekeeping);
   return [
     d.status,
     Object.keys(d.settings).length ? `settings ${JSON.stringify(d.settings)}` : "",
@@ -212,6 +215,7 @@ function memory(d: AiDecision): string {
     d.forbid?.length ? `forbid ${d.forbid.join(" ")}` : "",
     naval.length ? `naval ${tally(naval)}${d.navalSpentPence ? `, ${cr(d.navalSpentPence)} spent` : ""}` : "",
     money.length ? `money ${money.map((o) => `${o.kind} ${o.status}${o.code ? `: ${o.code}` : ""}`).join(", ")}` : "",
+    house.length ? `housekeeping ${house.map((o) => `${o.kind} ${o.status}${o.code ? `: ${o.code}` : ""}`).join(", ")}` : "",
   ]
     .filter(Boolean)
     .join(", ");
@@ -395,7 +399,7 @@ export class Advisor {
     return b && b.status !== "done" && b.status !== "refused" && b.status !== "lapsed" ? b : null;
   }
 
-  /** Money orders in force still to act on (borrow, repay, accept a commission): not done, refused or lapsed. */
+  /** Money and housekeeping orders in force still to act on (borrow, repay, accept a commission, break up, move home): not done, refused or lapsed. */
   financeOrders(): FinanceOrder[] {
     return (this.inForce()?.finance ?? []).filter((o) => o.status !== "done" && o.status !== "refused" && o.status !== "lapsed");
   }

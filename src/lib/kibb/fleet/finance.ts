@@ -12,12 +12,17 @@
  * year up to 30 game days, sliding to 30% at 360), balloon repayment; a request posted alongside lets a player lender
  * refinance it for less.
  *
+ * Ship mortgages (guide 3.4): a turnkey build our cash can't fund may have the yard region's Goldsmiths pay 60% of its
+ * price (80% for an oceanic hull), amortised over 180 game days with an installment every 10, one at a time, within the
+ * debt cap; only when the hull's net covers its installments MORTGAGE_COVER_X over and earns minLoanReturnX its interest
+ * over the term. Never repaid early: only its next MORTGAGE_FENCED_INSTALLMENTS are kept back from other spending.
+ *
  * Lending (idle cash): spare cash beyond what the fleet needs, less a buffer, quoted on players' secured requests (ship
  * liens or warehouse goods, with recourse) from borrowers with a clean credit record, at 0.9x the Goldsmiths' rate for
  * the term (never under 15% a year, always within the request's bounds).
  */
 
-import type { CreditReport, Loan } from "../schema";
+import type { CreditReport, Loan, MortgageTerms } from "../schema";
 
 /** A loan year: annual rates are per this many game days. */
 export const YEAR_DAYS = 360;
@@ -38,6 +43,18 @@ export const MAX_ACTIVE_LOANS = 2;
 export const LOAN_MAX_LOAD_PENCE = GOLDSMITHS_MAX_PRINCIPAL_PENCE;
 /** A loan bridges at most this share of a hull's cost: the rest is our own cash. */
 export const LOAN_MAX_HULL_SHARE = 0.5;
+/**
+ * A ship mortgage (guide 3.4): the share of a build's price the Goldsmiths pay (an oceanic hull's), its term and the game
+ * days between installments; how many of its next installments the fence keeps back (the later ones are the hull's own
+ * earnings' to pay), and how many times over the hull's net must cover them.
+ */
+export const MORTGAGE_SHARE = 0.6;
+export const MORTGAGE_OCEANIC_SHARE = 0.8;
+export const MORTGAGE_TERM_DAYS = 180;
+export const MORTGAGE_INSTALLMENT_DAYS = 10;
+export const MORTGAGE_FENCED_INSTALLMENTS = 2;
+export const MORTGAGE_FENCE_DAYS = MORTGAGE_INSTALLMENT_DAYS * MORTGAGE_FENCED_INSTALLMENTS;
+export const MORTGAGE_COVER_X = 1.5;
 /**
  * Room under the debt cap kept for interest before the term is known: principal × (1 + this), the Goldsmiths' 30-day
  * interest. borrow() checks the quote's own total against the cap.
@@ -112,6 +129,63 @@ export function loanCase(o: {
   return { ok: true, termDays, interest, ret };
 }
 
+/** A ship mortgage's terms (pence; annual bps): as a build quote states them, or estimated before one (`estimated`). */
+export interface MortgagePlan {
+  principal: number;
+  /** Principal and interest, paying on schedule. */
+  total: number;
+  installment: number;
+  installments: number;
+  termDays: number;
+  rateBps: number;
+  estimated?: boolean;
+}
+
+/** A quote's mortgage terms (guide 3.4) as a plan: an installment it leaves out is its total over the installments. */
+export function mortgagePlan(m: MortgageTerms): MortgagePlan {
+  const installments = Math.max(1, m.installments || Math.round((m.term_game_days || MORTGAGE_TERM_DAYS) / MORTGAGE_INSTALLMENT_DAYS));
+  const installment = m.installment_pence && m.installment_pence > 0 ? m.installment_pence : Math.ceil(m.total_repayable_pence / installments);
+  return { principal: m.principal_pence, total: m.total_repayable_pence, installment, installments, termDays: m.term_game_days || MORTGAGE_TERM_DAYS, rateBps: m.annual_rate_bps };
+}
+
+/**
+ * A mortgage's terms before a quote states them (a build priced from a cached quote): 60% of the price (80% oceanic) at the
+ * Goldsmiths' rate for 180 game days, in equal installments every 10 (an annuity on each period's simple interest: the
+ * server's own schedule may differ a little; the build re-quotes and checks the real terms).
+ */
+export function mortgageEstimate(price: number, oceanic: boolean): MortgagePlan {
+  const principal = Math.floor(price * (oceanic ? MORTGAGE_OCEANIC_SHARE : MORTGAGE_SHARE));
+  const rateBps = goldsmithsAnnualBps(MORTGAGE_TERM_DAYS);
+  const n = MORTGAGE_TERM_DAYS / MORTGAGE_INSTALLMENT_DAYS;
+  const i = (rateBps * MORTGAGE_INSTALLMENT_DAYS) / (10_000 * YEAR_DAYS);
+  const installment = Math.ceil(i > 0 ? (principal * i) / (1 - (1 + i) ** -n) : principal / n);
+  return { principal, total: installment * n, installment, installments: n, termDays: MORTGAGE_TERM_DAYS, rateBps, estimated: true };
+}
+
+export type MortgageCase = { ok: true; interest: number; ret: number } | { ok: false; why: string; code: "installments" | "interest" };
+
+/**
+ * Whether a ship mortgage pays on the hull it buys (guide 3.4): the hull's net per real hour (`netPerHour`) covers its
+ * installments (one every MORTGAGE_INSTALLMENT_DAYS game days, `hoursPerDay` real hours each) MORTGAGE_COVER_X times
+ * over, and earns at least `minReturnX` times its interest (total less principal) over the term.
+ */
+export function mortgageCase(m: MortgagePlan, netPerHour: number, hoursPerDay: number, minReturnX: number): MortgageCase {
+  const interest = Math.max(0, Math.ceil(m.total - m.principal));
+  const perHour = m.installment / (MORTGAGE_INSTALLMENT_DAYS * hoursPerDay);
+  if (!(netPerHour >= MORTGAGE_COVER_X * perHour)) {
+    return {
+      ok: false,
+      why: `it nets ~${Math.round(netPerHour / 100)} Cr/h, under ${MORTGAGE_COVER_X}x its installments (${Math.round(m.installment / 100)} Cr every ${MORTGAGE_INSTALLMENT_DAYS} game days, ~${Math.round(perHour / 100)} Cr/h)`,
+      code: "installments",
+    };
+  }
+  const ret = Math.round(netPerHour * m.termDays * hoursPerDay);
+  if (!(ret >= minReturnX * interest)) {
+    return { ok: false, why: `it earns ~${Math.round(ret / 100)} Cr over ${m.termDays} game days, under ${minReturnX}x the ~${Math.round(interest / 100)} Cr interest`, code: "interest" };
+  }
+  return { ok: true, interest, ret };
+}
+
 /** A loan's rate as a % a year ("45%", "4.5%"). */
 export function pctYear(annualBps: number): string {
   const pct = annualBps / 100;
@@ -141,16 +215,48 @@ export function repayBy(l: Pick<Loan, "matures_at">, dayMs: number, leadDays = R
 
 /**
  * What a loan we owe will take to clear at server time `at`: owed now, plus interest on its outstanding principal until
- * then at its own basis (an amortised loan's principal falls as installments are paid: this is the most it can be).
+ * then at its own basis. An amortised loan's installments falling due before then are counted in, each paying the
+ * interest accrued and then principal (guide 3.13.1), so its interest runs on the falling balance: those installments
+ * and what is left owed at `at`.
  */
 export function owedAt(
-  l: Pick<Loan, "owed_pence" | "outstanding_principal_pence" | "rate_basis" | "daily_rate_bps" | "annual_rate_bps">,
+  l: Pick<
+    Loan,
+    | "owed_pence"
+    | "outstanding_principal_pence"
+    | "rate_basis"
+    | "daily_rate_bps"
+    | "annual_rate_bps"
+    | "repayment"
+    | "installment_pence"
+    | "next_payment_due_at"
+    | "next_payment_pence"
+    | "arrears_pence"
+    | "arrears_due_by"
+    | "matures_at"
+  >,
   now: number,
   at: number,
   dayMs: number,
 ): number {
-  const days = Math.max(0, (at - now) / dayMs);
-  return Math.max(0, l.owed_pence) + Math.ceil((Math.max(0, l.outstanding_principal_pence) * perDayBps(l) * days) / 10_000);
+  const days = (from: number, to: number) => Math.max(0, (to - from) / dayMs);
+  const rate = perDayBps(l) / 10_000;
+  if (l.repayment !== "amortised") return Math.max(0, l.owed_pence) + Math.ceil(Math.max(0, l.outstanding_principal_pence) * rate * days(now, at));
+  let principal = Math.max(0, l.outstanding_principal_pence);
+  let interest = Math.max(0, l.owed_pence - principal);
+  let paid = 0;
+  let t = now;
+  for (const x of installmentsBefore(l, now, at, dayMs)) {
+    interest += principal * rate * days(t, x.at);
+    // The last may be whatever is then left: never more than is owed.
+    const pay = Math.min(x.pence, principal + interest);
+    const toInterest = Math.min(interest, pay);
+    interest -= toInterest;
+    principal -= pay - toInterest;
+    paid += pay;
+    t = Math.max(t, x.at);
+  }
+  return Math.ceil(paid + principal + interest + principal * rate * days(t, at));
 }
 
 /**

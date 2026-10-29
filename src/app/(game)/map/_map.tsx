@@ -222,7 +222,7 @@ export default function KibbMap({
                 <div className="capitalize">
                   {p.banking_region.replace(/_/g, " ")} · phase {p.phase}
                   {p.is_hub && " · hub"}
-                  {p.has_shipyard && " · shipyard"}
+                  {p.has_shipyard && (p.yard_discount ? " · discount shipyard" : " · shipyard")}
                   {p.is_cove && " · smugglers' cove"}
                 </div>
                 {!!(p.produces?.length || p.manufactures?.length) && (

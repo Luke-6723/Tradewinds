@@ -9,9 +9,9 @@
  * old, every couple of game hours, so players get first pick: a fresh policy at a positive margin is
  * ours if we take it before Lloyd's does. A listing without the estimate is no longer open for
  * underwriting (sailed, fully covered, expired, or no route): never written. Losses are real: a sinking or a
- * capture pays out the whole slice of the sum insured, a storm up to a quarter of the declared cargo,
- * pirates who let the ship go up to what they seized of it (at most half). So slices are small, capped
- * per policy and in total.
+ * capture pays out the whole slice of the sum insured, a storm the share it took of the declared cargo (it
+ * varies, `cargo_loss_pct`: most are light, a heavy one takes far more), pirates who let the ship go up to what
+ * they seized of it (at most half). So slices are small, capped per policy and in total.
  */
 
 import type { InsurancePolicyListing } from "../schema";

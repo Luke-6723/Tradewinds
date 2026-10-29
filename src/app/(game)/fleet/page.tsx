@@ -7,6 +7,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { DiscountYardBadge, yardDiscountText } from "@/components/kibb/deals-common";
+import { AnnualRateText, CashLine, LOAN, WarnBox, regionName, useRegionOf, useVaults } from "@/components/kibb/finance-common";
+import { Checkbox } from "@/components/kibb/naval-common";
 import { Field } from "@/components/kibb/pickers";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
@@ -40,6 +43,8 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
   const { catalog, portName, goodName } = useCatalog();
   const { data: clock } = usePoll(() => kibbGet<WorldClock>("/v1/world/clock"));
   const { data: factors } = usePoll(() => kibbGet<string[]>("/v1/company/factors"), 60_000);
+  const vaults = useVaults();
+  const regionOf = useRegionOf();
   const unlocked = clock?.unlocked_phase ?? 1;
 
   // A yard quotes and builds only for a company present there: a ship in port or a factor.
@@ -56,6 +61,7 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
   const [cls, setCls] = useState("");
   const [mode, setMode] = useState<BuildMode>("turnkey_cash");
   const [name, setName] = useState("");
+  const [mortgage, setMortgage] = useState(false);
   const yard = port || yards.find((p) => presence.has(p.id))?.id || "";
   const klass = classes.find((c) => c.id === (cls || "collier")) ?? classes[0];
   const here = presence.has(yard);
@@ -73,6 +79,8 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
   const build = useAction<BuildShipResult | null>((r) => {
     void requote();
     if (!r) return;
+    setMortgage(false);
+    void vaults.reload();
     onBuilt();
     void suggest.run(() => dash.get<{ name: string }>("/api/kibb/ship-name"));
   });
@@ -84,6 +92,13 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
   if (!catalog) return <Loading />;
   const locked = klass && klass.phase > unlocked;
   const missing = quote?.materials.filter((m) => !m.in_stock) ?? [];
+  const discount = quote?.yard_discount ?? catalog.ports.find((p) => p.id === yard)?.yard_discount ?? null;
+  const region = regionOf(yard);
+  // A ship mortgage (guide 3.4): the Goldsmiths of the yard's region pay 60% of the price (80% for an oceanic hull).
+  const terms = quote?.mortgage ?? null;
+  const mortgaged = mortgage && !!terms?.available;
+  const price = quote?.total_cost_pence ?? null;
+  const yourPart = price !== null ? Math.max(0, price - (mortgaged && terms ? terms.principal_pence : 0)) : null;
 
   return (
     <div className="grid items-start gap-6 lg:grid-cols-2">
@@ -94,6 +109,7 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
               {yards.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name}
+                  {p.yard_discount ? " · discount yard" : ""}
                   {presence.has(p.id) ? " ●" : " (no presence)"}
                 </option>
               ))}
@@ -159,16 +175,27 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
           <Loading />
         ) : (
           <>
+            {discount && (
+              <div className="flex flex-wrap items-center gap-2">
+                <DiscountYardBadge discount={discount} />
+                <span className="text-muted-foreground text-xs">
+                  {yardDiscountText(discount)}, already taken off below. The hull&apos;s rebuild value is unchanged: the full Crown list price, which ship
+                  sales, insurance, loans and break-ups go by.
+                </span>
+              </div>
+            )}
             <KV
               rows={[
-                ["Labour", fmtCr(quote.labour_pence)],
+                [discount ? `Labour (${(discount.labour_discount_bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}% off)` : "Labour", fmtCr(quote.labour_pence)],
                 ...(mode === "byom"
                   ? ([] as Array<[string, string]>)
                   : ([
                       ["Materials (players' asks and the NPC ladder)", fmtCr(quote.materials_pence)],
                       ["Customs on every fill", fmtCr(quote.customs_pence)],
                       [
-                        `Yard markup ${(quote.yard_markup_bps / 100).toFixed(1)}% on the NPC part (${fmtCr(quote.npc_materials_pence)})`,
+                        discount?.turnkey_markup_waived
+                          ? "Yard markup (waived at this yard)"
+                          : `Yard markup ${(quote.yard_markup_bps / 100).toFixed(1)}% on the NPC part (${fmtCr(quote.npc_materials_pence)})`,
                         fmtCr(quote.yard_markup_pence),
                       ],
                     ] as Array<[string, string]>)),
@@ -220,12 +247,55 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
                 }
               />
             )}
+            {terms && (
+              <div className="space-y-2 rounded-lg border p-3">
+                <Checkbox checked={mortgaged} onChange={(v) => setMortgage(v && terms.available)}>
+                  <span className={terms.available ? undefined : "text-muted-foreground"}>
+                    Ship mortgage from {terms.lender_name}
+                    {!terms.available && " (not available: you still owe on one)"}
+                  </span>
+                </Checkbox>
+                <KV
+                  rows={[
+                    ["They pay", `${fmtCr(terms.principal_pence)} (${klass.hull_category === "oceanic" ? "80%" : "60%"} of the price)`],
+                    ["Rate", <AnnualRateText key="r" bps={terms.annual_rate_bps} />],
+                    [
+                      "Repaid",
+                      `${terms.installments} installments${terms.installment_pence != null ? ` of ${fmtCr(terms.installment_pence)}` : ""} every ${LOAN.installmentEveryDays} game days over ${terms.term_game_days} game days`,
+                    ],
+                    ["Total repayable", fmtCr(terms.total_repayable_pence)],
+                    ["You pay now", price !== null ? fmtCr(Math.max(0, price - terms.principal_pence)) : "—"],
+                  ]}
+                />
+                <p className="text-muted-foreground text-xs">
+                  An ordinary Goldsmiths&apos; loan, amortised, with recourse and a lien on the new ship: she can sail and trade, but can&apos;t be listed, sold or
+                  pledged again until it is repaid. One mortgage at a time. Build and loan succeed or fail together. On a default she goes to them where she lies,
+                  credited at {LOAN.foreclosureCreditPct}% of her rebuild value, and they pay you any surplus over what you owe. Guns fitted later never count toward
+                  the price.
+                </p>
+              </div>
+            )}
+            <CashLine region={region} cash={vaults.cash(region)} need={yourPart ?? undefined} />
             <ErrorNote error={build.error} />
             {build.result && (
-              <p className="text-sm">
-                Built <Link href={`/fleet/${build.result.ship_id}`} className="font-medium hover:underline">{build.result.name}</Link> for{" "}
-                {fmtCr(build.result.total_cost_pence)}.
-              </p>
+              <div className="space-y-2 text-sm">
+                <p>
+                  Built <Link href={`/fleet/${build.result.ship_id}`} className="font-medium hover:underline">{build.result.name}</Link> for{" "}
+                  {fmtCr(build.result.total_cost_pence)}
+                  {build.result.mortgage ? `, of which the Goldsmiths lent ${fmtCr(build.result.mortgage.principal_pence)}` : ""}.
+                </p>
+                {build.result.mortgage && (
+                  <WarnBox tone="info">
+                    Ship mortgage: {fmtCr(build.result.mortgage.owed_pence)} owed in {regionName(build.result.mortgage.banking_region)}
+                    {build.result.mortgage.installment_pence != null ? `, ${fmtCr(build.result.mortgage.installment_pence)} every ${LOAN.installmentEveryDays} game days` : ""}
+                    {build.result.mortgage.matures_at ? `, the last ${fmtIn(build.result.mortgage.matures_at)}` : ""}. See{" "}
+                    <Link href="/loans" className="underline">
+                      Loans
+                    </Link>
+                    .
+                  </WarnBox>
+                )}
+              </div>
             )}
             <Button
               disabled={build.busy || !quote.available || quote.total_cost_pence == null || !name.trim()}
@@ -234,13 +304,26 @@ function Shipyard({ ships, onBuilt }: { ships: ShipResult[]; onBuilt: () => void
                   // Re-quote first: the charge is whatever the yard asks at the moment of building.
                   const fresh = await getQuote();
                   if (!fresh.available || fresh.total_cost_pence == null) throw new Error("The yard can't build this class right now.");
+                  const m = mortgaged ? fresh.mortgage : null;
+                  if (mortgaged && !m?.available) throw new Error("No ship mortgage is available on this build now (you may still owe on one): untick it to build without.");
                   const how = mode === "byom" ? "with your own materials" : "turnkey";
-                  if (!confirm(`Build the ${klass.name} "${name.trim()}" at ${portName(yard)} (${how}) for ${fmtCr(fresh.total_cost_pence)}?`)) return null;
-                  return kibbPost<BuildShipResult>("/v1/shipyard/build-ship", { port_id: yard, name: name.trim(), ship_class: klass.id, build_mode: mode });
+                  const loan = m
+                    ? `\n\nWith a ship mortgage: ${m.lender_name} pay ${fmtCr(m.principal_pence)} and you pay ${fmtCr(Math.max(0, fresh.total_cost_pence - m.principal_pence))} from your ${regionName(region)} vault. ${m.installments} installments${m.installment_pence != null ? ` of ${fmtCr(m.installment_pence)}` : ""} every ${LOAN.installmentEveryDays} game days, ${fmtCr(m.total_repayable_pence)} in all, with recourse. Until it is repaid she can't be listed, sold or pledged; on a default she goes to them credited at ${LOAN.foreclosureCreditPct}% of her rebuild value, any surplus paid to you.`
+                    : "";
+                  if (!confirm(`Build the ${klass.name} "${name.trim()}" at ${portName(yard)} (${how}) for ${fmtCr(fresh.total_cost_pence)}?${loan}`)) return null;
+                  return kibbPost<BuildShipResult>("/v1/shipyard/build-ship", {
+                    port_id: yard,
+                    name: name.trim(),
+                    ship_class: klass.id,
+                    build_mode: mode,
+                    ...(m ? { mortgage: true } : {}),
+                  });
                 })
               }
             >
-              {build.busy ? "Building…" : `Build ${klass.name}${quote.total_cost_pence != null ? ` for ${fmtCr(quote.total_cost_pence)}` : ""}`}
+              {build.busy
+                ? "Building…"
+                : `Build ${klass.name}${quote.total_cost_pence != null ? ` for ${fmtCr(quote.total_cost_pence)}` : ""}${mortgaged && yourPart !== null ? ` (you pay ${fmtCr(yourPart)})` : ""}`}
             </Button>
           </>
         )}

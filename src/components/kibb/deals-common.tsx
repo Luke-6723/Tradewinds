@@ -51,6 +51,21 @@ export function bandOf(rebuildPence: number): { min: number; max: number } {
   return { min: Math.ceil(rebuildPence * SHIP_PRICE_BAND.min), max: Math.floor(rebuildPence * SHIP_PRICE_BAND.max) };
 }
 
+/** What a discount yard (guide 3.4: Lisbon, Boston, Havana) takes off a build, in words. */
+export function yardDiscountText(d: S.YardDiscount): string {
+  return `shipwright labour ${(d.labour_discount_bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}% cheaper${d.turnkey_markup_waived ? ", no turnkey markup" : ""}`;
+}
+
+/** A "discount yard" badge where the port has one; nothing elsewhere. A hull built there keeps the full rebuild value. */
+export function DiscountYardBadge({ discount, size = "sm" }: { discount: S.YardDiscount | null | undefined; size?: "sm" | "default" }) {
+  if (!discount) return null;
+  return (
+    <Badge variant="success" size={size} title={`Discount yard: ${yardDiscountText(discount)}. A hull built here has the same rebuild value as any other.`}>
+      discount yard
+    </Badge>
+  );
+}
+
 /** "84%": a price as a share of a rebuild value. */
 export const pctOf = (price: number, of: number | null | undefined) => (of && of > 0 ? `${Math.round((price / of) * 100)}%` : "—");
 

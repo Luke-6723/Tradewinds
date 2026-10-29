@@ -41,7 +41,10 @@ export const LOAN = {
   goldsmithsForeclosureCreditPct: 35,
 } as const;
 
-/** Banks: 10,000 Cr fee, 50,000 Cr of own funds after it, 20% reserve, rates 0..=50 bps a day, notice 1..=720 game hours. */
+/**
+ * Banks: 10,000 Cr fee, 50,000 Cr of own funds after it, 20% reserve, rates 0..=50 bps a day, notice 1..=720 game hours;
+ * exchange fees 0..=1,200 bps a region; client terms a rate bonus of 0..=50 bps a day and an exchange discount of 0..=1,200.
+ */
 export const BANK = {
   charterFeePence: 1_000_000,
   ownFundsPence: 5_000_000,
@@ -51,6 +54,8 @@ export const BANK = {
   minDepositPence: 1_000,
   insuredCoverPence: 250_000,
   insuredAfterDays: 14,
+  exchangeFeeMaxBps: 1_200,
+  clientBonusMaxBps: 50,
 } as const;
 
 /** Ventures: investors take 25%..=90% of the profit after 2% stamp duty; raise 1..=168 game hours (default 24); stakes ≥ 10 Cr. */
@@ -262,7 +267,8 @@ export function useShips() {
 }
 
 /**
- * One of our ships' rebuild value (guide 3.4: the class's cheapest turnkey quote, guns and fitted components included), as
+ * One of our ships' rebuild value (guide 3.4: the class's cheapest current Crown list price at an open yard, at full labour and
+ * markup whatever the discount yards charge, plus her guns and fitted components), as
  * the Goldsmiths appraise her: a 100 Cr, 30-day instant quote carries it (stored for 6 game hours, never taken). It fails
  * (409) for a ship liened, listed or carrying a venture, or one that can't carry even that: `rebuild` is then undefined.
  */
@@ -354,6 +360,16 @@ export function LoanStatusBadge({ status }: { status: S.LoanStatus }) {
   );
 }
 
+/** A Goldsmiths' ship mortgage (guide 3.4: taken with a build, amortised over 180 game days, one at a time). */
+export function MortgageBadge({ loan }: { loan: Pick<S.Loan, "is_mortgage"> }) {
+  if (!loan.is_mortgage) return null;
+  return (
+    <Badge variant="info" size="sm" title="A Goldsmiths' ship mortgage taken with a build: a lien on the new ship with recourse, amortised over 180 game days; one at a time">
+      mortgage
+    </Badge>
+  );
+}
+
 export const COLLATERAL_LABEL: Record<S.CollateralKind, string> = {
   ship_lien: "Ship lien",
   warehouse_goods: "Warehouse goods",
@@ -412,6 +428,7 @@ export function CreditRecordView({ report }: { report: S.CreditReport }) {
       <KV
         rows={[
           ["Owes now (active loans)", `${fmtCr(report.active_owed_pence)} on ${report.active_loans}`],
+          ["Ship mortgages open", report.open_mortgages ? `${report.open_mortgages} (one at a time)` : "none"],
           ["Defaulted, still owed", report.defaulted_open_loans ? `${fmtCr(report.defaulted_owed_pence)} on ${report.defaulted_open_loans}` : "none"],
           ["Loans repaid", report.loans_repaid],
           ["Loans defaulted (ever)", report.loans_defaulted],
@@ -436,15 +453,17 @@ export interface Pledge {
   goodId: string;
   tons: string;
   contractId: string;
+  depositId: string;
 }
 
-export const EMPTY_PLEDGE: Pledge = { shipId: "", portId: "", goodId: "", tons: "", contractId: "" };
+export const EMPTY_PLEDGE: Pledge = { shipId: "", portId: "", goodId: "", tons: "", contractId: "", depositId: "" };
 
 /** The request fields a collateral kind needs. */
 export function pledgeBody(kind: S.CollateralKind, p: Pledge) {
   if (kind === "ship_lien") return { ship_id: p.shipId };
   if (kind === "warehouse_goods") return { port_id: p.portId, commodity_id: p.goodId, tons: num(p.tons) };
   if (kind === "contract_receivable") return { contract_id: p.contractId.trim() };
+  if (kind === "deposit") return { deposit_id: p.depositId.trim() };
   return {};
 }
 
@@ -455,8 +474,16 @@ export function pledgeProblem(kind: S.CollateralKind, p: Pledge): string | null 
     return !p.portId || !p.goodId ? "Choose the goods to pledge." : !(t > 0) ? "Enter the tons pledged." : null;
   }
   if (kind === "contract_receivable") return p.contractId.trim() ? null : "Enter the accepted contract's id.";
+  if (kind === "deposit") return p.depositId.trim() ? null : "Choose the deposit to pledge.";
   return null;
 }
+
+/**
+ * A deposit we may borrow against (guide 3.13.4): one of our own, open, not already pledged. Its free balance (less
+ * withdrawals asked for) must cover the loan's total repayable, checked by the game when asked, quoted and approved.
+ */
+export const pledgeableDeposit = (d: S.DepositResult, companyId: string | undefined) =>
+  d.depositor_company_id === companyId && d.status === "open" && d.pledged_pence <= 0 && d.balance_pence - d.pending_withdrawal_pence > 0;
 
 /**
  * The pledge for a collateral kind. `ours`: our own ships and free warehouse stock (borrowing); otherwise the
@@ -470,6 +497,7 @@ export function PledgeFields({
   ships,
   stock,
   pledged,
+  deposits,
 }: {
   kind: S.CollateralKind;
   value: Pledge;
@@ -480,6 +508,8 @@ export function PledgeFields({
   stock?: S.PortWarehouseResult[];
   /** Ships already under a lien (left out of the picker). */
   pledged?: Map<string, S.Loan>;
+  /** Our deposits that may secure a loan (a deposit pledge). */
+  deposits?: S.DepositResult[];
 }) {
   const { portName, goodName } = useCatalog();
   const set = (patch: Partial<Pledge>) => onChange({ ...value, ...patch });
@@ -492,6 +522,24 @@ export function PledgeFields({
     ) : (
       <Field label="Borrower's ship id (lien)">
         <Input value={value.shipId} onChange={(e) => set({ shipId: e.target.value })} placeholder="ship id" />
+      </Field>
+    );
+  }
+  if (kind === "deposit") {
+    return ours ? (
+      <Field label="Deposit pledged (only its bank may quote)">
+        <NativeSelect value={value.depositId} onChange={(e) => set({ depositId: e.target.value })}>
+          <option value="">{deposits === undefined ? "Reading your deposits…" : deposits.length ? "Choose a deposit…" : "No open deposit free to pledge"}</option>
+          {(deposits ?? []).map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.bank_name} · {d.banking_region.replace(/_/g, " ")} · {fmtCr(d.balance_pence - d.pending_withdrawal_pence)} free
+            </option>
+          ))}
+        </NativeSelect>
+      </Field>
+    ) : (
+      <Field label="Borrower's deposit id">
+        <Input value={value.depositId} onChange={(e) => set({ depositId: e.target.value })} placeholder="deposit id" />
       </Field>
     );
   }

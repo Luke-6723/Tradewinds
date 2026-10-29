@@ -16,6 +16,8 @@
  *   KIBB_MAX_PAYBACK_H    only build ships that pay back within this (default 8)
  *   KIBB_BUY_CLASSES      comma list (default collier,brigantine,fluyt,cutter)
  *   KIBB_FREIGHT=0        don't carry freight on empty legs
+ *   KIBB_PASSENGERS=0     don't offer spare hold to passengers on voyages sailed anyway (1|true on, 0|false off; any other
+ *                         value stops the CLI with an error, as for the other new switches below)
  *   KIBB_CONVOYS=0        don't sail in convoys with our other ships
  *   KIBB_RIVAL_INTEL=0    rival intel from quay sightings only (no public policies, convoys or leaderboard)
  *   KIBB_BYOM=0           always build turnkey (not from materials bought at the yard)
@@ -33,11 +35,17 @@
  *                         on the Goldsmiths' instant quote, refinanced by a cheaper player quote; the key needs treasury_remit.
  *                         A default on a Goldsmiths' instant loan takes the ship at 35% of her rebuild value, no surplus,
  *                         the rest still owed; after any walk-away they lend nothing for a real day, nor does the autopilot)
+ *   KIBB_MORTGAGES=0      never build on a ship mortgage (on by default, with leverage only: the Goldsmiths pay 60% of a turnkey
+ *                         build, 80% oceanic, amortised over 180 game days, one at a time, within the debt cap; strict 1|true / 0|false)
  *   KIBB_MAX_DEBT_PCT     most owed on loans, % of net worth (default 25)
  *   KIBB_MIN_LOAN_RETURN_X  a loan must earn this many times its interest over its term (default 2)
  *   KIBB_IDLE_CASH=0      don't quote spare cash on players' secured loan requests (clean borrowers, never our own companies)
  *   KIBB_SHIP_DEALS=0     don't buy ships for sale under building cost, nor build commissions to order
  *   KIBB_ENVELOPES=0      don't sell sealed news (intelligence envelopes) from our quays
+ *   KIBB_BREAKUP=0        never break up dead weight (on by default: a ship earning under her upkeep for days, sold to a yard for 35%
+ *                         of her rebuild value when the upkeep saved makes up the net worth it gives away; strict 1|true / 0|false)
+ *   KIBB_RELOCATE=0       never move the home port (on by default: 2,500 Cr, when the remit fees it saves beat that 1.5x over, at most
+ *                         once in 3 real days; strict 1|true / 0|false)
  *   KIBB_SMUGGLING=1      (1|true|resume on, 0|false off; any other value stops the CLI with an error)
  *                         the Free Trade (off by default; RISKY): one dedicated ship runs small loads of contraband from a
  *                         cove to a fresh want, only through zones no patrol works and only when the expected gain is twice
@@ -50,8 +58,9 @@
  *                         setting but its own within your ceilings (KIBB_MAX_SHIPS and the marque and underwriting budgets
  *                         never exceeded, KIBB_RESERVE_CR only raised), ban ports/zones/goods/charters, order single ships,
  *                         order one build, issue marques or patrols within the marque budget (1,000 Cr in 24 h by
- *                         default; an issued one can't be withdrawn), and give money orders (borrow for a load or a hull
- *                         within the debt cap, repay a loan early, build a commission to order) through every check;
+ *                         default; an issued one can't be withdrawn), give money orders (borrow for a load or a hull
+ *                         within the debt cap, repay a loan early, build a commission to order) and housekeeping orders
+ *                         (break up a ship, move the home port; never while those switches are off) through every check;
  *                         every order and its outcome is logged
  *   KIBB_AI_DAILY_USD     AI spend cap per UTC day in US$ (default 2)
  *   KIBB_AI_MODEL         claude-opus-5-5 (default) | claude-sonnet-5-5
@@ -77,6 +86,18 @@ function smugglingEnv(v: string | undefined): boolean | undefined {
   throw new Error(`KIBB_SMUGGLING must be 1, true or resume (on) or 0, false (off), not "${v}"`);
 }
 
+/**
+ * The switches added with passengers, mortgages and housekeeping are read strictly too: only 1/true turn one on and 0/false off;
+ * anything else (a typo) is refused, never guessed. (The older flags keep their loose reading: anything but "0" is on.)
+ */
+function switchEnv(name: string, v: string | undefined): boolean | undefined {
+  if (v === undefined || v.trim() === "") return undefined;
+  const x = v.trim().toLowerCase();
+  if (x === "1" || x === "true") return true;
+  if (x === "0" || x === "false") return false;
+  throw new Error(`${name} must be 1 or true (on) or 0 or false (off), not "${v}"`);
+}
+
 let settings: FleetSettings;
 try {
   settings = {
@@ -89,6 +110,7 @@ try {
       maxPaybackHours: env.KIBB_MAX_PAYBACK_H ? Number(env.KIBB_MAX_PAYBACK_H) : undefined,
       buyClasses: env.KIBB_BUY_CLASSES ? env.KIBB_BUY_CLASSES.split(",").map((x) => x.trim()) : undefined,
       useFreight: env.KIBB_FREIGHT ? env.KIBB_FREIGHT !== "0" : undefined,
+      usePassengers: switchEnv("KIBB_PASSENGERS", env.KIBB_PASSENGERS),
       convoys: env.KIBB_CONVOYS ? env.KIBB_CONVOYS !== "0" : undefined,
       rivalIntel: env.KIBB_RIVAL_INTEL ? env.KIBB_RIVAL_INTEL !== "0" : undefined,
       byomBuilds: env.KIBB_BYOM ? env.KIBB_BYOM !== "0" : undefined,
@@ -103,11 +125,14 @@ try {
       cashDuePct: env.KIBB_CASH_DUE ? Number(env.KIBB_CASH_DUE) : undefined,
       actOnEvents: env.KIBB_WORLD_EVENTS ? env.KIBB_WORLD_EVENTS !== "0" : undefined,
       leverage: env.KIBB_LEVERAGE ? env.KIBB_LEVERAGE !== "0" : undefined,
+      mortgages: switchEnv("KIBB_MORTGAGES", env.KIBB_MORTGAGES),
       maxDebtPct: env.KIBB_MAX_DEBT_PCT ? Number(env.KIBB_MAX_DEBT_PCT) : undefined,
       minLoanReturnX: env.KIBB_MIN_LOAN_RETURN_X ? Number(env.KIBB_MIN_LOAN_RETURN_X) : undefined,
       idleCash: env.KIBB_IDLE_CASH ? env.KIBB_IDLE_CASH !== "0" : undefined,
       shipDeals: env.KIBB_SHIP_DEALS ? env.KIBB_SHIP_DEALS !== "0" : undefined,
       envelopes: env.KIBB_ENVELOPES ? env.KIBB_ENVELOPES !== "0" : undefined,
+      autoBreakUp: switchEnv("KIBB_BREAKUP", env.KIBB_BREAKUP),
+      autoRelocate: switchEnv("KIBB_RELOCATE", env.KIBB_RELOCATE),
       smuggling: smugglingEnv(env.KIBB_SMUGGLING),
       smuggleMaxTons: env.KIBB_SMUGGLE_MAX_TONS ? Number(env.KIBB_SMUGGLE_MAX_TONS) : undefined,
       smuggleMaxPence: env.KIBB_SMUGGLE_MAX_CR ? cr(env.KIBB_SMUGGLE_MAX_CR) : undefined,

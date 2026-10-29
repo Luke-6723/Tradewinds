@@ -153,6 +153,19 @@ export function NativeSelect({ className, ...props }: React.SelectHTMLAttributes
   );
 }
 
+/** Multi-line text styled like the Input primitive (bulletin posts, notes). */
+export function TextArea({ className, ...props }: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return (
+    <textarea
+      className={cn(
+        "min-h-20 w-full rounded-lg border border-input bg-background px-[calc(--spacing(3)-1px)] py-1.5 text-base text-foreground shadow-xs/5 outline-none placeholder:text-muted-foreground/72 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64 dark:bg-input/32 sm:text-sm",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
 /** Two-column key/value list. */
 export function KV({ rows }: { rows: Array<[ReactNode, ReactNode]> }) {
   return (

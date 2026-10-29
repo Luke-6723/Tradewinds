@@ -70,12 +70,18 @@ export function InsurableCap({ cap, valueCr, onUseMax }: { cap: InsurableValue; 
 export const isHullOnly = (p: { insured_value_pence: number; hull_value_pence: number }) => p.insured_value_pence <= p.hull_value_pence;
 
 /**
- * Lloyd's writes only if premium ≥ ceil(2.5 × expected loss) + 25 bps, so a premium it accepted bounds the expected
- * loss (bps). Only where a listing doesn't carry Lloyd's own estimate (`lloyds_expected_loss_bps`).
+ * Lloyd's writes only if premium ≥ ceil(2.5 × expected loss) + 25 bps, or ceil(1.75 × expected loss) + 25 when the hull
+ * is rated for the water of every leg (guide 3.6), so a premium it accepted bounds the expected loss (bps). Which rule
+ * applied isn't on the listing, so the smaller multiplier, 1.75, gives the bound that holds either way. Only where a
+ * listing doesn't carry Lloyd's own estimate (`lloyds_expected_loss_bps`).
  */
-export const impliedMaxEl = (premiumBps: number) => Math.max(0, (premiumBps - 25) / 2.5);
+export const impliedMaxEl = (premiumBps: number) => Math.max(0, (premiumBps - 25) / 1.75);
 
-/** Most of the declared cargo one partial loss can claim: a storm 25%, pirates who let the ship go what they seized (at most 50%). */
+/**
+ * A partial loss's share of the declared cargo, for the worst-hit figure: pirates who let the ship go claim what they
+ * seized, at most half. A storm claims the share it took, which varies (most are light, a heavy one takes much more), so
+ * this is a guide for a bad storm, not a cap on one.
+ */
 export const MAX_PARTIAL_SHARE = 0.5;
 
 /** The most a slice of a policy covered `coveredBps` may be: steps of 100 from 500, or a remainder under 500 whole (guide 3.6). */

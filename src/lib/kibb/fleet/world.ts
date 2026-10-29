@@ -9,7 +9,8 @@
  * listing shows it or one of our ships in port finds none.
  */
 
-import type { KibbClient } from "../client";
+import { isApiError, isFatalApiError, pages, type KibbClient } from "../client";
+import { nudged, routeKey, type PaxRoute } from "./passengers";
 import { CAPTURE_PRIOR, landingOdds, ODDS_UNKNOWN, pirateAttention, RAID_TAKE_PRIOR, RECENT_LANDING_GAME_MIN, RivalTracker, sqrtShare, type RivalIntelSnapshot, type RivalLanding, type Sighting } from "../rivals";
 import type {
   BankingRegion,
@@ -24,7 +25,14 @@ import type {
   RoutePlan,
   ZoneClass,
 } from "../types";
-import type { LloydsListNotice, MonopolyResult, UnderwritingFigures, WorldEventResult, WorldEventType } from "../schema";
+import type { FareRecordView, LloydsListNotice, MonopolyResult, UnderwritingFigures, WorldEventResult, WorldEventType } from "../schema";
+
+/** Passenger fares (guide 3.20, public): pages of 200 read world-wide a game day at a time, a route's own up to this many, and routes learned kept. */
+const FARE_PAGES = 3;
+const ROUTE_FARE_LIMIT = 200;
+const PAX_ROUTES_KEPT = 300;
+/** After a passenger offer refused for the key's sake (403), none is tried for this long (real ms). */
+const PAX_BLOCK_MS = 60 * 60_000;
 
 export const ZONE_RANK: Record<ZoneClass, number> = { coastal: 0, regional: 1, oceanic: 2 };
 
@@ -71,6 +79,11 @@ const STORM_RATE_PRIOR = 0.5;
 const STORM_SEASON_PRIOR = 2;
 /** Per class a hull is below the leg's water ("storm damage on most legs"); the planner never sails such water. */
 const STORM_UNDERRATED = 4;
+/**
+ * An ocean-rated hull (`hull_category: oceanic`) against a lighter one's hits, in any water, before any are seen (guide rule 3:
+ * it weathers storms better everywhere, a long passage far better). A guess, learned in a cell of its own (`ocean`).
+ */
+const STORM_OCEAN_HULL = 0.6;
 /** Zone storm odds (bps) when the catalog gives none: about its class's catalog average. */
 const STORM_BPS_FALLBACK: Record<ZoneClass, number> = { coastal: 450, regional: 800, oceanic: 1400 };
 /** Share of every stack a hit destroys (a prior: the guide used to say 25%), refined from cargo_loss_pct. */
@@ -109,10 +122,14 @@ function poissonTail(lambda: number, k: number): number {
   return Math.max(0, 1 - below);
 }
 
-/** Where a storm is learned: the season, and how the hull sits against the leg's water (the rougher of zone and crossing). */
-type StormCell = `${"calm" | "storm"}|${"under" | "rated" | "above"}`;
-const stormCell = (stormy: boolean, margin: number): StormCell =>
-  `${stormy ? "storm" : "calm"}|${margin < 0 ? "under" : margin === 0 ? "rated" : "above"}`;
+/**
+ * Where a storm is learned: the season, and how the hull sits against the leg's water (the rougher of zone and crossing). An
+ * ocean-rated hull has a cell of its own (`ocean`) whatever the water, so its better weathering is learned apart; older saves'
+ * cells keep their meaning (its exposure and hits went into `rated` and `above` before, and stay there).
+ */
+type StormCell = `${"calm" | "storm"}|${"under" | "rated" | "above" | "ocean"}`;
+const stormCell = (stormy: boolean, margin: number, hull?: ZoneClass): StormCell =>
+  `${stormy ? "storm" : "calm"}|${hull === "oceanic" ? "ocean" : margin < 0 ? "under" : margin === 0 ? "rated" : "above"}`;
 
 /**
  * A tier's completion bonus is 12% of its base value (guide 3.15), split by the square root of each player's tons
@@ -265,6 +282,8 @@ export interface WorldSnapshot {
   /** Smugglers seized lately (public notices), and prize pools learned from our patrols' prize money; absent in older saves. */
   seizures?: SeizureSeen[];
   prizePools?: number[];
+  /** The passenger pricer's nudge and rounds won and lost per route (`from>to`); absent in older saves. */
+  paxRoutes?: Array<[string, PaxRoute]>;
 }
 
 /**
@@ -301,6 +320,11 @@ const BID_SAMPLES_MAX = 200;
 const EVENT_LOOKBACK_GAME_DAYS = 11;
 /** One page of the feed; a full page may be cut short (links for older events are then kept). */
 const EVENT_PAGE = 200;
+/**
+ * Pages of the feed read a refresh: the Exchequer's remittances (guide 3.1: up to one per region a game day, ~88 over the window)
+ * are listed with the shocks, so a single page could fill with them and cut the shocks short.
+ */
+const EVENT_PAGES = 3;
 /**
  * The charter premium taper (guide 3.7): Crown and Admiralty charters always pay the goods' value (per ton the catalog base
  * price, or the reward if lower); the premium above it is multiplied by √(50,000 Cr ÷ earnings) once our charter earnings
@@ -586,6 +610,7 @@ export interface WorldEventsReport {
   crisisFound: { rate: number; n: number };
 }
 
+/** The shocks the planner works from: `exchequer_remittance` (a Crown topped up, never how much) is news only, left out. */
 const WORLD_EVENT_TYPES: WorldEventType[] = ["supply_boom", "demand_shortage", "admiralty_mobilization", "pirate_outbreak", "production_collapse", "production_boom", "import_slump"];
 
 function toEvent(e: WorldEventResult): WorldEventInfo | null {
@@ -721,6 +746,17 @@ export class World {
   private catalogDue = false;
   /** Use rival intel beyond quay sightings (the `rivalIntel` setting; set by the manager). */
   rivalIntel = true;
+  /** Fill spare hold with passengers (the `usePassengers` setting; set by the manager): the fares are read only while it is on. */
+  usePassengers = true;
+  /** The company key was refused passenger offers (a 403 such as `missing_scope`): why, and until when none is tried (local ms). */
+  private paxBlocked: { why: string; until: number } | null = null;
+  /** Fares groups accepted world-wide (guide 3.20: public, newest first, never who carried them), and when read (local ms). */
+  private fareRecords: FareRecordView[] = [];
+  private faresAt = 0;
+  /** A route's own accepted fares (`from>to`), read when an offer there is priced (local ms). */
+  private readonly routeFareRecs = new Map<string, { at: number; items: FareRecordView[] }>();
+  /** The passenger pricer's nudge and the rounds won and lost per route (`from>to`). */
+  private readonly paxRoutes = new Map<string, PaxRoute>();
   /** Active trading companies (expansion board), or null before the first read. */
   activeCompanies: number | null = null;
   /** Expansion charters of the tier in play by `port|good`: our own flow into each, and its rival record. */
@@ -831,6 +867,7 @@ export class World {
       charterPay: this.charterPay.map(([at, p]): [number, number] => [at, p]),
       seizures: this.seizures.map((x) => ({ ...x })),
       prizePools: [...this.prizePools],
+      paxRoutes: [...this.paxRoutes].map(([k, v]): [string, PaxRoute] => [k, { ...v }]),
     };
   }
 
@@ -900,6 +937,9 @@ export class World {
         .slice(-SEIZURES_KEPT);
     }
     if (Array.isArray(s.prizePools)) this.prizePools = s.prizePools.filter((x) => Number.isFinite(x) && x > 0).slice(-PRIZE_POOLS_KEPT);
+    for (const [k, v] of Array.isArray(s.paxRoutes) ? s.paxRoutes.slice(-PAX_ROUTES_KEPT) : []) {
+      if (typeof k === "string" && v && Number.isFinite(v.adj) && v.adj > 0) this.paxRoutes.set(k, { adj: v.adj, won: v.won || 0, lost: v.lost || 0, at: v.at || 0 });
+    }
     this.updateBidHaircut();
   }
 
@@ -944,12 +984,15 @@ export class World {
       this.client.zones().catch(() => null),
       this.client.expansion().catch(() => null),
       // Public. A stream world_event only prompts this read (its payload isn't specified, and a port-scoped one may never reach us).
-      this.client.worldEvents({ include_expired: true, since, limit: EVENT_PAGE }).catch(() => null),
+      // Paged, so the Exchequer's remittances (news, never planned on) don't eat the window: complete only when read to its end.
+      pages((cursor) => this.client.worldEvents({ include_expired: true, since, cursor, limit: EVENT_PAGE }), (e) => e.id, EVENT_PAGE, EVENT_PAGES).catch(() => null),
       this.refreshVaults(),
       // Public: who holds which royal monopoly (an unread list keeps the last one).
       this.client.monopolyPages().catch(() => null),
       // Our own resting orders now and again: the news' anonymous best levels may be ours.
       this.refreshOwnOrders(),
+      // Passenger fares accepted world-wide, a game day at a time (the pricer's reference where a route has too few of its own).
+      this.refreshFares(),
     ]);
     const list = listing.items;
     if (freight) this.freight = toFreight(freight.items);
@@ -960,7 +1003,10 @@ export class World {
       this.piracyAt = asked + this.skewMs;
       this.stampSeizures(this.piracyAt);
     }
-    if (Array.isArray(events)) this.noteEvents(events.map(toEvent).filter((e): e is WorldEventInfo => e !== null), events.length < EVENT_PAGE);
+    if (events) {
+      const shocks = events.items.filter((e) => e?.event_type !== "exchequer_remittance");
+      this.noteEvents(shocks.map(toEvent).filter((e): e is WorldEventInfo => e !== null), events.complete);
+    }
     if (expansion) {
       const tier = expansion.current_tier;
       this.activeCompanies = expansion.active_trading_companies ?? null;
@@ -2239,6 +2285,83 @@ export class World {
     return (nm / Math.max(knots, 0.1)) * 60 * this.gameMinuteMs;
   }
 
+  // ── Passengers (guide 3.20) ─────────────────────────────────────────────────
+
+  /** Server time of the next whole game hour after `t`, when waiting passenger groups choose among the offers (null: no clock read yet). */
+  nextGameHour(t = this.now()): number | null {
+    const c = this.calendar;
+    if (!c) return null;
+    const hourMs = 60 * this.gameMinuteMs;
+    const h = c.hours + (t - c.at) / hourMs;
+    return t + (Math.floor(h) + 1 - h) * hourMs;
+  }
+
+  /** How long a read of the fares stands: a game day (real ms). */
+  private get fareTtlMs(): number {
+    return 24 * 60 * this.gameMinuteMs;
+  }
+
+  /** Fares accepted world-wide as last read (newest first), and when (local ms; 0: never). */
+  get fares(): { records: FareRecordView[]; at: number } {
+    return { records: this.fareRecords, at: this.faresAt };
+  }
+
+  /** The world-wide fares, once a game day while passengers are on (with the world refresh). A failed read keeps the last. */
+  private async refreshFares(): Promise<void> {
+    if (!this.usePassengers || Date.now() - this.faresAt < this.fareTtlMs) return;
+    this.faresAt = Date.now();
+    const page = await this.client.passengerFarePages(undefined, undefined, FARE_PAGES).catch(() => null);
+    if (page && (page.items.length > 0 || page.complete)) this.fareRecords = page.items;
+  }
+
+  /**
+   * The fares groups accepted on `from` → `to` (newest first), read when an offer there is priced and kept a game day; unread,
+   * the world-wide ones on that route. Never throws but on a dead key, a frozen company or a paused world.
+   */
+  async routeFares(from: string, to: string): Promise<FareRecordView[]> {
+    const key = routeKey(from, to);
+    const hit = this.routeFareRecs.get(key);
+    if (hit && Date.now() - hit.at < this.fareTtlMs) return hit.items;
+    let items: FareRecordView[];
+    try {
+      items = await this.client.passengerFares(from, to, { limit: ROUTE_FARE_LIMIT });
+    } catch (e) {
+      if (isFatalApiError(e) || isApiError(e, "world_paused")) throw e;
+      items = this.fareRecords.filter((f) => f.origin_port_id === from && f.dest_port_id === to);
+    }
+    this.routeFareRecs.set(key, { at: Date.now(), items });
+    if (this.routeFareRecs.size > PAX_ROUTES_KEPT) this.routeFareRecs.delete(this.routeFareRecs.keys().next().value!);
+    return items;
+  }
+
+  /** A passenger offer was refused for the key's sake (403): none is tried by any ship for an hour (the scope may be granted meanwhile). */
+  notePaxBlocked(why: string): void {
+    this.paxBlocked = { why, until: Date.now() + PAX_BLOCK_MS };
+  }
+
+  /** Why passenger offers aren't tried now (null: they are). */
+  paxBlockedNow(): string | null {
+    return this.paxBlocked && Date.now() < this.paxBlocked.until ? this.paxBlocked.why : null;
+  }
+
+  /** What the pricer learned on a route (`from>to`; undefined: nothing yet). */
+  paxRoute(key: string): PaxRoute | undefined {
+    return this.paxRoutes.get(key);
+  }
+
+  /** Every route the pricer learned on, for the report. */
+  paxRouteList(): Array<[string, PaxRoute]> {
+    return [...this.paxRoutes];
+  }
+
+  /** A game-hour round our offer on a route stood through: a group boarded (`won`), or none did with groups it could take waiting. */
+  notePaxRound(key: string, won: boolean, at = this.now()): void {
+    const r = this.paxRoutes.get(key) ?? { adj: 1, won: 0, lost: 0, at: 0 };
+    this.paxRoutes.delete(key);
+    this.paxRoutes.set(key, { adj: nudged(r.adj, won), won: r.won + (won ? 1 : 0), lost: r.lost + (won ? 0 : 1), at });
+    if (this.paxRoutes.size > PAX_ROUTES_KEPT) this.paxRoutes.delete(this.paxRoutes.keys().next().value!);
+  }
+
   // ── Routes ──────────────────────────────────────────────────────────────────
 
   /** The route `depart` would sail (cached up to ROUTE_TTL_MS; `maxAgeMs`: no older than this, e.g. as a hull is committed to it). */
@@ -2488,10 +2611,10 @@ export class World {
     const bps = water === zone.zone_class ? zoneBps : Math.max(zoneBps, STORM_BPS_FALLBACK[water] ?? zoneBps);
     const margin = ZONE_RANK[hull] - (ZONE_RANK[water] ?? ZONE_RANK[hull]);
     const stormy = this.stormSeasonAt(at);
-    const factor = STORM_RATE_PRIOR * (margin < 0 ? STORM_UNDERRATED ** -margin : 1) * (stormy ? STORM_SEASON_PRIOR : 1);
+    const factor = STORM_RATE_PRIOR * (margin < 0 ? STORM_UNDERRATED ** -margin : 1) * (stormy ? STORM_SEASON_PRIOR : 1) * (hull === "oceanic" ? STORM_OCEAN_HULL : 1);
     const days = this.sailMs(nm, knots) / (24 * 60 * this.gameMinuteMs);
     const hits = Math.min(1, (Math.max(0, bps) / 10_000) * days * factor);
-    return Number.isFinite(hits) ? { hits, cell: stormCell(stormy, margin) } : null;
+    return Number.isFinite(hits) ? { hits, cell: stormCell(stormy, margin, hull) } : null;
   }
 
   /**
@@ -2571,7 +2694,7 @@ export class World {
    */
   noteStorm(zone: string | null, hull: ZoneClass, at: number, share: number | null, sunk: boolean, edge?: ZoneClass | null, stores?: number | null): void {
     const water = zone ? this.legWater(zone, edge) : undefined;
-    const c = this.stormCellOf(stormCell(this.stormSeasonAt(at), water ? ZONE_RANK[hull] - (ZONE_RANK[water] ?? ZONE_RANK[hull]) : 0));
+    const c = this.stormCellOf(stormCell(this.stormSeasonAt(at), water ? ZONE_RANK[hull] - (ZONE_RANK[water] ?? ZONE_RANK[hull]) : 0, hull));
     c.hits++;
     if (sunk) c.sinks++;
     else if (share !== null && Number.isFinite(share) && share > 0 && share <= 1) {

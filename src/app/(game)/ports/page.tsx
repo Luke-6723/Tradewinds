@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { ErrorNote, Loading, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
+import { DiscountYardBadge } from "@/components/kibb/deals-common";
 import { RegionSelect } from "@/components/kibb/pickers";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
@@ -87,6 +88,7 @@ export default function PortsPage() {
                     <span className="ml-1.5 inline-flex gap-1 align-middle">
                       {p.is_hub && <Badge variant="info" size="sm">hub</Badge>}
                       {p.has_shipyard && <Badge variant="outline" size="sm">yard</Badge>}
+                      {p.has_shipyard && <DiscountYardBadge discount={p.yard_discount} />}
                       {p.phase > unlocked && <Badge variant="secondary" size="sm">phase {p.phase}</Badge>}
                     </span>
                   </td>

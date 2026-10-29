@@ -24,10 +24,30 @@
  */
 
 import { FATAL_CODES, fatalText, isApiError, isFatalApiError, KibbApiError, outcomeUnknown, type KibbClient } from "../client";
-import type { InsurancePolicy } from "../schema";
+import type { InsurancePolicy, PassengerKind, WaitingGroupView } from "../schema";
 import type { OrderCode, OrderStatus, ShipOrder } from "../ai/directives";
 import type { BankingRegion, ContractListing, DeliverCharterResult, OrderBookLevel, PortOrderBook, RoutePlan, ShipResult } from "../types";
 import type { FleetSettings } from "./manager";
+import {
+  aboardOf,
+  berthsFor,
+  fareFor,
+  fillHeads,
+  fittingGroups,
+  lateShare,
+  median,
+  PAX_RECENT_GAME_DAYS,
+  perHeadPerNm,
+  routeKey,
+  routeReference,
+  routesToMeasure,
+  speedFactor,
+  waitWorth,
+  weightMs,
+  winChance,
+  type PaxAboard,
+  type PaxOffer,
+} from "./passengers";
 import { cargoLane, minLoadTons, REPOST_GRACE_GAME_MIN, type FreightPick, type Lane, type Part, type StallStake } from "./planner";
 import type { World } from "./world";
 
@@ -82,6 +102,21 @@ const ARREST_RECHECK_MS    = 5 * 60_000;
 export const ARREST_RE     = /\barrest/i;
 /** A ship with contraband aboard in an ordinary port, kept from a berth trade: looks again this often (real ms). */
 const CONTRABAND_WAIT_MS   = 60_000;
+/** Passengers (guide 3.20): a failed read of those aboard is tried again after this (real ms); it never holds a voyage up. */
+const PAX_SYNC_RETRY_MS    = 60_000;
+/** The groups waiting at a port are read once a stay, again only once this old (game hours: new ones come every hour). */
+const PAX_WAITING_FRESH_GAME_H = 2;
+/** A hold for the next game-hour round ends this long after it (game minutes), so the groups' choice has been made. */
+const PAX_ROUND_SLACK_GAME_MIN = 3;
+/** Offers tried for one destination in one stay at most, priced or not (a depart refused again and again never loops posting). */
+const PAX_MAX_POSTS_PER_STAY = 3;
+/** Free hold kept back from berths for a stores top-up (a convoy's pace, a depart that finds them short): tons, and share of the leg's safe stores. */
+const PAX_STORES_SLACK_TONS = 2;
+const PAX_STORES_SLACK_SHARE = 0.25;
+/** Routes whose length is read for the world's fare per sea mile, when the route has too few fares of its own. */
+const PAX_FALLBACK_ROUTES  = 6;
+/** Share of the fares aboard counted as landing when the passage's pirate and storm odds weren't worked out. */
+const PAX_DEFAULT_KEPT     = 0.95;
 
 export interface FleetHost {
   readonly world: World;
@@ -161,6 +196,16 @@ export interface FleetHost {
    * still aboard, the hold in the roadstead).
    */
   smuggleTurn(agent: ShipAgent, r: ShipResult, adopt: boolean): Promise<number | null>;
+  /**
+   * Housekeeping (guide 3.4): where the fleet's retiring of this ship stands (`wanted`, `sail`, `listed`, `breakup`, `verify`), or
+   * null. While marked she is offered no lane, convoy or passengers.
+   */
+  retireStage(agent: ShipAgent): "wanted" | "sail" | "listed" | "breakup" | "verify" | null;
+  /**
+   * Her turn in port when the fleet is retiring her (empty, nothing else to do): the passage to the yard, a listing for sale, the
+   * break-up. A wait (real ms), or null: carry on as any ship (no mark, or it was withdrawn).
+   */
+  retireTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null>;
 }
 
 /** What one ship's agent saves, so a restart resumes its lane, sell floors and record. */
@@ -196,6 +241,13 @@ export interface AgentSnapshot {
   starvedVoyage?: string | null;
   /** Arrested for a defaulted loan (since when, local ms, and why); absent in older saves. */
   arrest?: { at: number; why: string } | null;
+  /**
+   * Passengers (guide 3.20): the groups aboard as last known, our open offers where she lies (closed on the server when she
+   * sails), and fares paid on a lane's passage before its trip began (they go into it); absent in older saves.
+   */
+  aboard?: PaxAboard[];
+  offers?: PaxOffer[];
+  laneFares?: { lane: string; pence: number } | null;
 }
 
 /** A ship about to sail: alone, now in one of our convoys (joined or formed), or a convoy that couldn't be entered. */
@@ -220,6 +272,8 @@ export interface AgentStats {
   rewardPence: number;
   spentPence: number;
   freightPence: number;
+  /** Passenger fares paid on arrival (guide 3.20); 0 in older saves. */
+  passengerPence: number;
 }
 
 /** Real milliseconds spent in each kind of work since the autopilot took command. */
@@ -247,7 +301,9 @@ export interface TripRecord {
   resizedTons?: number;
 }
 
-const IDLE_RE = /^(no lane pays|waiting for cash|waiting for provisions on sale|standing by|holding|waiting: the world is paused|AI order: holding|arrested)/;
+// "boarding passengers" (a hold at the berth for the next game-hour round) is port work, like a berth lock: never matched here.
+// "retiring" (housekeeping: listed for sale, or waiting on the breakers) is idle; her passage to the yard is ballast like any.
+const IDLE_RE = /^(no lane pays|waiting for cash|waiting for provisions on sale|standing by|holding|waiting: the world is paused|AI order: holding|arrested|retiring)/;
 const TRIP_HISTORY = 8;
 
 export interface CarriedFreight {
@@ -293,6 +349,10 @@ export interface AgentState {
   dispatchesSealed?: boolean;
   /** Smuggling for the fleet (guide 3.18; the smuggling mode's report says what she is about); absent: not. */
   smuggler?: boolean;
+  /** Passengers (guide 3.20): the groups aboard and our open offers where she lies; absent: none of either. */
+  passengers?: { heads: number; farePence: number; groups: PaxAboard[]; offers: PaxOffer[] };
+  /** Being retired by housekeeping (guide 3.4): the stage (wanted, sail, listed, breakup, verify); absent: not. */
+  retiring?: string;
 }
 
 /** One port call: what was done there, so nothing is repeated or mis-delivered. */
@@ -323,6 +383,11 @@ interface Stay {
   /** The last stores purchase found no cash, or no ask we can fill: waits in the roadstead until a ton could be had. */
   storesNoCash?: boolean;
   storesNoAsk?: boolean;
+  /** Passengers (guide 3.20): the groups waiting here as read this stay (server ms), and offers posted per destination. */
+  paxWaiting?: { at: number; groups: WaitingGroupView[] };
+  paxPosts?: Map<string, number>;
+  /** The one hold for a round this stay: until when (server ms), and the heads its offer had taken then (a boarding ends it early). */
+  paxHold?: { until: number; taken: number };
 }
 
 const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
@@ -348,7 +413,7 @@ const cr = (pence: number) => `${(pence / 100).toLocaleString("en-GB", { maximum
 export class ShipAgent {
   lane: Lane | null = null;
   activity = "starting";
-  stats: AgentStats = { trips: 0, deliveredTons: 0, rewardPence: 0, spentPence: 0, freightPence: 0 };
+  stats: AgentStats = { trips: 0, deliveredTons: 0, rewardPence: 0, spentPence: 0, freightPence: 0, passengerPence: 0 };
   last: ShipResult | null = null;
   /** Set when the ship is no longer ours (sunk, seized, gone). */
   gone = false;
@@ -421,6 +486,27 @@ export class ShipAgent {
    * checked for her release. Null: free.
    */
   private arrest: { at: number; why: string; checkedAt: number } | null = null;
+  /** Passenger groups aboard (guide 3.20), by id: from `passengers/aboard` each port call, and the boarding, paid and lost notices between. */
+  private readonly aboard = new Map<string, PaxAboard>();
+  /** Groups a read of those aboard no longer listed (paid or lost, the notice maybe still to come), by id, the newest few. */
+  private readonly paxLeft = new Map<string, PaxAboard>();
+  /** Our open sailing offers where she lies, by destination (one per ship and destination; the server closes them as she sails). */
+  private readonly offers = new Map<string, PaxOffer>();
+  /** `passengers/aboard` read since the start (else the saved list stands), and when last tried (local ms). */
+  private paxSynced = false;
+  private paxSyncAt = 0;
+  /** Cancels of our offers under way: a new offer waits for them (one open per ship and destination). */
+  private paxCancels: Promise<unknown> = Promise.resolve();
+  /**
+   * Passengers' ports found unsailable from where she lay (unrated water, no route, no hold left for the stores), by port: server
+   * time. Not pinned to for FREIGHT_BLOCK_MS (as sealed freight's blockedAt), so she works on and they stay aboard until she can go
+   * there or the server puts them ashore (guide 3.20). Not saved: a restart tries once more.
+   */
+  private readonly paxBlocked = new Map<string, number>();
+  /** Fares paid on the passage to a lane's source before its trip began: they go into that trip. */
+  private laneFares: { lane: string; pence: number } | null = null;
+  /** The pirate and storm odds of the passage our offers were posted for: the share of its fares expected to land. */
+  private paxKept: { dest: string; kept: number } | null = null;
 
   constructor(
     private readonly host: FleetHost,
@@ -460,6 +546,13 @@ export class ShipAgent {
       ...(this.arrest ? { arrested: this.arrest.why } : {}),
       ...(s?.dispatches_sealed ? { dispatchesSealed: true } : {}),
       ...(!this.gone && this.host.isSmuggler(this) ? { smuggler: true } : {}),
+      ...(() => {
+        const stage = this.gone ? null : this.host.retireStage(this);
+        return stage ? { retiring: stage } : {};
+      })(),
+      ...(this.aboard.size || this.offers.size
+        ? { passengers: { heads: this.paxHeads(), farePence: this.faresAboard(), groups: this.paxGroups(), offers: this.paxOffers() } }
+        : {}),
     };
   }
 
@@ -484,6 +577,9 @@ export class ShipAgent {
       storesBiasDays: this.storesBiasDays || undefined,
       starvedVoyage: this.starvedVoyage,
       arrest: this.arrest ? { at: this.arrest.at, why: this.arrest.why } : undefined,
+      aboard: this.aboard.size ? this.paxGroups() : undefined,
+      offers: this.offers.size ? this.paxOffers() : undefined,
+      laneFares: this.laneFares ?? undefined,
     };
   }
 
@@ -517,6 +613,11 @@ export class ShipAgent {
     this.starvedVoyage = s.starvedVoyage ?? null;
     // Still arrested after the restart until our loans say otherwise (checked at the first port tick).
     if (s.arrest && typeof s.arrest.why === "string" && Number.isFinite(s.arrest.at)) this.arrest = { at: s.arrest.at, why: s.arrest.why, checkedAt: 0 };
+    // Passengers as saved until the first read of those aboard (the pin and cash due work from them meanwhile); our offers stand
+    // while she still lies where they were posted (the first port tick drops them elsewhere).
+    for (const g of Array.isArray(s.aboard) ? s.aboard : []) if (g && typeof g.id === "string" && typeof g.dest === "string") this.aboard.set(g.id, { ...g });
+    for (const o of Array.isArray(s.offers) ? s.offers : []) if (o && typeof o.id === "string" && typeof o.dest === "string") this.offers.set(o.dest, { ...o });
+    if (s.laneFares && typeof s.laneFares.lane === "string" && s.laneFares.pence > 0) this.laneFares = { ...s.laneFares };
   }
 
   /**
@@ -530,6 +631,8 @@ export class ShipAgent {
       this.log(`ARRESTED (${text}): she can't depart or join a convoy until the debt is paid or the lender takes her; waiting in the roadstead, buying nothing`);
       if (this.lane) this.host.releaseLane(this);
     }
+    // No passengers board a ship that can't sail.
+    this.dropOffers("she is under arrest");
     this.arrest = { at: Date.now(), why: text, checkedAt: Date.now() };
     this.host.persist(true);
     this.nudge();
@@ -540,15 +643,19 @@ export class ShipAgent {
     return this.arrest !== null;
   }
 
-  /** After a restart: keep the restored lane only if its cargo (or freight) is still aboard, or nothing was loaded yet but some was bought. */
+  /**
+   * After a restart: keep the restored lane only if its cargo (or freight) is still aboard, or nothing was loaded yet but some was
+   * bought, or passengers aboard are bound for its source or its port (their voyage is the lane's: its plan and room stand).
+   */
   private checkRestoredLane(r: ShipResult): void {
     this.checkRestored = false;
     const lane = this.lane;
     if (!lane) return;
     const goods = this.laneGoodsAboard(r, lane);
     const freight = lane.freight.some((f) => this.freight.has(f.id));
-    if (goods > 0 || freight) {
-      this.log(`resumed lane ${lane.key}${this.laneLoaded === lane.key ? " (loaded)" : " (part loaded)"}`);
+    const pax = [...this.aboard.values()].some((g) => g.dest === lane.source || g.dest === lane.dest);
+    if (goods > 0 || freight || pax) {
+      this.log(`resumed lane ${lane.key}${this.laneLoaded === lane.key ? " (loaded)" : goods > 0 || freight ? " (part loaded)" : " (passengers aboard for it)"}`);
       // Still at the source (loaded or part bought): what's aboard was bought there, so it is never offered to
       // a charter here, and loading carries on from it.
       if (r.ship.status !== "sailing" && r.ship.current_port_id === lane.source) this.resumeAt = lane.source;
@@ -696,6 +803,9 @@ export class ShipAgent {
     // A trip of the same lane whose cargo never arrived (charter filled, sold off) is stale.
     const stale = this.trip?.key === lane.key && this.laneGoodsAboard(r, lane) === 0 && ![...this.trip.freightIds].some((id) => this.freight.has(id));
     if (!this.trip || this.trip.key !== lane.key || stale) {
+      // Fares paid on the passage here for this lane (its trip's time counts that passage) go into its takings.
+      const fares = this.laneFares?.lane === lane.key ? this.laneFares.pence : 0;
+      this.laneFares = null;
       this.trip = {
         key: lane.key,
         label: `${lane.good} ${lane.source} → ${lane.dest}`,
@@ -705,7 +815,7 @@ export class ShipAgent {
         est: (lane.cashProfit * 3_600_000) / Math.max(lane.deliverMs, 60_000),
         startedAt: this.laneKey === lane.key && this.laneSince ? this.laneSince : Date.now(),
         spent: 0,
-        reward: 0,
+        reward: fares,
         tons: 0,
         resized: lane.resizedFrom !== undefined ? lane.tons - lane.resizedFrom : undefined,
       };
@@ -720,26 +830,55 @@ export class ShipAgent {
 
   /**
    * Server time the cargo aboard must arrive by: the soonest charter the lane fills that won't be
-   * re-posted, or the soonest deadline of the sealed freight aboard. Null if nothing is due.
+   * re-posted, the soonest deadline of the sealed freight aboard, or (with `passengers`) the soonest
+   * arrival promised to passengers aboard (guide 3.20: later cuts the fare). Null if nothing is due.
+   * Without them it is the hard deadline: a charter pays nothing late and sealed freight forfeits its
+   * collateral, while a late group is only cut per game day down to a floor (3.20.6), weighed as a cost.
    */
-  deliverDeadline(): number | null {
-    const { world } = this.host;
-    const dues: number[] = [];
-    for (const [id] of this.lane?.fills ?? []) {
-      const c = world.charters.find((x) => x.id === world.currentId(id));
-      if (c?.expiresAt && !world.renews(c)) dues.push(c.expiresAt);
-    }
+  deliverDeadline(passengers = true): number | null {
+    const dues: number[] = [this.charterDue()];
     for (const f of this.freight.values()) if (f.deadline) dues.push(Date.parse(f.deadline));
+    if (passengers) {
+      // Groups bound for where she lies are paid there now: only those still to carry count.
+      const here = this.last?.ship.status !== "sailing" ? this.last?.ship.current_port_id : null;
+      for (const g of this.aboard.values()) if (g.promisedAt && g.dest !== here) dues.push(Date.parse(g.promisedAt));
+    }
     const ok = dues.filter((t) => Number.isFinite(t));
     return ok.length ? Math.min(...ok) : null;
+  }
+
+  /** The soonest expiry (server ms) of the charters the lane fills that won't be re-posted; Infinity: none. */
+  private charterDue(): number {
+    const { world } = this.host;
+    let due = Infinity;
+    for (const [id] of this.lane?.fills ?? []) {
+      const c = world.charters.find((x) => x.id === world.currentId(id));
+      if (c?.expiresAt && !world.renews(c)) due = Math.min(due, c.expiresAt);
+    }
+    return due;
+  }
+
+  /**
+   * What landing at `dest` at server time `at` rather than `otherwise` is expected to cut from the fares of the groups aboard bound
+   * there (pence; guide 3.20.6: per game day late, down to a floor): a convoy's muster and slower pace weighed as a cost, not refused.
+   */
+  paxLateCost(dest: string, at: number, otherwise: number): number {
+    const dayMs = 24 * 60 * this.host.world.gameMinuteMs;
+    let pence = 0;
+    for (const g of this.aboard.values()) {
+      if (g.dest === dest) pence += g.farePence * Math.max(0, lateShare(g.promisedAt, otherwise, dayMs) - lateShare(g.promisedAt, at, dayMs));
+    }
+    return pence;
   }
 
   /**
    * What this passage is expected to pay where it ends (pence, cash only, before any haircut): the
    * loaded lane's goods at their planned pay, less the share pirates and storms may still take, and
-   * freight bound there (reward and collateral). Parts held for a re-post don't count (when they pay
-   * is unsure), nor does anything while not sailing. `pence` lands in the destination's region; `back`
-   * is freight collateral returning to the region it was escrowed from, when that is another.
+   * freight bound there (reward and collateral), and the fares of passengers bound there (guide 3.20: paid
+   * into that region on arrival, less the late cut and the share pirates and storms may take; never insured).
+   * Parts held for a re-post don't count (when they pay is unsure), nor does anything while not sailing.
+   * `pence` lands in the destination's region; `back` is freight collateral returning to the region it was
+   * escrowed from, when that is another.
    */
   proceedsAboard(): { dest: string; at: number; pence: number; back: Array<{ region: BankingRegion; pence: number }> } | null {
     const r = this.last;
@@ -770,6 +909,14 @@ export class ShipAgent {
       if (home === world.region(dest)) pence += f.collateral ?? 0;
       else back.set(home, (back.get(home) ?? 0) + (f.collateral ?? 0));
     }
+    // Fares at the ETA (late arrivals pay less), less the passage's losses: the loaded lane's odds, else those worked out when offered.
+    const paxKept = lane
+      ? (1 - (lane.piracyBps ?? 0) / 10_000) * (1 - (lane.stormBps ?? 0) / 10_000)
+      : this.paxKept?.dest === dest
+        ? this.paxKept.kept
+        : PAX_DEFAULT_KEPT;
+    const dayMs = 24 * 60 * world.gameMinuteMs;
+    for (const g of this.aboard.values()) if (g.dest === dest) pence += g.farePence * lateShare(g.promisedAt, eta, dayMs) * paxKept;
     const flows = [...back].filter(([, p]) => p > 0).map(([region, p]) => ({ region, pence: Math.round(p) }));
     if (!(pence > 0) && flows.length === 0) return null;
     // Charters and freight pay once the base lock clears; selling needs the berth and its handling (as the planner times it).
@@ -966,6 +1113,525 @@ export class ShipAgent {
     return lots[0].dest;
   }
 
+  // ── Passengers (guide 3.20) ─────────────────────────────────────────────────
+
+  /** Heads aboard (bound for `dest`, if given). */
+  paxHeads(dest?: string): number {
+    let n = 0;
+    for (const g of this.aboard.values()) if (dest === undefined || g.dest === dest) n += g.size;
+    return n;
+  }
+
+  /** The whole fares of the groups aboard (pence): what losing her would cost in fares (never insured), and a richer prize for pirates. */
+  faresAboard(): number {
+    let n = 0;
+    for (const g of this.aboard.values()) n += g.farePence;
+    return n;
+  }
+
+  /** The groups aboard and our open offers, for the dashboard and the snapshot. */
+  paxGroups(): PaxAboard[] {
+    return [...this.aboard.values()].map((g) => ({ ...g }));
+  }
+
+  paxOffers(): PaxOffer[] {
+    return [...this.offers.values()].map((o) => ({ ...o }));
+  }
+
+  /** Whether an offer of ours stands where she lies (groups may board her any game hour). */
+  get offering(): boolean {
+    return this.offers.size > 0;
+  }
+
+  /** Whether a passenger notice naming this offer or group is about her (a group aboard, or just gone from her list). */
+  knowsPax(offerId: string | undefined, groupId: string | undefined): boolean {
+    if (offerId !== undefined && [...this.offers.values()].some((o) => o.id === offerId)) return true;
+    return groupId !== undefined && (this.aboard.has(groupId) || this.paxLeft.has(groupId));
+  }
+
+  /**
+   * The passengers' port to make for next: the soonest promise among the groups aboard bound elsewhere than `here` (null: none).
+   * A port found unsailable lately (paxBlock) is skipped, so a group she can't carry there doesn't hold her from all other work.
+   */
+  private passengerPort(here: string): string | null {
+    const now = this.host.world.now();
+    let best: { dest: string; due: number } | null = null;
+    for (const g of this.aboard.values()) {
+      if (g.dest === here) continue;
+      const blocked = this.paxBlocked.get(g.dest);
+      if (blocked !== undefined && now - blocked < FREIGHT_BLOCK_MS) continue;
+      const due = g.promisedAt ? Date.parse(g.promisedAt) : Infinity;
+      if (!best || (Number.isFinite(due) ? due : Infinity) < best.due) best = { dest: g.dest, due: Number.isFinite(due) ? due : Infinity };
+    }
+    return best?.dest ?? null;
+  }
+
+  /**
+   * `dest` found unsailable from here (unrated water, no route, no hold left for the stores): groups aboard bound there no longer
+   * pin her for FREIGHT_BLOCK_MS (passengerPort), said once a stay. Nothing aboard for it: nothing kept.
+   */
+  private paxBlock(dest: string, why: string): void {
+    const heads = this.paxHeads(dest);
+    if (heads === 0) return;
+    this.paxBlocked.set(dest, this.host.world.now());
+    this.logOnce(
+      `pax-blocked:${this.stay?.key ?? ""}:${dest}`,
+      `can't sail for ${dest} with the ${heads} passengers aboard for it (${why}): working on meanwhile; they stay aboard until she can go there or the server puts them ashore`,
+    );
+  }
+
+  /** The soonest arrival promised (server ms) to groups aboard bound for `dest` (undefined: anywhere but where she lies); Infinity: none. */
+  private paxDue(dest?: string): number {
+    const here = this.last?.ship.status !== "sailing" ? this.last?.ship.current_port_id : null;
+    let due = Infinity;
+    for (const g of this.aboard.values()) {
+      if (dest !== undefined ? g.dest !== dest : g.dest === here) continue;
+      const t = g.promisedAt ? Date.parse(g.promisedAt) : NaN;
+      if (Number.isFinite(t)) due = Math.min(due, t);
+    }
+    return due;
+  }
+
+  /** Reads who is aboard (`passengers/aboard`); a failed read keeps the last list (the pin and cash due work from it meanwhile). */
+  private async syncPassengers(): Promise<void> {
+    this.paxSyncAt = Date.now();
+    try {
+      const list = await this.host.client.passengersAboard(this.shipId);
+      const before = new Map(this.aboard);
+      this.aboard.clear();
+      for (const g of list) {
+        this.aboard.set(g.id, aboardOf(g));
+        // Boarded while we weren't listening (a restart), or by hand from the dashboard without a notice reaching us.
+        if (!before.has(g.id)) this.log(`passengers aboard: ${g.size} ${g.kind} for ${g.dest_port_id}, ${cr(g.full_fare_pence)} on arrival${g.promised_arrival_at ? ` by ${g.promised_arrival_at}` : ""}`);
+      }
+      // Gone from the list (paid or lost): kept a while, so their notice, if it comes after this read, still knows them.
+      for (const [id, g] of before) if (!this.aboard.has(id)) this.paxLeft.set(id, g);
+      while (this.paxLeft.size > 50) this.paxLeft.delete(this.paxLeft.keys().next().value!);
+      if (before.size || list.length) this.host.persist();
+      this.paxSynced = true;
+    } catch (e) {
+      soft(e);
+      this.logOnce(`pax-sync:${this.stay?.key ?? "sea"}`, `could not read the passengers aboard yet: ${(e as Error).message}`);
+    }
+  }
+
+  /** The groups waiting here (public), read once a stay (again once PAX_WAITING_FRESH_GAME_H old); a failed read is none. */
+  private async waitingHere(stay: Stay): Promise<WaitingGroupView[]> {
+    const { client, world } = this.host;
+    const seen = stay.paxWaiting;
+    if (seen && world.now() - seen.at < PAX_WAITING_FRESH_GAME_H * 60 * world.gameMinuteMs) return seen.groups;
+    let groups: WaitingGroupView[] = [];
+    try {
+      groups = await client.passengersWaiting(stay.port);
+    } catch (e) {
+      soft(e);
+      this.logOnce(`pax-waiting:${stay.key}`, `could not list the passengers waiting at ${stay.port}: ${(e as Error).message}`);
+    }
+    stay.paxWaiting = { at: world.now(), groups };
+    return groups;
+  }
+
+  /**
+   * Offers the spare hold to passengers bound for `dest`, the port this voyage makes for anyway (guide 3.20: never a detour or a
+   * passage of their own): only when groups for it wait here that would board whole before they give up, and the fares would land
+   * before the season ends; never on a smuggler, with contraband aboard, under arrest, or insured (passengers make a richer prize
+   * than the cargo declared: `cargo_exceeds_declared`), nor when it is unknown. Berths are the whole heads the free hold takes after
+   * `reserve` tons kept for a stores top-up. Priced by paxFare; posted once a stay, again at the same terms after a move closed it.
+   * A passenger failure never stops the voyage (only a dead key, a frozen company or a paused world is thrown).
+   */
+  private async offerBerths(r: ShipResult, dest: string, stay: Stay, plan: RoutePlan, reserve: number): Promise<void> {
+    const { client, world, settings } = this.host;
+    const port = stay.port;
+    if (!settings.usePassengers || world.paxBlockedNow() !== null || dest === port || r.ship.status === "sailing") return;
+    // Nor on a ship being retired (guide 3.4: none aboard or offered when she changes hands at the yard).
+    if (this.arrest || this.host.isSmuggler(this) || this.host.retireStage(this) !== null || this.contrabandAboard(r).length > 0) return;
+    const had = this.offers.get(dest);
+    if (had && had.port === port && had.spot === r.ship.status) return;
+    // Moved since it was posted (to or from the berth, into a convoy): taken as closed by the move, and posted again below.
+    if (had) this.offers.delete(dest);
+    await this.paxCancels;
+    const posts = stay.paxPosts ?? (stay.paxPosts = new Map());
+    if ((posts.get(dest) ?? 0) >= PAX_MAX_POSTS_PER_STAY) return;
+    const cls = world.shipClass(this.shipClass);
+    const perTon = cls?.passengers_per_ton || 1;
+    const berths = berthsFor(r.effective_hold_capacity_tons - r.cargo_used_tons, perTon, reserve);
+    if (berths < 1) return;
+    const now = world.now();
+    const groups = fittingGroups(await this.waitingHere(stay), dest, berths, now);
+    if (groups.length === 0) return;
+    const knots = ((cls?.base_speed_centiknots ?? 800) / 100) * 0.8;
+    const cap = Math.max(r.hold_capacity_tons, 1);
+    const fill = (r.cargo_used_tons + (r.ship.passenger_hold_tons || 0)) / cap;
+    // Paid on arrival, and nothing after the season ends (guide 3.11).
+    const lands = now + world.sailMs(plan.total_distance_nm, knots * (1 - 0.2 * Math.min(1, fill + berths / perTon / cap))) + 30 * world.gameMinuteMs;
+    if (!world.beforeSeasonEnd(lands)) return;
+    // Each try counts (priced or not), so a stay never reads the policy and the fares tick after tick.
+    posts.set(dest, (posts.get(dest) ?? 0) + 1);
+    if ((await this.policyNow()) !== null) return;
+
+    let perHead: number;
+    let why: string;
+    if (had && had.port === port) {
+      perHead = had.perHead;
+      why = "posted again from where she now lies";
+    } else {
+      const q = await this.paxFare(port, dest, groups, berths, plan, r);
+      if (!q) return;
+      perHead = q.perHead;
+      why = `${q.heads} of ${groups.reduce((n, g) => n + g.size, 0)} heads waiting would fit; ${q.basis} ${cr(q.ref)}/head`;
+    }
+    // What a loss at sea costs the fares (a sinking, a capture; Lloyd's never insures them): the share expected to land.
+    const value = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0) + fillHeads(groups, berths) * perHead;
+    const lost =
+      world.piracyRisk(plan, r.ship.cannons_count, knots, value).capture +
+      world.stormRisk(plan, cls?.hull_category ?? "coastal", knots, now, settings.stormWeightPct / 100).sink;
+    const kept = Math.max(0, 1 - Math.min(1, lost));
+    const until = Math.max(...groups.map((g) => Date.parse(g.board_by)));
+    try {
+      const o = await client.postPassengerOffer({ ship_id: this.shipId, dest_port_id: dest, fare_per_head_pence: perHead, max_berths: berths });
+      this.offers.set(dest, {
+        id: o.id,
+        port,
+        dest,
+        perHead: o.fare_per_head_pence || perHead,
+        berths: o.max_berths || berths,
+        taken: o.berths_taken || 0,
+        spot: r.ship.status,
+        at: now,
+        until,
+        kept,
+      });
+      this.paxKept = { dest, kept };
+      this.host.persist();
+      this.log(`offered ${berths} berths ${port} → ${dest} at ${cr(perHead)}/head (${why})`);
+    } catch (e) {
+      soft(e);
+      // The key may not post offers (`market_derivatives`): none tried for a while, said once.
+      if (isApiError(e) && e.status === 403) {
+        world.notePaxBlocked(`${e.code ?? "forbidden"}: ${e.detail || e.message}`);
+        this.log(`passenger offers refused (${e.code ?? "forbidden"}: ${e.detail || e.message}): not offering berths for a while`);
+        return;
+      }
+      // One open offer per ship and destination (409), or no answer (it may have landed): ours may stand already.
+      if ((outcomeUnknown(e) || (isApiError(e) && e.status === 409)) && (await this.adoptOffer(r, dest, until, kept))) return;
+      this.logOnce(`pax-post:${stay.key}:${dest}`, `passenger offer for ${dest} not posted: ${(e as Error).message}`);
+    }
+  }
+
+  /** An open offer of ours here for `dest` found on the server (after a 409 or no answer): kept as ours. Whether one was. */
+  private async adoptOffer(r: ShipResult, dest: string, until: number, kept: number): Promise<boolean> {
+    const port = r.ship.current_port_id;
+    const list = await this.host.client.passengerOffers(true, { ship_id: this.shipId }).catch((e: unknown) => {
+      soft(e);
+      return null;
+    });
+    const o = list?.find((x) => x.ship_id === this.shipId && x.status === "open" && x.port_id === port && x.dest_port_id === dest);
+    if (!o || !port) return false;
+    const at = Date.parse(o.created_at);
+    this.offers.set(dest, {
+      id: o.id,
+      port,
+      dest,
+      perHead: o.fare_per_head_pence,
+      berths: o.max_berths,
+      taken: o.berths_taken,
+      spot: r.ship.status,
+      at: Number.isFinite(at) ? at : this.host.world.now(),
+      until,
+      kept,
+    });
+    this.host.persist();
+    return true;
+  }
+
+  /**
+   * The fare per head to ask on `port` → `dest` for these groups (passengers.ts fareFor): the route's recent median by kind, else
+   * the world's per sea mile times this passage; never under what the weight of the berths costs in sailing time at this ship's
+   * rate. Null (said once a stay): no fare seen anywhere yet, or none the groups would take over that floor.
+   */
+  private async paxFare(port: string, dest: string, groups: WaitingGroupView[], berths: number, plan: RoutePlan, r: ShipResult): Promise<{ perHead: number; heads: number; ref: number; basis: string } | null> {
+    const { world } = this.host;
+    const now = world.now();
+    const since = now - PAX_RECENT_GAME_DAYS * 24 * 60 * world.gameMinuteMs;
+    const records = await world.routeFares(port, dest);
+    const refs = new Map<PassengerKind, number>();
+    const basis = new Map<PassengerKind, string>();
+    for (const kind of new Set(groups.map((g) => g.kind))) {
+      const own = routeReference(records, port, dest, kind, since) ?? routeReference(records, port, dest, undefined, since);
+      if (own) {
+        refs.set(kind, own.perHead);
+        basis.set(kind, `${kind} have paid a median of`);
+        continue;
+      }
+      const rate = await this.farePerNm(kind);
+      if (rate !== null) {
+        refs.set(kind, rate * plan.total_distance_nm);
+        basis.set(kind, `the world's fares per sea mile give ${kind}`);
+      }
+    }
+    const key = `pax-fare:${this.stay?.key ?? ""}:${dest}`;
+    if (refs.size === 0) {
+      this.logOnce(key, `not offering berths for ${dest}: no accepted fares seen yet, on the route or anywhere`);
+      return null;
+    }
+    const cls = world.shipClass(this.shipClass);
+    const knots = (cls?.base_speed_centiknots ?? 800) / 100;
+    const perTon = cls?.passengers_per_ton || 1;
+    const cap = Math.max(r.hold_capacity_tons, 1);
+    const fill = (r.cargo_used_tons + (r.ship.passenger_hold_tons || 0)) / cap;
+    // The weight slows her (passengers weigh like cargo): that extra time, at what her time is worth, is the least per head.
+    const extra = weightMs(plan.total_distance_nm, knots * 0.8, fill, berths / perTon / cap, (nm, k) => world.sailMs(nm, k));
+    const floor = ((extra / 3_600_000) * this.ratePerHour) / Math.max(berths, 1);
+    const refKnots = median(world.catalog.ship_classes.map((c) => c.base_speed_centiknots / 100)) ?? knots;
+    const q = fareFor({ refs, groups, berths, floor, adj: world.paxRoute(routeKey(port, dest))?.adj ?? 1, speed: speedFactor(knots, refKnots) });
+    if (!q) {
+      this.logOnce(key, `not offering berths for ${dest}: the weight's sailing time costs ${cr(floor)}/head, more than groups there have paid`);
+      return null;
+    }
+    return { ...q, basis: basis.get(q.kind) ?? "the reference" };
+  }
+
+  /**
+   * The world's accepted fare per head per sea mile (pence) for `kind` (any kind, if too few of it): over the newest fare records'
+   * routes, their length read as this hull sails them (cached routes mostly). Null: too few records of known length.
+   */
+  private async farePerNm(kind: PassengerKind): Promise<number | null> {
+    const { world } = this.host;
+    const records = world.fares.records;
+    if (records.length === 0) return null;
+    const routes = new Map<string, [string, string]>();
+    for (const x of [...routesToMeasure(records, kind, PAX_FALLBACK_ROUTES), ...routesToMeasure(records, undefined, PAX_FALLBACK_ROUTES)]) routes.set(routeKey(...x), x);
+    const nm = new Map<string, number>();
+    await Promise.all(
+      [...routes].map(async ([k, [a, b]]) => {
+        try {
+          nm.set(k, (await world.route(a, b, this.shipClass)).total_distance_nm);
+        } catch (e) {
+          soft(e);
+        }
+      }),
+    );
+    const nmOf = (a: string, b: string) => nm.get(routeKey(a, b));
+    return perHeadPerNm(records, nmOf, kind) ?? perHeadPerNm(records, nmOf);
+  }
+
+  /**
+   * The lock clear: whether to hold her where she lies until just after the first game-hour round since our offer for `dest` went
+   * up (guide 3.20: the groups choose then; she'd sail before it), once a stay: only while the fares the groups still waiting
+   * would bring, at the odds our offers on the route have won and the share expected to land, beat what the wait costs her time
+   * and dues. Real ms, or 0 to sail.
+   */
+  private paxHoldMs(r: ShipResult, dest: string, stay: Stay, plan: RoutePlan, reserve: number): number {
+    const { world, settings } = this.host;
+    // Switched off (by the user, or the AI's ceiling) or the key refused offers: no hold for a round (sailTo withdrew the offers).
+    if (!settings.usePassengers || world.paxBlockedNow() !== null) return 0;
+    const o = this.offers.get(dest);
+    if (!o || o.port !== stay.port || o.spot !== r.ship.status) return 0;
+    const now = world.now();
+    // Held already: on until the round is past (a tick woken early by some other notice keeps holding), or a group boarded.
+    if (stay.paxHold) return now < stay.paxHold.until && o.taken === stay.paxHold.taken ? stay.paxHold.until - now : 0;
+    const round = world.nextGameHour(o.at);
+    // A round passed already while the lock held her: the groups have chosen.
+    if (round === null || round <= now) return 0;
+    const waitMs = round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs - now;
+    // Decided once a stay, whichever way.
+    stay.paxHold = { until: now, taken: o.taken };
+    // Never past the charters' and sealed freight's hard deadline (as convoyDecision's fit): the wait, the passage at her laden pace,
+    // a base lock and a few minutes' slack must still land by it (a lane's planning slack may be eaten by queues and locks already).
+    const hard = this.deliverDeadline(false);
+    const knots = ((world.shipClass(this.shipClass)?.base_speed_centiknots ?? 800) / 100) * 0.8;
+    if (hard !== null && now + waitMs + world.sailMs(plan.total_distance_nm, knots) + 30 * world.gameMinuteMs + 5 * 60_000 > hard) return 0;
+    const free = berthsFor(r.effective_hold_capacity_tons - r.cargo_used_tons, world.shipClass(this.shipClass)?.passengers_per_ton || 1, reserve);
+    const berths = Math.min(o.berths - o.taken, free);
+    const groups = fittingGroups((stay.paxWaiting?.groups ?? []).filter((g) => !this.aboard.has(g.id)), dest, berths, round);
+    const heads = fillHeads(groups, berths);
+    if (heads <= 0) return 0;
+    const value = heads * o.perHead * winChance(world.paxRoute(routeKey(o.port, dest))) * o.kept;
+    const dues = r.ship.status === "berthed" ? world.berthDuesFor(stay.port, waitMs, false) : 0;
+    const { worth, cost } = waitWorth(value, waitMs, this.ratePerHour, dues);
+    if (!worth) return 0;
+    stay.paxHold.until = now + waitMs;
+    this.log(`holding ${secs(waitMs)} at ${stay.port} for the next game-hour round: ${heads} heads for ${dest} waiting, ~${cr(value)} in fares expected against ${cr(cost)} for the wait`);
+    return waitMs;
+  }
+
+  /** A round our offer stood through with groups it could take still waiting, and none boarded: its route's fare is nudged down. */
+  private settleOffer(o: PaxOffer): void {
+    const { world } = this.host;
+    const round = world.nextGameHour(o.at);
+    if (o.taken === 0 && round !== null && round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs <= world.now() && o.until > round) world.notePaxRound(routeKey(o.port, o.dest), false);
+  }
+
+  /** She sailed: the server closed our offers where she lay (each settled for the pricer). */
+  private closeOffers(): void {
+    for (const o of this.offers.values()) this.settleOffer(o);
+    this.offers.clear();
+    this.host.persist();
+  }
+
+  /**
+   * Withdraws our open offers where she lies (all but the one for `except`): the lane given up, an arrest, smuggling, waiting rather
+   * than sailing, a voyage now for another port. No passengers then board for a voyage she isn't making (they would pin her there).
+   * In the background: a new offer waits for these (one open per ship and destination); one that closed already is nothing to undo.
+   */
+  dropOffers(why: string, except?: string): void {
+    const drop = [...this.offers.values()].filter((o) => o.dest !== except);
+    if (drop.length === 0) return;
+    for (const o of drop) {
+      this.settleOffer(o);
+      this.offers.delete(o.dest);
+    }
+    this.host.persist();
+    const { client } = this.host;
+    const cancels = drop.map(async (o) => {
+      try {
+        await client.cancelPassengerOffer(o.id);
+        this.log(`withdrew the passenger offer for ${o.dest} at ${o.port} (${why})`);
+      } catch (e) {
+        if (isApiError(e) && (e.status === 404 || e.status === 409)) return;
+        this.log(`withdrawing the passenger offer for ${o.dest} failed (${(e as Error).message}): it closes when she sails`);
+      }
+    });
+    this.paxCancels = Promise.all([this.paxCancels, ...cancels]).catch(() => undefined);
+  }
+
+  /** After a move (to the roadstead for a convoy): our offers here posted again from where she now lies, while groups still wait. */
+  private async repostMoved(r: ShipResult, stay: Stay | null): Promise<void> {
+    if (!stay) return;
+    for (const o of [...this.offers.values()]) {
+      if (o.port !== stay.port || o.spot === r.ship.status) continue;
+      const plan = await this.host.world.route(stay.port, o.dest, this.shipClass).catch((e: unknown) => {
+        soft(e);
+        return null;
+      });
+      if (!plan) {
+        this.offers.delete(o.dest);
+        continue;
+      }
+      await this.offerBerths(r, o.dest, stay, plan, Math.max(PAX_STORES_SLACK_TONS, Math.ceil(this.safeStores(stay.port, o.dest, plan) * PAX_STORES_SLACK_SHARE)));
+    }
+  }
+
+  /**
+   * A group took our offer, or boarded by hand from the dashboard (`passengers_boarded`): aboard from now on, and the route's
+   * fare nudged up. A notice that doesn't name the group, its port and heads: the list aboard is read again at the next tick.
+   */
+  paxBoarded(g: { id?: string; kind?: string; size?: number; origin?: string; dest?: string; perHead?: number; farePence?: number; promisedAt?: string; boardedAt?: string; offerId?: string }): void {
+    const { world } = this.host;
+    const o = (g.offerId ? [...this.offers.values()].find((x) => x.id === g.offerId) : undefined) ?? (g.dest ? this.offers.get(g.dest) : undefined);
+    if (o) {
+      o.taken += g.size ?? 0;
+      world.notePaxRound(routeKey(o.port, o.dest), true);
+    }
+    if (!g.id || !g.dest || !(g.size && g.size > 0)) {
+      this.paxSynced = false;
+      this.paxSyncAt = 0;
+      this.log(`passengers boarded${g.dest ? ` for ${g.dest}` : ""}${g.size ? ` (${g.size} heads)` : ""}: reading who is aboard`);
+      this.nudge();
+      return;
+    }
+    const perHead = g.perHead ?? (g.farePence ? Math.round(g.farePence / g.size) : (o?.perHead ?? 0));
+    const fare = g.farePence ?? perHead * g.size;
+    this.aboard.set(g.id, {
+      id: g.id,
+      kind: g.kind ?? "travellers",
+      size: g.size,
+      origin: g.origin ?? o?.port ?? null,
+      dest: g.dest,
+      perHead,
+      farePence: fare,
+      promisedAt: g.promisedAt ?? null,
+      boardedAt: g.boardedAt ?? null,
+    });
+    this.log(
+      `${g.size} ${g.kind ?? "passengers"} boarded for ${g.dest} at ${cr(perHead)}/head: ${cr(fare)} on arrival${g.promisedAt ? ` by ${g.promisedAt}` : ""}${o ? "" : " (not on an offer of the autopilot's)"}`,
+    );
+    this.host.persist(true);
+    this.nudge();
+  }
+
+  /**
+   * A group's fare paid on arrival (`passengers_paid`, guide 3.20): into the vault of that port's region, the ship's takings, the
+   * lane's trip (or, before its trip began, kept for it; with no lane at all, a trip of fares alone), and ships waiting for cash
+   * look again. A notice that doesn't name the group: those bound for that port count as ashore, and the list is read again.
+   */
+  paxPaid(p: { fare?: number; late?: number; id?: string; port?: string }): void {
+    const { world } = this.host;
+    const g = p.id ? (this.aboard.get(p.id) ?? this.paxLeft.get(p.id)) : undefined;
+    const r = this.last;
+    const port = p.port ?? g?.dest ?? (r?.ship.status !== "sailing" ? r?.ship.current_port_id : r?.route_legs.at(-1)?.to_node) ?? null;
+    if (g) {
+      this.aboard.delete(g.id);
+      this.paxLeft.delete(g.id);
+    } else {
+      if (port) for (const [id, x] of [...this.aboard]) if (x.dest === port) this.aboard.delete(id);
+      this.paxSynced = false;
+      this.paxSyncAt = 0;
+    }
+    const fare = p.fare !== undefined && p.fare > 0 ? p.fare : 0;
+    if (fare > 0) {
+      if (port) world.vaults.set(world.region(port), world.vault(world.region(port)) + fare);
+      // Where it landed isn't known: the vaults are read again.
+      else void world.refreshVaults().catch(() => undefined);
+      this.stats.passengerPence += fare;
+      this.bookFare(fare, port, g);
+      this.host.cashArrived();
+    }
+    const late = p.late !== undefined && p.late > 0 ? ` (${p.late} game day${p.late === 1 ? "" : "s"} late: the fare was cut)` : "";
+    this.log(`passengers paid ${cr(fare)}${port ? ` at ${port}` : ""}${g ? ` for ${g.size} ${g.kind}${g.origin ? ` from ${g.origin}` : ""}` : ""}${late}`);
+    this.host.persist(true);
+  }
+
+  /** A fare into the trip it belongs to (see paxPaid). */
+  private bookFare(fare: number, port: string | null, g: PaxAboard | undefined): void {
+    if (this.trip && this.lane && this.trip.key === this.lane.key) {
+      this.trip.reward += fare;
+      return;
+    }
+    if (this.lane) {
+      this.laneFares = { lane: this.lane.key, pence: (this.laneFares?.lane === this.lane.key ? this.laneFares.pence : 0) + fare };
+      return;
+    }
+    // A trip of fares alone, timed from the boarding; when that isn't known, no trip (a rate made up would mislead the AI's record).
+    const boarded = g?.boardedAt ? Date.parse(g.boardedAt) : NaN;
+    if (!Number.isFinite(boarded)) return;
+    const hours = Math.max((this.host.world.now() - boarded) / 3_600_000, 1 / 60);
+    const rec: TripRecord = {
+      at: new Date().toISOString(),
+      lane: `passengers ${g?.origin ?? "?"} → ${port ?? "?"}`,
+      tons: 0,
+      hours: Math.round(hours * 100) / 100,
+      profitPence: fare,
+      estPerHour: 0,
+      actualPerHour: Math.round(fare / hours),
+    };
+    this.trips.push(rec);
+    if (this.trips.length > TRIP_HISTORY) this.trips.splice(0, this.trips.length - TRIP_HISTORY);
+    this.host.tripFinished(this, { ...rec, goods: [], spentPence: 0, rewardPence: fare });
+  }
+
+  /** A group lost unpaid (`passengers_lost`: the ship sunk, taken or seized, changed hands, or the group long overdue and put ashore). */
+  paxLost(p: { cause?: string; id?: string; size?: number }): void {
+    const g = p.id ? (this.aboard.get(p.id) ?? this.paxLeft.get(p.id)) : undefined;
+    if (g) {
+      this.aboard.delete(g.id);
+      this.paxLeft.delete(g.id);
+    } else {
+      this.paxSynced = false;
+      this.paxSyncAt = 0;
+    }
+    const causes: Record<string, string> = {
+      sunk: "the ship sank",
+      captured: "pirates took the ship",
+      seized: "the Crown seized the ship",
+      ship_changed_hands: "the ship changed hands",
+      overdue: "long overdue, put ashore unpaid",
+    };
+    const what = g ? `${g.size} ${g.kind} for ${g.dest} (${cr(g.farePence)})` : p.size ? `${p.size} passengers` : "passengers";
+    this.log(`${p.cause === "overdue" ? "WARNING: " : ""}${what} lost, unpaid: ${(p.cause && causes[p.cause]) ?? p.cause ?? "no cause given"}`);
+    this.host.persist(true);
+  }
+
   /**
    * Puts this voyage's storm exposure on the world's record once: as it sets out, or as we first see
    * it at sea after a restart. That way the storm odds learn from passages without a storm too. A
@@ -1047,11 +1713,18 @@ export class ShipAgent {
     // Forfeit to the Crown for smuggling (guide 3.18: as if she sank), should the game list her so before she goes.
     if ((s.status as string) === "seized") return this.leaveFleet("was seized by the Crown for smuggling");
     if (!this.freightSynced) await this.syncFreight();
+    // Passengers aboard: once after a start (or a notice that couldn't be read), and on each arrival while passengers are on or some
+    // are aboard (those bound there are paid, overdue ones put ashore). A failed read never holds the voyage up.
+    const arriving = s.status !== "sailing" && !!s.current_port_id && this.stay?.port !== s.current_port_id;
+    const pax = this.host.settings.usePassengers || this.aboard.size > 0;
+    if ((!this.paxSynced && Date.now() - this.paxSyncAt >= PAX_SYNC_RETRY_MS) || (arriving && pax)) await this.syncPassengers();
     if (this.checkRestored && this.freightSynced) this.checkRestoredLane(r);
     for (const good of [...this.minSale.keys()]) if (this.ownTons(r, good) <= 0) this.minSale.delete(good);
 
     if (s.status === "sailing") {
       this.stay = null;
+      // Sailed (alone, or with a convoy): the server closed our offers where she lay.
+      if (this.offers.size) this.closeOffers();
       this.noteVoyage(r);
       this.noteStarving(r);
       // An arrested ship's cargo goes toward the debt where she arrives: no lane is rebuilt for it.
@@ -1103,6 +1776,8 @@ export class ShipAgent {
         }
       }
       this.resumeAt = null;
+      // Offers posted somewhere else (saved before a restart, the ship since moved on) closed when she sailed.
+      for (const [dest, o] of [...this.offers]) if (o.port !== port) this.offers.delete(dest);
       await this.syncFreight();
       await this.refreshPortCharters(port);
     } else if (world.crisisDue(port, this.stay.lookedAt)) {
@@ -1113,6 +1788,8 @@ export class ShipAgent {
     // can't dock or sail alone, so there is nothing else to do meanwhile (after the stay is set up, so
     // leaving it short of stores can top up in this stay).
     if (s.convoy_id) {
+      // Moved to the roadstead to join (assumed to close an offer: `ship_moved`): posted again from where she now lies.
+      await this.repostMoved(r, this.stay);
       const wait = await this.host.convoyWait(this, r, s.convoy_id, port);
       if (wait !== null) return wait;
     }
@@ -1127,9 +1804,36 @@ export class ShipAgent {
     this.log(`${why}; stopping its autopilot`);
     this.activity = why;
     this.gone = true;
+    // The server closes a lost or sold ship's offers (and her passengers are lost: passengers_lost says).
+    this.offers.clear();
     this.host.releaseLane(this);
     this.stopRequested = true;
     return 0;
+  }
+
+  // ── Housekeeping: what retiring her asks (FleetManager.retireTurn) ─────────
+
+  /** Her last trips (newest last; TRIP_HISTORY of them): what she earned lately. */
+  get tripLog(): readonly TripRecord[] {
+    return this.trips;
+  }
+
+  /** Sails her from this stay to `dest` as any passage (the policy guard, stores, a convoy only if one pays): empty, to the breakers. */
+  async sailFor(r: ShipResult, dest: string): Promise<number> {
+    const stay = this.stay;
+    if (!stay || stay.port !== r.ship.current_port_id) return POLL_MS;
+    return this.sailTo(r, dest, stay);
+  }
+
+  /** Waits in the roadstead (no lock or dues running up), saying what for. */
+  async standBy(r: ShipResult, activity: string): Promise<void> {
+    await this.park(r);
+    this.activity = activity;
+  }
+
+  /** She left the fleet by our own hand (broken up at a yard): her autopilot stops; the scan retires her record. */
+  retired(why: string): number {
+    return this.leaveFleet(why);
   }
 
   /** After a restart mid-voyage: rebuild the lane so its charter room stays reserved. */
@@ -1394,6 +2098,26 @@ export class ShipAgent {
       await yardVisit();
       return this.sailTo(r, pinned, stay, { voidsPolicy: voids });
     }
+    // Passengers aboard (from our offer for the voyage's port, or boarded by hand from the dashboard) pin the next port to theirs
+    // (guide 3.20: late arrivals pay less), after sealed freight; a lane loading here for that port loads first, and a loaded lane's
+    // port comes first only when they still land by their promise by way of it (a route that can't be read: theirs first).
+    const paxTo = this.passengerPort(port);
+    let laneFirst = false;
+    if (paxTo && this.loaded && this.lane!.dest !== port && this.lane!.dest !== paxTo) {
+      laneFirst = (await this.reachesBy(port, this.lane!.dest, paxTo, this.paxDue(paxTo))) === true;
+      // Theirs first only while the lane's charters still make their expiry by way of their port: a charter late pays nothing,
+      // a late fare is only cut per game day down to a floor (guide 3.20.6). A route that can't be read: theirs first, as above.
+      if (!laneFirst) laneFirst = (await this.reachesBy(port, paxTo, this.lane!.dest, this.charterDue())) === false;
+    }
+    const paxPinned = !!paxTo && !laneFirst && !(this.lane && this.lane.dest === paxTo && (this.loaded || this.lane.source === port));
+    const sailForPassengers = async () => {
+      this.logOnce(`pax:${stay.key}:${paxTo}`, `passengers aboard for ${paxTo} (${this.paxHeads(paxTo!)} heads): sailing there next`);
+      // A lane bound from their port carries on from there; a loaded one is finished at its own port later.
+      if (this.lane && !this.loaded && this.lane.source !== paxTo) this.host.releaseLane(this);
+      await yardVisit();
+      return this.sailTo(r, paxTo!, stay);
+    };
+    if (paxPinned) return sailForPassengers();
     // At the source of the lane we hold: load (keeping the lane, whose charter may only be visible
     // from its own port), topping up whatever of the good is already aboard.
     if (this.lane && this.lane.source === port && this.laneLoaded !== this.lane.key && !stay.traded.has("cargo") && !this.isAvoided(this.lane.key)) {
@@ -1411,6 +2135,8 @@ export class ShipAgent {
       await yardVisit();
       return this.sailTo(r, this.lane.dest, stay);
     }
+    // The lane bound for the passengers' port didn't load here after all: to their port all the same.
+    if (paxTo) return sailForPassengers();
     for (const good of Object.keys(r.cargo_manifest)) {
       if (this.ownTons(r, good) <= 0) continue;
       const wait = await this.handleLeftover(r, good, stay);
@@ -1436,6 +2162,11 @@ export class ShipAgent {
       return HOLD_WAIT_GAME_MIN * world.gameMinuteMs;
     }
     this.holds = 0;
+
+    // Housekeeping is retiring her (guide 3.4: dead weight, broken up at a yard, listed first with ship deals on): her turn comes from
+    // it before any new work (an AI order withdraws it there, and wins).
+    const retiring = await this.host.retireTurn(this, r, port);
+    if (retiring !== null) return retiring;
 
     // An AI hold: no new work; it waits in the roadstead (counted idle by the tripwire).
     if (order?.order === "hold") {
@@ -1668,6 +2399,8 @@ export class ShipAgent {
    */
   private async park(r: ShipResult): Promise<void> {
     const port = r.ship.current_port_id;
+    // Waiting, not sailing: no passengers board for a voyage she isn't making now (posted again, from where she lies, when she is).
+    this.dropOffers("waiting here, not sailing yet");
     if (r.ship.status !== "berthed" || !port || this.locked(r)) return;
     try {
       await this.offshore(port);
@@ -1782,9 +2515,16 @@ export class ShipAgent {
    * water). Null: a route couldn't be read (unknown: decided next tick, nothing voided on a transient error).
    */
   private async reachesInTime(from: string, via: string, to: string): Promise<boolean | null> {
-    const { world } = this.host;
     const dues = [...this.freight.values()].filter((f) => f.dest === to && !f.undeliverable && f.deadline).map((f) => Date.parse(f.deadline!));
-    const due = Math.min(...dues.filter((t) => Number.isFinite(t)));
+    return this.reachesBy(from, via, to, Math.min(...dues.filter((t) => Number.isFinite(t))));
+  }
+
+  /**
+   * Whether sailing `from` → `via` → `to` (over rated water from `via`) lands at `to` by server time `due` (not finite: nothing
+   * is due, true). Null: a route couldn't be read.
+   */
+  private async reachesBy(from: string, via: string, to: string, due: number): Promise<boolean | null> {
+    const { world } = this.host;
     if (!Number.isFinite(due)) return true;
     const cls = world.shipClass(this.shipClass);
     const knots = ((cls?.base_speed_centiknots ?? 800) / 100) * 0.8;
@@ -1883,6 +2623,9 @@ export class ShipAgent {
 
   private async loadAt(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
     if (stay.traded.has("cargo")) return this.sailTo(r, lane.dest, stay);
+    // The voyage is now this lane's from here (a re-plan may have swapped it while she lay waiting to sail elsewhere): our offers for
+    // any other port go before the loading tick or the berth queue gives a round to groups that would take the hold sized for it.
+    this.dropOffers(`loading here for ${lane.dest}`, lane.dest);
     const { world } = this.host;
     // Nothing is loaded with contraband aboard in an ordinary port (guide 3.18: berth trades, searched there): the lane goes.
     if (this.contrabandBarred(r, "loading")) {
@@ -2705,7 +3448,10 @@ export class ShipAgent {
 
     // Stores this ship could carry for a leg: what it has, plus free hold, plus provisions cargo it could eat.
     const stockable = r.stores.provisions_tons + Math.max(0, r.effective_hold_capacity_tons - r.cargo_used_tons) + this.ownTons(r, STORES_GOOD);
-    const reachable = (plan: RoutePlan) => world.routeRated(plan, hull) && plan.safe_provisions_tons <= stockable;
+    // A detour never lands passengers aboard after their promise (guide 3.20: late cuts the fare; the pin sends her to theirs first).
+    const promised = this.paxDue();
+    const reachable = (plan: RoutePlan) =>
+      world.routeRated(plan, hull) && plan.safe_provisions_tons <= stockable && now + world.sailMs(plan.total_distance_nm, knots * 0.8) + 30 * world.gameMinuteMs <= promised;
 
     let best: { c: (typeof world.charters)[number]; take: number; value: number } | null = null;
     for (const c of world.charters) {
@@ -3118,6 +3864,8 @@ export class ShipAgent {
       this.activity = `insured for ${policy.dest_port_id}: not sailing to ${dest}`;
       return 15_000;
     }
+    // Our offers here for another port (the voyage changed: a new lane, sealed freight): withdrawn before anyone boards for it.
+    this.dropOffers(`she sails for ${dest} now`, dest);
 
     let plan: RoutePlan;
     try {
@@ -3126,11 +3874,14 @@ export class ShipAgent {
     } catch (e) {
       soft(e);
       this.log(`no route ${port} → ${dest}: ${(e as Error).message}`);
+      this.paxBlock(dest, "no route");
       this.host.releaseLane(this);
       return IDLE_WAIT_MS;
     }
     const sealed = [...this.freight.values()].filter((f) => f.dest === dest && !f.undeliverable);
     if (!world.routeRated(plan, hull)) {
+      // The user's policy for there waits on them (below); otherwise passengers for there stop pinning her for a while.
+      if (!(policy && policy.dest_port_id === dest)) this.paxBlock(dest, `the route crosses water a ${hull} hull isn't rated for`);
       if (policy && policy.dest_port_id === dest) {
         // The user insured this voyage: theirs to decide (cancel the policy, or wait for the route to change).
         this.logOnce(`unrated:${policy.id}`, `WARNING: the policy on this ship is for ${dest}, but ${port} → ${dest} crosses water a ${hull} hull isn't rated for: waiting here`);
@@ -3152,7 +3903,7 @@ export class ShipAgent {
         if (this.lane && (this.lane.dest === dest || (!this.loaded && this.lane.source === dest))) this.host.releaseLane(this);
         return 5_000;
       }
-      this.log(`${port} → ${dest} crosses water a ${hull} hull isn't rated for; dropping the lane`);
+      this.logOnce(`${stay.key}|unrated|${dest}`, `${port} → ${dest} crosses water a ${hull} hull isn't rated for; dropping the lane`);
       this.host.releaseLane(this);
       return 5_000;
     }
@@ -3231,6 +3982,7 @@ export class ShipAgent {
       if (r.ship.status === "berthed" && this.storesHoldNeed(r.stores.provisions_tons, safe) > free) {
         // No room to stock this leg: give the destination up so the cargo is sold or sent somewhere reachable.
         this.logOnce(`${stay.key}|hold|${dest}`, `can't stock stores for ${dest} with the hold this full; re-planning`);
+        this.paxBlock(dest, "no hold left to stock the stores for the passage");
         this.host.releaseLane(this);
         // Sealed freight or a policy still binds the ship there: not every few seconds.
         return sealed.length > 0 || policy?.dest_port_id === dest ? 60_000 : 5_000;
@@ -3258,10 +4010,24 @@ export class ShipAgent {
       }
     }
 
+    // Passengers in the spare hold, for the port this voyage makes for anyway (guide 3.20): the cargo and stores are aboard by
+    // now, so a boarding starves no purchase; the berth lock gives the groups a game-hour round to choose. Never stops the voyage.
+    const paxReserve = Math.max(PAX_STORES_SLACK_TONS, Math.ceil(safe * PAX_STORES_SLACK_SHARE));
+    // Switched off since one went up (the user, or the AI's ceiling): withdrawn, so no group boards to pin her.
+    if (!this.host.settings.usePassengers) this.dropOffers("passengers switched off");
+    await this.offerBerths(r, dest, stay, plan, paxReserve);
+
     if (this.locked(r)) {
       const wait = Date.parse(r.ship.turnaround_unlocks_at!) - world.now();
       this.activity = `berth lock: leaving for ${dest} in ${secs(wait)}`;
       return wait + 750;
+    }
+    // The lock clear before the first round since the offer went up: one hold where she lies (a move would close it) until just
+    // after that round, when the fares it may bring beat what the wait costs.
+    const paxHold = this.paxHoldMs(r, dest, stay, plan, paxReserve);
+    if (paxHold > 0) {
+      this.activity = `boarding passengers for ${dest}: waiting ${secs(paxHold)} for the next game-hour round`;
+      return paxHold;
     }
 
     // Our other ships bound the same way soon: sail together (pirates board just one ship of a
@@ -3287,6 +4053,8 @@ export class ShipAgent {
     try {
       const res = await client.depart({ ship_id: this.shipId, dest_port_id: dest });
       this.noteDues(port, res.berth_dues_pence);
+      // Departing closed our offers here on the server.
+      if (this.offers.size) this.closeOffers();
       for (const w of res.warnings) {
         if (w.code !== "stores_below_safe") {
           this.log(`depart warning ${w.code}: ${w.detail}`);
@@ -3299,7 +4067,8 @@ export class ShipAgent {
       }
       const eta = Date.parse(res.estimated_arrival_at);
       const own = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g), 0);
-      this.log(`sailing ${port} → ${dest} with ${own} t${this.freight.size ? ` + ${this.sealedTons()} t freight` : ""}, arrives in ${secs(eta - world.now())}`);
+      const heads = this.paxHeads();
+      this.log(`sailing ${port} → ${dest} with ${own} t${this.freight.size ? ` + ${this.sealedTons()} t freight` : ""}${heads ? ` + ${heads} passengers` : ""}, arrives in ${secs(eta - world.now())}`);
       // depart plots its own route: one other than the plan checked for this hull is logged, over unrated water loudly.
       const sailed = res.route_legs ?? [];
       if (sailed.length && (sailed.length !== plan.legs.length || sailed.some((l, i) => l.to_node !== plan.legs[i].to_node))) {

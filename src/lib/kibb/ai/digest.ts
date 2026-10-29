@@ -15,7 +15,7 @@ import type { Lane, StallStake } from "../fleet/planner";
 import type { TripRecord } from "../fleet/agent";
 import type { Catalog } from "../types";
 import type { ScreenedEvent } from "./screen";
-import { aiRange, NUMBER_KEYS, SWITCH_KEYS, type Active, type BanKind, type Bias, type ShipOrderKind } from "./directives";
+import { aiRange, isHousekeeping, NUMBER_KEYS, SWITCH_KEYS, type Active, type BanKind, type Bias, type ShipOrderKind } from "./directives";
 
 // ── System prompt ────────────────────────────────────────────────────────────
 
@@ -32,18 +32,21 @@ const RULES = `You are the strategist for a fleet autopilot in Tradewinds, a mul
 - The Crown's wealth levy: a company's net worth (as the leaderboard counts it: cash, escrow, goods, hulls, loans, deposits, venture stakes) above 1,000,000 Cr pays 0.1% of the excess every game day (about 6% a real day), taken from cash (richest vault first, never below the threshold). Putting money to work doesn't avoid it: it is simply a cost of size, kept in the home floor (the digest gives it).
 - Contraband (goods of category contraband) lives only aboard ships: no market, warehouse, charter, freight or pledge takes it. Smugglers' coves (is_cove ports) sell it from the Underworld's book and sell ships' stores, but host no lawful lanes and no factor. The autopilot never plans lawful trade at a cove or in contraband; a ship with contraband aboard never berths, buys stores or trades in an ordinary port (a ship lying there with it may be searched, berthed more than in the roadstead; a cove is never searched), and holds it in the roadstead unless the smuggling mode takes her.
 - The Free Trade (smuggling): ordinary ports want contraband from time to time (a multiple of base for the first ton ashore, fading, each ton walking it down); the news travels only to the coves (their board, with its age) or is seen where our ships lie. At sea only patrols search, in their zones; in port a ship lying there with contraband may be searched any time; runs ashore often draw the Crown's attention. Caught: the ship and everything aboard are forfeit, insurance pays nothing (Lloyd's never covers contraband), and the conviction goes on our public credit record. The smuggling mode (setting smuggling: only the user can turn it on, you may switch it off; it needs the key's underworld scope) uses one dedicated ship at a time (never the only one, never pledged, insured, listed, in a convoy, or with lawful cargo or sealed freight aboard), buys at most smuggleMaxTons and smuggleMaxPence at a cove on a fresh rich want (a game day old at most, 3x base or more), sails only routes no patrol works (checked again before departing), lies in the roadstead and runs it ashore at once, and only when the expected gain is at least twice the expected loss on a conservative seizure model learned from our own runs; after a seizure it switches itself off until the user turns it on again. Switched off (by the user, you or a seizure), nothing new is bought, but a load already aboard is finished first (run ashore where she lies, or sold at a cove clear of patrols): switching it off doesn't strand a ship with contraband. No patrol of ours goes where our smugglers sail, nor anywhere while a ship with contraband aboard lies in an ordinary port with no passage planned (a patrol order then waits or is dropped). The digest's "Free Trade" section says what it does.
-- Shipyards: a turnkey build buys each material off the yard port's ask book (players' asks and the NPC ladder, cheapest first; our own and linked asks, and asks over 2.5x the mid, are passed over), pays customs on every fill and a 15% markup on the NPC-sourced part only; byomBuilds saves that markup. A book that can't supply refuses the build. The packet (Phase 2, 16 kn, 16 t, can seal its dispatches) is a courier: the buyer never builds one.
+- Shipyards: a turnkey build buys each material off the yard port's ask book (players' asks and the NPC ladder, cheapest first; our own and linked asks, and asks over 2.5x the mid, are passed over), pays customs on every fill and a 15% markup on the NPC-sourced part only; byomBuilds saves that markup. Discount yards (Lisbon, Boston, Havana) charge 30% less labour and no markup: their quotes (the digest's) are what we'd pay, but a hull's rebuild value stays the full price. A book that can't supply refuses the build. The packet (Phase 2, 16 kn, 16 t, can seal its dispatches) is a courier: the buyer never builds one.
 - Ships pledged to loans: a liened ship can't be listed, sold or pledged again until repaid; a defaulted loan's ship is arrested (it can't depart or join a convoy; cargo aboard is sold toward the debt). The autopilot parks an arrested ship until our loans show it free (state "arrested").
-- Loans by quote: a loan has a fixed annual rate (bps per 360 game days) for 1-360 game days, simple interest for the game time elapsed; repaid "balloon" (all at maturity) or "amortised" (installments every 10 game days; one missed is in arrears for a game day, then the whole loan defaults). Repaying early is free (interest to date only). The Goldsmiths' Company quotes at once against one of our ships (at most 40% of her rebuild value and 7,500 Cr a loan, with recourse) at 45% a year for terms up to 30 game days sliding to 30% at 360 (the digest lists it by term); players post requests for quotes and lenders quote on them (within a tenth to three times the Goldsmiths' rate for the term), the borrower approving one. A default on a player lender's loan (or a Goldsmiths' ship mortgage) hands a liened ship to the lender where she lies, credited at 80% of her rebuild value (a surplus over the debt is paid back to the borrower), and arrests her meanwhile; with recourse the rest is claimed from our vaults. A default on a Goldsmiths' instant loan (every loan the autopilot takes) is harsher: they take the ship credited only at her break-up value, 35% of her rebuild value, pay no surplus, and the rest is still owed (taken from our vaults until paid). An insured ship lost under a lien pays the lender first. Walking away (written off, except on a Goldsmiths' instant loan, where the rest stays owed; a permanent mark on the credit record) is the owner's call only: the autopilot never does it. After any walk-away by us or a linked company the Goldsmiths quote and lend nothing for a real day (the autopilot borrows nothing until then). Net worth subtracts what is owed, so borrowing never lifts us up the board. With leverage on, the autopilot borrows only to bridge a hull our own cash can't fund (against cash due from cargo at sea, at most half the hull) or a load at its source that cash limits, when the money earns at least minLoanReturnX times the interest over the term and pays back within half of it, on the Goldsmiths' quote (balloon), with what is owed kept within maxDebtPct of net worth; it then asks player lenders for quotes and approves one that refinances the Goldsmiths' loan for less. What is owed (installments included) is never spent on hulls, marques or lending, loads never spend what a repayment counts on, it is repaid early when cash isn't scarce, and always in full 2 game days before maturity (short: all new spending stops). No new loans in the season's last 12 hours, while one is overdue or in arrears, or while our idle cash is quoted (it is taken back first). With idleCash on, spare cash the fleet hasn't needed for 20 game hours (beyond its loads, our loans and 25,000 Cr) is quoted on players' secured requests (ship liens or goods, with recourse, at most 60 game days) from borrowers with a clean credit record (no default, walk-away, write-off, bankruptcy or smuggling conviction), never our own companies, at 0.9x the Goldsmiths' rate for the term (never under 15% a year); the quote's principal is escrowed until the borrower approves another, it lapses, or the fleet needs the cash and it is withdrawn.
+- Loans by quote: a loan has a fixed annual rate (bps per 360 game days) for 1-360 game days, simple interest for the game time elapsed; repaid "balloon" (all at maturity) or "amortised" (installments every 10 game days; one missed is in arrears for a game day, then the whole loan defaults). Repaying early is free (interest to date only). The Goldsmiths' Company quotes at once against one of our ships (at most 40% of her rebuild value and 7,500 Cr a loan, with recourse) at 45% a year for terms up to 30 game days sliding to 30% at 360 (the digest lists it by term); players post requests for quotes and lenders quote on them (within a tenth to three times the Goldsmiths' rate for the term), the borrower approving one. A default on a player lender's loan (or a Goldsmiths' ship mortgage) hands a liened ship to the lender where she lies, credited at 80% of her rebuild value (a surplus over the debt is paid back to the borrower), and arrests her meanwhile; with recourse the rest is claimed from our vaults. A default on a Goldsmiths' instant loan (the autopilot's own, bar ship mortgages) is harsher: they take the ship credited only at her break-up value, 35% of her rebuild value, pay no surplus, and the rest is still owed (taken from our vaults until paid). An insured ship lost under a lien pays the lender first. Walking away (written off, except on a Goldsmiths' instant loan, where the rest stays owed; a permanent mark on the credit record) is the owner's call only: the autopilot never does it. After any walk-away by us or a linked company the Goldsmiths quote and lend nothing for a real day (the autopilot borrows nothing until then). Net worth subtracts what is owed, so borrowing never lifts us up the board. With leverage on, the autopilot borrows only to bridge a hull our own cash can't fund (against cash due from cargo at sea, at most half the hull) or a load at its source that cash limits, when the money earns at least minLoanReturnX times the interest over the term and pays back within half of it, on the Goldsmiths' quote (balloon), with what is owed kept within maxDebtPct of net worth; it then asks player lenders for quotes and approves one that refinances the Goldsmiths' loan for less. Its other loan is a ship mortgage (mortgages on, with leverage): a turnkey hull our cash can't fund is built with the yard region's Goldsmiths paying 60% of its price (80% for an oceanic hull), amortised over 180 game days (an installment every 10), a lien on the new hull with recourse, one at a time, within the debt cap (principal and interest), when the hull's net covers its installments 1.5x and earns minLoanReturnX its interest (the cheaper in interest when an instant loan would also do); never repaid early (in full only as the season ends); a default credits 80% of her rebuild value plus the surplus. What is owed (installments included; of a mortgage, its next 2) is never spent on hulls, marques or lending, loads never spend what a repayment counts on, an instant loan is repaid early when cash isn't scarce, and always in full 2 game days before maturity (short: all new spending stops). No new loans in the season's last 12 hours, while one is overdue or in arrears, or while our idle cash is quoted (it is taken back first). With idleCash on, spare cash the fleet hasn't needed for 20 game hours (beyond its loads, our loans and 25,000 Cr) is quoted on players' secured requests (ship liens or goods, with recourse, at most 60 game days) from borrowers with a clean credit record (no default, walk-away, write-off, bankruptcy or smuggling conviction), never our own companies, at 0.9x the Goldsmiths' rate for the term (never under 15% a year); the quote's principal is escrowed until the borrower approves another, it lapses, or the fleet needs the cash and it is withdrawn.
 - Piracy per sea zone (letters of marque raise it and pay their sponsor prize money from interceptions there, naval patrols lower it, corsair outbreaks are strong and long). Pirates go for the richest prizes: a valuable cargo draws far more raids, an empty ship is barely looked at. An interception carries the ship off, cargo and stores and all, in 5-10% of cases (fewer the more guns face it); otherwise it seizes 20-50% of every cargo stack and of the stores and lets the ship go. Guns make interceptions much rarer. The planner already prices this per lane (cargo at risk, and the hull at risk of capture), refits guns to it and stocks stores for a raid (the route's safe figure covers one storm only).
-- Storms: each leg rolls for the sea zone it ends in, at the zone's storm odds; worse for a hull below the leg's water (the rougher of the zone and the crossing; never sailed) and in storm season (game months 11 to 2, about 2 real days in every 6). A hit destroys a share of every cargo stack and of the stores, from a light soaking to a heavy loss (most are light; rougher water and an under-rated hull hit harder). The route's safe stores figure covers the worst storm. The planner already prices storms per lane (learned from our own voyages) and stocks stores for extra hits, so long Baltic and North Sea legs rank lower in storm season by themselves.
+- Storms: each leg rolls for the sea zone it ends in, at the zone's storm odds; worse for a hull below the leg's water (the rougher of the zone and the crossing; never sailed) and in storm season (game months 11 to 2, about 2 real days in every 6). A hit destroys a share of every cargo stack and of the stores, from a light soaking to a heavy loss (losses vary, most are light; rougher water and an under-rated hull hit harder, and an ocean-rated hull weathers them better in any water). The route's safe stores figure covers the worst storm. The planner already prices storms per lane (learned from our own voyages) and stocks stores for extra hits, so long Baltic and North Sea legs rank lower in storm season by themselves.
 - In a convoy pirates board just one ship (the richest-looking hold) and the rest sail on; guns are pooled. The autopilot forms convoys of its own ships bound the same way soon when the risk avoided outweighs the wait. Quays post news of public forming convoys (organizer, route, sailing up to 14 game days out, muster); rival intel counts them as low-confidence traffic until a listing or a sighting shows the convoy.
-- Marine insurance: Lloyd's writes a policy only at a premium of at least 2.5x its expected loss + 25 bps (it looks at a listing an hour or more old, every 2 game hours), and each open policy lists Lloyd's estimate of its expected loss (an upper bound) and the premium's margin over it. Underwriting (underwrite, underwriteMinEdgeBps: the least margin taken) writes slices where that margin is wide, first pick before Lloyd's looks; a remainder under 500 bps is taken whole. A storm claims at most 25% of the declared cargo, pirates who let the ship go at most what they seized (up to half), a sinking or capture the whole sum.
+- Marine insurance: Lloyd's posts a policy's price at ceil(1.75x its expected loss) + 25 bps when the hull is rated for every leg of the voyage, else 2.5x + 25 bps, and writes one only at that premium or more (it looks at a listing an hour or more old, every 2 game hours), and each open policy lists Lloyd's estimate of its expected loss (an upper bound) and the premium's margin over it. Underwriting (underwrite, underwriteMinEdgeBps: the least margin taken) writes slices where that margin is wide, first pick before Lloyd's looks; a remainder under 500 bps is taken whole. A storm claims the share of the declared cargo it destroyed (it varies), pirates who let the ship go at most what they seized (up to half), a sinking or capture the whole sum.
 - Coffee-house gossip gives each remote port's stock, best bid and ask, and the best players' resting bid and ask with their tons (anonymous; ours left out). The planner may sell into a remote player's bid above the port's buyers and buy from a remote player's ask below the ladder, up to those tons, discounted for the news' age.
 - Royal monopolies: the Crown sells the sole right to buy one good from its (NPC) asks at every port of one banking region for 5-20 game days. Everyone else, our own other companies included, buys it there only from players' resting asks (or brings it in); selling, provisioning and charters are unaffected, and provisions and silver are never monopolised. The planner sources around the monopolies listed in the digest.
 - Players post charters too (paid from the poster's escrow, the goods go to its warehouse, no prestige); one posted by any of our own companies can't be delivered to, and is left out of the digest and every plan.
-- Ship market: ships are listed for sale at 50-150% of their rebuild value (the class's cheapest turnkey quote plus 150 Cr a gun) and bought where they lie (quay presence there), with their stores and guns, at once. Commissions: a buyer escrows a price (50-150% of rebuild value) for a hull of a class built at a yard by a deadline, and the builder escrows up to 25% of it as collateral; the builder builds it at its own cost and gets the price and its collateral back, or forfeits the collateral at the deadline. Commissions are never freight. With shipDeals on, the buyer also buys a ship for sale at our quays that costs less than building its class (through every check a build passes), and the autopilot takes commissions at yards where we have presence when the price beats our cheapest build (turnkey, or own materials; own materials only when the turnkey walk draws on players' asks) by 10% of the price and 1,000 Cr after the collateral's risk, with the cash for the build and the collateral after loads and the deadline far enough, building and delivering at once. Our own companies' listings and commissions are never taken; the autopilot never lists our ships.
+- Ship market: ships are listed for sale at 50-150% of their rebuild value (her class at the yards' full price plus 150 Cr a gun) and bought where they lie (quay presence there), with their stores and guns, at once. Commissions: a buyer escrows a price (50-150% of rebuild value) for a hull of a class built at a yard by a deadline, and the builder escrows up to 25% of it as collateral; the builder builds it at its own cost and gets the price and its collateral back, or forfeits the collateral at the deadline. Commissions are never freight. With shipDeals on, the buyer also buys a ship for sale at our quays that costs less than building its class (through every check a build passes), and the autopilot takes commissions at yards where we have presence when the price beats our cheapest build (turnkey, or own materials; own materials only when the turnkey walk draws on players' asks) by 10% of the price and 1,000 Cr after the collateral's risk, with the cash for the build and the collateral after loads and the deadline far enough, building and delivering at once. Our own companies' listings and commissions are never taken; the autopilot lists a ship of ours only to retire her (below).
 - Intelligence envelopes: at a quay where we have presence, news held there (its coffee-house board and our crews' reports, its last day of sailing notices, its non-public charters) can be sealed and sold; buyers see only a generated title and ages, never the contents. With envelopes on, the autopilot seals and lists fresh port reports and sailings (sailings only when none of ours is among them; and non-public charters, only of goods it isn't carrying, planning or letting lapse) at each of our quays every 2 game hours, at a modest price per item halved for every 12 game hours of age (10 Cr at least), withdraws them unsold after 12 game hours, and never buys any.
+- Passengers (guide 3.20): groups wait at ports for a destination and each game hour board the best-value open offer (cheaper or faster wins; groups never split), 1 t of hold a head (a packet 2 a ton). The fare is paid on arrival, cut for each game day late, and lost with the ship (Lloyd's never covers fares; pirates ransom passengers, a richer prize). With usePassengers on, the autopilot offers only the spare hold of voyages it sails anyway (never a detour), a little under the route's accepted fares, never on a smuggler, a ship with contraband, one arrested or an insured ship; passengers aboard pin her next port to theirs.
+- Break-up (guide 3.4): the yard where a ship lies buys her for 35% of her rebuild value, paid by its region's Crown (a Crown can run short: the Exchequer tops them up), only when she is free to change hands (empty; no convoy, policy, lien or mortgage, passengers, listing, outside shares or venture). Net worth counts a hull at its build value, so it gives 65% away at once; a sale to a player pays at least 50%. With autoBreakUp on, the autopilot breaks up dead weight watched for 2 game days (idle, earning under her share of the upkeep with no lane beating it; or an out-of-date class whose slot a paying new hull would take, the fleet full) when the upkeep saved to the season's end, less her earnings, makes up the net worth given away; never the last ship, a courier, a smuggler, one arrested, under your order or with components fitted; one at a time, listed for a day first with shipDeals on.
+- Home port (guide 3.12): moving it costs 2,500 Cr from the new home's vault, at most once a real day, and needs presence there (a ship of ours in port or a factor), never a cove; upkeep, marques, patrols and R&D then bill there. With autoRelocate on, the autopilot moves when one region paid most of the remit fees that kept home funded over 3 game days and those fees to the season's end beat the move 1.5x, that vault holds the fee above its floor, and it hasn't moved in 3 real days.
 
 ## What the autopilot already does well (don't redo it)
 - Ranks every lane (charter, market and freight legs, mixed loads, the onward leg) by profit per real hour from live and remembered prices (remote players' resting bids and asks in the gossip included), costs, fees, berth dues, piracy, storms, the load's marginal share of the phase bonus and re-post terms. Reserves charter room, source stock and buyers across our own ships. Sizes loads to spare cash plus cash due before they are bought, and sizes each again at its source; when cash is scarce it charges each load for the cash it ties up.
@@ -54,9 +57,9 @@ const RULES = `You are the strategist for a fleet autopilot in Tradewinds, a mul
 ## What you decide
 Your directives last for your horizon, then lapse. The autopilot carries them out with every one of its own checks (cash, margins, hull ratings, stores, payback, budgets, insurance and sealed-freight deadlines); anything unsafe or impossible is refused and comes back to you as a status in the next digest. Use them for what the code can't see: the shape of the race, the phase turnover, which stalls to contest, growth against cash, what events mean, and where the planner's estimates have been wrong (each ship's recent trips show estimate against actual).
 Answer with a list of actions, each {do, key, ref, to, n, m, reason}; a field an action doesn't use is "" (text) or 0 (number). Give every action a reason. The kinds of "do":
-- "set" (key a setting, n its value; a switch: n 1 on, 0 off): change any setting the digest lists, for the horizon, within the range it gives (in the setting's own units: pence, %, hours, bps). maxShips, marqueBudgetPence, the underwriting budgets, maxDebtPct and cashDuePct can't go above the user's values; reservePence and minLoanReturnX can only go up; leverage, idleCash and smuggling can't be switched on while the user's are off; smuggleMaxTons and smuggleMaxPence can't go above the user's values. Not listed = unchanged. Give each a reason.
+- "set" (key a setting, n its value; a switch: n 1 on, 0 off): change any setting the digest lists, for the horizon, within the range it gives (in the setting's own units: pence, %, hours, bps). maxShips, marqueBudgetPence, the underwriting budgets, maxDebtPct and cashDuePct can't go above the user's values; reservePence and minLoanReturnX can only go up; leverage, mortgages, idleCash, usePassengers, autoBreakUp, autoRelocate and smuggling can't be switched on while the user's are off; smuggleMaxTons and smuggleMaxPence can't go above the user's values. Not listed = unchanged. Give each a reason.
   - maxShips: the fleet size the buyer may grow to. reservePence: cash always kept at home. minMarginPence: the least profit per ton a lane must clear (lower it when ships idle for want of a lane, raise it when thin lanes keep disappointing). maxPaybackHours: the buyer builds only what pays back within this. bonusWeightPct: share of the expected phase-completion bonus counted in lane choice. stormWeightPct: share of expected storm losses counted. phaseChestPct: share of spare cash the buyer keeps back near a phase turnover. cashDuePct: share of cash due from cargo at sea a load may count on. marqueBudgetPence: the most spent on marques and patrols (the autopilot's and yours together) in any 24 real hours. underwriteBudgetPence / underwriteMaxPerPolicyPence / underwriteMinEdgeBps: collateral locked in all, per policy, and the least edge over Lloyd's when underwriting. maxDebtPct: the most owed on loans, as a % of net worth (0 stops new borrowing). minLoanReturnX: how many times its interest a loan must earn over its term.
-  - autoBuy: the ship buyer. marques: sponsor marques where the game's quote (prize expected from the zone's traffic) beats its price plus our own ships' extra losses, and patrols where the smuggler prize money expected from the seizures seen at sea there, plus the piracy taken off our own ships' passages, beats the patrol's quoted price (one game day at a time, within the marque budget; never where our own ships carry contraband or our marque is in force). underwrite: underwrite other companies' policies. useFreight: carry sealed freight. convoys: sail in convoys of our own ships. rivalIntel: read public rival intel. byomBuilds: build from materials bought at the yard. yardFactor: hire a factor to build where no ship of ours is. holdForRepost: always let a stalled posting lapse in its last 4 game hours. captureEscalations: the fleet's own stall calls. actOnEvents: plan on world events. resizeLoads: plan each load again at its source (load loans need it). leverage: borrow to bridge hulls and loads as above. idleCash: quote spare cash on players' secured loan requests as above. shipDeals: buy ships for sale under building cost and build commissions to order. envelopes: sell sealed news from our quays. smuggling: the Free Trade mode as above (switch it off when its risk isn't worth it, e.g. near a phase turnover or with the fleet thin); smuggleMaxTons / smuggleMaxPence: the most one run buys (tons, pence).
+  - autoBuy: the ship buyer. marques: sponsor marques where the game's quote (prize expected from the zone's traffic) beats its price plus our own ships' extra losses, and patrols where the smuggler prize money expected from the seizures seen at sea there, plus the piracy taken off our own ships' passages, beats the patrol's quoted price (one game day at a time, within the marque budget; never where our own ships carry contraband or our marque is in force). underwrite: underwrite other companies' policies. useFreight: carry sealed freight. convoys: sail in convoys of our own ships. rivalIntel: read public rival intel. byomBuilds: build from materials bought at the yard. yardFactor: hire a factor to build where no ship of ours is. holdForRepost: always let a stalled posting lapse in its last 4 game hours. captureEscalations: the fleet's own stall calls. actOnEvents: plan on world events. resizeLoads: plan each load again at its source (load loans need it). leverage: borrow to bridge hulls and loads as above. idleCash: quote spare cash on players' secured loan requests as above. mortgages: let the buyer build on a ship mortgage (with leverage on). usePassengers: offer spare hold to passengers as above. shipDeals: buy ships for sale under building cost and build commissions to order. envelopes: sell sealed news from our quays. autoBreakUp / autoRelocate: break up dead weight / move the home port as above. smuggling: the Free Trade mode as above (switch it off when its risk isn't worth it, e.g. near a phase turnover or with the fleet thin); smuggleMaxTons / smuggleMaxPence: the most one run buys (tons, pence).
 - "guns" (key "auto", "full" or "off"; no action = keep): a policy for the horizon: "auto" (refit to each lane's piracy at yard calls), "full" (every ship to its class maximum), "off" (no refits).
 - "avoid" (key port, zone, good, charter or contested; ref the port id, zone id, good id or charter alias, "" for contested; up to 12): hard bans for the horizon: a port (no loading, delivering or selling there), a sea zone (no passage through it, laden or empty), a good, a charter, or "contested" (no public charter where rivals are due before us). New plans only: cargo aboard is never stranded.
 - "bias" (key dest, source, port, zone, good, charter or lane; ref the id or alias; n the factor 0.5-1.5; up to 12): reorders lanes by destination, source, port (either end), zone (laden passage), good, charter or lane. Factors multiply. It only reorders lanes that pass every check and earn something.
@@ -64,13 +67,14 @@ Answer with a list of actions, each {do, key, ref, to, n, m, reason}; a field an
 - "order" (ref a ship alias, at most one per ship; key lane, charter, port, hold or release; to the lane or charter alias or port id, "" for hold and release): "lane" / "charter": at its next plan the ship takes the best passing lane that is that lane / fills that charter, else plans as usual; "port": it plans only loads from that port, or sails there empty when none pays (for instance so the buyer has presence at a yard); "hold": no new work, it waits in the roadstead (counts as idle for the tripwire; at most a third of the fleet); "release": it drops a planned lane nothing has been bought for and plans again. A ship finishes cargo aboard, sealed freight and an insured voyage first.
 - "buy" (key "hold" or "build"; no action = the buyer's own rules): "hold" stops building for the horizon; "build" (ref a class id, to a shipyard port id) builds one ship of that class at that yard if it passes the buyer's checks (payback limit, cash after loads, max ships, the season); it needs one of our ships there or, with yardFactor on, a factor (750 Cr). "forbid" (ref a class id, one action each): the buyer may not build that class for the horizon.
 - "naval" (key "marque" or "patrol"; ref a sea zone id; n the bps; m the term in game hours; at most 2, one per zone): "marque" adds piracy in a zone (prize money from interceptions there, mostly rival traffic, less the Admiral's tenth; our own ships there lose more too) or "patrol" suppresses it; bps 50-1500, a term of 5 game hours up to your horizon, within what the marque budget has left over the last 24 hours (digest). A patrol is priced by the game per zone from its recent smuggling traffic, never under 2 Cr per bps per game day (where nobody smuggles, that floor); it lowers piracy for everyone there, cheapens insurance, searches ships carrying contraband, and pays its sponsor prize money: every smuggler seized at sea in its zone while it is in force pays half the base value of her and everything aboard, split among the patrols in force by bps, less the Admiral's tenth (a seizure in port pays nothing; the digest counts recent seizures per zone). A patrol where our own ships carry contraband always loses (its search may take our ship): none is ever funded where the digest says NO PATROL. A marque is priced by the game per zone from its last 7 game days of player traffic: 60% of the prize money a bps-day is expected to earn there (so it pays ~1.67x if traffic holds; a quiet zone is cheap but earns nothing). The digest gives a zone's last quoted prices; the autopilot quotes either again when issuing and cuts it to what the budget has left at that price. Each side of a zone is capped at 5,000 bps. Issued ones can't be withdrawn.
-- money (each with every check of the autopilot's own: the debt cap, minLoanReturnX and payback within half the term, cash after loads, a commission's margin, presence and deadline): "borrow" (key "load" with ref a ship alias: that ship's next load at its source may borrow up to n pence when cash limits it, leverage and resizeLoads on; key "hull" with ref "": the buyer may borrow up to n pence for a hull our cash can't fund, not only against cash due; at most one). "repay" (ref a loan alias D1…): repay that loan early in full from spare cash after loads (not while a ship waits for cash). "accept" (ref a commission alias K1…): build that commission to order (even with shipDeals off). Never invent amounts the digest gives no reason for.
+- money (each with every check of the autopilot's own: the debt cap, minLoanReturnX and payback within half the term, cash after loads, a commission's margin, presence and deadline): "borrow" (key "load" with ref a ship alias: that ship's next load at its source may borrow up to n pence when cash limits it, leverage and resizeLoads on; key "hull" with ref "": the buyer may borrow up to n pence for a hull our cash can't fund, not only against cash due; at most one). "repay" (ref a loan alias D1…): repay that loan early in full from spare cash after loads (not while a ship waits for cash; never a ship mortgage). "accept" (ref a commission alias K1…): build that commission to order (even with shipDeals off). Never invent amounts the digest gives no reason for.
+- housekeeping (at most one of each, through the autopilot's own hard checks): "break_up" (ref a ship alias): retire her as the dead-weight path would, without its days of watching: every never above, one at a time, her class quoted at a yard of ours, a yard in reach and the value test (payout and upkeep saved to the season's end, less her earnings, must make up the net worth given away) still apply; refused while autoBreakUp is off. A lane, cargo or passengers aboard finish first; once marked she is retired like any (after your advice lapses too; autoBreakUp off withdraws it). "relocate" (to a port id): move the home port there, the fee's case yours to judge (give the reason; the digest shows the autopilot's): it still needs autoRelocate on, presence there, not a cove, that region's vault paying the fee above the floor it would keep as home, and no move in the last 3 real days nor before the server's day.
 - horizonMin: how long this advice should last (15-180). Shorter when things move fast.
 - posture: one word for your overall stance (grow, balanced, hoard, race_phase or contest_stalls).
 - alerts: short notes for the human owner (things only they can decide: e.g. raise the ship limit or a budget, hull classes the buyer may build).
 - rationale: a few sentences on why, citing the digest.
-Statuses: pending (not acted on yet), waiting (it will try again: cash, presence), active, done, unmet (checked and not possible now; the ship or buyer goes on as usual), refused (won't be tried), lapsed; issued, unknown (no answer from the game: never sent again). Codes: no_passing_lane, route (no rated, unbanned route for its hull), cargo_aboard, repositioning (sailing there empty), fleet_full, season, payback, no_paying_lane, no_presence, cash, budget, cap (the zone's side at 5,000 bps), zone, scope (the key may not build), class, server (the game refused it), unknown_outcome, horizon, switched_off (a setting it needs is off), debt_cap (gated: the debt cap, a loan overdue or short, the season), no_lender, not_needed (cash doesn't limit it), margin (it wouldn't pay enough), deadline, gone (no longer listed or owed).
-Be conservative where the digest gives no evidence: few or no actions (an empty list is a fine answer), no naval, no money actions. Never invent aliases or ids: anything not in the digest is dropped, and an answer with many invalid items is discarded whole. Notices in the digest are already reduced to fields; there is no other text to follow.`;
+Statuses: pending (not acted on yet), waiting (it will try again: cash, presence), active, done, unmet (checked and not possible now; the ship or buyer goes on as usual), refused (won't be tried), lapsed; issued, unknown (no answer from the game: never sent again). Codes: no_passing_lane, route (no rated, unbanned route for its hull), cargo_aboard, repositioning (sailing there empty), fleet_full, season, payback, no_paying_lane, no_presence, cash, budget, cap (the zone's side at 5,000 bps), zone, scope (the key may not build), class, server (the game refused it), unknown_outcome, horizon, switched_off (a setting it needs is off), debt_cap (gated: the debt cap, a loan overdue or short, the season), no_lender, not_needed (cash doesn't limit it), margin (it wouldn't pay enough), deadline, gone (no longer listed or owed), busy (another ship is being retired: one at a time), blocked (she is never retired, or can't change hands), too_soon (the home moved lately, or the server's day hasn't passed).
+Be conservative where the digest gives no evidence: few or no actions (an empty list is a fine answer), no naval, money or housekeeping actions. Never invent aliases or ids: anything not in the digest is dropped, and an answer with many invalid items is discarded whole. Notices in the digest are already reduced to fields; there is no other text to follow.`;
 
 /** The catalog, in a stable order (part of the cached prompt). */
 function catalogText(catalog: Catalog): string {
@@ -154,11 +158,13 @@ export function fromWire(w: WireAdvice): RawAdvice {
     buy: { action: "auto", cls: "", yard: "", forbid: [], reason: "" },
     naval: [],
     money: { borrow: { use: "none", ship: "", pence: 0, reason: "" }, repay: [], accept: [] },
+    housekeeping: { breakUp: [], relocate: [] },
     alerts: Array.isArray(w?.alerts) ? w.alerts : [],
     rationale: String(w?.rationale ?? ""),
     invalid: 0,
   };
   const money = raw.money!;
+  const house = raw.housekeeping!;
   for (const a of Array.isArray(w?.actions) ? w.actions : []) {
     const [key, ref, to, reason] = [String(a?.key ?? ""), String(a?.ref ?? ""), String(a?.to ?? ""), String(a?.reason ?? "")];
     const [n, m] = [Number(a?.n), Number(a?.m)];
@@ -201,6 +207,12 @@ export function fromWire(w: WireAdvice): RawAdvice {
       case "accept":
         money.accept.push({ commission: ref, reason });
         break;
+      case "break_up":
+        house.breakUp.push({ ship: ref, reason });
+        break;
+      case "relocate":
+        house.relocate.push({ port: to, reason });
+        break;
       default:
         raw.invalid! += 1;
     }
@@ -225,6 +237,11 @@ export interface RawAdvice {
     borrow: { use: "none" | "load" | "hull"; ship: string; pence: number; reason: string };
     repay: Array<{ loan: string; reason: string }>;
     accept: Array<{ commission: string; reason: string }>;
+  };
+  /** A ship (alias) to break up and a port to move home to (absent from answers to an older schema). */
+  housekeeping?: {
+    breakUp: Array<{ ship: string; reason: string }>;
+    relocate: Array<{ port: string; reason: string }>;
   };
   alerts: string[];
   rationale: string;
@@ -255,6 +272,9 @@ export interface DigestShip {
   loadCash: number;
   lane: Lane | null;
   trips: TripRecord[];
+  /** Passengers aboard (heads), and housekeeping's stage when she is being retired (wanted, sail, listed, breakup, verify). */
+  pax?: number;
+  retiring?: string | null;
 }
 
 export interface DigestDecision {
@@ -383,7 +403,19 @@ export interface DigestInput {
       nextPaymentInMs: number | null;
       nextPaymentPence: number | null;
       arrears: number;
+      /** A ship mortgage (amortised, never repaid early); absent: an older manager's row. */
+      mortgage?: boolean;
     }>;
+    /**
+     * Ship mortgages in the buyer (guide 3.4): whether it may take one now (`on`, or why not: off, leverage off, one owed or
+     * pending), its latest checks of one (`yard`, `cls`, the verdict: ok, cap, lane, payback, installments, interest, season),
+     * and the last hull built on one (real ms ago, the Goldsmiths' part). Absent: not reported.
+     */
+    mortgage?: {
+      state: string;
+      checks: Array<{ yard: string; cls: string; code: string }>;
+      lastBuilt: { cls: string; yard: string; agoMs: number; principal: number } | null;
+    };
     lentOut: number;
     quoted: number;
     quotes: Array<{ principal: number; rateBps: number; termDays: number }>;
@@ -428,6 +460,59 @@ export interface DigestInput {
     odds: number;
     recentRuns: number;
   };
+  /**
+   * Passengers in the spare hold (guide 3.20; pence): the switch in force, a refusal for the key, fares paid so far, groups aboard
+   * by ship id (aliased) and destination (heads, whole fares paid on arrival, real ms to the soonest promise), our open offers, and
+   * what the pricer learned per route (`from>to`: its nudge on the reference fare, game-hour rounds won and left unfilled), with
+   * the fare records it reads. Absent: not reported.
+   */
+  passengers?: {
+    enabled: boolean;
+    blocked: boolean;
+    earned: number;
+    aboard: Array<{ ship: string; dest: string; heads: number; fares: number; dueInMs: number | null }>;
+    offers: Array<{ ship: string; port: string; dest: string; perHead: number; berths: number; taken: number }>;
+    routes: Array<{ route: string; adj: number; won: number; lost: number }>;
+    records: number;
+  };
+  /**
+   * Fleet housekeeping (guide 3.4, 3.12; pence). Break-up: the switch in force, why nothing is judged (our own words; null: judged),
+   * the dead-weight candidates by ship id (aliased; idle or obsolete, the checks behind it, ready to act on, the case over the
+   * horizon: payout, earnings and upkeep a game day, cash and net worth by then, broken up against kept; null: not weighed), ships
+   * being retired (stage, yard, payout, by your order), the last retired, regions whose Crown couldn't pay lately, and the record.
+   * Home: the port and region, the remit fees that kept it funded (a game day, by donor region and share), the fees to the
+   * horizon against the bar, the verdict (our words), where a move would go, ports where we have presence to move to, and real ms
+   * to the next move allowed (null: now). Crowns the Exchequer topped up lately (real ms ago). Absent: not reported.
+   */
+  housekeeping?: {
+    breakUp: {
+      enabled: boolean;
+      blocked: string | null;
+      candidates: Array<{ ship: string; reason: string; checks: number; ready: boolean; payout: number; earnPerDay: number; upkeepPerDay: number; horizonH: number; gain: number | null; worthGain: number | null }>;
+      pending: Array<{ ship: string; stage: string; yard: string; payout: number; ordered: boolean }>;
+      done: Array<{ cls: string; port: string; how: string; pence: number; agoMs: number }>;
+      refused: string[];
+      brokenUp: number;
+      payout: number;
+      sold: number;
+      soldPence: number;
+    };
+    relocate: {
+      enabled: boolean;
+      home: string | null;
+      region: string | null;
+      perDay: number;
+      byRegion: Array<{ region: string; share: number }>;
+      saving: number;
+      threshold: number;
+      fee: number;
+      verdict: string;
+      target: string | null;
+      presence: string[];
+      nextInMs: number | null;
+    };
+    toppedUp: Array<{ region: string | null; agoMs: number }>;
+  };
 }
 
 export interface Aliases {
@@ -446,6 +531,16 @@ const kcr = (p: number) => `${(p / 100_000).toFixed(1)}k Cr`;
 const pct = (bps: number) => `${(bps / 100).toFixed(1)}%`;
 /** An annual loan rate (bps per 360 game days) as "% a year". */
 const pctYr = (bps: number) => `${pct(bps)} a year`;
+/** The buyer's verdict on a ship mortgage it weighed (manager judge), in words. */
+const MORTGAGE_CHECKS: Record<string, string> = {
+  ok: "passed",
+  cap: "over the debt cap",
+  lane: "no paying first lane after our part",
+  payback: "our part and the interest don't pay back",
+  installments: "its net doesn't cover the installments 1.5x",
+  interest: "doesn't earn minLoanReturnX its interest",
+  season: "the endgame comes before it pays",
+};
 
 /**
  * The digest for one call, and the aliases it used. Every line is derived from our own state or
@@ -525,8 +620,8 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
     const where = s.status === "sailing" ? `sailing to ${s.dest}${s.etaMs !== null ? `, arrives in ${realMin(s.etaMs)}` : ""}` : `at ${s.port ?? "?"} (${s.state})`;
     const o = a?.shipOrders.find((x) => x.ship === s.id);
     out.push(
-      `- ${alias} ${s.cls} (${s.hull}) ${s.guns}/${s.maxGuns} guns, stores ${s.stores.toFixed(1)}t, ${s.cargoTons}/${s.hold}t aboard, ${where}; spare for its next load ~${kcr(s.loadCash)}` +
-        `${o ? `; your order: ${o.order}${o.label ? ` ${o.label}` : ""} (${status(o.status, o.code)})` : ""}`,
+      `- ${alias} ${s.cls} (${s.hull}) ${s.guns}/${s.maxGuns} guns, stores ${s.stores.toFixed(1)}t, ${s.cargoTons}/${s.hold}t aboard${s.pax ? ` + ${s.pax} passengers` : ""}, ${where}; spare for its next load ~${kcr(s.loadCash)}` +
+        `${s.retiring ? `; BEING RETIRED (${s.retiring})` : ""}${o ? `; your order: ${o.order}${o.label ? ` ${o.label}` : ""} (${status(o.status, o.code)})` : ""}`,
     );
     if (s.lane) out.push(`  lane ${laneText(s.lane)}`);
     const trips = s.trips.slice(-3);
@@ -556,7 +651,7 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
       aliases.loans.set(alias, { id: l.id, owed: l.owed });
       loanAlias.set(l.id, alias);
       return (
-        `- ${alias} owe ${cr(l.owed)} at ${pctYr(l.rateBps)}, ${l.repayment}${l.use ? ` (for a ${l.use})` : ""}` +
+        `- ${alias} owe ${cr(l.owed)} at ${pctYr(l.rateBps)}, ${l.repayment}${l.mortgage ? ", a SHIP MORTGAGE (runs on its installments, never repaid early)" : l.use ? ` (for a ${l.use})` : ""}` +
         `${l.defaulted ? ", DEFAULTED" : l.repayInMs !== null ? `, repaid in full within ${realMin(l.repayInMs)}` : ""}` +
         `${l.arrears > 0 ? `, ${cr(l.arrears)} IN ARREARS (the whole loan defaults after a game day)` : l.nextPaymentInMs !== null && l.nextPaymentPence !== null && l.repayment === "amortised" ? `, next installment ~${cr(l.nextPaymentPence)} in ${realMin(l.nextPaymentInMs)}` : ""}`
       );
@@ -565,6 +660,13 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
       (r) =>
         `- our request for quotes: ${cr(r.principal)} for ${r.termDays} game days${r.refinancesBps !== null ? ` (to refinance a Goldsmiths' loan at ${pctYr(r.refinancesBps)})` : ""}: ${r.quotes ? `${r.quotes} quote${r.quotes === 1 ? "" : "s"}, best ${r.bestBps !== null ? pctYr(r.bestBps) : "?"}` : "no quote yet"}`,
     ),
+    ...(d.finance.mortgage
+      ? [
+          `ship mortgages in the buyer: ${d.finance.mortgage.state}` +
+            `${d.finance.mortgage.checks.length ? `; its latest checks: ${d.finance.mortgage.checks.map((c) => `${c.cls}@${c.yard} ${MORTGAGE_CHECKS[c.code] ?? c.code}`).join(", ")}` : ""}` +
+            `${d.finance.mortgage.lastBuilt ? `; last built on one: ${d.finance.mortgage.lastBuilt.cls}@${d.finance.mortgage.lastBuilt.yard} ${realMin(d.finance.mortgage.lastBuilt.agoMs)} ago (${cr(d.finance.mortgage.lastBuilt.principal)} from the Goldsmiths)` : ""}`,
+        ]
+      : []),
     `Goldsmiths' rate by term: ${d.finance.goldsmiths.map((g) => `${g.days} days ${pctYr(g.bps)}`).join(", ")}`,
     `## Budgets (the user's ceilings)`,
     `marques+patrols in the last 24 h: ${b.navalSpent24h === null ? `not read yet, of ${cr(b.navalBudget)}` : `${cr(b.navalSpent24h)} of ${cr(b.navalBudget)} (${cr(Math.max(0, b.navalBudget - b.navalSpent24h))} left)`}; ` +
@@ -608,6 +710,49 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
     );
   }
 
+  // Passengers (spare hold on voyages sailed anyway)
+  const px = d.passengers;
+  if (px && (px.enabled || px.earned > 0 || px.aboard.length || px.offers.length)) {
+    const heads = px.aboard.reduce((n, g) => n + g.heads, 0);
+    const of = (id: string) => shipAlias.get(id) ?? "a ship no longer listed";
+    out.push(
+      `## Passengers (spare hold only)`,
+      `${px.enabled ? "on" : "off"}${px.blocked ? "; offers refused for the key (none tried for an hour)" : ""}; fares paid so far ${cr(px.earned)}; ` +
+        `${heads} heads aboard paying ~${cr(px.aboard.reduce((n, g) => n + g.fares, 0))} on arrival; ${px.offers.length} offer${px.offers.length === 1 ? "" : "s"} open`,
+      ...(px.aboard.length
+        ? [`aboard: ${px.aboard.slice(0, 6).map((g) => `${of(g.ship)} ${g.heads} for ${g.dest} ~${cr(g.fares)}${g.dueInMs !== null ? ` (promised in ${realMin(g.dueInMs)})` : ""}`).join("; ")}`]
+        : []),
+      ...(px.offers.length
+        ? [`offers: ${px.offers.slice(0, 6).map((o) => `${of(o.ship)} at ${o.port} for ${o.dest} ${o.berths} berths at ${cr(o.perHead)} a head${o.taken ? `, ${o.taken} taken` : ""}`).join("; ")}`]
+        : []),
+      `fares learned (route: nudge on the accepted fare, rounds won/unfilled): ${px.routes.slice(0, 6).map((r) => `${r.route} x${r.adj.toFixed(2)} ${r.won}/${r.lost}`).join(", ") || "none yet"}; ${px.records} fare records read`,
+    );
+  }
+
+  // Housekeeping (break-ups, the home port, the Crowns' top-ups)
+  const hk = d.housekeeping;
+  if (hk) {
+    const bu = hk.breakUp;
+    const rl = hk.relocate;
+    const of = (id: string) => shipAlias.get(id) ?? "a ship no longer listed";
+    out.push(
+      `## Housekeeping (break-ups and the home port)`,
+      `break-up of dead weight: ${bu.blocked ?? (bu.enabled ? "on" : "off")}; retired so far ${bu.brokenUp} broken up for ${cr(bu.payout)}, ${bu.sold} sold for ${cr(bu.soldPence)}` +
+        `${bu.refused.length ? `; Crowns that couldn't pay a break-up lately: ${bu.refused.join(", ")}` : ""}`,
+      ...bu.candidates.slice(0, 4).map(
+        (c) =>
+          `- candidate ${of(c.ship)} ${c.reason}, ${c.checks} check${c.checks === 1 ? "" : "s"}${c.ready ? ", ready" : ", still watched"}: payout ${cr(c.payout)}, earns ~${cr(c.earnPerDay)} vs upkeep ~${cr(c.upkeepPerDay)} a game day` +
+          `${c.gain !== null && c.worthGain !== null ? `; over ${c.horizonH} h cash ${c.gain >= 0 ? "+" : ""}${cr(c.gain)}, net worth ${c.worthGain >= 0 ? "+" : ""}${cr(c.worthGain)} broken up against kept` : ""}`,
+      ),
+      ...bu.pending.slice(0, 2).map((p) => `- being retired: ${of(p.ship)} ${p.stage}, at ${p.yard} for ~${cr(p.payout)}${p.ordered ? " (your order)" : ""}`),
+      ...(bu.done.length ? [`retired lately: ${bu.done.slice(-3).map((x) => `${x.cls}@${x.port} ${x.how === "sold" ? "sold" : "broken up"} for ${cr(x.pence)} ${realMin(x.agoMs)} ago`).join("; ")}`] : []),
+      `home ${rl.home ?? "?"} (${rl.region ?? "?"}), moving it ${rl.enabled ? "on" : "off"}: remit fees that kept it funded ~${cr(rl.perDay)} a game day` +
+        `${rl.byRegion.length ? ` (${rl.byRegion.slice(0, 3).map((x) => `${x.region} ${Math.round(x.share * 100)}%`).join(", ")})` : ""}, ~${cr(rl.saving)} to the horizon against the bar ${cr(rl.threshold)} (the move ${cr(rl.fee)} x1.5); ` +
+        `${rl.verdict}${rl.target ? `; a move would go to ${rl.target}` : ""}; presence to move to: ${rl.presence.slice(0, 8).join(", ") || "none"}; next move ${rl.nextInMs !== null ? `allowed in ${realMin(rl.nextInMs)}` : "allowed now"}`,
+      ...(hk.toppedUp.length ? [`Crowns topped up by the Exchequer lately: ${hk.toppedUp.slice(-5).map((t) => `${t.region ?? "a Crown"} ${gameH(t.agoMs)} ago`).join(", ")}`] : []),
+    );
+  }
+
   // Settings and ranges
   const u = d.user;
   out.push(
@@ -638,18 +783,21 @@ export function buildDigest(d: DigestInput): { text: string; aliases: Aliases } 
         ? `naval: ${a.naval.map((n) => `${n.kind} ${n.zone} ${n.bps} bps ${n.gameHours} game h ${n.costPence > 0 ? `~${cr(n.costPence)}` : "priced when issued"} (${status(n.status, n.code)})`).join("; ")}`
         : "",
       // (finance: absent on directives saved before money orders)
-      (a.finance ?? []).length
-        ? `money: ${a.finance
-            .map((o) => {
-              const of =
-                o.kind === "borrow_load" ? (shipAlias.get(o.ref) ?? "a ship no longer listed")
-                : o.kind === "repay" ? (loanAlias.get(o.ref) ?? "no longer owed")
-                : o.kind === "commission" ? (commissionAlias.get(o.ref) ?? "no longer listed")
-                : "";
-              return `${o.label}${of ? ` (${of})` : ""} (${status(o.status, o.code)})`;
-            })
-            .join("; ")}`
-        : "",
+      ...[false, true].map((house) => {
+        const xs = (a.finance ?? []).filter((o) => isHousekeeping(o) === house);
+        return xs.length
+          ? `${house ? "housekeeping" : "money"}: ${xs
+              .map((o) => {
+                const of =
+                  o.kind === "borrow_load" || o.kind === "break_up" ? (shipAlias.get(o.ref) ?? "a ship no longer listed")
+                  : o.kind === "repay" ? (loanAlias.get(o.ref) ?? "no longer owed")
+                  : o.kind === "commission" ? (commissionAlias.get(o.ref) ?? "no longer listed")
+                  : "";
+                return `${o.label}${of ? ` (${of})` : ""} (${status(o.status, o.code)})`;
+              })
+              .join("; ")}`
+          : "";
+      }),
     ].filter(Boolean);
     out.push(...lines);
   }

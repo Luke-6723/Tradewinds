@@ -55,7 +55,7 @@ const FIRST_PICK_GAME_MIN = 60;
 interface Risk {
   collateral: number;
   premium: number;
-  /** Most one partial loss can cost the slice: pirates who let the ship go up to half the declared cargo (a storm a quarter); 0 for hull-only cover. */
+  /** What one bad partial loss costs the slice: pirates who let the ship go take up to half the declared cargo (a storm's share varies); 0 for hull-only cover. */
   maxHit: number;
   /** Ceiling on the expected loss (bps), null without anything to go on. */
   elMax: number | null;
@@ -374,8 +374,8 @@ function Underwrite({ policy, ourId, mine, onDone }: { policy: S.InsurancePolicy
         </>
       )}
       <p className="text-muted-foreground text-xs">
-        A storm pays at most 25% of the declared cargo, pirates who let the ship go at most what they seized of it (up to 50%), shared by slice; a sinking or a
-        capture takes the whole collateral. The bound is Lloyd&apos;s own estimate on the listing (an upper bound, so the margin is at least the edge shown);
+        A storm pays the share of the declared cargo it took (storms vary: most are light, a heavy one takes much more), pirates who let the ship go what they
+        seized of it (up to 50%), shared by slice; a sinking or a capture takes the whole collateral. The bound is Lloyd&apos;s own estimate on the listing (an upper bound, so the margin is at least the edge shown);
         without one, what the policy&apos;s own cover or the lane&apos;s other policies imply.
       </p>
       <ErrorNote error={act.error} />
@@ -824,9 +824,10 @@ export default function InsurancePage() {
             <p className="mt-3 text-muted-foreground text-xs">
               EL ≤: Lloyd&apos;s own estimate of the claim on each policy still open for underwriting (an upper bound: legs summed, rescues
               undercounted), so a slice earns at least the edge (premium − EL, the listing&apos;s margin). A listing without it (its ship sailed, or no
-              route) falls back on its own cover by someone else, which implies EL ≤ (premium − 25) / 2.5 (Lloyd&apos;s writes only at ≥ 2.5 × EL + 25), or
-              ~ for Lloyd&apos;s price on the lane&apos;s other policies: only a guide. {fmtBps(GOOD_EDGE)} or more is highlighted. Lloyd&apos;s price is its posted
-              hurdle (2.5 × EL + 25): a policy whose premium meets it is written by Lloyd&apos;s for what players leave, once it is about a game hour old, so until
+              route) falls back on its own cover by someone else, which implies EL ≤ (premium − 25) / 1.75 (Lloyd&apos;s writes only at ≥ 2.5 × EL + 25, or
+              1.75 × EL + 25 for a hull rated for every leg, so 1.75 bounds both), or ~ for Lloyd&apos;s price on the lane&apos;s other policies: only a guide.{" "}
+              {fmtBps(GOOD_EDGE)} or more is highlighted. Lloyd&apos;s price is its posted hurdle (2.5 × EL + 25, or 1.75 × EL + 25 when the hull is rated for
+              the water of every leg): a policy whose premium meets it is written by Lloyd&apos;s for what players leave, once it is about a game hour old, so until
               then the pick is yours; one under it waits on players. The autopilot writes on Lloyd&apos;s listed estimate only (a listing without it is no longer open for underwriting).
             </p>
           )}
@@ -889,10 +890,10 @@ export default function InsurancePage() {
               <li>Sum insured ≤ hull rebuild quote + 150 Cr a gun + cargo aboard. Stores are not insurable. Cannons can&apos;t be removed while insured.</li>
               <li>Quote first: Lloyd&apos;s price for the very voyage, from the ship, its guns, the cargo, the season and any convoy. Offer less to draw player underwriters in the hour before Lloyd&apos;s looks, or the price to be sure of cover.</li>
               <li>Declare your whole cargo, and load nothing after the policy is written: if the hold draws more pirates than the declared cargo would, it is void when the ship sails (cargo_exceeds_declared).</li>
-              <li>A sinking, or a capture by pirates, pays the full cover; a storm pays the lost share, capped at 25% of declared cargo; pirates who let the ship go pay what they seized of it, at most half (hull-only cover pays only on a total loss); a convoy rescue caps at 60%.</li>
+              <li>A sinking, or a capture by pirates, pays the full cover; a storm pays the lost share, capped at the share it took of the declared cargo (storms vary, and an ocean-rated hull rides them better); pirates who let the ship go pay what they seized of it, at most half (hull-only cover pays only on a total loss); a convoy rescue caps at 60%.</li>
               <li>Pirates go for the richest prizes and take the ship itself in 5–10% of interceptions (fewer the more guns face them), so rich or dangerous runs cost more to insure.</li>
               <li>Arrival closes it settled safe: collateral goes back to underwriters and unwritten premium to you. Insure each leg anew. A mutiny pays nothing.</li>
-              <li>Lloyd&apos;s looks only at policies open about a game hour, every couple of game hours, and writes at the premium offered if it is ≥ ceil(2.5 × its expected loss) + 25 bps (its price); it locks at most 10% of its funds on one policy and 20% per sea zone.</li>
+              <li>Lloyd&apos;s looks only at policies open about a game hour, every couple of game hours, and writes at the premium offered if it is ≥ ceil(2.5 × its expected loss) + 25 bps, or ceil(1.75 × it) + 25 when your hull is rated for the water of every leg (its price); it locks at most 10% of its funds on one policy and 20% per sea zone.</li>
               <li>Slices are steps of 100 bps from 500 up to what is uncovered; a remainder under 500 may be taken whole.</li>
               <li>A policy can&apos;t be withdrawn: one priced below Lloyd&apos;s price that no player writes just waits, and blocks a new one until the ship sails or it lapses.</li>
               <li>A policy still in port 15 game days after it was written lapses.</li>

@@ -24,6 +24,7 @@ import {
   LOAN,
   LoanRateText,
   LoanStatusBadge,
+  MortgageBadge,
   type Pledge,
   PledgeFields,
   WarnBox,
@@ -34,6 +35,7 @@ import {
   num,
   pledgeBody,
   pledgeProblem,
+  pledgeableDeposit,
   regionName,
   shortId,
   useCompanyDirectory,
@@ -61,7 +63,7 @@ type Vaults = ReturnType<typeof useVaults>;
 type Pledged = ReturnType<typeof usePledgedShips>;
 
 const STATUSES: S.LoanStatus[] = ["active", "repaid", "defaulted", "recovered", "written_off", "offered", "withdrawn", "declined", "lapsed"];
-const REQUEST_KINDS: S.CollateralKind[] = ["ship_lien", "warehouse_goods", "contract_receivable", "unsecured"];
+const REQUEST_KINDS: S.CollateralKind[] = ["ship_lien", "warehouse_goods", "contract_receivable", "deposit", "unsecured"];
 const REPAYMENTS: Array<{ value: S.LoanRepayment; label: string }> = [
   { value: "balloon", label: "Balloon" },
   { value: "amortised", label: "Amortised" },
@@ -115,7 +117,9 @@ function RequestPledge({ r }: { r: S.LoanRequestView }) {
           ? `Lien on ship ${shortId(r.collateral_ship_id)}`
           : r.collateral_kind === "contract_receivable"
             ? `Receivable on contract ${shortId(r.collateral_contract_id)}`
-            : COLLATERAL_LABEL[r.collateral_kind]}
+            : r.collateral_kind === "deposit"
+              ? `Bank deposit ${shortId(r.collateral_deposit_id)}`
+              : COLLATERAL_LABEL[r.collateral_kind]}
       {!r.recourse && <span className="text-muted-foreground"> · non-recourse</span>}
     </span>
   );
@@ -191,6 +195,12 @@ function RepayForm({ loan, cash, fleet, onDone, onClose }: { loan: S.Loan; cash:
           {fleet.running
             ? `The fleet autopilot took this loan (${purpose}) and repays it itself, in full 2 game days before maturity at the latest.`
             : `The fleet autopilot took this loan (${purpose}) but is stopped: repay it yourself before it matures.`}
+        </WarnBox>
+      )}
+      {loan.is_mortgage && (
+        <WarnBox tone="info">
+          A ship mortgage, taken with a build: its installments are collected as they fall due. Repaying early costs no penalty and frees the ship to be listed, sold
+          or pledged again, and lets you take another mortgage (one at a time).
         </WarnBox>
       )}
       {loan.status === "defaulted" && (
@@ -275,6 +285,7 @@ function OwedPanel({
                 <td>
                   <span className="inline-flex flex-wrap items-center gap-1">
                     <CompanyLabel id={l.lender_company_id} />
+                    <MortgageBadge loan={l} />
                     <AutopilotTag fleet={fleet} loanId={l.id} />
                   </span>
                 </td>
@@ -341,7 +352,10 @@ function LentPanel({ loans, error, companyId, ourIds, onCredit }: { loans: S.Loa
           {loans.map((l) => (
             <tr key={l.id}>
               <td>
-                <CompanyLabel id={l.borrower_company_id} companyId={companyId} ourIds={ourIds} />
+                <span className="inline-flex flex-wrap items-center gap-1">
+                  <CompanyLabel id={l.borrower_company_id} companyId={companyId} ourIds={ourIds} />
+                  <MortgageBadge loan={l} />
+                </span>
               </td>
               <td className="capitalize">{regionName(l.banking_region)}</td>
               <td className="tabular-nums">
@@ -436,6 +450,11 @@ function HistoryPanel({ refreshKey, companyId, shipName }: { refreshKey: number;
                 </td>
                 <td>
                   <LoanStatusBadge status={l.status} />
+                  {l.is_mortgage && (
+                    <span className="ml-1">
+                      <MortgageBadge loan={l} />
+                    </span>
+                  )}
                   {l.walked_away_at && (
                     <Badge variant="error" size="sm" className="ml-1">
                       walked away
@@ -590,6 +609,7 @@ function RequestForm({
   homeRegion,
   ships,
   stock,
+  deposits,
   pledged,
   fleet,
   onDone,
@@ -597,6 +617,8 @@ function RequestForm({
   homeRegion: string;
   ships: ShipResult[] | undefined;
   stock: S.PortWarehouseResult[] | undefined;
+  /** Our own open deposits not already pledged. */
+  deposits: S.DepositResult[] | undefined;
   pledged: Pledged;
   fleet: FleetFinance;
   onDone: () => void;
@@ -632,7 +654,7 @@ function RequestForm({
         repayment,
         collateral_kind: kind,
         ...pledgeBody(kind, pledge),
-        recourse: kind === "unsecured" ? true : recourse,
+        recourse: kind === "unsecured" || kind === "deposit" ? true : recourse,
         open_game_hours: h,
       }),
     );
@@ -670,13 +692,13 @@ function RequestForm({
             </NativeSelect>
           </Field>
           <div className="flex items-end pb-1.5">
-            <Checkbox checked={kind === "unsecured" ? true : recourse} onChange={(v) => kind !== "unsecured" && setRecourse(v)}>
+            <Checkbox checked={kind === "unsecured" || kind === "deposit" ? true : recourse} onChange={(v) => kind !== "unsecured" && kind !== "deposit" && setRecourse(v)}>
               With recourse
             </Checkbox>
           </div>
         </div>
         <Segmented value={repayment} onChange={setRepayment} options={REPAYMENTS} />
-        <PledgeFields kind={kind} value={pledge} onChange={setPledge} ours ships={ships} stock={stock} pledged={pledged.byShip} />
+        <PledgeFields kind={kind} value={pledge} onChange={setPledge} ours ships={ships} stock={stock} pledged={pledged.byShip} deposits={deposits} />
         {kind === "ship_lien" && fleet.ships.has(pledge.shipId) && (
           <WarnBox>The fleet autopilot sails this ship. A lien doesn&apos;t stop it sailing, but it can&apos;t be sold, listed or pledged again until repaid.</WarnBox>
         )}
@@ -692,7 +714,14 @@ function RequestForm({
             closes without paying, the receivable is lost (with recourse, the loan stays owed). One financing per contract and party.
           </p>
         )}
-        {!recourse && kind !== "unsecured" && <p className="text-muted-foreground text-xs">Non-recourse: a lender may lend at most the pledge&apos;s appraisal, and a shortfall after it is forgiven.</p>}
+        {kind === "deposit" && (
+          <p className="text-muted-foreground text-xs">
+            Against one of your own bank deposits: only the bank holding it may quote, always with recourse, and the loan may be in any region it lends in. The
+            deposit&apos;s free balance must cover the total repayable when you ask, when the bank quotes and when you approve; from approval it carries a lock of
+            that much (it keeps earning interest, and every payment shrinks the lock). Unpaid at default, the bank sets what you owe off against the deposit.
+          </p>
+        )}
+        {!recourse && kind !== "unsecured" && kind !== "deposit" && <p className="text-muted-foreground text-xs">Non-recourse: a lender may lend at most the pledge&apos;s appraisal, and a shortfall after it is forgiven.</p>}
         <ErrorNote error={act.error ?? (principal ? why : null)} />
         {act.result && <p className="text-sm">Posted: {fmtCr(act.result.principal_pence)}, open until {fmtIn(act.result.expires_at)}.</p>}
         <Button className="w-full" disabled={!!why || act.busy} onClick={submit}>
@@ -888,6 +917,12 @@ function QuoteForm({
         {credit && credit.company_id === req.borrower_company_id ? <CreditRecordView report={credit} /> : !creditError && <Loading />}
       </div>
       {req.collateral_kind === "unsecured" && <WarnBox>Unsecured: on default only a claim on the borrower&apos;s vaults stands behind it.</WarnBox>}
+      {req.collateral_kind === "deposit" && (
+        <WarnBox tone="info">
+          Secured by the borrower&apos;s deposit with your bank, with recourse: from approval it carries a lock of the total repayable, and on a default you set what
+          is owed off against it (no cash moves).
+        </WarnBox>
+      )}
       <ErrorNote error={act.error ?? why} />
       <div className="flex gap-2">
         <Button className="flex-1" disabled={!!why || act.busy} onClick={submit}>
@@ -1005,12 +1040,12 @@ function LendTab({
                           {fleet.isAutopilotQuote(q.id) && " (autopilot)"}
                         </Button>
                       ))}
-                      {!own && mine.length === 0 && r.collateral_kind === "deposit" && (
+                      {!own && mine.length === 0 && r.collateral_kind === "deposit" && r.collateral_deposit_bank_id !== companyId && (
                         <span className="self-center text-muted-foreground text-xs" title="Secured by a bank deposit: only the bank holding it may quote (guide 3.13.2)">
                           Bank only
                         </span>
                       )}
-                      {!own && mine.length === 0 && r.collateral_kind !== "deposit" && (
+                      {!own && mine.length === 0 && (r.collateral_kind !== "deposit" || r.collateral_deposit_bank_id === companyId) && (
                         <Button
                           size="sm"
                           variant="outline"
@@ -1149,6 +1184,7 @@ export default function LoansPage() {
   const { data: profile } = usePoll(() => kibbGet<CompanyProfile>("/v1/company/profile"));
   const { data: ships } = useShips();
   const { data: stock } = useStock();
+  const { data: allDeposits } = usePoll(() => kibbGet<S.DepositResult[]>("/v1/bank/deposits"), 60_000);
   const fleet = useFleetFinance();
   const vaults = useVaults();
   const pledged = usePledgedShips();
@@ -1265,7 +1301,15 @@ export default function LoansPage() {
         <TabsPanel value="borrow" className="space-y-4 pt-2">
           <div className="grid items-start gap-4 xl:grid-cols-2">
             <GoldsmithsPanel ships={ships} pledged={pledged} vaults={vaults} fleet={fleet} onDone={refresh} />
-            <RequestForm homeRegion={homeRegion} ships={ships} stock={stock} pledged={pledged} fleet={fleet} onDone={refresh} />
+            <RequestForm
+              homeRegion={homeRegion}
+              ships={ships}
+              stock={stock}
+              deposits={allDeposits?.filter((d) => pledgeableDeposit(d, companyId))}
+              pledged={pledged}
+              fleet={fleet}
+              onDone={refresh}
+            />
           </div>
           <MyRequestsPanel data={mine.data} error={mine.error} companyId={companyId} ourIds={ourIds} fleet={fleet} onCredit={credit} onDone={refresh} />
         </TabsPanel>

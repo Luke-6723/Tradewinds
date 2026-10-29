@@ -250,6 +250,7 @@ function VentureDetail({
           ["Region", <span key="r" className="capitalize">{regionName(venture.banking_region)}</span>],
           ["Investors' share of profit", fmtBps(venture.investor_share_bps)],
           ["Raise by", `${fmtDateTime(venture.raise_by)} (${fmtIn(venture.raise_by)})`],
+          ["On the Exchange", venture.unlisted ? "no: unlisted, quay only" : "yes"],
           ["Capital raised", fmtCr(venture.capital_pence)],
           ["Cash held", fmtCr(venture.cash_pence)],
           ["Spent on cargo", fmtCr(venture.spent_pence)],
@@ -327,6 +328,7 @@ function OpenVenture({
   const [dest, setDest] = useState("");
   const [share, setShare] = useState("50");
   const [hours, setHours] = useState(String(VENTURE.raiseHoursDefault));
+  const [unlisted, setUnlisted] = useState(false);
   const [override, setOverride] = useState(false);
   const act = useAction<S.Venture>(onDone);
   const ship = ships?.find((r) => r.ship.id === shipId);
@@ -347,11 +349,13 @@ function OpenVenture({
   function submit() {
     if (
       !confirm(
-        `Open a venture on ${ship?.ship.name} from ${portName(origin)} to ${portName(dest)}, offering investors ${bps / 100}% of the profit after 2% stamp duty, raising for ${h} game hours?\n\nIts capital buys cargo only into this ship here. The ship may then sail only to ${portName(dest)}, alone, before the deadline, and can't sail again before settling.`,
+        `Open a venture on ${ship?.ship.name} from ${portName(origin)} to ${portName(dest)}, offering investors ${bps / 100}% of the profit after 2% stamp duty, raising for ${h} game hours?\n\nIts capital buys cargo only into this ship here. The ship may then sail only to ${portName(dest)}, alone, before the deadline, and can't sail again before settling.${unlisted ? " Unlisted: only companies with quay presence there see it, not the Exchange." : " It is posted on the Exchange (route, share, deadline and capital raised, never its cargo)."}`,
       )
     )
       return;
-    void act.run(() => kibbPost<S.Venture>("/v1/venture/open", { ship_id: shipId, dest_port_id: dest, investor_share_bps: bps, raise_game_hours: h }));
+    void act.run(() =>
+      kibbPost<S.Venture>("/v1/venture/open", { ship_id: shipId, dest_port_id: dest, investor_share_bps: bps, raise_game_hours: h, ...(unlisted ? { unlisted: true } : {}) }),
+    );
   }
 
   return (
@@ -390,6 +394,9 @@ function OpenVenture({
           <Input type="number" min={1} max={VENTURE.raiseHoursMax} step={1} value={hours} onChange={(e) => setHours(e.target.value)} />
         </Field>
       </div>
+      <Checkbox checked={unlisted} onChange={setUnlisted}>
+        <span className="text-xs">Unlisted: keep it off the Exchange, so only companies with quay presence at the origin see it</span>
+      </Checkbox>
       <p className="text-muted-foreground text-xs">
         Capital is raised in {origin ? `the ${regionName(regionOf(origin))} region` : "the origin's region"}. Profit: investors get their capital plus their
         share pro rata, you the rest; a loss is shared pro rata; if the ship is lost only unspent cash comes back.
@@ -446,6 +453,11 @@ export default function VenturesPage() {
         <td>{merchant ? (shipName(v.ship_id) ?? shortId(v.ship_id)) : <span className="font-mono text-xs">{shortId(v.ship_id)}</span>}</td>
         <td className="whitespace-nowrap text-xs">
           {portName(v.origin_port_id)} → {portName(v.dest_port_id)}
+          {v.unlisted && (
+            <Badge variant="outline" size="sm" className="ml-1.5" title="Kept off the Exchange: only companies with quay presence at the origin see it">
+              quay only
+            </Badge>
+          )}
         </td>
         <td>
           <VentureStatus status={v.status} />
@@ -532,7 +544,10 @@ export default function VenturesPage() {
           </Panel>
           <Panel title="How ventures work">
             <div className="space-y-2 text-muted-foreground text-sm">
-              <p>Open on your ship lying at the origin (not in a convoy, not liened), offering investors 25% to 90% of the profit after the Crown&apos;s 2% stamp duty.</p>
+              <p>
+                Open on your ship lying at the origin (not in a convoy, not liened), offering investors 25% to 90% of the profit after the Crown&apos;s 2% stamp duty.
+                It is posted on the Exchange (never its cargo) unless you open it unlisted, which keeps it to the origin&apos;s quay.
+              </p>
               <p>Anyone may invest, at least {fmtCr(VENTURE.minStakePence)}, the merchant included. The capital buys cargo only into that ship at the origin.</p>
               <p>
                 The ship sails alone, only to the declared port, before the raise deadline. There the merchant sells and settles (automatic a game day after arrival;

@@ -155,6 +155,8 @@ export interface CatalogShipClass {
   crew_required: number;
   /** A news hull (the packet) whose owner may seal its dispatches (`POST /v1/fleet/seal-dispatches`). Merchant hulls always share. */
   can_seal_dispatches: boolean;
+  /** Passengers a ton of hold carries (guide 3.20): one in a merchant hull, two in a packet. */
+  passengers_per_ton: number;
 }
 
 export interface CatalogPort {
@@ -168,6 +170,11 @@ export interface CatalogPort {
   /** A smugglers' cove (guide 3.12, 3.18): ships' stores only, few berths, no Resident Factor (`403 no_factor_at_cove`). Absent: not one. */
   is_cove?: boolean;
   customs_bps: number;
+  /**
+   * A discount yard (guide 3.4: Lisbon, Boston, Havana): labour `labour_discount_bps` cheaper and no turnkey markup. Null or
+   * absent elsewhere. A hull built there keeps the full rebuild value.
+   */
+  yard_discount?: S.YardDiscount | null;
   produces?: string[] | null;
   manufactures?: string[] | null;
   imports?: string[] | null;
@@ -228,6 +235,8 @@ export interface PortDetail {
   phase: number;
   is_hub: boolean;
   has_shipyard: boolean;
+  /** A discount yard's cut (as on `CatalogPort`); null or absent elsewhere. */
+  yard_discount?: S.YardDiscount | null;
   customs_bps: number;
   base_customs_bps: number;
   base_berths: number;
@@ -271,6 +280,8 @@ export interface LeaderboardResult {
   next_refresh_at?: string | null;
   entries: { rank: number; company_name: string; home_port_id: string; net_worth_pence: number; titles: unknown[] }[];
   you?: { rank: number; company_name: string; net_worth_pence: number; is_calling_company: boolean } | null;
+  /** Growth over the last 7 real days, all of a player's companies together (guide 3.17); display only. */
+  rising: S.RisingBoard;
 }
 
 export interface RouteLeg {
@@ -376,6 +387,11 @@ export interface Ship {
   cannons_count: number;
   convoy_id?: string | null;
   stores_provisions_units: number;
+  /**
+   * Hold the passengers aboard take (guide 3.20): not cargo, but it cuts what she can load and weighs her down like cargo.
+   * `effective_hold_capacity_tons` already leaves it out.
+   */
+  passenger_hold_tons: number;
   /** A packet's sealed dispatches: its crew's gossip is not posted to the boards it calls at. */
   dispatches_sealed: boolean;
   created_at?: string;
@@ -613,13 +629,15 @@ export type BuildMode = "byom" | "turnkey_cash";
 /**
  * `GET /v1/shipyard/quote`. Turnkey buys each material off the port's ask book (players' asks and the NPC
  * ladder, cheapest first; our own and sibling asks and asks over 2.5x the mid passed over), pays customs on
- * every fill, and marks up only the NPC-sourced part. BYOM: labour only (materials, customs and markup 0).
+ * every fill, and marks up only the NPC-sourced part. BYOM: labour only (materials, customs and markup 0). At a discount
+ * yard (`yard_discount`) the labour cut and the waived markup are already taken off.
  */
 export interface BuildQuote {
   port_id: string;
   ship_class: string;
   build_mode: BuildMode;
   available: boolean;
+  /** Shipwright labour, charged in every mode (less a discount yard's cut). */
   labour_pence: number;
   /** Turnkey: sum of the materials' `cost_pence`, paid to the sellers (before customs and markup). */
   materials_pence: number;
@@ -627,11 +645,18 @@ export interface BuildQuote {
   npc_materials_pence: number;
   /** Turnkey: sum of the materials' importer customs. */
   customs_pence: number;
-  /** Markup on `npc_materials_pence` (`1,500` = 15%). */
+  /** Markup on `npc_materials_pence` (`1,500` = 15%; 0 at a yard that waives it). */
   yard_markup_bps: number;
   yard_markup_pence: number;
   /** `labour + materials + customs + markup`; null when a turnkey material cannot be supplied. */
   total_cost_pence?: number | null;
+  /** The discount this yard gives (guide 3.4), already in the figures above; null or absent elsewhere. */
+  yard_discount?: S.YardDiscount | null;
+  /**
+   * What a ship mortgage on this build would lend (guide 3.4): 60% of the price, 80% for an oceanic hull, amortised over 180
+   * game days. `available: false` while we still owe on one (one at a time). Null when the build can't be priced now.
+   */
+  mortgage?: S.MortgageTerms | null;
   materials: {
     commodity_id: string;
     quantity: number;
@@ -656,7 +681,10 @@ export interface BuildShipResult {
   ship_class: string;
   build_mode: BuildMode;
   status: ShipStatus;
+  /** The build's whole price. With a mortgage the Goldsmiths paid `mortgage.principal_pence` of it; our vault paid the rest. */
   total_cost_pence: number;
+  /** The ship mortgage taken with the build (`mortgage: true`; `is_mortgage`, a `ship_lien` on the new hull); null or absent without. */
+  mortgage?: S.Loan | null;
 }
 
 // ── Treasury ──────────────────────────────────────────────────────────────────
@@ -687,6 +715,51 @@ export interface TreasuryVaults {
   company_id: string;
   vaults: VaultBalance[];
 }
+
+// ── Event payloads (guide 4.4) ────────────────────────────────────────────────
+// The spec leaves `StreamEvent.payload` untyped. Only the fields the guide names are certain; every field is optional and
+// read defensively (as the manager's `str`/`num` do). The other keys here are the likely ones, not published.
+
+/** `passengers_lost` `cause` (guide 4.4). */
+export type PassengersLostCause = "sunk" | "captured" | "seized" | "ship_changed_hands" | "overdue";
+
+/**
+ * `passengers_boarded`: a group took our offer. The guide names heads, fare and `promised_arrival_at`; the group's own fields
+ * are assumed. `passengersAboard` is the authority on what is aboard.
+ */
+export type PassengersBoardedPayload = Partial<S.AboardGroupView> & { ship_id?: string; offer_id?: string; group_id?: string };
+
+/** `passengers_paid`: a group's fare on arrival (`fare_paid_pence`, `game_days_late` named by the guide), into that port's region. */
+export interface PassengersPaidPayload {
+  fare_paid_pence?: number;
+  game_days_late?: number;
+  ship_id?: string;
+  group_id?: string;
+  dest_port_id?: string;
+  size?: number;
+}
+
+/** `passengers_lost`: a group gone, unpaid (`cause` named by the guide). */
+export interface PassengersLostPayload {
+  cause?: PassengersLostCause;
+  ship_id?: string;
+  group_id?: string;
+  size?: number;
+}
+
+/** `bulletin_posted` (public): every field named by the guide. */
+export interface BulletinPostedPayload {
+  thread_id?: string;
+  post_id?: string;
+  title?: string;
+  company_name?: string;
+  body?: string;
+  is_reply?: boolean;
+  link?: S.BulletinLink | null;
+}
+
+/** `exchange_posted` (public): an entry as `GET /v1/exchange` lists it (a new offer, or a bank's new terms). */
+export type ExchangePostedPayload = Partial<S.ExchangeEntry>;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 

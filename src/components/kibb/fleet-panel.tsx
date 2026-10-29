@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Empty, ErrorNote, Loading, Metrics, NativeSelect, Panel, Table } from "@/components/kibb/bits";
+import { MortgageBadge } from "@/components/kibb/finance-common";
 import { Segmented } from "@/components/kibb/naval-common";
 import type { AiMode, AiReport } from "@/lib/kibb/ai/advisor";
 import { useCatalog } from "@/hooks/use-catalog";
@@ -16,7 +17,7 @@ import { dash } from "@/lib/kibb/browser";
 import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
-import type { DealsReport, FinanceLoanRow, FinanceReport, FleetSettings, GunPolicy, SmuggleReport } from "@/lib/kibb/fleet/manager";
+import type { DealsReport, FinanceLoanRow, FinanceReport, FleetSettings, GunPolicy, HousekeepingReport, PassengerReport, SmuggleReport } from "@/lib/kibb/fleet/manager";
 import type { Lane } from "@/lib/kibb/fleet/planner";
 
 const TIME_PARTS: Array<{ key: keyof TimeUse; label: string; className: string }> = [
@@ -30,6 +31,15 @@ const pct = (part: number, total: number) => (total > 0 ? Math.round((part / tot
 
 /** The company key's expiry is shown this long before it. */
 const KEY_WARN_MS = 7 * 24 * 3_600_000;
+
+/** Where housekeeping's retiring of a ship stands, in words. */
+const RETIRE_STAGE: Record<string, string> = {
+  wanted: "to be retired",
+  sail: "sailing to the breakers",
+  listed: "listed for sale",
+  breakup: "at the breakers",
+  verify: "break-up being checked",
+};
 
 /** One bar split by where the time went. */
 function TimeBar({ t }: { t: TimeUse }) {
@@ -178,6 +188,10 @@ function SettingsForm({
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.useFreight} onChange={(e) => setD({ ...d, useFreight: e.target.checked })} />
           Carry freight on empty legs
+        </label>
+        <label className="flex items-center gap-1.5" title="Off here is off for Claude too: it may switch it off, never on">
+          <input type="checkbox" checked={d.usePassengers} onChange={(e) => setD({ ...d, usePassengers: e.target.checked })} />
+          Offer spare hold to passengers on voyages we sail anyway (never a detour, a smuggler or an insured ship)
         </label>
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.byomBuilds} onChange={(e) => setD({ ...d, byomBuilds: e.target.checked })} />
@@ -331,6 +345,10 @@ function SettingsForm({
           </div>
         </div>
         <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.mortgages} disabled={!d.leverage} onChange={(e) => setD({ ...d, mortgages: e.target.checked })} />
+          Ship mortgages (needs borrowing on): build a new ship our cash can&apos;t fund with the Goldsmiths paying 60% of it, repaid over 180 game days (on by default)
+        </label>
+        <label className="flex items-center gap-1.5 text-sm">
           <input type="checkbox" checked={d.idleCash} onChange={(e) => setD({ ...d, idleCash: e.target.checked })} />
           Lend spare cash the fleet doesn&apos;t need by quoting players&apos; secured loan requests (on by default)
         </label>
@@ -344,7 +362,12 @@ function SettingsForm({
           the rest still owed; she is arrested meanwhile). After any walk-away (any lender, any of your companies) the Goldsmiths lend
           nothing for a real day: the autopilot borrows nothing until then. A request for quotes follows, pledging
           another free ship: a player lender&apos;s quote cheaper than the Goldsmiths&apos; (never one of your companies&apos;) is approved
-          and repays the Goldsmiths&apos; loan at once. What is owed (installments included) is never spent on ships, marques,
+          and repays the Goldsmiths&apos; loan at once. A ship mortgage is taken only on a turnkey build our own cash can&apos;t fund: the yard
+          region&apos;s Goldsmiths pay 60% of its price (80% for an oceanic hull), amortised over 180 game days with an installment every 10, a
+          lien on the new ship with recourse, one at a time and within the debt cap; only when her earnings cover the installments 1.5
+          times and the required multiple of the interest, and the cheaper in interest when an instant loan would also do. It is never
+          repaid early (only its next two installments are kept back), and a default hands her to the Goldsmiths at 80% of her rebuild
+          value, the surplus paid back. What is owed (installments included) is never spent on ships, marques,
           underwriting or lending, and loads never spend what a repayment counts on unless cash due lands first; the autopilot&apos;s
           loans are repaid early when no ship waits for cash, and every loan in full 2 game days before it matures (one of yours with a
           shorter term, half its term before; an installment in arrears at once; short then: all new spending stops until it is). It
@@ -450,6 +473,26 @@ function SettingsForm({
           hours; unsold ones are withdrawn after 12. At most 16 open. Envelopes are never bought.
         </p>
       </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.autoBreakUp} onChange={(e) => setD({ ...d, autoBreakUp: e.target.checked })} />
+          Break up dead weight: a ship that has earned less than her upkeep for days goes to a yard for 35% of her rebuild value (on by default)
+        </label>
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.autoRelocate} onChange={(e) => setD({ ...d, autoRelocate: e.target.checked })} />
+          Move the home port to where the cash lands, when the remit fees it saves beat the 2,500 Cr move (on by default)
+        </label>
+        <p className="text-muted-foreground text-xs">
+          Break-up: only a ship idle for 2 game days and 3 checks running that earned less than her share of the upkeep, with no lane from
+          where she lies beating it (or an out-of-date class whose slot a paying new ship would take, the fleet full), and only when the
+          upkeep saved to the season&apos;s end, less what she would earn, makes up the 65% of her hull net worth loses at once. Never the last
+          ship, a packet, a smuggler, one arrested, insured, pledged or mortgaged, listed by you, with outside shares, a venture or components
+          fitted. One at a time; with ship deals on she is listed for sale for a day first (a sale pays at least half). Home: when one region
+          paid most of the remit fees that kept home funded over 3 game days and those fees to the season&apos;s end beat the move 1.5 times,
+          that region&apos;s vault holds the fee above its floor and a ship of yours (or a factor) is there; at most once in 3 real days, to the
+          region&apos;s hub with a shipyard where you have presence. Off here is off for Claude too: it may switch either off, never on.
+        </p>
+      </div>
       <p className="col-span-full text-muted-foreground text-xs">
         Each gun takes 2 t of hold. Auto refits a ship at shipyard calls when it pays: in quiet Channel and North Sea water that means none.
         Expansion charters also earn a share of the phase-completion bonus when the tier fills; the percentage is how much of that
@@ -490,7 +533,8 @@ export function FleetPanel() {
   const managerUp = st?.status === "running" || st?.status === "starting";
   const keyExpiresAt = (managerUp ? st?.keyExpiresAt : null) ?? view.keyExpiresAt ?? null;
   const keyLeft = keyExpiresAt ? Date.parse(keyExpiresAt) - Date.now() : null;
-  const net = t ? t.rewardPence + t.freightPence - t.spentPence - t.shipSpendPence : 0;
+  // (passengerPence: absent from a manager older than passengers)
+  const net = t ? t.rewardPence + t.freightPence + (t.passengerPence ?? 0) - t.spentPence - t.shipSpendPence : 0;
 
   async function command(ai: "run" | "clear" | "retry") {
     setBusy(true);
@@ -529,7 +573,7 @@ export function FleetPanel() {
   const agents = st?.agents ?? [];
   const doing = (a: (typeof agents)[number]) => (a.status === "sailing" ? `→ ${portName(a.dest)} ${fmtIn(a.eta)}` : a.activity);
   const laneText = (a: (typeof agents)[number]) => (a.lane ? `${loadText(a.lane)}: ${portName(a.lane.source)} → ${portName(a.lane.dest)}` : null);
-  const agentNet = (a: (typeof agents)[number]) => a.stats.rewardPence + a.stats.freightPence - a.stats.spentPence;
+  const agentNet = (a: (typeof agents)[number]) => a.stats.rewardPence + a.stats.freightPence + (a.stats.passengerPence ?? 0) - a.stats.spentPence;
   // The buyer as it runs: the AI may switch it for its horizon, or order one build.
   // (A manager from before this report's shape, kept across a dev reload, reports none.)
   const aiActive = Array.isArray(st?.ai?.active?.settings) ? st!.ai.active : null;
@@ -681,7 +725,8 @@ export function FleetPanel() {
               !confirm(
                 `Let Claude steer the autopilot for its horizon: any setting within your ceilings (ship limit and budgets never above yours, the reserve only raised, borrowing and idle-cash lending never on while yours are off), ` +
                   `bans on ports, zones, goods and charters, lane bias, stall calls, orders to single ships (a lane, a charter, a port, hold, release), ` +
-                  `the ship buyer (hold, one build, classes forbidden), and marques or patrols within your marque budget (${fmtCr(view.settings.marqueBudgetPence)} a day; an issued one can't be withdrawn)? ` +
+                  `the ship buyer (hold, one build, classes forbidden), marques or patrols within your marque budget (${fmtCr(view.settings.marqueBudgetPence)} a day; an issued one can't be withdrawn), ` +
+                  `money orders, and housekeeping orders (break up a ship, move the home port; never while yours are off)? ` +
                   `Every autopilot check still runs. Spend is capped at $${view.settings.aiDailyCapUsd} a day and $${view.settings.aiTotalCapUsd} in total.`,
               )
             )
@@ -710,6 +755,7 @@ export function FleetPanel() {
                 { label: "Net", value: <span className={net < 0 ? "text-destructive" : undefined}>{fmtCr(net)}</span> },
                 { label: "Charter pay", value: fmtCr(t.rewardPence) },
                 { label: "Freight", value: fmtCr(t.freightPence) },
+                { label: "Passengers", value: fmtCr(t.passengerPence ?? 0), hint: "fares paid on arrival" },
                 { label: "Cargo bought", value: fmtCr(t.spentPence) },
                 { label: "Delivered", value: fmtTons(t.deliveredTons), hint: `${t.trips} trip${t.trips === 1 ? "" : "s"}` },
                 { label: "Ships bought", value: t.shipsBought, hint: t.shipsBought ? fmtCr(t.shipSpendPence) : undefined },
@@ -732,6 +778,11 @@ export function FleetPanel() {
                     <span className="truncate font-medium">{a.name}</span>
                     <span className="shrink-0 text-muted-foreground text-xs">{shipClassName(a.shipClass)}</span>
                   </div>
+                  {a.retiring && (
+                    <Badge variant="warning" size="sm" className="mt-1">
+                      retiring: {RETIRE_STAGE[a.retiring] ?? a.retiring}
+                    </Badge>
+                  )}
                   <div className="mt-1 text-sm">{doing(a)}</div>
                   {laneText(a) && <div className="mt-0.5 text-muted-foreground text-xs">{laneText(a)}</div>}
                   <div className="mt-2 flex justify-between gap-2 text-muted-foreground text-xs tabular-nums">
@@ -763,10 +814,24 @@ export function FleetPanel() {
                         smuggling
                       </Badge>
                     )}
+                    {a.retiring && (
+                      <Badge
+                        variant="warning"
+                        size="sm"
+                        title="Housekeeping is retiring her (dead weight, or the AI's order): no new work, passengers or convoy; broken up at a yard for 35% of her rebuild value, listed for sale for a day first with ship deals on"
+                      >
+                        retiring: {RETIRE_STAGE[a.retiring] ?? a.retiring}
+                      </Badge>
+                    )}
                   </td>
                   <td className="text-xs">
                     {doing(a)}
                     {a.freight.length > 0 && <div className="text-muted-foreground">+ freight to {a.freight.map((f) => portName(f.dest)).join(", ")}</div>}
+                    {a.passengers && a.passengers.heads > 0 && (
+                      <div className="text-muted-foreground">
+                        + {a.passengers.heads} passengers ({fmtCr(a.passengers.farePence)} on arrival)
+                      </div>
+                    )}
                   </td>
                   <td className="text-xs">
                     {a.lane ? (
@@ -843,6 +908,12 @@ export function FleetPanel() {
         {st?.finance && <FinanceView f={st.finance} maxDebtPct={view.settings.maxDebtPct} shipName={(id) => agents.find((a) => a.shipId === id)?.name ?? id.slice(0, 8)} />}
 
         {st?.deals && <DealsView d={st.deals} />}
+
+        {st?.passengers && (st.passengers.enabled || st.passengers.earnedPence > 0 || st.passengers.aboard.length > 0 || st.passengers.offers.length > 0) && (
+          <PassengersView p={st.passengers} />
+        )}
+
+        {st?.housekeeping && <HousekeepingView h={st.housekeeping} />}
 
         {st?.smuggling && (st.smuggling.enabled || st.smuggling.ships.length > 0 || st.smuggling.stats.seizures > 0 || st.smuggling.runs.length > 0) && (
           <SmugglingView m={st.smuggling} shipName={(id) => agents.find((a) => a.shipId === id)?.name ?? id.slice(0, 8)} />
@@ -970,7 +1041,7 @@ function Efficiency({
         </div>
         <ul className="space-y-2">
           {agents.map((a) => {
-            const net = a.stats.rewardPence + a.stats.freightPence - a.stats.spentPence;
+            const net = a.stats.rewardPence + a.stats.freightPence + (a.stats.passengerPence ?? 0) - a.stats.spentPence;
             return (
               <li key={a.shipId} className="space-y-1">
                 <div className="flex items-baseline justify-between gap-2 text-xs">
@@ -1138,10 +1209,14 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
   const quoted = quotes.reduce((n, q) => n + q.principalPence, 0);
   const pledge = (l: FinanceLoanRow) => (l.shipId ? `lien on ${shipName(l.shipId)}` : l.collateral.replace(/_/g, " "));
   const yr = (bps: number) => `${(bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%/yr`;
+  // (isMortgage: absent from a manager older than ship mortgages)
+  const mortgage = f.borrowed.find((l) => l.isMortgage && l.status !== "closed");
   return (
     <details className="text-sm">
       <summary className="cursor-pointer text-muted-foreground text-xs">
         Loans: {f.debtPence > 0 ? `owe ${fmtCr(f.debtPence)}` : "nothing owed"}
+        {mortgage &&
+          ` · ship mortgage ${fmtCr(mortgage.owedPence)}${mortgage.arrearsPence > 0 ? `, ${fmtCr(mortgage.arrearsPence)} IN ARREARS` : mortgage.nextPaymentAt && mortgage.nextPaymentPence !== null ? `, next installment ${fmtCr(mortgage.nextPaymentPence)} ${fmtIn(mortgage.nextPaymentAt)}` : ""}`}
         {f.capPence !== null && ` (cap ${fmtCr(f.capPence)}: ${maxDebtPct}% of ~${fmtCr(f.netWorthPence)} net worth${f.worthSource === "estimate" ? ", our estimate" : ""})`}
         {f.nextRepayBy && ` · repaid in full ${fmtIn(f.nextRepayBy)}`}
         {` · interest paid ~${fmtCr(f.interestPaidPence)}`}
@@ -1171,13 +1246,22 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
                   of {fmtCr(l.principalPence)} in {l.region.replace(/_/g, " ")}
                   {l.totalRepayablePence !== null && `; ${fmtCr(l.totalRepayablePence)} on schedule`}
                 </div>
+                <MortgageBadge loan={{ is_mortgage: !!l.isMortgage }} />
               </td>
               <td className="whitespace-nowrap tabular-nums">
                 {loanRate(l)}
                 <div className="text-muted-foreground text-xs">{l.repayment}</div>
               </td>
               <td className="whitespace-nowrap text-xs">
-                {l.status === "defaulted" ? <Badge variant="destructive" size="sm">defaulted</Badge> : l.repayBy ? fmtIn(l.repayBy) : "—"}
+                {l.status === "defaulted" ? (
+                  <Badge variant="destructive" size="sm">defaulted</Badge>
+                ) : l.isMortgage ? (
+                  "on its installments"
+                ) : l.repayBy ? (
+                  fmtIn(l.repayBy)
+                ) : (
+                  "—"
+                )}
                 {l.maturesAt && <div className="text-muted-foreground">matures {fmtIn(l.maturesAt)}</div>}
               </td>
               <td className="whitespace-nowrap text-xs">
@@ -1186,7 +1270,7 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
                     {fmtCr(l.arrearsPence)} in arrears
                   </Badge>
                 ) : l.nextPaymentAt && l.nextPaymentPence !== null ? (
-                  `${fmtCr(l.nextPaymentPence)} ${fmtIn(l.nextPaymentAt)}`
+                  `${l.isMortgage ? "installment " : ""}${fmtCr(l.nextPaymentPence)} ${fmtIn(l.nextPaymentAt)}`
                 ) : (
                   "—"
                 )}
@@ -1242,8 +1326,9 @@ function FinanceView({ f, maxDebtPct, shipName }: { f: FinanceReport; maxDebtPct
       <p className="mt-2 text-muted-foreground text-xs">
         Rates are a year (360 game days), simple, fixed for the loan; a loan from before loans by quote keeps its rate a game day to maturity.
         Net worth for the cap is the hourly leaderboard&apos;s figure for this company while fresh, else our own estimate (vaults and escrow,
-        ships at the cheapest quote seen, goods at base, less what is owed). Interest accrues every game day on what is still owed; repaying
-        early pays interest only to date.
+        ships at their rebuild value, goods at base, less what is owed). Interest accrues every game day on what is still owed; repaying
+        early pays interest only to date. A ship mortgage runs on its installments (every 10 game days, over 180): the autopilot never
+        repays one early, only its next two installments are kept back from spending, and it is repaid in full only as the season ends.
       </p>
     </details>
   );
@@ -1441,6 +1526,183 @@ function DealsView({ d }: { d: DealsReport }) {
   );
 }
 
+/** Passengers in the spare hold (guide 3.20): fares earned, the groups aboard, our open offers, what the pricer learned per route. */
+function PassengersView({ p }: { p: PassengerReport }) {
+  const { portName } = useCatalog();
+  const heads = p.aboard.reduce((n, g) => n + g.size, 0);
+  const route = (r: string) => r.split(">").map(portName).join(" → ");
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Passengers: {fmtCr(p.earnedPence)} in fares · {heads} aboard ({fmtCr(p.aboardFarePence)} on arrival) · {p.offers.length} offer
+        {p.offers.length === 1 ? "" : "s"} open
+        {!p.enabled && " · off"}
+        {p.blocked && " · offers refused for the key"}
+      </summary>
+      {p.blocked && <p className="mt-2 text-muted-foreground text-xs">Not offering for now: {p.blocked}.</p>}
+      {p.aboard.length > 0 && (
+        <Table head={["Aboard", "Group", "Bound for", "Fare", "Promised"]} className="mt-2">
+          {p.aboard.map((g) => (
+            <tr key={`${g.shipId}|${g.id}`}>
+              <td className="whitespace-nowrap">{g.ship}</td>
+              <td className="text-xs">
+                {g.size} {g.kind}
+                {g.origin ? ` from ${portName(g.origin)}` : ""}
+              </td>
+              <td className="text-xs">{portName(g.dest)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(g.farePence)}
+                <div className="text-muted-foreground text-xs">{fmtCr(g.perHead)} a head</div>
+              </td>
+              <td className="whitespace-nowrap text-xs">{g.promisedAt ? fmtIn(g.promisedAt) : "—"}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {p.offers.length > 0 && (
+        <Table head={["Our offer", "Where", "Fare a head", "Berths", "Posted"]} className="mt-2">
+          {p.offers.map((o) => (
+            <tr key={o.id}>
+              <td className="whitespace-nowrap">{o.ship}</td>
+              <td className="text-xs">
+                {portName(o.port)} → {portName(o.dest)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(o.perHead)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {o.berths}
+                {o.taken > 0 ? ` (${o.taken} taken)` : ""}
+              </td>
+              <td className="whitespace-nowrap text-xs">{fmtAgo(o.postedAt)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Only the spare hold of voyages the fleet sails anyway (1 t a head), offered once the cargo and stores are aboard, a little under the
+        fares groups accepted on the route and never under what the weight&apos;s extra sailing time costs; never on a smuggler, with contraband
+        aboard, arrested or insured. A fare is paid on arrival, cut for each game day late, and lost with the ship (Lloyd&apos;s never covers
+        fares). {p.fares.records} accepted fares read{p.fares.readAt ? ` ${fmtAgo(p.fares.readAt)}` : ""}
+        {p.routes.length > 0 &&
+          `; learned per route (nudge on the accepted fare, rounds won/unfilled): ${p.routes
+            .slice(0, 6)
+            .map((r) => `${route(r.route)} ×${r.adj.toFixed(2)} ${r.won}/${r.lost}`)
+            .join(", ")}`}
+        . Offer by hand on the{" "}
+        <Link href="/passengers" className="underline">
+          Passengers page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Fleet housekeeping (guide 3.4, 3.12): dead weight judged and retired, the home port's case for a move, the Crowns topped up. */
+function HousekeepingView({ h }: { h: HousekeepingReport }) {
+  const { portName, shipClassName } = useCatalog();
+  const b = h.breakUp;
+  const m = h.relocate;
+  const region = (r: string | null) => (r ? r.replace(/_/g, " ") : "—");
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Housekeeping: {b.candidates.length > 0 ? `${b.candidates.length} ship${b.candidates.length === 1 ? "" : "s"} judged dead weight` : "no dead weight"}
+        {b.pending.length > 0 && ` · retiring ${b.pending.map((p) => p.ship).join(", ")}`}
+        {b.brokenUp + b.sold > 0 && ` · ${b.brokenUp} broken up for ${fmtCr(b.payoutPence)}, ${b.sold} sold for ${fmtCr(b.soldPence)}`}
+        {!b.enabled && " · break-ups off"}
+        {` · home ${m.homePort ? portName(m.homePort) : "not known"}`}
+        {!m.enabled && " · moving it off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        Break-ups: {b.blocked ?? b.action}.{b.refusedRegions.length > 0 && ` Crowns that couldn't pay lately: ${b.refusedRegions.map((r) => `${region(r.region)} until ${fmtTime(r.until)}`).join(", ")}.`}
+      </p>
+      {b.candidates.length > 0 && (
+        <Table head={["Dead weight", "Why", "Payout", "Earns / upkeep", "By the horizon", "Verdict"]} className="mt-2">
+          {b.candidates.map((c) => (
+            <tr key={c.shipId} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{c.ship}</div>
+                {shipClassName(c.cls)}
+                {c.port ? ` at ${portName(c.port)}` : ""}
+              </td>
+              <td className="text-xs">
+                {c.why}
+                <div className="text-muted-foreground">
+                  {c.checks} check{c.checks === 1 ? "" : "s"} since {fmtAgo(c.since)}
+                  {c.matured ? "" : ", still watched"}
+                </div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(c.payoutPence)}
+                <div className="text-muted-foreground text-xs">of {fmtCr(c.rebuildPence)}</div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums text-xs">
+                {fmtCr(c.earnPerDayPence)} / {fmtCr(c.upkeepPerDayPence)}
+                <div className="text-muted-foreground">a game day</div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums text-xs">
+                {c.gainPence === null ? "—" : `cash ${c.gainPence >= 0 ? "+" : ""}${fmtCr(c.gainPence)}`}
+                <div className="text-muted-foreground">
+                  {c.worthGainPence === null ? `−${fmtCr(c.worthLossPence)} net worth at once` : `net worth ${c.worthGainPence >= 0 ? "+" : ""}${fmtCr(c.worthGainPence)} over ${c.horizonHours} h`}
+                </div>
+              </td>
+              <td className="text-muted-foreground text-xs">{c.verdict}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {b.pending.length > 0 && (
+        <Table head={["Being retired", "Stage", "Yard", "Payout", "Listed"]} className="mt-2">
+          {b.pending.map((p) => (
+            <tr key={p.shipId} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{p.ship}</div>
+                {p.why}
+              </td>
+              <td className="text-xs">{RETIRE_STAGE[p.stage] ?? p.stage}</td>
+              <td className="text-xs">{portName(p.yard)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                ~{fmtCr(p.payoutPence)}
+                <div className="text-muted-foreground text-xs">of {fmtCr(p.rebuildPence)}</div>
+              </td>
+              <td className="whitespace-nowrap text-xs">{p.listing ? `${fmtCr(p.listing.pricePence)} until ${fmtTime(p.listing.until)}` : "—"}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {b.done.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {[...b.done].reverse().slice(0, 8).map((x) => (
+            <li key={`${x.shipId}|${x.at}`}>
+              {fmtDateTime(x.at)}: {x.how === "sold" ? "sold" : "broke up"} the {shipClassName(x.cls)} {x.ship} at {portName(x.port)} for {fmtCr(x.pence)} (−
+              {fmtCr(x.worthLossPence)} of net worth): {x.why}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Home {m.homePort ? portName(m.homePort) : "not known"} ({region(m.homeRegion)}): remit fees that kept it funded over the last {m.windowGameDays} game days{" "}
+        {fmtCr(m.feesPence)} (~{fmtCr(m.perDayPence)} a game day
+        {m.byRegion.length > 0 ? `; ${m.byRegion.map((x) => `${region(x.region)} ${Math.round(x.share * 100)}%`).join(", ")}` : ""}), ~{fmtCr(m.savingPence)} over the{" "}
+        {m.gameDaysLeft} game days ahead against the bar of {fmtCr(m.thresholdPence)} (the {fmtCr(m.feePence)} move 1.5&times;).{" "}
+        {m.verdict}.{m.target ? ` A move would go to ${portName(m.target)}.` : ""} Next move allowed {m.nextAllowedAt ? fmtIn(m.nextAllowedAt) : "now"}
+        {m.lastMovedAt ? `; last moved ${fmtAgo(m.lastMovedAt)}` : ""}.
+      </p>
+      {h.crownsToppedUp.length > 0 && (
+        <p className="mt-2 text-muted-foreground text-xs">
+          The Exchequer topped up:{" "}
+          {[...h.crownsToppedUp]
+            .reverse()
+            .slice(0, 8)
+            .map((t) => `${t.region ? `the ${region(t.region)} Crown` : "a Crown"} ${fmtAgo(t.at)}`)
+            .join(", ")}
+          . A Crown that couldn&apos;t pay for a break-up may pay again after one.
+        </p>
+      )}
+    </details>
+  );
+}
+
 /** World events in force, what the planner makes of each, and what it has learned from them. */
 function WorldEventsView({ w }: { w: NonNullable<FleetView["state"]>["worldEvents"] }) {
   const { catalog, portName, goodName } = useCatalog();
@@ -1549,9 +1811,15 @@ function AiPanel({
     o.order === "lane" ? `take the lane ${o.label}` : o.order === "charter" ? `fill the ${o.label}` : o.order === "port" ? `go to ${portName(o.label)}` : o.order === "hold" ? "hold in the roadstead" : "drop its planned lane";
   const navalText = (n: { kind: string; bps: number; zone: string; gameHours: number; costPence: number }) =>
     `${n.kind === "marque" ? "letter of marque +" : "naval patrol −"}${n.bps} bps in ${n.zone} for ${n.gameHours} game h, ${n.costPence > 0 ? `~${fmtCr(n.costPence)}` : "at the zone's quoted price"}`;
-  // A money order: borrow for a ship's load (named here: the AI only saw an alias), for a hull, repay a loan, build a commission.
+  // A money order: borrow for a ship's load (named here: the AI only saw an alias), for a hull, repay a loan, build a commission;
+  // a housekeeping order: break up a ship, move the home port.
   const moneyText = (o: { kind: string; ref: string; pence: number; label: string }) =>
-    o.kind === "borrow_load" ? `Borrow up to ${fmtCr(o.pence)} for ${shipName(o.ref)}'s next load` : o.kind === "borrow_hull" ? `Borrow up to ${fmtCr(o.pence)} for a new ship` : o.label.charAt(0).toUpperCase() + o.label.slice(1);
+    o.kind === "borrow_load" ? `Borrow up to ${fmtCr(o.pence)} for ${shipName(o.ref)}'s next load`
+    : o.kind === "borrow_hull" ? `Borrow up to ${fmtCr(o.pence)} for a new ship`
+    : o.kind === "break_up" ? `Break up ${shipName(o.ref)} at a yard`
+    : o.kind === "relocate" ? `Move the home port to ${portName(o.ref)}`
+    : o.label.charAt(0).toUpperCase() + o.label.slice(1);
+  const house = (o: { kind: string }) => o.kind === "break_up" || o.kind === "relocate";
   const status = !r
     ? mode === "off"
       ? "Off."
@@ -1604,11 +1872,13 @@ function AiPanel({
       <p className="text-muted-foreground text-xs">
         Shadow: Claude advises and every answer is logged, nothing changes. Live: its directives apply until they lapse (15-180 min): any
         setting but its own within your ceilings (max ships, the marque and underwriting budgets, the debt cap and the cash due counted
-        never above yours, the reserve only raised, borrowing and idle-cash lending never switched on while yours are off), bans on ports, sea zones, goods and charters, a bias on lane ranks, calls on stalled expansion charters, orders to single
+        never above yours, the reserve only raised, borrowing, mortgages, idle-cash lending, passengers, break-ups and moving home never switched on while yours are off), bans on ports, sea zones, goods and charters, a bias on lane ranks, calls on stalled expansion charters, orders to single
         ships (a lane, a charter, a port, hold in the roadstead, drop a planned lane), the ship buyer (hold, one build, classes forbidden),
         marques or patrols within your marque budget (set it to 0 to forbid them; an issued one runs its term and can&apos;t be withdrawn), and
         money orders: borrow for a ship&apos;s load or a new ship (within your debt cap and required return), repay a loan early, build a
-        commission to order.
+        commission to order; and housekeeping orders: break up a given ship (every never and the value test still apply, only the days of
+        watching are skipped; refused while break-ups are off), or move the home port to a given port (presence, never a cove, the vault
+        and 3 real days between moves still apply; the fee&apos;s case is its call, its reason logged).
         Every autopilot check still runs; what it refuses goes back to Claude as a status. Held ships count as idle for the tripwire. It
         drops back to shadow by itself if trips under its advice earn clearly less.
       </p>
@@ -1730,14 +2000,15 @@ function AiPanel({
                         {x.navalSpentPence ? ` · issued ${fmtCr(x.navalSpentPence)}` : ""}
                       </div>
                     )}
-                    {(x.finance ?? []).length > 0 && (
-                      <div className="text-muted-foreground">
-                        Money:{" "}
-                        {(x.finance ?? [])
-                          .map((o) => `${moneyText(o)}${x.mode === "live" ? ` [${o.status}${o.code ? `: ${o.code.replace(/_/g, " ")}` : ""}]` : ""} (${o.reason})`)
-                          .join("; ")}
-                      </div>
-                    )}
+                    {[false, true].map((h) => {
+                      const xs = (x.finance ?? []).filter((o) => house(o) === h);
+                      return xs.length > 0 ? (
+                        <div key={h ? "house" : "money"} className="text-muted-foreground">
+                          {h ? "Housekeeping" : "Money"}:{" "}
+                          {xs.map((o) => `${moneyText(o)}${x.mode === "live" ? ` [${o.status}${o.code ? `: ${o.code.replace(/_/g, " ")}` : ""}]` : ""} (${o.reason})`).join("; ")}
+                        </div>
+                      ) : null;
+                    })}
                     {x.alerts.map((t, i) => (
                       <div key={i} className="text-warning-foreground">Note: {t}</div>
                     ))}

@@ -156,6 +156,26 @@ export async function pages<T>(
   return { items: [...byId.values()], complete: false };
 }
 
+/**
+ * Every page of a list paged by the answer's `next_cursor` (null on the last page), up to `maxPages`. `complete` is false
+ * when it stopped at the page limit with more to come.
+ */
+export async function nextCursorPages<P extends { next_cursor?: string | null }, T>(
+  list: (cursor: string | undefined) => Promise<P>,
+  itemsOf: (page: P) => T[],
+  maxPages = 10,
+): Promise<{ items: T[]; complete: boolean }> {
+  const items: T[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const res = await list(cursor);
+    items.push(...itemsOf(res));
+    if (!res.next_cursor) return { items, complete: true };
+    cursor = res.next_cursor;
+  }
+  return { items, complete: false };
+}
+
 /** A fatal error in words for the dashboard and log (what to do about an expired key). */
 export function fatalText(e: unknown): string {
   if (isApiError(e, "expired_api_key")) return "the company key expired: select the company again (dashboard) or mint a new KIBB_API_KEY (CLI)";
@@ -291,6 +311,10 @@ export class KibbClient {
       const fail = () =>
         Object.assign(new KibbApiError(res.status, problem?.code, problem?.detail ?? problem?.title ?? (text || res.statusText), problem ?? text), { maybeLanded });
 
+      // The bulletin's per-company hourly post limit (guide 3.21), not the token bucket: waiting it out here would hold every
+      // write on the bucket for up to an hour. Thrown at once; `detail` says how long.
+      if (res.status === 429 && problem?.code === "bulletin_limit") throw fail();
+
       if (res.status === 429) {
         const waitS = Number(res.headers.get("retry-after") ?? "5") || 5;
         // Every call on this bucket waits it out, not just this one.
@@ -364,6 +388,11 @@ export class KibbClient {
   factors = () => this.get<string[]>("/v1/company/factors");
   hireFactor = (portId: string) => this.post<S.FactorActionResult>("/v1/company/hire-factor", { port_id: portId });
   dismissFactor = (portId: string) => this.post<S.FactorActionResult>("/v1/company/dismiss-factor", { port_id: portId });
+  /**
+   * Moves our home port (guide 3.12): 2,500 Cr from our vault in the new home's region, once per real day (`409`). Needs a factor
+   * or a ship berthed or in the roadstead there (`403 no_port_presence`); never a cove (`400`).
+   */
+  relocateHome = (portId: string) => this.post<S.RelocateHomePortResult>("/v1/company/relocate", { port_id: portId });
   declareBankruptcy = () => this.post<S.DeclareBankruptcyResult>("/v1/company/declare-bankruptcy");
 
   // ── World ───────────────────────────────────────────────────────────────────
@@ -372,6 +401,7 @@ export class KibbClient {
   catalog = () => this.get<Catalog>("/v1/world/catalog");
   expansion = () => this.get<ExpansionStatus>("/v1/world/expansion");
   port = (portId: string) => this.get<PortDetail>("/v1/world/port", { port_id: portId });
+  /** The net-worth board and the `rising` board (growth over 7 real days), both refreshed hourly (guide 3.17). */
   leaderboard = () => this.get<LeaderboardResult>("/v1/world/leaderboard");
   hallOfFame = () => this.get<S.HallOfFameSeason[]>("/v1/world/hall-of-fame");
   publicCompany = (name: string) => this.get<S.PublicCompanyProfile>("/v1/world/company", { name });
@@ -435,9 +465,12 @@ export class KibbClient {
   /** Every page of a ship listing (200 a page). */
   shipListingPages = (filter: { port_id?: string } = {}, maxPages = 10) =>
     pages((cursor) => this.shipListings({ ...filter, cursor, limit: 200 }), (l) => l.id, 200, maxPages);
-  /** Offers a ship lying in port for sale at 50–150% of its rebuild value (empty hold, no convoy, insurance or lien). */
-  listShip = (shipId: string, pricePence: number) =>
-    this.post<S.ShipListingResult>("/v1/fleet/list-ship", { ship_id: shipId, price_pence: pricePence });
+  /**
+   * Offers a ship lying in port for sale at 50–150% of its rebuild value (empty hold, no convoy, insurance or lien). `unlisted`
+   * keeps it off the Exchange, seen only on the port's quay (guide 3.21).
+   */
+  listShip = (shipId: string, pricePence: number, unlisted?: boolean) =>
+    this.post<S.ShipListingResult>("/v1/fleet/list-ship", { ship_id: shipId, price_pence: pricePence, ...(unlisted ? { unlisted: true } : {}) });
   /** Needs quay presence at the listing's port; paid from our vault in that region. `409` if the rebuild value moved. */
   buyShip = (listingId: string) => this.post<S.ShipSaleResult>("/v1/fleet/buy-ship", { listing_id: listingId });
   cancelShipListing = (listingId: string) => this.post<S.ShipListingResult>("/v1/fleet/cancel-ship-listing", { listing_id: listingId });
@@ -524,7 +557,7 @@ export class KibbClient {
   postCharter = (req: S.PostCharterRequest) => this.post<ContractListing>("/v1/contract/post-charter", req);
   /** Withdraws one of our open charters: the undelivered reward is refunded and its warehouse space freed. */
   cancelCharter = (contractId: string) => this.post<S.CancelCharterResult>("/v1/contract/cancel-charter", { contract_id: contractId });
-  /** Orders a hull built at a yard for `price_pence` (escrowed now, 50–150% of its rebuild value) by a deadline. */
+  /** Orders a hull built at a yard for `price_pence` (escrowed now, 50–150% of its rebuild value) by a deadline; `unlisted` keeps it off the Exchange. */
   createCommission = (req: S.CreateCommissionRequest) => this.post<S.Contract>("/v1/contract/create-commission", req);
   /** Binds us to build it (needs presence at the yard; escrows its collateral). */
   acceptCommission = (contractId: string) => this.post<S.CommissionResult>("/v1/contract/accept-commission", { contract_id: contractId });
@@ -547,6 +580,32 @@ export class KibbClient {
     this.post<ContractListing>("/v1/contract/fill-licence-request", { contract_id: contractId, units });
   /** Withdraws one of our licence contracts (a request's unfilled escrow refunded). */
   cancelLicence = (contractId: string) => this.post<ContractListing>("/v1/contract/cancel-licence", { contract_id: contractId });
+
+  // ── Passengers (guide 3.20) ─────────────────────────────────────────────────
+
+  /** Public: the groups waiting at a port for a passage, oldest first (`kind`, `size`, `dest_port_id`, `board_by`); never what they'd pay. */
+  passengersWaiting = (portId: string) => this.get<S.WaitingGroupView[]>("/v1/passengers/waiting", { port_id: portId });
+  /** Public: fares groups accepted, newest first, from and/or to a port (either may be omitted); never who carried them. */
+  passengerFares = (from?: string, to?: string, page: { cursor?: string; limit?: number } = {}) =>
+    this.get<S.FareRecordView[]>("/v1/passengers/fares", { from, to, ...page });
+  /** Every page of a fare listing (200 a page). */
+  passengerFarePages = (from?: string, to?: string, maxPages = 10) =>
+    pages((cursor) => this.passengerFares(from, to, { cursor, limit: 200 }), (f) => f.id, 200, maxPages);
+  /**
+   * Offers our ship lying in port (berthed or in the roadstead) to the groups there for `dest_port_id`, at most `max_berths`
+   * heads in all; one open offer per ship and destination. It closes when she sails, changes hands or is lost.
+   */
+  postPassengerOffer = (req: S.PostOfferRequest) => this.post<S.PassengerOfferView>("/v1/passengers/offer", req);
+  /** Closes one of our open sailing offers (heads already boarded stay aboard). */
+  cancelPassengerOffer = (offerId: string) => this.post<S.PassengerOfferView>("/v1/passengers/cancel-offer", { offer_id: offerId });
+  /** Our sailing offers, newest first; `openOnly` false adds the closed ones with their `close_reason`. */
+  passengerOffers = (openOnly = true, filter: { ship_id?: string; cursor?: string; limit?: number } = {}) =>
+    this.get<S.PassengerOfferView[]>("/v1/passengers/offers", { open_only: openOnly, ...filter });
+  /** Every page of our sailing offers (200 a page). */
+  passengerOfferPages = (openOnly = true, filter: { ship_id?: string } = {}, maxPages = 10) =>
+    pages((cursor) => this.passengerOffers(openOnly, { ...filter, cursor, limit: 200 }), (o) => o.id, 200, maxPages);
+  /** The groups aboard our ship: the fare agreed, `full_fare_pence` and `promised_arrival_at` (each game day later cuts the fare). */
+  passengersAboard = (shipId: string) => this.get<S.AboardGroupView[]>("/v1/passengers/aboard", { ship_id: shipId });
 
   // ── Futures and insurance ───────────────────────────────────────────────────
 
@@ -605,13 +664,33 @@ export class KibbClient {
 
   // ── Shipyard ────────────────────────────────────────────────────────────────
 
-  /** Turnkey walks the port's ask book (players' asks and the NPC ladder, cheapest first) plus customs, and marks up the NPC part only. */
+  /**
+   * Turnkey walks the port's ask book (players' asks and the NPC ladder, cheapest first) plus customs, and marks up the NPC part
+   * only. A discount yard's cut is already taken off (`yard_discount`); `mortgage` gives the ship-mortgage terms (guide 3.4).
+   */
   shipyardQuote = (portId: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
     this.get<BuildQuote>("/v1/shipyard/quote", { port_id: portId, ship_class: shipClass, build_mode: buildMode });
 
-  /** A turnkey build gets `409` when the ask book can't supply a material (or a royal monopoly bars it). */
-  buildShip =(portId: string, name: string, shipClass: string, buildMode: BuildMode = "turnkey_cash") =>
-    this.post<BuildShipResult>("/v1/shipyard/build-ship", { port_id: portId, name, ship_class: shipClass, build_mode: buildMode });
+  /**
+   * A turnkey build gets `409` when the ask book can't supply a material (or a royal monopoly bars it). `mortgage`: the yard
+   * region's Goldsmiths pay 60% of the price (80% for an oceanic hull) as a ship mortgage (guide 3.4), one at a time (`409`
+   * while we owe on one); build and loan stand or fall together, and the result's `mortgage` is the loan.
+   */
+  buildShip = (portId: string, name: string, shipClass: string, buildMode: BuildMode = "turnkey_cash", opts: { mortgage?: boolean } = {}) =>
+    this.post<BuildShipResult>("/v1/shipyard/build-ship", {
+      port_id: portId,
+      name,
+      ship_class: shipClass,
+      build_mode: buildMode,
+      ...(opts.mortgage ? { mortgage: true } : {}),
+    });
+
+  /**
+   * Sells a ship lying at a port with an open yard to it for 35% of her rebuild value, paid by that region's Crown into our vault
+   * there (guide 3.4). She must be free to change hands (empty hold, no convoy, insurance, lien, passengers or open offers, sale
+   * listing, outside 64ths or venture); `409` while that Crown can't pay.
+   */
+  breakUpShip = (shipId: string) => this.post<S.BreakUpShipResult>("/v1/shipyard/break-up", { ship_id: shipId });
 
   /** Sets the cannon count; adding guns needs a shipyard port (150 Cr each). */
   modifyShip = (shipId: string, cannons: number) =>
@@ -664,13 +743,14 @@ export class KibbClient {
   /**
    * Loans we made (`lender`) or owe (`borrower`), or both, newest first: `owed_pence`, the fixed `annual_rate_bps`
    * (`rate_basis: "daily"`: an older loan on `daily_rate_bps`), `total_repayable_pence` and the next payment due.
+   * `is_mortgage`: a ship mortgage taken with a build (guide 3.4).
    */
   loans = (filter: { role?: S.LoanRole; status?: S.LoanStatus; cursor?: string; limit?: number } = {}) =>
     this.get<S.Loan[]>("/v1/loan/list", filter);
   /** Every page of our loans (50 a page: the docs give this endpoint no maximum). */
   loanPages = (filter: { role?: S.LoanRole; status?: S.LoanStatus } = {}, maxPages = 10) =>
     pages((cursor) => this.loans({ ...filter, cursor, limit: 50 }), (l) => l.id, 50, maxPages);
-  /** Any company's public credit record (defaults, walk-aways, smuggling convictions). */
+  /** Any company's public credit record (defaults, walk-aways, smuggling convictions, `open_mortgages`). */
   creditReport = (companyId: string) => this.get<S.CreditReport>("/v1/loan/credit", { company_id: companyId });
   /**
    * The Goldsmiths' instant quote (default region: home) against a lien on one of our ships: at most 40% of its rebuild
@@ -681,7 +761,10 @@ export class KibbClient {
     this.get<S.GoldsmithsQuote>("/v1/loan/quote", q);
   /** Takes a Goldsmiths' quote before it expires: the lien goes on and the principal lands in the quote's region. */
   acceptLoanQuote = (quoteId: string) => this.post<S.Loan>("/v1/loan/accept-quote", { quote_id: quoteId });
-  /** Asks lenders for quotes, open 1-72 game hours (default 24). Nothing is escrowed; the pledge is checked now and at approval. */
+  /**
+   * Asks lenders for quotes, open 1-72 game hours (default 24). Nothing is escrowed; the pledge is checked now and at approval.
+   * `collateral_kind: "deposit"` with `deposit_id`: only the bank holding it may quote, always with recourse (guide 3.13.4).
+   */
   postLoanRequest = (req: S.PostLoanRequest) => this.post<S.LoanRequestView>("/v1/loan/request", req);
   /**
    * Open requests (oldest first; `banking_region` narrows them) with their rate bounds and our own quotes on them; `mine`:
@@ -731,19 +814,27 @@ export class KibbClient {
   /** Our deposits (for a bank, the deposits it holds). */
   deposits = () => this.get<S.DepositResult[]>("/v1/bank/deposits");
   deposit = (req: S.DepositRequest) => this.post<S.DepositResult>("/v1/bank/deposit", req);
-  /** A demand deposit is paid at once as far as the bank's cash reaches; a notice deposit after its notice. */
-  withdrawDeposit = (depositId: string, amountPence?: number) =>
-    this.post<S.DepositResult>("/v1/bank/withdraw", { deposit_id: depositId, amount_pence: amountPence });
-  /** Takes a royal banking charter on these terms. */
+  /**
+   * A demand deposit is paid at once as far as the bank's cash reaches; a notice deposit after its notice. `toRegion`: paid into
+   * our vault there less the bank's posted `exchange_fee_bps` for it, fixed when asked (guide 3.13.4); a region it doesn't offer is `409`.
+   */
+  withdrawDeposit = (depositId: string, amountPence?: number, toRegion?: BankingRegion) =>
+    this.post<S.DepositResult>("/v1/bank/withdraw", { deposit_id: depositId, amount_pence: amountPence, to_region: toRegion });
+  /** Takes a royal banking charter on these terms (`exchange_fee_bps`: region → fee on withdrawals paid into a vault there). */
   charterBank = (req: S.BankTermsRequest) => this.post<S.BankResult>("/v1/bank/charter", req);
-  /** Our bank's terms for new deposits. */
+  /** Our bank's terms for new deposits; `exchange_fee_bps` omitted keeps the schedule, `{}` withdraws every exchange offer. */
   setBankTerms = (req: S.BankTermsRequest) => this.post<S.BankResult>("/v1/bank/terms", req);
   windDownBank = () => this.post<S.BankResult>("/v1/bank/wind-down");
+  /** Private client terms (guide 3.13.4): those our bank gives, and those banks give us, newest change first. */
+  clientTerms = () => this.get<S.ClientTermsResult[]>("/v1/bank/client-terms");
+  /** Our bank's terms for one company: `rate_bonus_bps` (0-50) on its deposits, `exchange_discount_bps` (0-1,200) off its fees; both 0 clears them. */
+  setClientTerms = (req: S.ClientTermsRequest) => this.post<S.ClientTermsResult>("/v1/bank/client-terms", req);
 
   // ── Ventures (commenda) ─────────────────────────────────────────────────────
 
   /** With `port_id`: ventures raising capital there. Without: our own ventures and those we hold a stake in. */
   ventures = (filter: { port_id?: string; status?: string } = {}) => this.get<S.Venture[]>("/v1/venture/list", filter);
+  /** `unlisted` keeps it off the Exchange, seen only on the origin's quay (guide 3.21). */
   openVenture = (req: S.OpenVentureRequest) => this.post<S.Venture>("/v1/venture/open", req);
   investInVenture = (ventureId: string, amountPence: number) =>
     this.post<S.Venture>("/v1/venture/invest", { venture_id: ventureId, amount_pence: amountPence });
@@ -784,4 +875,34 @@ export class KibbClient {
   /** Needs presence (storage tier or better) at the envelope's port. */
   buyEnvelope = (envelopeId: string) => this.post<S.EnvelopeDetail>("/v1/envelope/buy", { envelope_id: envelopeId });
   withdrawEnvelope = (envelopeId: string) => this.post<S.EnvelopeListing>("/v1/envelope/withdraw", { envelope_id: envelopeId });
+
+  // ── The Exchange and the bulletin (guide 3.21; reads are public) ────────────
+
+  /** Every open player offer world-wide, newest first (default 50, at most 200 a page; the answer's `next_cursor` pages on). */
+  exchange = (filter: { kind?: S.ExchangeKind; region?: BankingRegion; since?: string; cursor?: string; limit?: number } = {}) =>
+    this.get<S.ExchangePage>("/v1/exchange", filter);
+  /** Every page of the Exchange (200 a page). */
+  exchangePages = (filter: { kind?: S.ExchangeKind; region?: BankingRegion; since?: string } = {}, maxPages = 10) =>
+    nextCursorPages((cursor) => this.exchange({ ...filter, cursor, limit: 200 }), (p) => p.entries, maxPages);
+  /** Pins a note to our own open entry: plain words, at most 200 characters, no digits (`400`); empty or null clears it. */
+  setExchangeNote = (kind: S.ExchangeKind, id: string, note: string | null) =>
+    this.post<S.ExchangeEntry>("/v1/exchange/note", { kind, id, note });
+
+  /** Threads, most recently active first (`since`: a post after then; default 30, at most 100 a page; `next_cursor` pages on). */
+  bulletin = (query: { since?: string; cursor?: string; limit?: number } = {}) => this.get<S.BulletinPage>("/v1/bulletin", query);
+  /** A thread with every post, oldest first. */
+  bulletinThread = (threadId: string) => this.get<S.BulletinThreadDetail>("/v1/bulletin/thread", { id: threadId });
+  /**
+   * Opens a thread signed with our company's name (title 1-120, body 1-1,000 characters; `link`: an Exchange entry or a company).
+   * At most 10 posts, 3 of them new threads, a real hour (`429 bulletin_limit`, thrown at once).
+   */
+  openBulletinThread = (req: S.CreateThreadRequest) => this.post<S.BulletinThreadDetail>("/v1/bulletin/thread", req);
+  /** Replies to a thread (1-1,000 characters); an archived or removed one is `409`. Counts against the hourly 10. */
+  replyBulletin = (threadId: string, body: string) => this.post<S.BulletinPost>("/v1/bulletin/reply", { thread_id: threadId, body });
+  /** Replaces our post's body (and an opening post's `title`) within 10 real minutes of posting (`409` after). */
+  editBulletin = (postId: string, body: string, title?: string) => this.post<S.BulletinPost>("/v1/bulletin/edit", { post_id: postId, body, title });
+  /** Deletes our post within 10 real minutes: it keeps its place as `deleted by its author` and still counts against the limit. */
+  deleteBulletin = (postId: string) => this.post<S.BulletinPost>("/v1/bulletin/delete", { post_id: postId });
+  /** Asks the harbourmaster to look at a post (`reason` 1-200 characters): once per post (`409`), never our own (`400`). */
+  flagBulletin = (postId: string, reason: string) => this.post<S.FlagResult>("/v1/bulletin/flag", { post_id: postId, reason });
 }

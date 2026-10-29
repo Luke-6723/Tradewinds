@@ -19,17 +19,20 @@ const MAX_EVENTS = 1000;
 
 const GROUPS: Array<{ label: string; match: string[] }> = [
   { label: "Ships", match: ["ship_", "voyage_hazard"] },
+  { label: "Passengers", match: ["passengers_"] },
   { label: "Convoys", match: ["convoy_"] },
   { label: "Market", match: ["order_filled", "maker_order_filled", "order_cancelled"] },
   { label: "Charters & expansion", match: ["charter_", "expansion_", "world_phase_unlocked"] },
   { label: "Freight", match: ["freight_"] },
   { label: "Futures", match: ["futures_"] },
   { label: "Insurance", match: ["insurance_"] },
+  { label: "Loans & banks", match: ["loan_", "bank_"] },
   {
     label: "Money",
-    match: ["company_upkeep_billed", "auto_remittance", "tax_and_fee_charged", "crown_bailiff_", "company_bankruptcy_reset"],
+    match: ["company_upkeep_billed", "auto_remittance", "tax_and_fee_charged", "home_port_relocated", "crown_bailiff_", "company_bankruptcy_reset"],
   },
-  { label: "World & piracy", match: ["world_event", "letter_of_marque_issued", "naval_patrol_funded", "marque_prize_paid"] },
+  { label: "World & piracy", match: ["world_event", "letter_of_marque_issued", "naval_patrol_funded", "marque_prize_paid", "patrol_prize_paid"] },
+  { label: "Exchange & bulletin", match: ["exchange_posted", "bulletin_posted"] },
   { label: "Server", match: ["server_announcement"] },
 ];
 
@@ -41,6 +44,7 @@ const WORLD_EVENT_TYPES: S.WorldEventType[] = [
   "production_collapse",
   "production_boom",
   "import_slump",
+  "exchequer_remittance",
 ];
 
 const inGroup = (type: string, group: string) => {
@@ -143,6 +147,20 @@ function headline(e: S.StreamEvent, p: Payload, h: CatalogHelpers, shipName: (id
       return `${ship}: the crew mutinied`;
     case "ship_provisions_exhausted":
       return `${ship} ran out of stores`;
+    case "ship_broken_up":
+      return `${ship} was broken up at ${port}${n("payout_pence") !== undefined ? ` for ${fmtCr(n("payout_pence")!)}` : ""}`;
+    case "passengers_boarded":
+      return `${n("size") ?? "A group of"} ${s("kind") ?? "passengers"} boarded ${ship}${s("dest_port_id") ? ` for ${h.portName(s("dest_port_id"))}` : ""}`;
+    case "passengers_paid":
+      return `${ship}: ${n("fare_paid_pence") !== undefined ? `${fmtCr(n("fare_paid_pence")!)} in fares paid` : "fares paid"}${n("game_days_late") ? `, ${n("game_days_late")} game day${n("game_days_late") === 1 ? "" : "s"} late` : ""}`;
+    case "passengers_lost":
+      return `${ship}: passengers lost unpaid${s("cause") ? ` (${s("cause")!.replace(/_/g, " ")})` : ""}`;
+    case "home_port_relocated":
+      return `Home port moved${s("from_port_id") ? ` from ${h.portName(s("from_port_id"))}` : ""}${s("to_port_id") ? ` to ${h.portName(s("to_port_id"))}` : ""}`;
+    case "bulletin_posted":
+      return `${s("company_name") ?? "A company"} ${p.is_reply === true ? "replied on" : "opened"} the bulletin${s("title") ? `: ${s("title")}` : ""}`;
+    case "exchange_posted":
+      return `New on the Exchange: ${(s("kind") ?? "an offer").replace(/_/g, " ")}`;
     case "server_announcement":
       return s("message") ?? "Server announcement";
     default:
@@ -150,7 +168,7 @@ function headline(e: S.StreamEvent, p: Payload, h: CatalogHelpers, shipName: (id
   }
 }
 
-const SEVERE = ["voyage_hazard", "ship_mutinied", "ship_provisions_exhausted", "crown_bailiff_", "freight_defaulted", "futures_defaulted", "convoy_salvage"];
+const SEVERE = ["voyage_hazard", "ship_mutinied", "ship_provisions_exhausted", "crown_bailiff_", "freight_defaulted", "futures_defaulted", "convoy_salvage", "passengers_lost", "loan_defaulted"];
 
 function EventRow({ e, h, shipName }: { e: S.StreamEvent; h: CatalogHelpers; shipName: (id: string) => string }) {
   const [open, setOpen] = useState(false);

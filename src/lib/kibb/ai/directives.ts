@@ -7,8 +7,9 @@
  * marque and underwriting budgets, the debt cap, the cash due counted on and the smuggling loads never above the user's
  * values, leverage, idle-cash lending and smuggling only ever switched off (the user's "off" is a ceiling), the home reserve and a
  * loan's required return only ever raised, and the AI's own settings not even nameable (they are not in the
- * schema's enum). Money orders (borrow for a load or a hull, repay a loan early, build a commission to order) refer
- * only to what the digest listed and are carried out through the autopilot's own checks.
+ * schema's enum). Money orders (borrow for a load or a hull, repay a loan early, build a commission to order) and
+ * housekeeping orders (break up a ship, move the home port) refer only to what the digest listed and are carried out
+ * through the autopilot's own checks.
  */
 
 import type { FleetSettings, GunPolicy } from "../fleet/manager";
@@ -30,6 +31,9 @@ export const MAX_NAVAL = 2;
 /** Money orders in one answer: one loan, and at most this many repayments and commissions each. */
 export const MAX_REPAY = 2;
 export const MAX_COMMISSIONS = 2;
+/** Housekeeping orders in one answer: one ship to break up (they are retired one at a time), one move of the home port. */
+const MAX_BREAK_UPS = 1;
+const MAX_RELOCATES = 1;
 /** One order per ship; a list longer than any fleet is cut here. */
 const MAX_SHIP_ORDERS = 30;
 /** How long its directives last before they lapse (real minutes). */
@@ -69,6 +73,7 @@ export const SWITCH_KEYS = [
   "marques",
   "underwrite",
   "useFreight",
+  "usePassengers",
   "convoys",
   "rivalIntel",
   "byomBuilds",
@@ -78,13 +83,16 @@ export const SWITCH_KEYS = [
   "actOnEvents",
   "resizeLoads",
   "leverage",
+  "mortgages",
   "idleCash",
   "shipDeals",
   "envelopes",
+  "autoBreakUp",
+  "autoRelocate",
   "smuggling",
 ] as const satisfies readonly KeysOfType<FleetSettings, boolean>[];
 /** Risky switches the user's "off" is a ceiling for: the AI may only turn them off. */
-export const CEILING_SWITCHES = ["leverage", "idleCash", "smuggling"] as const satisfies readonly SwitchKey[];
+export const CEILING_SWITCHES = ["leverage", "mortgages", "idleCash", "smuggling", "usePassengers", "autoBreakUp", "autoRelocate"] as const satisfies readonly SwitchKey[];
 /** Never the AI's: its mode, caps, model, effort and cadence. */
 export const AI_KEYS = ["ai", "aiDailyCapUsd", "aiTotalCapUsd", "aiModel", "aiEffort", "aiIntervalMin"] as const satisfies readonly (keyof FleetSettings)[];
 
@@ -227,6 +235,9 @@ export const ORDER_CODES = [
   "deadline",
   "gone",
   "underwritten",
+  "busy",
+  "blocked",
+  "too_soon",
 ] as const;
 export type OrderCode = (typeof ORDER_CODES)[number];
 
@@ -276,16 +287,21 @@ export interface NavalOrder {
 }
 
 /**
- * A money order, carried out with every check of the autopilot's own (the debt cap, a loan's required return and
- * payback, cash after loads, a commission's margin, presence and deadline): `borrow_load` up to `pence` for that ship's
- * next load at its source (leverage and re-sizing on), `borrow_hull` up to `pence` for a hull our cash can't fund (not
- * only against cash due), `repay` that loan early in full from spare cash, `commission` build that commission to order.
+ * A money or housekeeping order, carried out with every check of the autopilot's own (the debt cap, a loan's required return
+ * and payback, cash after loads, a commission's margin, presence and deadline; a break-up's and a move's hard gates):
+ * `borrow_load` up to `pence` for that ship's next load at its source (leverage and re-sizing on), `borrow_hull` up to `pence`
+ * for a hull our cash can't fund (not only against cash due), `repay` that loan early in full from spare cash, `commission`
+ * build that commission to order; `break_up` retire that ship to the breakers (every never and the value test, not the days of
+ * watching), `relocate` move the home port there (presence, never a cove, the vault, our gap; the fee's case the AI's).
  */
-export type FinanceKind = "borrow_load" | "borrow_hull" | "repay" | "commission";
+export type FinanceKind = "borrow_load" | "borrow_hull" | "repay" | "commission" | "break_up" | "relocate";
+/** The housekeeping orders among them (a ship to break up, a port to move home to): shown apart from the money orders. */
+export const HOUSEKEEPING_KINDS = ["break_up", "relocate"] as const satisfies readonly FinanceKind[];
+export const isHousekeeping = (o: { kind: string }): boolean => (HOUSEKEEPING_KINDS as readonly string[]).includes(o.kind);
 export interface FinanceOrder {
   id: string;
   kind: FinanceKind;
-  /** Ship id (borrow_load), loan id (repay), commission (contract) id; "" for borrow_hull. */
+  /** Ship id (borrow_load, break_up), loan id (repay), commission (contract) id, port id (relocate); "" for borrow_hull. */
   ref: string;
   /** The most to borrow (pence; borrows only, else 0). */
   pence: number;
@@ -308,7 +324,7 @@ export interface Directives {
   /** Classes the buyer may not build (folded into buyClasses while the user's list is unchanged). */
   forbid: string[];
   naval: NavalOrder[];
-  /** Borrow, repay, accept a commission (absent from older saves: normalizeActive). */
+  /** Borrow, repay, accept a commission; break up a ship, move the home port (absent from older saves: normalizeActive). */
   finance: FinanceOrder[];
 }
 
@@ -669,6 +685,29 @@ export function validateAnswer(raw: RawAdvice, aliases: Aliases, ctx: ValidateCt
       continue;
     }
     d.finance.push({ id: `k${i}`, kind: "commission", ref: k.id, pence: 0, label: `build a ${k.cls} at ${k.yard} to order for ${crs(k.price)}`, reason: text(c.reason), status: "pending" });
+  }
+
+  // Housekeeping: a ship of ours to break up (never one this answer also gives an order: an order in force keeps her from the
+  // breakers), and a port to move home to (open, never a cove). Acted on through every hard check of the autopilot's own; the
+  // switches, presence, the vault and the gap between moves are the manager's to check, and come back as a status.
+  const house = raw.housekeeping;
+  for (const [i, x] of list(house?.breakUp).slice(0, MAX_BREAK_UPS).entries()) {
+    items++;
+    const ship = fleet.find((s) => s.id === aliases.ships.get(x?.ship));
+    if (!ship || d.shipOrders.some((o) => o.ship === ship.id)) {
+      dropped++;
+      continue;
+    }
+    d.finance.push({ id: `u${i}`, kind: "break_up", ref: ship.id, pence: 0, label: "break up a ship", reason: text(x.reason), status: "pending" });
+  }
+  for (const [i, x] of list(house?.relocate).slice(0, MAX_RELOCATES).entries()) {
+    items++;
+    const port = cat.ports.find((p) => p.id === x?.port);
+    if (!port || port.is_cove || !ctx.isOpen(port.id)) {
+      dropped++;
+      continue;
+    }
+    d.finance.push({ id: `h${i}`, kind: "relocate", ref: port.id, pence: 0, label: `move the home port to ${port.id}`, reason: text(x.reason), status: "pending" });
   }
 
   return { d, horizonMin, items, dropped };

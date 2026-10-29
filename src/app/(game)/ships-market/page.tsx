@@ -58,6 +58,7 @@ function ListShipForm({
   const pledged = usePledgedShips();
   const [shipId, setShipId] = useState(initial);
   const [price, setPrice] = useState("");
+  const [unlisted, setUnlisted] = useState(false);
   const [override, setOverride] = useState(false);
   // Resolves to null when the confirmation is declined.
   const act = useAction<S.ShipListingResult | null>((r) => r && onDone());
@@ -66,19 +67,29 @@ function ListShipForm({
   // Her rebuild value (guns and fitted components included), as the Goldsmiths appraise her: the price band is 50%..150% of it.
   const { rebuild, error: appraisalError } = useAppraisal(shipId);
   const band = rebuild !== undefined ? bandOf(rebuild) : undefined;
-  // Without the appraisal, a turnkey quote at the yard she lies at (plus her guns) is at least her rebuild value: an upper bound.
-  const yardHere = !!r && atPort(r) && !!catalog?.ports.find((p) => p.id === r.ship.current_port_id)?.has_shipyard;
+  // Without the appraisal, a rough upper bound: a turnkey quote at a full-price yard (the class's list price there, plus
+  // her guns). Never a discount yard's (Lisbon, Boston, Havana): its quote is below the rebuild value, which stays the full
+  // Crown list price. She has to lie at the yard we quote, or we need presence at another; with components fitted the bound
+  // would understate her, so none is used then.
+  const fullPrice = (id: string | null | undefined) => {
+    const port = catalog?.ports.find((x) => x.id === id);
+    return !!port?.has_shipyard && !port.yard_discount;
+  };
+  const boundYard = !r || (r.components ?? []).length > 0 ? undefined : fullPrice(r.ship.current_port_id) && atPort(r) ? r.ship.current_port_id ?? undefined : [...presence.quay].find(fullPrice);
   const { data: yardQuote } = usePoll(
-    appraisalError && yardHere && r
-      ? () => kibbGet<S.BuildQuoteResult>("/v1/shipyard/quote", { port_id: r.ship.current_port_id ?? "", ship_class: r.ship.ship_class, build_mode: "turnkey_cash" })
+    appraisalError && boundYard && r
+      ? () => kibbGet<S.BuildQuoteResult>("/v1/shipyard/quote", { port_id: boundYard, ship_class: r.ship.ship_class, build_mode: "turnkey_cash" })
       : null,
     0,
-    [shipId, !!appraisalError, yardHere],
+    [shipId, !!appraisalError, boundYard],
   );
   const upper =
-    rebuild === undefined && r && yardQuote?.ship_class === r.ship.ship_class && yardQuote.total_cost_pence != null
+    rebuild === undefined && r && yardQuote?.ship_class === r.ship.ship_class && yardQuote.port_id === boundYard && !yardQuote.yard_discount && yardQuote.total_cost_pence != null
       ? yardQuote.total_cost_pence + r.ship.cannons_count * GUN_PENCE
       : undefined;
+  // A bound from above only when the quote's whole walk came off the NPC ladder: players' asks under it make the build cheaper than
+  // the Crown list price (guide 3.4: a yard where players sell materials builds cheaper), so 150% of it is then only a warning.
+  const hardUpper = upper !== undefined && !!yardQuote && yardQuote.materials_pence === yardQuote.npc_materials_pence;
   const { data: policies } = usePoll(shipId ? () => kibbGet<S.InsurancePolicy[]>("/v1/insurance/list", { ship_id: shipId, limit: 20 }) : null, 30_000, [shipId]);
   const insured = (policies ?? []).find((p) => p.status === "open" || p.status === "active");
   const lien = shipId ? pledged.byShip.get(shipId) : undefined;
@@ -97,7 +108,7 @@ function ListShipForm({
     [!insured, `She holds an ${insured?.status} policy to ${portName(insured?.dest_port_id)}: a ship with open insurance can't change hands.`],
     [p > 0, "Enter the price."],
     [!band || (p >= band.min && p <= band.max), `The price must lie within ${fmtCr(band?.min)} – ${fmtCr(band?.max)} (50%–150% of her rebuild value, ${fmtCr(rebuild)}).`],
-    [upper === undefined || p <= Math.floor(upper * 1.5), `Over 150% of a turnkey build here plus her guns (${fmtCr(upper)}), so over 150% of her rebuild value: it would be refused.`],
+    [!hardUpper || p <= Math.floor(upper! * 1.5), `Over 150% of a turnkey build at ${portName(boundYard)} plus her guns (${fmtCr(upper)}), so likely over 150% of her rebuild value: it would be refused.`],
     [!autopilot || override, "The autopilot sails her: tick the box to list her anyway."],
   ]);
 
@@ -107,11 +118,11 @@ function ListShipForm({
     void act.run(async () => {
       if (
         !confirm(
-          `List ${r.ship.name} (${shipClassName(r.ship.ship_class)}, ${r.ship.cannons_count} guns, ${fmtTons(r.stores.provisions_tons, 1)} of stores) at ${portName(r.ship.current_port_id)} for ${fmtCr(p)}${rebuild ? ` (${pctOf(p, rebuild)} of her rebuild value, ${fmtCr(rebuild)})` : ""}?\n\nA buyer pays it into your ${regionName(region)} vault and she is theirs at once, with her berth or roadstead place, stores and guns (not her crew's gossip). The listing lapses if she sails, sinks, joins a convoy, changes guns or has stores taken off.${autopilot ? "\n\nThe autopilot sails her: unless you stop it, it will load or sail her and the listing lapses." : ""}`,
+          `List ${r.ship.name} (${shipClassName(r.ship.ship_class)}, ${r.ship.cannons_count} guns, ${fmtTons(r.stores.provisions_tons, 1)} of stores) at ${portName(r.ship.current_port_id)} for ${fmtCr(p)}${rebuild ? ` (${pctOf(p, rebuild)} of her rebuild value, ${fmtCr(rebuild)})` : ""}?\n\nA buyer pays it into your ${regionName(region)} vault and she is theirs at once, with her berth or roadstead place, stores and guns (not her crew's gossip). The listing lapses if she sails, sinks, joins a convoy, changes guns or has stores taken off.${unlisted ? " Unlisted: only companies with quay presence there see it, not the Exchange." : " It is also posted on the Exchange for everyone to see."}${autopilot ? "\n\nThe autopilot sails her: unless you stop it, it will load or sail her and the listing lapses." : ""}`,
         )
       )
         return null;
-      return kibbPost<S.ShipListingResult>("/v1/fleet/list-ship", { ship_id: r.ship.id, price_pence: p });
+      return kibbPost<S.ShipListingResult>("/v1/fleet/list-ship", { ship_id: r.ship.id, price_pence: p, ...(unlisted ? { unlisted: true } : {}) });
     });
   }
 
@@ -146,14 +157,14 @@ function ListShipForm({
               rebuild !== undefined
                 ? fmtCr(rebuild)
                 : upper !== undefined
-                  ? `at most ${fmtCr(upper)} (a turnkey build here plus her guns)`
+                  ? `about ${fmtCr(upper)}${hardUpper ? " at most" : ""} (a turnkey build at ${portName(boundYard)} plus her guns)`
                   : appraisalError
                     ? "couldn't be appraised"
                     : "…",
             ],
             [
               "Allowed price",
-              band ? `${fmtCr(band.min)} – ${fmtCr(band.max)}` : upper !== undefined ? `at most ${fmtCr(Math.floor(upper * 1.5))}` : "50%–150% of it, checked by the game",
+              band ? `${fmtCr(band.min)} – ${fmtCr(band.max)}` : hardUpper ? `at most ${fmtCr(Math.floor(upper! * 1.5))}` : "50%–150% of it, checked by the game",
             ],
             ["Price vs rebuild", p > 0 && rebuild ? pctOf(p, rebuild) : "—"],
             ["Goes with her", `${r.ship.cannons_count} guns, ${fmtTons(r.stores.provisions_tons, 1)} of stores`],
@@ -163,6 +174,15 @@ function ListShipForm({
           ]}
         />
       )}
+      {upper !== undefined && !hardUpper && p > Math.floor(upper * 1.5) && (
+        <WarnBox>
+          Over 150% of a turnkey build at {portName(boundYard)} plus her guns. Players&apos; asks made part of that quote, so her rebuild value may be higher, but a
+          price this high may be refused.
+        </WarnBox>
+      )}
+      <Checkbox checked={unlisted} onChange={setUnlisted}>
+        <span className="text-xs">Unlisted: keep it off the Exchange, so only companies with quay presence at her port see it</span>
+      </Checkbox>
       {autopilot && (
         <div className="space-y-1.5">
           <WarnBox>
@@ -319,6 +339,11 @@ function ForSale({
                   <div className="mt-0.5 flex flex-wrap gap-1">
                     {ours && <Badge variant="secondary" size="sm">yours</Badge>}
                     {sibling && <Badge variant="outline" size="sm">your other company</Badge>}
+                    {l.unlisted && (
+                      <Badge variant="outline" size="sm" title="Kept off the Exchange: only companies with quay presence at her port see it">
+                        quay only
+                      </Badge>
+                    )}
                   </div>
                 </td>
                 <td>{portName(l.port_id)}</td>
@@ -396,7 +421,10 @@ function OurListings({ rows, error, onDone }: { rows: S.ShipListingResult[] | un
                 <Link href={`/fleet/${l.ship_id}`} className="font-medium hover:underline">
                   {l.ship_name}
                 </Link>
-                <div className="text-muted-foreground text-xs">{shipClassName(l.ship_class)}</div>
+                <div className="text-muted-foreground text-xs">
+                  {shipClassName(l.ship_class)}
+                  {l.unlisted ? " · unlisted (quay only)" : " · on the Exchange"}
+                </div>
               </td>
               <td>{portName(l.port_id)}</td>
               <td className="tabular-nums">{fmtCr(l.price_pence)}</td>
@@ -483,9 +511,11 @@ function ShipsMarketView() {
               </Panel>
               <WarnBox tone="info">
                 <p>
-                  Ships sell at 50%–150% of their rebuild value: the class&apos;s cheapest current turnkey quote at an open yard plus 150 Cr a gun. The band is
-                  checked again when a buyer takes her (refused if the rebuild value has moved: the seller must relist).
+                  Ships sell at 50%–150% of their rebuild value: the class&apos;s cheapest current Crown list price at an open yard (at full labour and markup,
+                  whatever the discount yards charge), plus 150 Cr a gun and what fitted components add. The band is checked again when a buyer takes her (refused if
+                  the rebuild value has moved: the seller must relist).
                 </p>
+                <p>A listing is also posted on the Exchange for everyone to see, unless it is unlisted.</p>
                 <p>A bought ship keeps her berth or roadstead place, stores and guns. Berth dues up to the sale are the seller&apos;s, the buyer&apos;s from then on.</p>
                 <p>The Goldsmiths list the ships they foreclose on here too.</p>
                 {deals.running && (

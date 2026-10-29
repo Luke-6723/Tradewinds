@@ -6,6 +6,7 @@ import { useParams } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, ErrorNote, KV, Loading, PageHeader, Panel, ShipStatusBadge, Table } from "@/components/kibb/bits";
+import { DiscountYardBadge } from "@/components/kibb/deals-common";
 import { FactorPanel, LeasePanel, PortEventsPanel } from "@/components/kibb/fleet-ui-port";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
@@ -51,6 +52,7 @@ export default function PortPage() {
           <>
             {port.is_hub && <Badge variant="info">hub</Badge>}
             {port.has_shipyard && <Badge variant="outline">shipyard</Badge>}
+            {port.has_shipyard && <DiscountYardBadge discount={port.yard_discount} size="default" />}
             <Badge variant={visible ? "success" : "secondary"}>{port.visibility}</Badge>
           </>
         }

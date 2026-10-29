@@ -1,6 +1,6 @@
 "use client";
 
-// Per-ship action panels for the ship page: stores, guns, warehouse, contracts, insurance, convoys.
+// Per-ship action panels for the ship page: stores, guns, sale and break-up, passengers, warehouse, contracts, insurance, convoys.
 // `blocked` disables writes while the autopilot sails the ship (reads still show).
 
 import { useState } from "react";
@@ -22,13 +22,14 @@ import {
   useLaneFloors,
   type InsurableValue,
 } from "@/components/kibb/insurance-common";
-import { useCompanyNames } from "@/components/kibb/finance-common";
+import { WarnBox, regionName, useAppraisal, useCompanyNames, useRegionOf } from "@/components/kibb/finance-common";
 import { num, useOurCompanyIds } from "@/components/kibb/naval-common";
+import { AboardTable, OfferForm, OffersTable, PassengerRules, useAboard, useCancelOffer, useOffers } from "@/components/kibb/passengers-common";
 import { fetchAll } from "@/components/kibb/trade-common";
 import { useAction } from "@/hooks/use-action";
 import { useCatalog } from "@/hooks/use-catalog";
 import { usePoll } from "@/hooks/use-poll";
-import { kibbGet, kibbPost } from "@/lib/kibb/browser";
+import { DashboardApiError, kibbGet, kibbPost } from "@/lib/kibb/browser";
 import { fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
 import type {
@@ -262,6 +263,7 @@ export function OwnershipPanel({
   insured,
   lien,
   liensKnown,
+  blocked = false,
   onDone,
 }: {
   r: ShipResult;
@@ -269,6 +271,8 @@ export function OwnershipPanel({
   /** The borrower loan she is pledged to (active or defaulted), if any. */
   lien: S.Loan | undefined;
   liensKnown: boolean;
+  /** The autopilot sails her: no break-up. */
+  blocked?: boolean;
   onDone: () => void;
 }) {
   const { catalog, portName } = useCatalog();
@@ -317,7 +321,7 @@ export function OwnershipPanel({
                 "…"
               ) : lien ? (
                 <span key="l">
-                  pledged to {names.label(lien.lender_company_id)}: {fmtCr(lien.owed_pence)} owed
+                  {lien.is_mortgage ? "ship mortgage from" : "pledged to"} {names.label(lien.lender_company_id)}: {fmtCr(lien.owed_pence)} owed
                   {lien.matures_at && !arrested ? `, matures ${fmtIn(lien.matures_at)}` : ""} ·{" "}
                   <Link href="/loans" className="text-primary hover:underline">
                     Loans
@@ -347,10 +351,11 @@ export function OwnershipPanel({
         </div>
         {lien && !arrested && (
           <p className="text-muted-foreground text-xs">
-            A liened ship can still sail before any default, but can&apos;t be listed, sold, pledged again or carry a venture until the loan is repaid. If she sinks the
-            lien is lost and the loan stays owed.
+            A liened ship can still sail before any default, but can&apos;t be listed, sold, pledged again, broken up or carry a venture until the loan is repaid
+            {lien.is_mortgage ? " (a ship mortgage too)" : ""}. If she sinks the lien is lost and the loan stays owed.
           </p>
         )}
+        <BreakUpSection r={r} insured={insured} lien={lien} liensKnown={liensKnown} listed={listings ? !!listed : undefined} blocked={blocked} onDone={onDone} />
         {cls?.can_seal_dispatches && (
           <div className="space-y-2 border-t pt-3">
             <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -376,6 +381,186 @@ export function OwnershipPanel({
             </Button>
           </div>
         )}
+      </div>
+    </Panel>
+  );
+}
+
+/** Break-up pays 35% of the rebuild value (guide 3.4); a sale to another company pays at least 50%. */
+const BREAK_UP_SHARE = 0.35;
+
+/**
+ * Selling her to the yard where she lies, the buyer of last resort (guide 3.4): 35% of her rebuild value, paid by that
+ * region's Crown. She must lie at a port with an open shipyard and be free to change hands, with no passengers or
+ * sailing offers, listing, outside 64ths or venture; a 409 while that Crown can't pay.
+ */
+function BreakUpSection({
+  r,
+  insured,
+  lien,
+  liensKnown,
+  listed,
+  blocked,
+  onDone,
+}: {
+  r: ShipResult;
+  insured: boolean;
+  lien: S.Loan | undefined;
+  liensKnown: boolean;
+  /** An open sale listing of hers (undefined while unread). */
+  listed: boolean | undefined;
+  blocked: boolean;
+  onDone: () => void;
+}) {
+  const { catalog, portName } = useCatalog();
+  const regionOf = useRegionOf();
+  const s = r.ship;
+  const [open, setOpen] = useState(false);
+  const inPort = s.status === "berthed" || s.status === "anchored_roadstead";
+  const yard = !!catalog?.ports.find((p) => p.id === s.current_port_id)?.has_shipyard;
+  const region = regionOf(s.current_port_id);
+  const { data: offers } = useOffers(true, s.id, open);
+  const { data: ventures } = usePoll(open ? () => kibbGet<S.Venture[]>("/v1/venture/list", {}) : null, 60_000, [open]);
+  const { rebuild } = useAppraisal(open && !lien && !listed ? s.id : null);
+  const venture = (ventures ?? []).find((v) => v.ship_id === s.id && ["raising", "sailing", "arrived"].includes(v.status));
+  const openOffers = open ? (offers ?? []).filter((o) => o.ship_id === s.id && o.status === "open") : [];
+  // Resolves to null when the confirmation is declined.
+  const act = useAction<S.BreakUpShipResult | null>((x) => x && onDone());
+  const blockers = [
+    !inPort ? "she must lie at a port (berthed or in the roadstead)" : null,
+    inPort && !yard ? `${portName(s.current_port_id)} has no shipyard` : null,
+    r.cargo_used_tons > 0 ? `her hold must be empty (${fmtTons(r.cargo_used_tons, 1)} aboard, sealed freight and salvage included)` : null,
+    s.convoy_id ? "she must leave her convoy (and any convoy request)" : null,
+    insured ? "her open or bound insurance must settle first" : null,
+    lien ? `${lien.is_mortgage ? "her ship mortgage" : "the loan pledging her"} must be repaid first` : null,
+    s.passenger_hold_tons > 0 ? "she has passengers aboard" : null,
+    openOffers.length ? `she has ${openOffers.length} open sailing offer${openOffers.length === 1 ? "" : "s"}: cancel ${openOffers.length === 1 ? "it" : "them"} first` : null,
+    listed ? "she is listed for sale: cancel the listing first" : null,
+    venture ? `she carries an open venture (${venture.status})` : null,
+  ].filter((x): x is string => !!x);
+  const ready = liensKnown && listed !== undefined && offers !== undefined && ventures !== undefined;
+  const payout = rebuild !== undefined ? Math.floor(rebuild * BREAK_UP_SHARE) : undefined;
+
+  function breakUp() {
+    void act.run(async () => {
+      if (
+        !confirm(
+          `Break up ${s.name} at ${portName(s.current_port_id)}? The yard pays ${payout !== undefined ? `about ${fmtCr(payout)} (35% of her rebuild value, ${fmtCr(rebuild)})` : "35% of her rebuild value"}, from the Crown of ${regionName(region)} into your vault there. The hull is destroyed with her guns, components and stores; berth dues up to now are yours. This cannot be undone.\n\nShe must lie at a port with an open shipyard and be free to change hands: empty hold (no cargo, sealed freight or salvage), no convoy or convoy request, no open or bound insurance, no loan lien or mortgage, no passengers aboard or open sailing offers, no sale listing, no 64ths held by other companies or listed, and no open venture.\n\nA sale to another company always pays more when a buyer exists: at least 50% of the same rebuild value, and she keeps sailing.`,
+        ) ||
+        !confirm(`Last check: break up ${s.name} for good?`)
+      )
+        return null;
+      try {
+        return await kibbPost<S.BreakUpShipResult>("/v1/shipyard/break-up", { ship_id: s.id });
+      } catch (e) {
+        if (e instanceof DashboardApiError && e.status === 409) {
+          throw new Error(`The yard refused: ${e.detail}. If the Crown of ${regionName(region)} can't pay for a break-up now, try a yard in another region, or later.`);
+        }
+        throw e;
+      }
+    });
+  }
+
+  return (
+    <div className="space-y-2 border-t pt-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="font-medium text-sm">Break up</span>
+        {!open && !act.result && (
+          <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
+            Check…
+          </Button>
+        )}
+      </div>
+      <p className="text-muted-foreground text-xs">
+        The yard where she lies buys her as a last resort: 35% of her rebuild value, paid by that region&apos;s Crown. A sale to another company pays at least 50% and
+        she sails on, so list her first if a buyer may exist. Your hulls count in your net worth at build value, so breaking one up lowers it.
+      </p>
+      {act.result ? (
+        <WarnBox tone="info">
+          <p>
+            {act.result.ship_name} was broken up at {portName(act.result.port_id)}: {fmtCr(act.result.payout_pence)} paid (35% of {fmtCr(act.result.rebuild_value_pence)})
+            {act.result.berth_dues_pence > 0 ? `, ${fmtCr(act.result.berth_dues_pence)} of berth dues settled` : ""}
+            {act.result.stores_lost_tons > 0 ? `, ${fmtTons(act.result.stores_lost_tons, 1)} of stores lost with her` : ""}.
+          </p>
+          <p>
+            <Link href="/fleet" className="underline">
+              Back to the fleet
+            </Link>
+          </p>
+        </WarnBox>
+      ) : (
+        open && (
+          <>
+            <KV
+              rows={[
+                ["Rebuild value", rebuild !== undefined ? fmtCr(rebuild) : lien || listed ? "not appraised while liened or listed" : "…"],
+                ["The yard pays", payout !== undefined ? `about ${fmtCr(payout)} into your ${regionName(region)} vault` : "35% of it"],
+                ["Free to break up", !ready ? "…" : blockers.length ? `no: ${blockers.join("; ")}` : "yes, as far as can be seen (outside 64ths are checked by the game)"],
+              ]}
+            />
+            {blocked && <p className="text-muted-foreground text-xs">The fleet autopilot sails her: stop it, or tick &quot;act anyway&quot; above, first.</p>}
+            <ErrorNote error={act.error} />
+            <Button size="sm" variant="destructive" disabled={act.busy || blocked || !ready || blockers.length > 0} onClick={breakUp}>
+              {act.busy ? "Breaking up…" : `Break up ${s.name}`}
+            </Button>
+          </>
+        )
+      )}
+    </div>
+  );
+}
+
+// ── Passengers ────────────────────────────────────────────────────────────────
+
+/** Her passengers aboard (guide 3.20), her open sailing offers, and an offer form while she lies in port. */
+export function PassengersPanel({ r, blocked, onDone }: Props) {
+  const { portName } = useCatalog();
+  const s = r.ship;
+  const inPort = s.status === "berthed" || s.status === "anchored_roadstead";
+  // Read only what can be there: groups while she carries any, offers while she lies in port (sailing closes them).
+  const carrying = s.passenger_hold_tons > 0;
+  const aboard = useAboard(carrying ? s.id : null);
+  const groups = carrying ? aboard.groups : [];
+  const listed = useOffers(true, s.id, inPort);
+  const offers = inPort ? listed.data : [];
+  const [offering, setOffering] = useState(false);
+  const done = () => {
+    void aboard.reload();
+    void listed.reload();
+    onDone();
+  };
+  const cancel = useCancelOffer(done);
+  const open = (offers ?? []).filter((o) => o.ship_id === s.id && o.status === "open");
+  const heads = (groups ?? []).reduce((n, g) => n + g.size, 0);
+  const due = (groups ?? []).reduce((n, g) => n + g.full_fare_pence, 0);
+  return (
+    <Panel title="Passengers" action={<Link href="/passengers" className="text-muted-foreground text-xs hover:text-foreground">Passengers →</Link>}>
+      <div className="space-y-3">
+        <KV
+          rows={[
+            ["Aboard", groups === undefined ? "…" : heads ? `${heads} head${heads === 1 ? "" : "s"} in ${groups.length} group${groups.length === 1 ? "" : "s"}, ${fmtTons(s.passenger_hold_tons)} of hold` : "none"],
+            ["Fares due on arrival", groups === undefined ? "…" : heads ? `${fmtCr(due)} if on time` : "—"],
+            ["Open sailing offers", offers === undefined ? "…" : open.length ? open.map((o) => `${portName(o.dest_port_id)} at ${fmtCr(o.fare_per_head_pence, 2)}`).join(", ") : "none"],
+          ]}
+        />
+        <ErrorNote error={(carrying ? aboard.error : null) ?? cancel.error} />
+        {groups && groups.length > 0 && <AboardTable groups={groups} />}
+        {open.length > 0 && <OffersTable offers={open} shipName={() => s.name} busy={cancel.busy || blocked} onCancel={(o) => cancel.cancel(o, s.name)} />}
+        {!inPort ? (
+          <p className="text-muted-foreground text-xs">Passengers board only while she lies in port (berthed or in the roadstead). Sailing closes her offers.</p>
+        ) : offering ? (
+          <div className="space-y-3 rounded-lg border p-3">
+            <OfferForm ship={r} blocked={blocked} autopilotShips={new Set()} openOffers={offers} onDone={done} />
+            <Button size="sm" variant="ghost" onClick={() => setOffering(false)}>
+              Close
+            </Button>
+          </div>
+        ) : (
+          <Button size="sm" variant="outline" disabled={blocked} onClick={() => setOffering(true)}>
+            Offer passengers
+          </Button>
+        )}
+        {offering && <PassengerRules />}
       </div>
     </Panel>
   );
