@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, ErrorNote, Loading, NativeSelect, PageHeader, Panel, Table, TextArea } from "@/components/kibb/bits";
 import { LoadMore, useNextCursorPaged } from "@/components/kibb/company-paged";
-import { COLLATERAL_LABEL, WarnBox, regionName } from "@/components/kibb/finance-common";
+import { COLLATERAL_LABEL, WarnBox, lineRateText, regionName } from "@/components/kibb/finance-common";
 import { useCompanyId } from "@/components/kibb/naval-common";
 import { RegionSelect } from "@/components/kibb/pickers";
 import { fetchAll } from "@/components/kibb/trade-common";
@@ -28,6 +28,7 @@ const KINDS: Array<{ kind: S.ExchangeKind; label: string; href?: string; act: st
   { kind: "loan_request", label: "Loan requests", href: "/loans", act: "quote a rate (Lend)" },
   { kind: "bank", label: "Banks", href: "/banks", act: "deposit" },
   { kind: "futures", label: "Futures", href: "/futures", act: "take the other side" },
+  { kind: "lending_line", label: "Lending lines", href: "/banks", act: "post a loan request it covers" },
 ];
 
 const kindOf = (k: S.ExchangeKind) => KINDS.find((x) => x.kind === k)!;
@@ -49,7 +50,7 @@ function useOwnEntries(companyId: string | undefined) {
       ? async () => {
           const safe = <T,>(p: Promise<T[]>) => p.catch(() => [] as T[]);
           const contracts = (type: string) => safe(fetchAll<S.ContractListing>("/v1/contract/list", { contract_type: type, status: "open" }, 200, 5));
-          const [listings, commissions, offers, requests, ventures, shares, loans, futures] = await Promise.all([
+          const [listings, commissions, offers, requests, ventures, shares, loans, futures, lines] = await Promise.all([
             safe(fetchAll<S.ShipListingResult>("/v1/fleet/ship-listings", {}, 200, 5)),
             contracts("commission"),
             contracts("licence_offer"),
@@ -58,6 +59,7 @@ function useOwnEntries(companyId: string | undefined) {
             safe(kibbGet<S.ShareListing[]>("/v1/ship-shares/listings")),
             safe(kibbGet<S.LoanRequestView[]>("/v1/loan/requests", { mine: true, limit: 50 })),
             safe(fetchAll<S.FuturesContract>("/v1/future/list", { status: "open" }, 200, 5)),
+            safe(kibbGet<S.LendingLine[]>("/v1/bank/lending-lines", { company_id: companyId })),
           ]);
           const issued = (rows: S.ContractListing[]) => rows.filter((c) => c.issuer_company_id === companyId).map((c) => c.id);
           return new Set<string>([
@@ -69,6 +71,7 @@ function useOwnEntries(companyId: string | undefined) {
             ...shares.filter((l) => l.seller_company_id === companyId && l.status === "open").map((l) => `ship_shares:${l.id}`),
             ...loans.filter((r) => r.status === "open").map((r) => `loan_request:${r.id}`),
             ...futures.filter((f) => f.creator_company_id === companyId).map((f) => `futures:${f.id}`),
+            ...lines.filter((l) => l.bank_company_id === companyId).map((l) => `lending_line:${l.id}`),
             `bank:${companyId}`,
           ]);
         }
@@ -98,7 +101,10 @@ function Summary({ e }: { e: S.ExchangeEntry }) {
     }
     case "commission": {
       const d = e.details as S.CommissionDetails;
-      return line(`${shipClassName(d.ship_class)} built at ${portName(d.port_id)}`, `${fmtCr(d.price_pence)} · deliver ${fmtIn(d.deadline)}`);
+      return line(
+        `${d.admiralty ? "Admiralty: " : ""}${shipClassName(d.ship_class)} built at ${portName(d.port_id)}`,
+        `${fmtCr(d.price_pence)}${d.admiralty ? " from the Crown (the hull joins the Royal Navy; a deposit, one at a time)" : ""} · deliver ${fmtIn(d.deadline)}`,
+      );
     }
     case "venture": {
       const d = e.details as S.VentureDetails;
@@ -137,6 +143,13 @@ function Summary({ e }: { e: S.ExchangeEntry }) {
       return line(
         `${d.side === "ask" ? "Sells" : "Buys"} ${fmtTons(d.lot_tons)} ${goodName(d.commodity_id)} at ${portName(d.port_id)}`,
         `strike ${fmtCr(d.strike_price_pence, 2)}/t · matures ${fmtIn(d.matures_at)}`,
+      );
+    }
+    case "lending_line": {
+      const d = e.details as S.LendingLineDetails;
+      return line(
+        `${d.bank_name} lends at ${lineRateText(d.rate_pct_of_goldsmiths_bps)} rate`,
+        `${d.regions.map(regionName).join(", ")} · ${d.collateral_kinds.map((k) => COLLATERAL_LABEL[k] ?? k).join(", ")} · ${d.repayments.join(", ")} · ${fmtCr(d.min_principal_pence)}–${fmtCr(d.max_principal_pence)} up to ${d.max_term_game_days} game days, LTV ≤ ${fmtBps(d.max_ltv_bps)}${d.allow_non_recourse ? ", non-recourse ok" : ""} · ${fmtCr(d.remaining_capacity_pence)} room`,
       );
     }
   }
@@ -335,7 +348,15 @@ export default function ExchangePage() {
             <p>An offer appears the moment it opens and goes the moment it is sold, filled, taken, withdrawn or lapses. Player charters and freight are not listed: they stay port gossip.</p>
             <p>
               Ship listings, commissions and ventures are posted here unless they were opened unlisted, which keeps them to their port&apos;s quay. A bank&apos;s entry is
-              dated by its last change of terms.
+              dated by its last change of terms, a lending line&apos;s by its last change.
+            </p>
+            <p>
+              A lending line quotes on its own on every new request it covers: to borrow on one, post a loan request in its region against a pledge it takes, within
+              its term, principal and loan-to-value. See every column on the{" "}
+              <Link href="/banks" className="text-primary hover:underline">
+                banks
+              </Link>{" "}
+              page.
             </p>
           </WarnBox>
         </div>

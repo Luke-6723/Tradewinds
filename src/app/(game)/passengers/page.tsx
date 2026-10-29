@@ -17,6 +17,7 @@ import {
   PassengerRules,
   median,
   useCancelOffer,
+  useFaresSummary,
   useOffers,
 } from "@/components/kibb/passengers-common";
 import { useCatalog } from "@/hooks/use-catalog";
@@ -59,7 +60,7 @@ function WaitingPanel({ ships, onOffer }: { ships: ShipResult[] | undefined; onO
       ) : groups.length === 0 ? (
         <Empty>No groups waiting at {portName(port)}.</Empty>
       ) : (
-        <Table head={["Group", "Bound for", "Gives up", ""]}>
+        <Table head={["Group", "Bound for", "Gives up", "Route unserved lately", ""]}>
           {groups.map((g) => (
             <tr key={g.id}>
               <td className="whitespace-nowrap">
@@ -72,6 +73,18 @@ function WaitingPanel({ ships, onOffer }: { ships: ShipResult[] | undefined; onO
               </td>
               <td>{portName(g.dest_port_id)}</td>
               <td className="whitespace-nowrap text-xs">{fmtIn(g.board_by)}</td>
+              <td className="whitespace-nowrap text-xs">
+                {(g.route_unmet_groups ?? 0) > 0 ? (
+                  <span title={`Groups of ${g.kind} on this route that gave up waiting without a passage lately: if no other ship offers for it, open high`}>
+                    {g.route_unmet_groups} group{g.route_unmet_groups === 1 ? "" : "s"}, {g.route_unmet_heads} heads{" "}
+                    <Badge variant="success" size="sm">
+                      open high?
+                    </Badge>
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">none</span>
+                )}
+              </td>
               <td className="text-right">
                 {ours && (
                   <Button size="sm" variant="outline" onClick={() => onOffer(port, g.dest_port_id)}>
@@ -84,8 +97,9 @@ function WaitingPanel({ ships, onOffer }: { ships: ShipResult[] | undefined; onO
         </Table>
       )}
       <p className="mt-3 text-muted-foreground text-xs">
-        A group boards whole or not at all, and gives up waiting at its time. What it will pay at most is never shown: the fares groups accepted on a route are
-        the guide.{lying.length > 0 ? ` Your ships lie at ${lying.map(portName).join(", ")}.` : " None of your ships is in port."}
+        A group boards whole or not at all, and gives up waiting at its time. What it will pay at most is never shown: the median of the route&apos;s length band
+        is the guide. A route whose groups keep giving up unboarded may have nobody offering for it.
+        {lying.length > 0 ? ` Your ships lie at ${lying.map(portName).join(", ")}.` : " None of your ships is in port."}
       </p>
     </Panel>
   );
@@ -130,7 +144,7 @@ function FaresPanel() {
       {page.items.length === 0 ? (
         page.loading ? <Loading /> : <Empty>No fares recorded{from || to ? " on this route" : ""}.</Empty>
       ) : (
-        <Table head={["Accepted", "Group", "Route", "Fare / head", "Whole fare"]}>
+        <Table head={["Accepted", "Group", "Route", "Length", "Fare / head", "Whole fare"]}>
           {page.items.map((f) => (
             <tr key={f.id}>
               <td className="whitespace-nowrap text-muted-foreground text-xs">{fmtDateTime(f.accepted_at)}</td>
@@ -140,6 +154,10 @@ function FaresPanel() {
               <td className="whitespace-nowrap text-xs">
                 {portName(f.origin_port_id)} → {portName(f.dest_port_id)}
               </td>
+              <td className="whitespace-nowrap text-xs tabular-nums">
+                {f.route_nm != null ? `${f.route_nm.toLocaleString("en-GB")} nm` : "—"}
+                {f.band && <div className="text-muted-foreground">{f.band}</div>}
+              </td>
               <td className="tabular-nums">{fmtCr(f.fare_per_head_pence, 2)}</td>
               <td className="tabular-nums">{fmtCr(f.fare_per_head_pence * f.size)}</td>
             </tr>
@@ -147,7 +165,89 @@ function FaresPanel() {
         </Table>
       )}
       <LoadMore loading={page.loading} done={page.done} onClick={page.loadMore} count={page.items.length} />
-      <p className="mt-3 text-muted-foreground text-xs">Newest first, never who carried them. A fast ship can ask a little more than these and still win; a slow one must be cheaper.</p>
+      <p className="mt-3 text-muted-foreground text-xs">
+        Newest first, never who carried them. Each is what the cheapest ship asked, not what the group would have paid: judge a route by its length band&apos;s
+        median below. A fast ship can ask a little more than these and still win; a slow one must be cheaper.
+      </p>
+    </Panel>
+  );
+}
+
+/** The fares board's summary (guide 3.20): medians by route-length band, and routes where groups gave up waiting unboarded. */
+function FaresSummaryPanel() {
+  const { portName } = useCatalog();
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const { summary, error } = useFaresSummary(from, to);
+  return (
+    <Panel title="Fares by route length">
+      <ErrorNote error={error} />
+      {!summary ? (
+        !error && <Loading />
+      ) : (
+        <div className="space-y-5">
+          <div>
+            <Table head={["Band", "Fares", "Heads", "Median / head"]}>
+              {summary.bands.map((b) => (
+                <tr key={b.band}>
+                  <td className="whitespace-nowrap">{b.band}</td>
+                  <td className="tabular-nums">{b.fares}</td>
+                  <td className="tabular-nums">{b.heads}</td>
+                  <td className="font-medium tabular-nums">{b.median_fare_per_head_pence != null ? fmtCr(b.median_fare_per_head_pence, 2) : "—"}</td>
+                </tr>
+              ))}
+            </Table>
+            <p className="mt-2 text-muted-foreground text-xs">
+              Fares accepted over the last {summary.fares_window_game_days} game days (since {fmtDateTime(summary.fares_since)}), by the length of their route.
+              Compare like with like: a long passage against its own band.
+            </p>
+          </div>
+          <div>
+            <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
+              <h3 className="font-medium text-muted-foreground text-xs">Routes where groups gave up waiting</h3>
+              <div className="flex w-full flex-wrap gap-2 sm:w-auto">
+                <div className="w-full sm:w-40">
+                  <PortSelect value={from} onChange={setFrom} placeholder="From any port" />
+                </div>
+                <div className="w-full sm:w-40">
+                  <PortSelect value={to} onChange={setTo} placeholder="To any port" />
+                </div>
+              </div>
+            </div>
+            {summary.unmet.length === 0 ? (
+              <Empty>No group gave up unboarded{from || to ? " on these routes" : ""} lately.</Empty>
+            ) : (
+              <Table head={["Route", "Kind", "Groups", "Heads", "Length"]}>
+                {summary.unmet.map((u) => (
+                  <tr key={`${u.origin_port_id}>${u.dest_port_id}|${u.kind}`}>
+                    <td className="whitespace-nowrap text-xs">
+                      {portName(u.origin_port_id)} → {portName(u.dest_port_id)}
+                    </td>
+                    <td className="whitespace-nowrap">
+                      {u.kind}
+                      {u.kind === "emigrants" && (
+                        <Badge variant="info" size="sm" className="ml-1.5">
+                          long haul
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="tabular-nums">{u.groups}</td>
+                    <td className="tabular-nums">{u.heads}</td>
+                    <td className="whitespace-nowrap text-xs tabular-nums">
+                      {u.route_nm != null ? `${u.route_nm.toLocaleString("en-GB")} nm` : "—"}
+                      {u.band && <div className="text-muted-foreground">{u.band}</div>}
+                    </td>
+                  </tr>
+                ))}
+              </Table>
+            )}
+            <p className="mt-2 text-muted-foreground text-xs">
+              Most heads first, over the last {summary.unmet_window_game_days} game days. Where groups keep giving up and no other ship offers for that destination,
+              nobody is competing: open well above the band median and step down after an unfilled round or two, stopping at the first fare taken.
+            </p>
+          </div>
+        </div>
+      )}
     </Panel>
   );
 }
@@ -225,7 +325,7 @@ export default function PassengersPage() {
     <div className="space-y-5 pb-8 sm:space-y-6">
       <PageHeader
         title="Passengers"
-        subtitle="Groups wait at ports for a passage. Offer a ship lying there, name the fare per head, and the groups choose: cheaper wins, and so does faster. The fare is paid on arrival."
+        subtitle="Groups wait at ports for a passage. Offer a ship lying there, name the fare per head, and the groups choose: cheaper wins, and so does faster. Fares are an auction, paid on arrival."
       />
       <Metrics
         className="sm:grid-cols-3 xl:grid-cols-3"
@@ -271,6 +371,7 @@ export default function PassengersPage() {
             </p>
           </Panel>
           <AboardPanel ships={ships} />
+          <FaresSummaryPanel />
           <FaresPanel />
         </div>
         <div className="space-y-4">

@@ -4,12 +4,16 @@
  * `autoRelocate`; the user's "off" is a ceiling the AI can't lift) and can't be undone, so every threshold leans towards
  * doing nothing.
  *
- * Break-up: the yard where a ship lies buys her for 35% of her rebuild value (her class at the yards' full price, 150 Cr a gun,
+ * Disposal: the yard where a ship lies buys her for 35% of her rebuild value (her class at the yards' full price, 150 Cr a gun,
  * fitted components), paid by that region's Crown (409 while it can't). Net worth counts a hull at its build value, so a
  * break-up gives 65% of it away at once: only a ship that has earned less than her share of the upkeep for days on end, with no
  * lane from where she lies that beats it (or an out-of-date class whose slot a paying new hull would take, the fleet being
- * full), and only when the upkeep saved by the horizon, less what she would earn, makes up the net worth given away. A sale to
- * another company pays at least half and keeps her sailing: with ship deals on she is listed first, for a day.
+ * full), and only when the upkeep saved by the horizon, less what she would earn, makes up the net worth given away (judged on
+ * that 35%, the worst case). A sale pays at least half and keeps her sailing, and the ship broker (guide 3.4: the Merchant
+ * Adventurers of her region) buys a hull listed on the Exchange at a yard port far below its rebuild value once the listing is a
+ * game hour old, looking every 2 game hours: so at the yard she is always listed first, on the Exchange, down a ladder of the
+ * server's rebuild value (BROKER_LADDER, each step held BROKER_STEP_GAME_H), and broken up only when unsold just over the band's
+ * floor. A hull we disposed of that way and the broker resells is never bought back by our own buyer.
  *
  * Home: upkeep is billed in the home region every game day (and marques, patrols and R&D are paid there); a home where the cash
  * no longer lands is kept funded by remits whose fees are the measurable cost of it (keepHomeFloor, auto-remit). A move costs
@@ -24,13 +28,39 @@ import type { TripRecord } from "./agent";
 export const BREAK_UP_SHARE = 0.35;
 export const SALE_MIN_SHARE = 0.5;
 /**
- * Ship deals on: listed first at this share of our rebuild figure (at least 55%; a buyer's own build costs about all of it, and
- * the server takes 50-150% of its own figure, so a small error in ours stays in range), for this long (real ms).
+ * At the yard she is listed for sale on the Exchange (never `unlisted`: the ship broker buys only what the Exchange shows, guide
+ * 3.4) before any break-up, down this ladder of the server's rebuild value, each step held this many game hours (the broker looks
+ * only at listings a game hour old, every 2 game hours). The last step is a point over the band's 50% floor: the band is checked
+ * again at purchase (a `409` if the rebuild value moved, guide 3.4), so a listing at the floor itself is left unbuyable by any rise
+ * in the yards' prices. A step down is a withdrawal and a new listing. Unsold at the last step after its time: broken up.
  */
-export const LIST_SHARE = 0.6;
-export const LIST_MS = 24 * 3_600_000;
+export const BROKER_LADDER: readonly number[] = [0.6, 0.55, 0.51];
+export const BROKER_STEP_GAME_H = 3;
 /** A listed ship's listing is read back at most this often (real ms) while she waits: sold, or closed under her. */
 export const LIST_CHECK_MS = 5 * 60_000;
+
+/** The ladder in words, for the log: "60%, 55% then 51% of her rebuild value, 3 game hours a step". */
+export function ladderText(): string {
+  const pct = BROKER_LADDER.map((x) => `${Math.round(x * 100)}%`);
+  return `${pct.slice(0, -1).join(", ")} then ${pct.at(-1)} of her rebuild value, ${BROKER_STEP_GAME_H} game hours a step`;
+}
+
+/** The ladder's price for `step` (pence): its share of `rebuild` rounded up, never under the band's floor of it (guide 3.4: 50%..=150%). */
+export function ladderPrice(rebuild: number, step: number): number {
+  const share = Math.max(SALE_MIN_SHARE, BROKER_LADDER[Math.min(Math.max(0, step), BROKER_LADDER.length - 1)]);
+  return Math.max(100, Math.ceil(Math.max(0, rebuild) * share));
+}
+
+/**
+ * A ship being retired bound for another yard (its Crown refused, out of reach, or the port she is stuck at): she is listed there
+ * from the ladder's top, since that yard's buyers (and another region's broker, guide 3.4) never saw her, never broken up unlisted.
+ */
+export function freshLadder(m: RetireMark): void {
+  m.listTried = false;
+  delete m.ladderStep;
+  delete m.ladderRebuild;
+  delete m.ladderRetry;
+}
 /** Dead weight: trips over this many trailing game days are what she earned lately. */
 export const DEAD_TRAIL_GAME_DAYS = 4;
 /** A candidate this many checks running (the bills cadence, 10 real min) over this many game days at least: never one bad trip. */
@@ -71,8 +101,9 @@ export type RetireReason = "idle" | "obsolete";
 
 /**
  * A ship the fleet is retiring (saved). `wanted`: judged dead weight, her fresh checks still to pass at her next turn in port;
- * `sail`: bound empty for `yard`; `listed`: for sale at the yard (`listed.id` null while a listing with no answer is looked for);
- * `breakup`: broken up at her next turn there; `verify`: a break-up with no answer (`sentAt`, local ms), read back first.
+ * `sail`: bound empty for `yard` (or there, between steps of the broker's ladder); `listed`: for sale on the Exchange at the yard
+ * (`listed.id` null while a listing with no answer is looked for); `breakup`: broken up at her next turn there; `verify`: a
+ * break-up with no answer (`sentAt`, local ms), read back first.
  */
 export interface RetireMark {
   stage: "wanted" | "sail" | "listed" | "breakup" | "verify";
@@ -86,10 +117,19 @@ export interface RetireMark {
   rebuild: number;
   payout: number;
   at: number;
-  /** Local ms. */
-  listed?: { id: string | null; price: number; at: number; until: number; sentAt?: number; checkedAt?: number };
-  /** A listing was tried (or wasn't to be): she is broken up at the yard. */
+  /**
+   * Local ms. `step`: her step on the broker's ladder (BROKER_LADDER; absent on an older save's day-long listing, which then holds
+   * one step from `at` and steps down like the first); `rebuild`: the server's rebuild value the listing gave; `cancelSentAt`: our
+   * withdrawal at the step's end was sent (a cancelled listing read back then is that step taken, not a listing closed under her).
+   */
+  listed?: { id: string | null; price: number; at: number; until: number; sentAt?: number; checkedAt?: number; step?: number; rebuild?: number; cancelSentAt?: number };
+  /** A listing was tried (or wasn't to be): she is broken up at the yard. Cleared at another yard (its ladder starts again). */
   listTried?: boolean;
+  /** Between steps of the ladder: the step to list at next, and the server's rebuild value the last listing gave (absent: the first). */
+  ladderStep?: number;
+  ladderRebuild?: number;
+  /** The step whose listing was refused for the band (400) and is tried once more, priced afresh (absent: none). */
+  ladderRetry?: number;
   sentAt?: number;
   /** Where she was first asked to sail for the yard from, and since when (server ms): reset at each port she reaches. */
   sailWait?: { port: string; since: number };

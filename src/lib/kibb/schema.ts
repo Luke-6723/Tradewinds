@@ -136,6 +136,10 @@ export interface BankResult {
   demand_rate_bps: number;
   /** What it owes its depositors. */
   deposits_pence: Pence;
+  /** The fees it kept on them. */
+  draft_fees_pence: Pence;
+  /** Remittances it has carried as drafts (see the module docs). */
+  drafts_carried: number;
   /**
    * Its exchange fee schedule: for each banking region it pays withdrawals into besides a
    * deposit's own, the fee in bps of what is withdrawn there, kept by the bank. A region left
@@ -147,6 +151,11 @@ export interface BankResult {
   insured: boolean;
   /** How much more it may lend or lock now. */
   lending_headroom_pence: Pence;
+  /**
+   * Its open lending lines' cheapest rate for each pledge, as a share of the Goldsmiths' rate
+   * for the term in bps (`GET /v1/bank/lending-lines` for the lines in full).
+   */
+  lending_line_best_rates: Record<string, number>;
   /** Principal and interest owed to it on its loans, and its standing quotes' escrow. */
   loans_out_pence: Pence;
   name: string;
@@ -509,6 +518,8 @@ export interface CommissionActionRequest {
 }
 
 export interface CommissionDetails {
+  /** Ordered by the Admiralty and paid by the regional Crown on delivery. */
+  admiralty?: boolean;
   /** Delivered by then, or it lapses. */
   deadline: string;
   /** The yard it is built and delivered at: a builder needs presence there. */
@@ -519,8 +530,11 @@ export interface CommissionDetails {
 
 /** A commission after acceptance or withdrawal. */
 export interface CommissionResult {
+  /** Ordered by the Admiralty and paid by the regional Crown; the hull joins the Royal Navy. */
+  admiralty: boolean;
   builder_company_id?: string | null;
-  buyer_company_id: string;
+  /** `null` for an Admiralty commission: the regional Crown is the buyer. */
+  buyer_company_id?: string | null;
   collateral_pence: Pence;
   contract_id: string;
   /** Deliver before this, or the commission lapses. */
@@ -1082,7 +1096,8 @@ export interface DeliverCommissionResult {
   /** What the build cost the builder ([`shipyard::BuildShipResult::total_cost_pence`]). */
   build_cost_pence: Pence;
   build_mode: BuildMode;
-  buyer_company_id: string;
+  /** `null` for an Admiralty commission: the hull went to the Royal Navy, not to a company. */
+  buyer_company_id?: string | null;
   collateral_returned_pence: Pence;
   contract_id: string;
   port_id: PortId;
@@ -1216,6 +1231,42 @@ export interface DepositResult {
   written_off_pence: Pence;
 }
 
+/** `GET /v1/world/desks`. */
+export interface DeskBoard {
+  as_of: string;
+  desks: DeskSection[];
+  /** Length of the window, in game days. */
+  window_game_days: number;
+  /** Real instant the window opens at. */
+  window_since: string;
+}
+
+/** A count of deals and the money they moved. */
+export interface DeskFigures {
+  count: number;
+  value_pence: Pence;
+}
+
+/** A desk on the board. */
+export type DeskKind = "ship_shares" | "envelopes" | "ventures" | "ships" | "futures" | "admiralty_commissions" | "charter_filler";
+
+/** One desk's market over the window. */
+export interface DeskSection {
+  desk: DeskKind;
+  /**
+   * What the desk did: listings, envelopes or hulls bought, stakes put into ventures, futures
+   * taken (their notional), Admiralty hulls delivered (the price paid) or charter fills landed
+   * (the reward paid).
+   */
+  desk_bought: DeskFigures;
+  /** The NPC house behind the desk. */
+  house: string;
+  /** What is traded, in words. */
+  market: string;
+  /** Deals in the same market between player companies (no NPC house on either side). */
+  player_trades: DeskFigures;
+}
+
 export interface DockActionResult {
   berth_dues_debt_pence?: null | Pence;
   berth_dues_pence?: null | Pence;
@@ -1342,7 +1393,7 @@ export interface ExchangeComponent {
 }
 
 /** What an entry shows, by its kind. */
-export type ExchangeDetails = ShipForSaleDetails | CommissionDetails | VentureDetails | ShipSharesDetails | LicenceDetails | LoanRequestDetails | BankDetails | FuturesDetails;
+export type ExchangeDetails = ShipForSaleDetails | CommissionDetails | VentureDetails | ShipSharesDetails | LicenceDetails | LoanRequestDetails | BankDetails | FuturesDetails | LendingLineDetails;
 
 /** One open offer on the Exchange. */
 export interface ExchangeEntry {
@@ -1360,7 +1411,7 @@ export interface ExchangeEntry {
 }
 
 /** What kind of offer an entry is. */
-export type ExchangeKind = "ship_for_sale" | "commission" | "venture" | "ship_shares" | "licence_offer" | "licence_request" | "loan_request" | "bank" | "futures";
+export type ExchangeKind = "ship_for_sale" | "commission" | "venture" | "ship_shares" | "licence_offer" | "licence_request" | "loan_request" | "bank" | "futures" | "lending_line";
 
 /** A page of the Exchange, newest first. */
 export interface ExchangePage {
@@ -1488,15 +1539,53 @@ export interface FactorPortRequest {
   port_id: PortId;
 }
 
+/** The fares accepted on the routes of one length band. */
+export interface FareBandView {
+  /** The band's name, e.g. `300-699nm`. */
+  band: string;
+  /** Fares accepted on routes of this length within the window: one per group boarded. */
+  fares: number;
+  /** Heads boarded on them. */
+  heads: number;
+  /** The band ends just short of this (`None`: no upper bound). */
+  max_nm?: number | null;
+  /** The median fare per head of those fares (`None` when there were none). */
+  median_fare_per_head_pence?: number | null;
+  min_nm: number;
+}
+
 /** A fare a group accepted. */
 export interface FareRecordView {
   accepted_at: string;
+  /** The route-length band it counts in on `GET /v1/passengers/fares/summary`. */
+  band?: string | null;
   dest_port_id: PortId;
   fare_per_head_pence: number;
   id: string;
   kind: PassengerKind;
   origin_port_id: PortId;
+  /** Sea distance of the route (nm) over the zones open now. */
+  route_nm?: number | null;
   size: number;
+}
+
+/**
+ * The fares board's summary: what recent fares paid by route length, and where groups went
+ * unserved.
+ */
+export interface FaresSummaryView {
+  /** Every band, shortest first, empty ones included. */
+  bands: FareBandView[];
+  /** The bands count fares accepted since this time... */
+  fares_since: string;
+  /** ...the last this many game days. */
+  fares_window_game_days: number;
+  /** Routes where groups gave up waiting, most heads first. */
+  unmet: UnmetRouteView[];
+  /** `unmet` counts groups that gave up since this time... */
+  unmet_since: string;
+  /** ...the last this many game days. */
+  unmet_window_game_days: number;
 }
 
 export interface FitComponentRequest {
@@ -1715,8 +1804,8 @@ export type InsurancePolicyListing = InsurancePolicy & {
    */
   lloyds_expected_loss_bps?: number | null;
   /**
-   * Lloyd's posted price for this voyage (`npc_houses::lloyds_rate`: the estimate x 2.5 + 25
-   * bps, x 1.75 + 25 bps for a hull rated for every leg's water), its hurdle. Lloyd's writes what players have left of a policy at or above it once it
+   * Lloyd's posted price for this voyage (`npc_houses::lloyds_rate`: the estimate x 1.25 + 25
+   * bps, x 1 + 25 bps for a hull rated for every leg's water), its hurdle. Lloyd's writes what players have left of a policy at or above it once it
    * is an hour old (`NPC_RESPONSE_DELAY`), within its collateral caps, at the premium offered.
    * `null` with the estimate.
    */
@@ -1833,6 +1922,113 @@ export interface LegEstimate {
    */
   starving: boolean;
   to_node: string;
+}
+
+/** A lending line, as anyone sees it. */
+export interface LendingLine {
+  allow_non_recourse: boolean;
+  bank_company_id: string;
+  bank_name: string;
+  /** Posted or last changed (the earlier wins a tie on rate). */
+  changed_at: string;
+  collateral_kinds: CollateralKind[];
+  created_at: string;
+  id: string;
+  max_defaults?: number | null;
+  max_line_pence: Pence;
+  max_ltv_bps: number;
+  max_owed_pence?: null | Pence;
+  max_per_borrower_pence: Pence;
+  max_principal_pence: Pence;
+  max_term_game_days: number;
+  max_walk_aways: number;
+  min_loans_repaid: number;
+  min_principal_pence: Pence;
+  no_default_within_game_days?: number | null;
+  /** Principal outstanding on the line's loans, and escrowed in its open quotes. */
+  outstanding_pence: Pence;
+  quoted_pence: Pence;
+  rate_pct_of_goldsmiths_bps: number;
+  regions: BankingRegion[];
+  /** What it may still lend: `max_line_pence` less both. */
+  remaining_capacity_pence: Pence;
+  repayments: LoanRepayment[];
+  /** `open` or `withdrawn`. */
+  status: string;
+  withdraw_reason?: string | null;
+  withdrawn_at?: string | null;
+}
+
+/** `POST /v1/bank/lending-line/withdraw`. */
+export interface LendingLineAction {
+  line_id: string;
+}
+
+export interface LendingLineDetails {
+  allow_non_recourse: boolean;
+  bank_name: string;
+  collateral_kinds: CollateralKind[];
+  max_ltv_bps: number;
+  max_principal_pence: Pence;
+  max_term_game_days: number;
+  min_principal_pence: Pence;
+  /** Its rate as a share of the Goldsmiths' rate for the term, in bps. */
+  rate_pct_of_goldsmiths_bps: number;
+  /** Every region it lends in (the entry's `banking_region` is the first). */
+  regions: BankingRegion[];
+  /** What it may still lend. */
+  remaining_capacity_pence: Pence;
+  repayments: LoanRepayment[];
+}
+
+/** A line's terms: `POST /v1/bank/lending-line`, and in full again on `/update`. */
+export interface LendingLineTerms {
+  /** Whether you lend to a request asking for non-recourse. Default `false`. */
+  allow_non_recourse?: boolean;
+  /**
+   * Pledges it lends against: `ship_lien`, `warehouse_goods`, `contract_receivable`,
+   * `deposit` (only on deposits held with you) and/or `unsecured`.
+   */
+  collateral_kinds: CollateralKind[];
+  /**
+   * Credit filters, on the borrower's public record summed with its own and linked companies':
+   * most loans ever defaulted on (none: no limit).
+   */
+  max_defaults?: number | null;
+  /** Most this line has out: principal outstanding on its loans plus its open quotes. */
+  max_line_pence: PositivePence;
+  /**
+   * Most you lend against the pledge's appraisal, in bps (`1..=10000`; not applied to an
+   * unsecured request, nor to a deposit, which must cover the total repayable instead).
+   */
+  max_ltv_bps: number;
+  /** Most owed on loans now (none: no limit). */
+  max_owed_pence?: number | null;
+  /**
+   * Most you have out to one borrower and its own and linked companies together: loans
+   * outstanding from your bank plus its open line quotes to them.
+   */
+  max_per_borrower_pence: PositivePence;
+  max_principal_pence: PositivePence;
+  /** Longest term you lend for (`1..=360` game days). */
+  max_term_game_days: number;
+  /** Most loans walked away from (default `0`). */
+  max_walk_aways?: number | null;
+  /** Fewest loans repaid (default `0`). */
+  min_loans_repaid?: number | null;
+  /** Principal range you lend (at least 100 Cr). */
+  min_principal_pence: PositivePence;
+  /** No default within this many game days (`1..=3600`; none: no limit). */
+  no_default_within_game_days?: number | null;
+  /**
+   * Your rate as a share of the Goldsmiths' rate for the request's term, in bps
+   * (`1000..=30000`: 10% to 300%, the band every quote must lie in).
+   */
+  rate_pct_of_goldsmiths_bps: number;
+  /** Banking regions of the requests it lends on (the loan is paid and repaid there). */
+  regions: BankingRegion[];
+  /** `balloon` and/or `amortised`. */
+  repayments: LoanRepayment[];
 }
 
 export interface LetterOfMarque {
@@ -1990,7 +2186,7 @@ export interface LloydsQuoteResult {
   /** The estimate in pence of the sum insured (rounded up). */
   lloyds_expected_loss_pence: number;
   /**
-   * Lloyd's posted price: 2.5x the estimate plus 25 bps (1.75x for a hull rated for every leg's
+   * Lloyd's posted price: 1.25x the estimate plus 25 bps (1x for a hull rated for every leg's
    * water), rated on the policy's full 15 days to expiry. An **upper bound** on the hurdle Lloyd's applies when it looks, an hour or more
    * later (no harsher a season ahead), while piracy, guns and convoy stand: offer it and Lloyd's
    * writes what players leave of the policy, within its collateral caps (the listing's
@@ -2094,6 +2290,8 @@ export interface Loan {
    */
   is_mortgage: boolean;
   lender_company_id: string;
+  /** The bank's lending line that quoted it automatically, if one did. */
+  lending_line_id?: string | null;
   matures_at?: string | null;
   /**
    * When the next payment falls due and roughly how much it is (interest accrues until it is
@@ -2143,6 +2341,8 @@ export interface LoanActionRequest {
 export interface LoanQuote {
   /** Interest per 360 game days, in bps of the outstanding principal, fixed for the term. */
   annual_rate_bps: number;
+  /** Made by a bank's lending line on its own (`lending_line_id`), rather than quoted by hand. */
+  auto: boolean;
   banking_region: BankingRegion;
   borrower_company_id: string;
   /** A Goldsmiths' quote's ship. */
@@ -2153,6 +2353,7 @@ export interface LoanQuote {
   installment_pence?: null | Pence;
   lender_company_id: string;
   lender_name: string;
+  lending_line_id?: string | null;
   loan_id?: string | null;
   principal_pence: Pence;
   repayment: LoanRepayment;
@@ -2185,6 +2386,11 @@ export interface LoanRequestDetails {
 
 /** A request for quotes, as anyone sees it (`GET /v1/loan/requests`). */
 export interface LoanRequestView {
+  /**
+   * Whether the banks' lending lines (and the Goldsmiths, for a ship lien) may quote on it on
+   * their own.
+   */
+  auto_quote: boolean;
   banking_region: BankingRegion;
   borrower_company_id: string;
   borrower_name: string;
@@ -2767,6 +2973,11 @@ export interface PostEnvelopeRequest {
 
 /** `POST /v1/loan/request`. */
 export interface PostLoanRequest {
+  /**
+   * `false` keeps the request out of automatic quoting (the banks' lending lines and the
+   * Goldsmiths' answer to a ship lien); default `true`.
+   */
+  auto_quote?: boolean | null;
   /** The region whose vaults the loan is paid into and repaid from. */
   banking_region: BankingRegion;
   /**
@@ -2962,6 +3173,31 @@ export interface RelocateHomePortResult {
   next_relocation_at: string;
   relocated_at: string;
   to_port_id: PortId;
+}
+
+/** Who carried a remittance. */
+export type RemittanceCarrier = "crown" | "bank";
+
+/** `POST /v1/treasury/remit`: the ACH result's fields, plus who carried it. */
+export interface RemittanceResult {
+  /** The bank that carried it as a draft (`carried_by: bank` only). */
+  bank_company_id?: string | null;
+  bank_name?: string | null;
+  carried_by: RemittanceCarrier;
+  /**
+   * The Crown's ACH fee for the route when it was sent: on a draft, what the bank beat (the
+   * saving is `crown_fee_pence - fee_pence`); carried by the Crown, the fee itself.
+   */
+  crown_fee_bps: number;
+  crown_fee_pence: Pence;
+  /** The fee charged: the Crown's ACH fee, or the bank's posted fee less any client discount. */
+  fee_bps: number;
+  fee_pence: Pence;
+  from_region: BankingRegion;
+  gross_amount_pence: Pence;
+  net_credited_pence: Pence;
+  to_region: BankingRegion;
+  tx_group_id: string;
 }
 
 /** `POST /v1/loan/repay`. */
@@ -3633,6 +3869,20 @@ export interface UnderwritingFigures {
   underwriters: number;
 }
 
+/** Groups of one kind on one route that gave up waiting without a passage. */
+export interface UnmetRouteView {
+  band?: string | null;
+  dest_port_id: PortId;
+  /** Groups that gave up waiting unboarded within the window. */
+  groups: number;
+  /** Their heads. */
+  heads: number;
+  kind: PassengerKind;
+  origin_port_id: PortId;
+  /** Sea distance of the route (nm) over the zones open now. */
+  route_nm?: number | null;
+}
+
 export interface UnprovisionShipRequest {
   /** Where the provisions taken out of the stores go. */
   destination: StoresCounterpart;
@@ -3648,6 +3898,11 @@ export interface UpdateCompanySettingsRequest {
   auto_remit_for_bills?: boolean | null;
   auto_remit_min_reserve_pence?: null | Pence;
 }
+
+/** `POST /v1/bank/lending-line/update`: a line's terms, replaced in full. */
+export type UpdateLendingLine = LendingLineTerms & {
+  line_id: string;
+};
 
 export interface VaultBalanceResult {
   account_id: string;
@@ -3748,6 +4003,13 @@ export interface WaitingGroupView {
   id: string;
   kind: PassengerKind;
   origin_port_id: PortId;
+  /**
+   * Groups of this kind on this route (same origin and destination) that gave up waiting
+   * unboarded within the unmet-demand window (see `GET /v1/passengers/fares/summary`).
+   */
+  route_unmet_groups: number;
+  /** Their heads. */
+  route_unmet_heads: number;
   /** Heads in the group. It boards whole or not at all. */
   size: number;
 }
@@ -3788,6 +4050,13 @@ export interface WithdrawRequest {
   amount_pence?: null | PositivePence;
   deposit_id: string;
   to_region?: null | BankingRegion;
+}
+
+/** What `/withdraw` did. */
+export interface WithdrawnLine {
+  line: LendingLine;
+  /** Open quotes of the line released, their escrow refunded. */
+  quotes_released: number;
 }
 
 export interface WorldCatalogResult {

@@ -19,6 +19,8 @@ const MAX_EVENTS = 1000;
 
 const GROUPS: Array<{ label: string; match: string[] }> = [
   { label: "Ships", match: ["ship_", "voyage_hazard"] },
+  // Sales include the ship broker's buys (ship_sold) and the Crown's commissions for navy hulls.
+  { label: "Commissions & ship sales", match: ["commission_", "admiralty_commission_", "ship_listed", "ship_sold", "ship_broken_up"] },
   { label: "Passengers", match: ["passengers_"] },
   { label: "Convoys", match: ["convoy_"] },
   { label: "Market", match: ["order_filled", "maker_order_filled", "order_cancelled"] },
@@ -26,12 +28,17 @@ const GROUPS: Array<{ label: string; match: string[] }> = [
   { label: "Freight", match: ["freight_"] },
   { label: "Futures", match: ["futures_"] },
   { label: "Insurance", match: ["insurance_"] },
-  { label: "Loans & banks", match: ["loan_", "bank_"] },
+  { label: "Loans & banks", match: ["loan_", "bank_", "lending_line_"] },
+  // The NPC desks' co-investments, share buys and news buys arrive as the market's own events.
+  { label: "Ventures, shares & envelopes", match: ["venture_", "ship_shares_", "envelope_"] },
   {
     label: "Money",
-    match: ["company_upkeep_billed", "auto_remittance", "tax_and_fee_charged", "home_port_relocated", "crown_bailiff_", "company_bankruptcy_reset"],
+    match: ["company_upkeep_billed", "auto_remittance", "bank_draft", "tax_and_fee_charged", "home_port_relocated", "crown_bailiff_", "company_bankruptcy_reset"],
   },
-  { label: "World & piracy", match: ["world_event", "letter_of_marque_issued", "naval_patrol_funded", "marque_prize_paid", "patrol_prize_paid"] },
+  {
+    label: "World & piracy",
+    match: ["world_event", "letter_of_marque_issued", "naval_patrol_funded", "marque_prize_paid", "patrol_prize_paid", "admiralty_commission_"],
+  },
   { label: "Exchange & bulletin", match: ["exchange_posted", "bulletin_posted"] },
   { label: "Server", match: ["server_announcement"] },
 ];
@@ -155,6 +162,22 @@ function headline(e: S.StreamEvent, p: Payload, h: CatalogHelpers, shipName: (id
       return `${ship}: ${n("fare_paid_pence") !== undefined ? `${fmtCr(n("fare_paid_pence")!)} in fares paid` : "fares paid"}${n("game_days_late") ? `, ${n("game_days_late")} game day${n("game_days_late") === 1 ? "" : "s"} late` : ""}`;
     case "passengers_lost":
       return `${ship}: passengers lost unpaid${s("cause") ? ` (${s("cause")!.replace(/_/g, " ")})` : ""}`;
+    case "admiralty_commission_posted":
+      return `The Admiralty orders ${s("ship_class") ? `a ${h.shipClassName(s("ship_class")).toLowerCase()}` : "a navy hull"} at ${port}${n("price_pence") !== undefined ? ` for ${fmtCr(n("price_pence")!)}` : ""}`;
+    case "admiralty_commission_delivered":
+      return `${s("ship_name") ?? (s("ship_class") ? `A ${h.shipClassName(s("ship_class")).toLowerCase()}` : "A navy hull")} joined the Royal Navy at ${port}`;
+    case "charter_fill_dispatched":
+      return `The Merchant Adventurers sent ${n("quantity") !== undefined ? `${n("quantity")} t of ` : ""}${h.goodName(s("commodity_id"))} for your charter${s("source_port_id") ? ` from ${h.portName(s("source_port_id"))}` : ""}${s("arrives_at") ? `, landing ${fmtDateTime(s("arrives_at"))}` : ""}`;
+    case "bank_draft":
+      return `Bank draft${s("bank_name") ? ` by ${s("bank_name")}` : ""}: ${n("gross_amount_pence") !== undefined ? fmtCr(n("gross_amount_pence")!) : "a remittance"}${s("from_region") && s("to_region") ? ` ${s("from_region")!.replace(/_/g, " ")} → ${s("to_region")!.replace(/_/g, " ")}` : ""}${n("fee_pence") !== undefined ? `, fee ${fmtCr(n("fee_pence")!, 2)}` : ""}`;
+    case "lending_line_posted":
+      return `${s("bank_name") ?? "A bank"} posted a lending line${n("rate_pct_of_goldsmiths_bps") !== undefined ? ` at ${fmtBps(n("rate_pct_of_goldsmiths_bps")!)} of the Goldsmiths' rate` : ""}`;
+    case "lending_line_quoted":
+      return `Your lending line quoted${n("principal_pence") !== undefined ? ` ${fmtCr(n("principal_pence")!)}` : ""}${s("borrower_name") ? ` to ${s("borrower_name")}` : ""}${n("annual_rate_bps") !== undefined ? ` at ${fmtBps(n("annual_rate_bps")!)} a year` : ""}`;
+    case "lending_line_exhausted":
+      return "A lending line of yours has less room left than its smallest principal";
+    case "loan_quote_received":
+      return `${p.auto === true ? "Automatic quote" : "Quote"} on your loan request${s("lender_name") ? ` from ${s("lender_name")}` : ""}${n("annual_rate_bps") !== undefined ? ` at ${fmtBps(n("annual_rate_bps")!)} a year` : ""}`;
     case "home_port_relocated":
       return `Home port moved${s("from_port_id") ? ` from ${h.portName(s("from_port_id"))}` : ""}${s("to_port_id") ? ` to ${h.portName(s("to_port_id"))}` : ""}`;
     case "bulletin_posted":

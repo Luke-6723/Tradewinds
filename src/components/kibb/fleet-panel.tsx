@@ -759,6 +759,8 @@ export function FleetPanel() {
                 { label: "Cargo bought", value: fmtCr(t.spentPence) },
                 { label: "Delivered", value: fmtTons(t.deliveredTons), hint: `${t.trips} trip${t.trips === 1 ? "" : "s"}` },
                 { label: "Ships bought", value: t.shipsBought, hint: t.shipsBought ? fmtCr(t.shipSpendPence) : undefined },
+                // (drafts: absent from a manager older than bank drafts)
+                ...(t.drafts ? [{ label: "Draft savings", value: fmtCr(t.draftSavedPence ?? 0), hint: `${t.drafts} remittance${t.drafts === 1 ? "" : "s"} a bank carried under the Crown's fee` }] : []),
               ]}
             />
             <p className="text-muted-foreground text-xs">
@@ -1538,6 +1540,8 @@ function PassengersView({ p }: { p: PassengerReport }) {
         {p.offers.length === 1 ? "" : "s"} open
         {!p.enabled && " · off"}
         {p.blocked && " · offers refused for the key"}
+        {/* (summary: absent from a manager older than the fares summary) */}
+        {p.summary && p.summary.uncontested > 0 && ` · ${p.summary.uncontested} uncontested route${p.summary.uncontested === 1 ? "" : "s"} (offers open high)`}
       </summary>
       {p.blocked && <p className="mt-2 text-muted-foreground text-xs">Not offering for now: {p.blocked}.</p>}
       {p.aboard.length > 0 && (
@@ -1665,7 +1669,10 @@ function HousekeepingView({ h }: { h: HousekeepingReport }) {
                 ~{fmtCr(p.payoutPence)}
                 <div className="text-muted-foreground text-xs">of {fmtCr(p.rebuildPence)}</div>
               </td>
-              <td className="whitespace-nowrap text-xs">{p.listing ? `${fmtCr(p.listing.pricePence)} until ${fmtTime(p.listing.until)}` : "—"}</td>
+              <td className="whitespace-nowrap text-xs">
+                {p.listing ? `${fmtCr(p.listing.pricePence)} until ${fmtTime(p.listing.until)}` : "—"}
+                {p.listing?.step && p.listing.steps ? <div className="text-muted-foreground">price step {p.listing.step} of {p.listing.steps}, for the ship broker</div> : null}
+              </td>
             </tr>
           ))}
         </Table>

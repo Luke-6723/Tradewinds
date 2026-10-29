@@ -562,6 +562,11 @@ export interface ContractListing {
   funded_by?: CharterFunding | null;
   /** Commissions: the hull ordered (built at `origin_port_id`). Null otherwise. */
   ship_class?: string | null;
+  /**
+   * Commissions: ordered by the Admiralty (guide 3.4), no buyer company: paid by the yard region's Crown on delivery, the hull joins
+   * the Royal Navy; one taken at a time across a player's companies. Absent from older listings (then in `metadata`, if at all).
+   */
+  admiralty?: boolean | null;
   /** True when this is second-hand news; `remaining_quantity` may be out of date. */
   stale: boolean;
   gossip?: { age_seconds: number; heard_at_port_id: string; news_as_of: string } | null;
@@ -699,9 +704,19 @@ export interface RemitResult {
   from_region: BankingRegion;
   to_region: BankingRegion;
   gross_amount_pence: number;
+  /** The fee charged: the Crown's, or the carrying bank's posted fee less any client discount (guide 3.12 bank drafts). */
   fee_bps: number;
   fee_pence: number;
   net_credited_pence: number;
+  /** Who carried it: the Crown, or a bank as a draft (cheaper than the Crown's fee and with the cash at the destination). */
+  carried_by?: "crown" | "bank";
+  bank_company_id?: string | null;
+  bank_name?: string | null;
+  /** What the Crown charged, or would have on the route then: on a draft the saving is `crown_fee_pence - fee_pence`. */
+  crown_fee_bps?: number;
+  crown_fee_pence?: number;
+  /** The ledger's transaction group (a draft's `bank_draft` notice may name it). */
+  tx_group_id?: string;
 }
 
 export interface VaultBalance {

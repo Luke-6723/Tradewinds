@@ -9,7 +9,9 @@
  *            their value at what the goods would fetch if they are gone;
  *   market   goods bought at S and sold to D's buyers at the last bid seen there (a live book, or
  *            coffee-house gossip marked down for its age), less the drop selling the load causes;
- *   freight  Merchant Adventurers lots listed at the ship's own port, carried sealed to D.
+ *   freight  Merchant Adventurers lots listed at the ship's own port, carried sealed to D (return freight, paid by
+ *            the Crown, among them: its sealed cargo is worth nothing, so it draws no raid; only the collateral and
+ *            the reward go down with the ship).
  *
  * Whatever room and cash the first choice leaves is filled ("mixed loads") with other goods S sells
  * that D's charters or buyers want, best margin per ton first, and with freight lots from S to D.
@@ -46,7 +48,7 @@
  */
 
 import type { RoutePlan, ZoneClass } from "../types";
-import { BID_HAIRCUT_BASE, PROVISIONAL_PREFIX, type CharterInfo, type World } from "./world";
+import { BID_HAIRCUT_BASE, freightLoot, PROVISIONAL_PREFIX, type CharterInfo, type World } from "./world";
 
 export interface ShipSpec {
   shipClass: string;
@@ -94,6 +96,8 @@ export interface FreightPick {
   tons: number;
   reward: number;
   collateral: number;
+  /** Return freight (guide 3.8, Crown-funded): worth nothing to pirates (world.ts freightLoot). Absent on older saves: an ordinary lot. */
+  ret?: boolean;
 }
 
 export interface Lane {
@@ -636,10 +640,14 @@ function marketPart(ctx: Ctx, a: PartArgs): Part | null {
   };
 }
 
-/** Freight lots at `source` for `dest`, best reward per ton first, packed into the room and cash. */
+/**
+ * Freight lots at `source` for `dest`, best reward per ton first, packed into the room and cash. Return freight (guide 3.8) only
+ * while our companies' cap on it hasn't refused one lately (world.returnBlocked).
+ */
 function freightPicks(ctx: Ctx, source: string, dest: string, room: number, cash: number): FreightPick[] {
   const { world, res } = ctx;
   if (!ctx.opts.freight) return [];
+  const retOk = !world.returnBlocked();
   const lots = world.freight
     .filter(
       (f) =>
@@ -649,13 +657,14 @@ function freightPicks(ctx: Ctx, source: string, dest: string, room: number, cash
         // Never lots any of our player's companies issued (refused as same-player dealing).
         !world.ownIssued(f) &&
         (f.expiresAt === null || f.expiresAt >= ctx.now) &&
-        f.tons > 0,
+        f.tons > 0 &&
+        (retOk || !f.ret),
     )
     .sort((a, b) => b.reward / b.tons - a.reward / a.tons);
   const picks: FreightPick[] = [];
   for (const f of lots) {
     if (f.tons > room || f.collateral > cash) continue;
-    picks.push({ id: f.id, good: f.good, tons: f.tons, reward: f.reward, collateral: f.collateral });
+    picks.push({ id: f.id, good: f.good, tons: f.tons, reward: f.reward, collateral: f.collateral, ...(f.ret ? { ret: true } : {}) });
     room -= f.tons;
     cash -= f.collateral;
   }
@@ -686,11 +695,11 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   if (banZ?.size && (zones.some((z) => banZ.has(z)) || dead?.legs.some((l) => banZ.has(world.hazardZone(l.to_node)?.id ?? "")))) return null;
 
   // Pirates go for the richest prizes. To price the goods, a first guess: the hold full of the main
-  // good at its base price (freight: the lots here at about three times their collateral). The
-  // load actually chosen is re-judged below.
+  // good at its base price (freight: the lots here at about three times their collateral; return
+  // freight at nothing, guide 3.8). The load actually chosen is re-judged below.
   const guessValue =
     primary.kind === "freight"
-      ? world.freight.filter((f) => f.origin === source && f.dest === dest && !ctx.res.freightIds.has(f.id)).reduce((n, f) => n + 3 * f.collateral, 0)
+      ? world.freight.filter((f) => f.origin === source && f.dest === dest && !ctx.res.freightIds.has(f.id)).reduce((n, f) => n + freightLoot(f), 0)
       : ship.cap * world.basePrice(primary.good);
   const piracy = world.piracyRisk(out, ship.guns, ship.knots * 0.8, guessValue).cargoShare;
   const deadMs = dead ? world.sailMs(dead.total_distance_nm, ship.knots) : 0;
@@ -793,8 +802,8 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const dues = world.berthDuesFor(source, loadMs, from !== source) + world.berthDuesFor(dest, unloadMs);
 
   // The load as chosen, as the pirates see it: its share lost (captures included) and the chance
-  // of losing the ship itself, at what it would cost to replace.
-  const lootValue = parts.reduce((n, p) => n + p.tons * world.basePrice(p.good), 0) + freight.reduce((n, f) => n + 3 * f.collateral, 0);
+  // of losing the ship itself, at what it would cost to replace. Return freight draws no raid.
+  const lootValue = parts.reduce((n, p) => n + p.tons * world.basePrice(p.good), 0) + freight.reduce((n, f) => n + freightLoot(f), 0);
   const risk = world.piracyRisk(out, ship.guns, ship.knots * 0.8, lootValue);
   const kept = (1 - risk.cargoShare) * (1 - storm.cargoShare);
   const captureCost = risk.capture * (ship.hullValue ?? 0);

@@ -30,6 +30,7 @@ import type { BankingRegion, ContractListing, DeliverCharterResult, OrderBookLev
 import type { FleetSettings } from "./manager";
 import {
   aboardOf,
+  bandReference,
   berthsFor,
   fareFor,
   fillHeads,
@@ -49,7 +50,7 @@ import {
   type PaxOffer,
 } from "./passengers";
 import { cargoLane, minLoadTons, REPOST_GRACE_GAME_MIN, type FreightPick, type Lane, type Part, type StallStake } from "./planner";
-import type { World } from "./world";
+import { freightLoot, isReturnFreight, returnLotStake, type World } from "./world";
 
 const POLL_MS              = 15_000;
 const MAX_SAIL_SLEEP_MS    = 60_000;
@@ -322,6 +323,12 @@ export interface CarriedFreight {
   blockedAt?: number;
   /** Delivery was rejected outright: keep counting the sealed tons, stop sailing for it. */
   undeliverable?: boolean;
+  /**
+   * Return freight (guide 3.8, Crown-funded): sealed tons labelled as a cheap local export that are no real goods (they leave the
+   * hold on delivery and never touch a market or warehouse), worth nothing to pirates, storms or insurance; only the collateral and
+   * the reward go down with the ship. Absent: an ordinary lot (older saves too).
+   */
+  ret?: boolean;
 }
 
 export interface AgentState {
@@ -1071,6 +1078,8 @@ export class ShipAgent {
             const f = this.freight.get(id)!;
             this.log(`freight to ${f.dest} is no longer active; treating the ${f.tons} t ${f.good} as settled`);
             this.freight.delete(id);
+            // A return lot of ours settled: room under our companies' cap again (guide 3.8).
+            if (f.ret) this.host.world.noteReturnDelivered();
           }
         }
         this.listedFreight.clear();
@@ -1092,7 +1101,13 @@ export class ShipAgent {
   }
 
   private trackFreight(c: ContractListing): void {
-    if (!c.dest_port_id || !c.commodity_id || this.freight.has(c.id)) return;
+    if (!c.dest_port_id || !c.commodity_id) return;
+    const had = this.freight.get(c.id);
+    // Return freight taken before it was flagged (an older save, an answer lost): the server's record says so.
+    if (had) {
+      if (!had.ret && isReturnFreight(c)) had.ret = true;
+      return;
+    }
     this.freight.set(c.id, {
       dest: c.dest_port_id,
       good: c.commodity_id,
@@ -1101,7 +1116,33 @@ export class ShipAgent {
       collateral: c.collateral_pence,
       deadline: c.expires_at ?? null,
       origin: c.origin_port_id || undefined,
+      ...(isReturnFreight(c) ? { ret: true } : {}),
     });
+  }
+
+  /** Tons of return freight aboard (of `good`, if given): sealed, worth nothing (guide 3.8), never ours to sell or count as cargo value. */
+  returnTons(good?: string): number {
+    let t = 0;
+    for (const f of this.freight.values()) if (f.ret && (good === undefined || f.good === good)) t += f.tons;
+    return t;
+  }
+
+  /**
+   * What a hold as read is worth to pirates and storms (pence, at base prices): every stack aboard but return freight, which no raid
+   * or storm touches (guide 3.8). Ordinary sealed freight counts at its goods' value, as it did.
+   */
+  lootValue(r: ShipResult, basePrice: (good: string) => number): number {
+    return Object.entries(r.cargo_manifest).reduce((n, [g, t]) => n + Math.max(0, t - this.returnTons(g)) * basePrice(g), 0);
+  }
+
+  /**
+   * What the return freight aboard stakes on the hull (pence): each lot's reward and collateral, lost with her if she sinks or is
+   * taken (guide 3.8), though it draws no raid and no storm touches it otherwise (lootValue leaves it out).
+   */
+  returnStake(): number {
+    let n = 0;
+    for (const f of this.freight.values()) n += returnLotStake(f);
+    return n;
   }
 
   /** The freight destination to make for next: earliest deadline first (not one found over unrated water lately). */
@@ -1271,14 +1312,19 @@ export class ShipAgent {
 
     let perHead: number;
     let why: string;
+    let open = false;
     if (had && had.port === port) {
       perHead = had.perHead;
+      open = !!had.open;
       why = "posted again from where she now lies";
     } else {
       const q = await this.paxFare(port, dest, groups, berths, plan, r);
       if (!q) return;
       perHead = q.perHead;
-      why = `${q.heads} of ${groups.reduce((n, g) => n + g.size, 0)} heads waiting would fit; ${q.basis} ${cr(q.ref)}/head`;
+      open = q.open;
+      why =
+        `${q.heads} of ${groups.reduce((n, g) => n + g.size, 0)} heads waiting would fit; ${q.basis} ${cr(q.ref)}/head` +
+        `${q.open ? `; groups give up unboarded on this route and nobody competes for them, so ${q.high ? "opened high over that" : "asked at that"} on the route's uncontested level, a step lower each unfilled round` : ""}`;
     }
     // What a loss at sea costs the fares (a sinking, a capture; Lloyd's never insures them): the share expected to land.
     const value = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0) + fillHeads(groups, berths) * perHead;
@@ -1300,6 +1346,7 @@ export class ShipAgent {
         at: now,
         until,
         kept,
+        ...(open ? { open: true } : {}),
       });
       this.paxKept = { dest, kept };
       this.host.persist();
@@ -1313,13 +1360,16 @@ export class ShipAgent {
         return;
       }
       // One open offer per ship and destination (409), or no answer (it may have landed): ours may stand already.
-      if ((outcomeUnknown(e) || (isApiError(e) && e.status === 409)) && (await this.adoptOffer(r, dest, until, kept))) return;
+      if ((outcomeUnknown(e) || (isApiError(e) && e.status === 409)) && (await this.adoptOffer(r, dest, until, kept, open ? perHead : undefined))) return;
       this.logOnce(`pax-post:${stay.key}:${dest}`, `passenger offer for ${dest} not posted: ${(e as Error).message}`);
     }
   }
 
-  /** An open offer of ours here for `dest` found on the server (after a 409 or no answer): kept as ours. Whether one was. */
-  private async adoptOffer(r: ShipResult, dest: string, until: number, kept: number): Promise<boolean> {
+  /**
+   * An open offer of ours here for `dest` found on the server (after a 409 or no answer): kept as ours. Whether one was. `openAt`:
+   * the uncontested ask just sent; the offer found at that fare is that one (its rounds teach the route's uncontested level).
+   */
+  private async adoptOffer(r: ShipResult, dest: string, until: number, kept: number, openAt?: number): Promise<boolean> {
     const port = r.ship.current_port_id;
     const list = await this.host.client.passengerOffers(true, { ship_id: this.shipId }).catch((e: unknown) => {
       soft(e);
@@ -1339,6 +1389,7 @@ export class ShipAgent {
       at: Number.isFinite(at) ? at : this.host.world.now(),
       until,
       kept,
+      ...(openAt !== undefined && o.fare_per_head_pence === openAt ? { open: true } : {}),
     });
     this.host.persist();
     return true;
@@ -1346,21 +1397,43 @@ export class ShipAgent {
 
   /**
    * The fare per head to ask on `port` → `dest` for these groups (passengers.ts fareFor): the route's recent median by kind, else
-   * the world's per sea mile times this passage; never under what the weight of the berths costs in sailing time at this ship's
-   * rate. Null (said once a stay): no fare seen anywhere yet, or none the groups would take over that floor.
+   * the median of its length band on the fares summary (guide 3.20 item 9: like with like), else the world's per sea mile times
+   * this passage; where the route is uncontested for a kind (groups of it gave up unboarded lately: `route_unmet_groups`, or the
+   * summary's `unmet` list) on the route's uncontested level, opened high over a band's or the world's median (`high`) but never
+   * over the route's own (the fares groups took there, our learned asks already), a little under the reference elsewhere; never
+   * under what the weight of the berths costs in sailing time at this ship's rate. Null (said once a stay): no fare seen anywhere
+   * yet, or none the groups would take over that floor.
    */
-  private async paxFare(port: string, dest: string, groups: WaitingGroupView[], berths: number, plan: RoutePlan, r: ShipResult): Promise<{ perHead: number; heads: number; ref: number; basis: string } | null> {
+  private async paxFare(
+    port: string,
+    dest: string,
+    groups: WaitingGroupView[],
+    berths: number,
+    plan: RoutePlan,
+    r: ShipResult,
+  ): Promise<{ perHead: number; heads: number; ref: number; basis: string; open: boolean; high: boolean } | null> {
     const { world } = this.host;
     const now = world.now();
     const since = now - PAX_RECENT_GAME_DAYS * 24 * 60 * world.gameMinuteMs;
     const records = await world.routeFares(port, dest);
     const refs = new Map<PassengerKind, number>();
     const basis = new Map<PassengerKind, string>();
+    // Kinds whose reference is the route's own median.
+    const ownRef = new Set<PassengerKind>();
+    // The route's band as a fare on it counted (the server's own length), else our sea distance for the passage.
+    const routeBand = records.find((f) => f.origin_port_id === port && f.dest_port_id === dest && f.band)?.band ?? null;
     for (const kind of new Set(groups.map((g) => g.kind))) {
       const own = routeReference(records, port, dest, kind, since) ?? routeReference(records, port, dest, undefined, since);
       if (own) {
         refs.set(kind, own.perHead);
+        ownRef.add(kind);
         basis.set(kind, `${kind} have paid a median of`);
+        continue;
+      }
+      const band = bandReference(world.fareSummary.bands, routeBand, plan.total_distance_nm);
+      if (band) {
+        refs.set(kind, band.perHead);
+        basis.set(kind, `fares on ${band.band} passages have a median of`);
         continue;
       }
       const rate = await this.farePerNm(kind);
@@ -1383,12 +1456,18 @@ export class ShipAgent {
     const extra = weightMs(plan.total_distance_nm, knots * 0.8, fill, berths / perTon / cap, (nm, k) => world.sailMs(nm, k));
     const floor = ((extra / 3_600_000) * this.ratePerHour) / Math.max(berths, 1);
     const refKnots = median(world.catalog.ship_classes.map((c) => c.base_speed_centiknots / 100)) ?? knots;
-    const q = fareFor({ refs, groups, berths, floor, adj: world.paxRoute(routeKey(port, dest))?.adj ?? 1, speed: speedFactor(knots, refKnots) });
+    // Nobody competing for a kind here (guide 3.20 item 9): groups of it on this route gave up waiting unboarded lately.
+    const open = new Set<PassengerKind>();
+    for (const kind of refs.keys()) {
+      if (groups.some((g) => g.kind === kind && (g.route_unmet_groups ?? 0) > 0) || world.paxUnmet(port, dest, kind)) open.add(kind);
+    }
+    const route = world.paxRoute(routeKey(port, dest));
+    const q = fareFor({ refs, groups, berths, floor, adj: route?.adj ?? 1, adjOpen: route?.adjOpen, speed: speedFactor(knots, refKnots), open, own: ownRef, win: winChance(route) });
     if (!q) {
       this.logOnce(key, `not offering berths for ${dest}: the weight's sailing time costs ${cr(floor)}/head, more than groups there have paid`);
       return null;
     }
-    return { ...q, basis: basis.get(q.kind) ?? "the reference" };
+    return { ...q, basis: basis.get(q.kind) ?? "the reference", high: q.open && !ownRef.has(q.kind) };
   }
 
   /**
@@ -1455,11 +1534,16 @@ export class ShipAgent {
     return waitMs;
   }
 
-  /** A round our offer stood through with groups it could take still waiting, and none boarded: its route's fare is nudged down. */
+  /**
+   * A round our offer stood through with groups it could take still waiting, and none boarded: its route's fare is nudged down (for
+   * an uncontested ask its own level, a step lower and faster).
+   */
   private settleOffer(o: PaxOffer): void {
     const { world } = this.host;
     const round = world.nextGameHour(o.at);
-    if (o.taken === 0 && round !== null && round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs <= world.now() && o.until > round) world.notePaxRound(routeKey(o.port, o.dest), false);
+    if (o.taken === 0 && round !== null && round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs <= world.now() && o.until > round) {
+      world.notePaxRound(routeKey(o.port, o.dest), false, world.now(), !!o.open);
+    }
   }
 
   /** She sailed: the server closed our offers where she lay (each settled for the pricer). */
@@ -1521,7 +1605,8 @@ export class ShipAgent {
     const o = (g.offerId ? [...this.offers.values()].find((x) => x.id === g.offerId) : undefined) ?? (g.dest ? this.offers.get(g.dest) : undefined);
     if (o) {
       o.taken += g.size ?? 0;
-      world.notePaxRound(routeKey(o.port, o.dest), true);
+      // Up the level the offer was priced on (uncontested or contested), never the other.
+      world.notePaxRound(routeKey(o.port, o.dest), true, world.now(), !!o.open);
     }
     if (!g.id || !g.dest || !(g.size && g.size > 0)) {
       this.paxSynced = false;
@@ -2915,7 +3000,9 @@ export class ShipAgent {
     let cashShort = false;
     for (const f of lane.freight) {
       if (this.freight.has(f.id) || f.tons > room) continue;
-      const res = await this.acceptFreightLot(port, f.id, f.collateral, r, lane);
+      // Return freight refused for our companies' cap since the lane was planned: left (the lane carries on without it).
+      if (f.ret && this.host.world.returnBlocked()) continue;
+      const res = await this.acceptFreightLot(port, f.id, f.collateral, r, lane, !!f.ret);
       if (typeof res === "object") return { taken, cashShort, stop: { p: res.insured } };
       if (res === "taken") {
         taken++;
@@ -2928,6 +3015,8 @@ export class ShipAgent {
   /**
    * Accepts one freight lot onto this ship (collateral from the port's region). Never once a policy is on her
    * (read afresh: freight loaded after it is written voids it); `insured` then says which (undefined: unknown).
+   * `ret`: return freight (guide 3.8), kept flagged aboard; a 409 on it is our companies' cap on return lots (unless it
+   * says the lot is gone), so none is planned or taken fleet-wide for a while instead of dropping lots one by one.
    */
   private async acceptFreightLot(
     port: string,
@@ -2935,6 +3024,7 @@ export class ShipAgent {
     collateral: number,
     r: ShipResult,
     lane: Lane | null,
+    ret = false,
   ): Promise<"taken" | "cash" | "no" | { insured: InsurancePolicy | undefined }> {
     const { client, world } = this.host;
     const policy = await this.policyNow();
@@ -2952,6 +3042,7 @@ export class ShipAgent {
           deadline: res.delivery_deadline,
           collateral: res.collateral_pence,
           origin: res.origin_port_id || port,
+          ...(ret ? { ret: true } : {}),
         });
         world.dropFreight(id);
         world.vaults.set(world.region(port), world.vault(world.region(port)) - res.collateral_pence);
@@ -2961,7 +3052,10 @@ export class ShipAgent {
           trip.freightIds.add(id);
           trip.tons += res.quantity;
         }
-        this.log(`took freight: ${res.quantity} t ${res.commodity_id} ${port} → ${res.dest_port_id} for ${cr(res.reward_pence)} (collateral ${cr(res.collateral_pence)})`);
+        this.log(
+          `took ${ret ? "return freight (the Crown's)" : "freight"}: ${res.quantity} t ${res.commodity_id} ${port} → ${res.dest_port_id} for ${cr(res.reward_pence)} (collateral ${cr(res.collateral_pence)})` +
+            `${ret ? "; sealed and worth nothing aboard, only the collateral and the reward ride on the hull" : ""}`,
+        );
         return "taken";
       } catch (e) {
         soft(e);
@@ -2973,6 +3067,15 @@ export class ShipAgent {
         // Rate limited (nothing ran): the lot is still there for a later tick.
         if (isApiError(e) && e.status === 429) throw e;
         world.dropFreight(id);
+        // Our companies carry as many return lots as one owner may (guide 3.8: 409 beyond): no ship tries another for a while. Only a
+        // 409 that says the lot itself is gone (taken, closed) is left as that.
+        const said = isApiError(e) ? `${e.code ?? ""} ${e.detail} ${e.message}` : "";
+        const capped = /\bcap\b|limit|at a time|too many|maximum/i.test(said) || !(CLOSED_RE.test(said) || /\b(?:taken|accepted)\b/i.test(said));
+        if (ret && isApiError(e) && e.status === 409 && capped) {
+          world.noteReturnCap();
+          this.log(`return freight ${id.slice(0, 8)} not taken (${e.detail || e.message}): our companies carry as many return lots as they may; none tried fleet-wide until one is delivered or a game day passes`);
+          return "no";
+        }
         this.log(`freight ${id.slice(0, 8)} not taken: ${(e as Error).message}`);
         return "no";
       }
@@ -3318,8 +3421,10 @@ export class ShipAgent {
       world.vaults.set(back, world.vault(back) + (res.collateral_returned_pence ?? 0));
       void world.refreshVaults().catch(() => undefined);
       if (this.trip?.freightIds.has(id)) this.trip.reward += res.reward_paid_pence;
+      // A return lot delivered (guide 3.8): its sealed tons simply leave the hold, and our companies have room under the cap again.
+      if (f.ret) world.noteReturnDelivered();
       this.host.cashArrived();
-      this.log(`delivered freight: ${res.delivered_quantity} t ${f.good} at ${f.dest} for ${cr(res.reward_paid_pence)}`);
+      this.log(`delivered ${f.ret ? "return freight" : "freight"}: ${res.delivered_quantity} t ${f.good} at ${f.dest} for ${cr(res.reward_paid_pence)}`);
       return "delivered";
     } catch (e) {
       if (!(e instanceof KibbApiError) || e.status >= 500) throw e;
@@ -3393,14 +3498,19 @@ export class ShipAgent {
     const aboard =
       Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0) +
       this.contrabandAboard(r).reduce((n, [g, t]) => n + t * world.basePrice(g), 0);
+    const retBlocked = world.returnBlocked();
     const candidates = listings
       // Never lots any of our player's companies issued (same-player dealing is refused, guide 4.2).
       .filter((c) => c.origin_port_id === port && c.dest_port_id === next && !c.stale && !world.ownIssued({ issuer: c.issuer_company_id }))
+      // Return freight not while our companies' cap on it refused one lately (guide 3.8).
+      .filter((c) => !retBlocked || !isReturnFreight(c))
       // Paid only if it lands before the season ends (guide 3.11): loaded, sailed, and the base lock there cleared.
       .filter((c) => world.beforeSeasonEnd(sailsAt + c.quantity_required * handling + sailMs + 30 * world.gameMinuteMs))
       .map((c) => {
         // Sealed freight goes down with the ship (a sinking or a capture): reward unearned, collateral forfeit (as the planner prices it).
-        const lost = Math.min(1, world.piracyRisk(plan, r.ship.cannons_count, knots, aboard + 3 * c.collateral_pence).capture + storm.sink);
+        // Return freight draws no raid of its own (worth nothing aboard), but is lost with the hull all the same.
+        const loot = freightLoot({ collateral: c.collateral_pence, ret: isReturnFreight(c) });
+        const lost = Math.min(1, world.piracyRisk(plan, r.ship.cannons_count, knots, aboard + loot).capture + storm.sink);
         return { c, value: c.reward_pence * (1 - lost) - c.collateral_pence * lost - c.quantity_required * handling * profitPerMs };
       })
       .filter((x) => x.value > 0)
@@ -3412,8 +3522,11 @@ export class ShipAgent {
 
     for (const { c } of candidates) {
       if (c.quantity_required > room || this.host.freightClaimed(this, c.id)) continue;
+      const ret = isReturnFreight(c);
+      // One refused for the cap a moment ago, by this ship or another: the rest are left alone.
+      if (ret && world.returnBlocked()) continue;
       const lane = this.lane && this.lane.dest === next ? this.lane : null;
-      const res = await this.acceptFreightLot(port, c.id, c.collateral_pence, r, lane);
+      const res = await this.acceptFreightLot(port, c.id, c.collateral_pence, r, lane, ret);
       if (typeof res === "object") return;
       if (res === "taken") room -= c.quantity_required;
     }

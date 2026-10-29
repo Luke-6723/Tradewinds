@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
 import { CommissionsView } from "@/components/kibb/commissions";
-import { CHARTER } from "@/components/kibb/deals-common";
+import { CHARTER, RETURN_FREIGHT_NOTE, ReturnFreightBadge, isReturnFreight } from "@/components/kibb/deals-common";
 import { CashLine, crToPence, firstProblem, regionName, useRegionOf, useVaults } from "@/components/kibb/finance-common";
 import { Checkbox } from "@/components/kibb/naval-common";
 import { Field, GoodSelect, PortSelect, ShipSelect } from "@/components/kibb/pickers";
@@ -569,7 +569,14 @@ function FreightTab({
                     </td>
                     <td>{portName(c.origin_port_id)}</td>
                     <td>{portName(c.dest_port_id)}</td>
-                    <td className="font-medium">{goodName(c.commodity_id)}</td>
+                    <td>
+                      <span className="font-medium">{goodName(c.commodity_id)}</span>
+                      {isReturnFreight(c) && (
+                        <div className="mt-0.5">
+                          <ReturnFreightBadge />
+                        </div>
+                      )}
+                    </td>
                     <td className="tabular-nums">{fmtTons(c.quantity_required)}</td>
                     <td className="tabular-nums">{fmtCr(c.reward_pence)}</td>
                     <td className="text-muted-foreground tabular-nums">{fmtCr(payPerTon(c), 2)}</td>
@@ -581,6 +588,7 @@ function FreightTab({
             </Table>
           )}
           <LoadMore done={open.done} loading={open.loading} onMore={() => void open.more()} />
+          {listings.some(isReturnFreight) && <p className="text-muted-foreground text-xs">{RETURN_FREIGHT_NOTE}</p>}
         </div>
       </Panel>
 
@@ -618,6 +626,12 @@ function FreightTab({
               </p>
             )}
             {planned.some((c) => autopilot.has(plan[c.id])) && <AutopilotWarning shipName="one of these ships" />}
+            {planned.some(isReturnFreight) && (
+              <p className="text-muted-foreground text-xs">
+                Return freight (Crown) among these: its cargo is a sealed token worth nothing (no insurance or prize value), but default still forfeits the
+                collateral. Only a few return lots at a time per owner and linked companies: one beyond that is refused (409).
+              </p>
+            )}
             <ErrorNote error={accept.error} />
             {accept.result && (
               <p className="text-sm">
@@ -660,7 +674,14 @@ function FreightTab({
                 const there = !!r && AT_PORT.has(r.ship.status) && r.ship.current_port_id === c.dest_port_id;
                 return (
                   <tr key={c.id}>
-                    <td className="font-medium">{goodName(c.commodity_id)}</td>
+                    <td>
+                      <span className="font-medium">{goodName(c.commodity_id)}</span>
+                      {isReturnFreight(c) && (
+                        <div className="mt-0.5">
+                          <ReturnFreightBadge />
+                        </div>
+                      )}
+                    </td>
                     <td className="tabular-nums">{fmtTons(c.quantity_required)}</td>
                     <td>
                       {portName(c.origin_port_id)} → {portName(c.dest_port_id)}

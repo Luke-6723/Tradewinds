@@ -58,6 +58,31 @@ export const BANK = {
   clientBonusMaxBps: 50,
 } as const;
 
+/**
+ * Lending lines (guide 3.13.8): a rate of 10%..=300% of the Goldsmiths' rate for each request's term (1000..=30000 bps of it),
+ * loan-to-value 1..=10000 bps, terms up to 360 game days, principal at least 100 Cr, "no default within" 1..=3600 game days.
+ * A line's quote stands 6 game hours at most.
+ */
+export const LINE = {
+  rateMinBps: 1_000,
+  rateMaxBps: 30_000,
+  ltvMaxBps: 10_000,
+  termMaxDays: 360,
+  minPrincipalPence: 10_000,
+  noDefaultMaxDays: 3_600,
+  quoteGameHours: 6,
+} as const;
+
+/** "60% of the Goldsmiths'": a lending line's rate, as a share of the Goldsmiths' rate for the term. */
+export const lineRateText = (bps: number) => `${(bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}% of the Goldsmiths'`;
+
+/** A bank's best lending-line rate per pledge (`lending_line_best_rates`), cheapest first, in words; "" for none. */
+export const bestRatesText = (rates: Record<string, number> | null | undefined) =>
+  Object.entries(rates ?? {})
+    .sort((a, b) => a[1] - b[1])
+    .map(([k, bps]) => `${COLLATERAL_LABEL[k as S.CollateralKind] ?? k.replace(/_/g, " ")} ${(bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%`)
+    .join(", ");
+
 /** Ventures: investors take 25%..=90% of the profit after 2% stamp duty; raise 1..=168 game hours (default 24); stakes ≥ 10 Cr. */
 export const VENTURE = { shareMinBps: 2_500, shareMaxBps: 9_000, stampDutyBps: 200, raiseHoursMax: 168, raiseHoursDefault: 24, minStakePence: 1_000 } as const;
 
@@ -366,6 +391,16 @@ export function MortgageBadge({ loan }: { loan: Pick<S.Loan, "is_mortgage"> }) {
   return (
     <Badge variant="info" size="sm" title="A Goldsmiths' ship mortgage taken with a build: a lien on the new ship with recourse, amortised over 180 game days; one at a time">
       mortgage
+    </Badge>
+  );
+}
+
+/** A loan a bank's lending line quoted on its own (guide 3.13.8: `lending_line_id`). */
+export function LendingLineBadge({ loan }: { loan: Pick<S.Loan, "lending_line_id"> }) {
+  if (!loan.lending_line_id) return null;
+  return (
+    <Badge variant="outline" size="sm" title={`Quoted on its own by the bank's lending line ${shortId(loan.lending_line_id)}`}>
+      lending line
     </Badge>
   );
 }

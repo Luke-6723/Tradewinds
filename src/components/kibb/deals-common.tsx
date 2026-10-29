@@ -81,6 +81,44 @@ export function ageText(seconds: number | null | undefined): string {
   return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
+/** A contract's raw record (`metadata`), when it is an object. */
+const metaOf = (c: { metadata?: unknown }) => (c.metadata && typeof c.metadata === "object" ? (c.metadata as Record<string, unknown>) : {});
+
+/**
+ * An Admiralty commission (guide 3.4): the Crown orders a navy hull, so there is no buyer. `admiralty` on the listing or its
+ * raw record, or a commission with no issuer.
+ */
+export const isAdmiralty = (c: { contract_type?: string; issuer_company_id?: string | null; metadata?: unknown; admiralty?: boolean }) =>
+  c.admiralty === true || metaOf(c).admiralty === true || (c.contract_type === "commission" && !c.issuer_company_id);
+
+/** Return freight (guide 3.8): a Merchant Adventurers' lot for the trip home, paid by the Crown (`funded_by: crown`). */
+export const isReturnFreight = (c: { contract_type?: string; funded_by?: string | null; metadata?: unknown }) =>
+  c.contract_type === "freight" && (c.funded_by === "crown" || metaOf(c).funded_by === "crown");
+
+export const ADMIRALTY_NOTE =
+  "An Admiralty commission: the Crown orders a navy hull and pays a little over its rebuild value into your vault in the yard's region on delivery. There is no buyer: the hull joins the Royal Navy and patrols the yard's waters for a while. Taking it escrows a deposit (its collateral), forfeited to the Crown if the deadline passes undelivered. You, counting your own and linked companies, may hold only one taken at a time, and it can't be financed. Building from your own materials is usually what makes it pay.";
+
+export const RETURN_FREIGHT_NOTE =
+  "Return freight: a lot for the trip home, paid by the Crown at a fixed rate by distance and sized for a big hold. The cargo isn't real goods: it appears sealed in the hold, labelled as a cheap local export, and simply leaves on delivery. It is worth nothing (no insurance, prize or salvage value; storms and pirates leave it alone, though it goes down with the ship), but the usual collateral is forfeited on default. One owner with its linked companies may carry only a few lots at a time.";
+
+/** "Admiralty" on a commission the Crown ordered, with the rules as a tooltip. */
+export function AdmiraltyBadge() {
+  return (
+    <Badge variant="warning" size="sm" title={ADMIRALTY_NOTE}>
+      Admiralty
+    </Badge>
+  );
+}
+
+/** "Return freight (Crown)" on a Crown-paid freight lot, with what that means as a tooltip. */
+export function ReturnFreightBadge() {
+  return (
+    <Badge variant="info" size="sm" title={RETURN_FREIGHT_NOTE}>
+      Return freight (Crown)
+    </Badge>
+  );
+}
+
 /** A small "autopilot" tag for things the fleet autopilot did itself. */
 export function AutopilotTag({ children = "autopilot", title }: { children?: ReactNode; title?: string }) {
   return (

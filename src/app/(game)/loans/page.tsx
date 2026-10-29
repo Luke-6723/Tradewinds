@@ -22,6 +22,7 @@ import {
   WALK_AWAY_BAN_WARNING,
   type FleetFinance,
   LOAN,
+  LendingLineBadge,
   LoanRateText,
   LoanStatusBadge,
   MortgageBadge,
@@ -74,6 +75,18 @@ const pctToBps = (v: string) => Math.round(num(v) * 100);
 
 /** "% a year" for a confirm box. */
 const pctText = (bps: number) => `${(bps / 100).toLocaleString("en-GB", { maximumFractionDigits: 2 })}% a year`;
+
+/** The clock, ticking every second while `active` (quote countdowns). */
+function useNow(active: boolean) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(t);
+  }, [active]);
+  return now;
+}
 
 /** "matures in …" (active), when it defaulted, or when it closed. */
 function whenText(l: S.Loan): string {
@@ -180,6 +193,7 @@ function RepayForm({ loan, cash, fleet, onDone, onClose }: { loan: S.Loan; cash:
       <KV
         rows={[
           ["Lender", <CompanyLabel key="l" id={loan.lender_company_id} />],
+          ...(loan.lending_line_id ? ([["Quoted by", `its lending line ${shortId(loan.lending_line_id)}`]] as Array<[string, string]>) : []),
           ["Owed now", fmtCr(loan.owed_pence, 2)],
           ["Principal outstanding", fmtCr(loan.outstanding_principal_pence, 2)],
           ["Interest accrued", fmtCr(loan.accrued_interest_pence, 2)],
@@ -286,6 +300,7 @@ function OwedPanel({
                   <span className="inline-flex flex-wrap items-center gap-1">
                     <CompanyLabel id={l.lender_company_id} />
                     <MortgageBadge loan={l} />
+                    <LendingLineBadge loan={l} />
                     <AutopilotTag fleet={fleet} loanId={l.id} />
                   </span>
                 </td>
@@ -355,6 +370,7 @@ function LentPanel({ loans, error, companyId, ourIds, onCredit }: { loans: S.Loa
                 <span className="inline-flex flex-wrap items-center gap-1">
                   <CompanyLabel id={l.borrower_company_id} companyId={companyId} ourIds={ourIds} />
                   <MortgageBadge loan={l} />
+                  <LendingLineBadge loan={l} />
                 </span>
               </td>
               <td className="capitalize">{regionName(l.banking_region)}</td>
@@ -453,6 +469,11 @@ function HistoryPanel({ refreshKey, companyId, shipName }: { refreshKey: number;
                   {l.is_mortgage && (
                     <span className="ml-1">
                       <MortgageBadge loan={l} />
+                    </span>
+                  )}
+                  {l.lending_line_id && (
+                    <span className="ml-1">
+                      <LendingLineBadge loan={l} />
                     </span>
                   )}
                   {l.walked_away_at && (
@@ -631,6 +652,7 @@ function RequestForm({
   const [pledge, setPledge] = useState<Pledge>(EMPTY_PLEDGE);
   const [recourse, setRecourse] = useState(true);
   const [hours, setHours] = useState(String(LOAN.requestHoursDefault));
+  const [auto, setAuto] = useState(true);
   const act = useAction<S.LoanRequestView>(onDone);
   const at = region || homeRegion;
   const p = crToPence(principal);
@@ -645,7 +667,10 @@ function RequestForm({
   const gs = Number.isInteger(t) && t >= 1 && t <= LOAN.termMaxDays ? goldsmithsAnnualBps(t) : null;
 
   function submit() {
-    if (!confirm(`Ask lenders to quote ${fmtCr(p)} in ${regionName(at)} for ${t} game days, ${repayment}? Nothing is escrowed: you approve a quote (or none) before it lapses.`)) return;
+    const quotes = auto
+      ? " Banks' lending lines that cover it quote at once, and a ship lien with recourse still unquoted after a game hour may draw the Goldsmiths' quote at their rate."
+      : " Only lenders quoting by hand will see it (no lending line or Goldsmiths' answer).";
+    if (!confirm(`Ask lenders to quote ${fmtCr(p)} in ${regionName(at)} for ${t} game days, ${repayment}? Nothing is escrowed: you approve a quote (or none) before it expires.${quotes}`)) return;
     void act.run(() =>
       kibbPost<S.LoanRequestView>("/v1/loan/request", {
         banking_region: at,
@@ -656,6 +681,7 @@ function RequestForm({
         ...pledgeBody(kind, pledge),
         recourse: kind === "unsecured" || kind === "deposit" ? true : recourse,
         open_game_hours: h,
+        auto_quote: auto,
       }),
     );
   }
@@ -699,6 +725,9 @@ function RequestForm({
         </div>
         <Segmented value={repayment} onChange={setRepayment} options={REPAYMENTS} />
         <PledgeFields kind={kind} value={pledge} onChange={setPledge} ours ships={ships} stock={stock} pledged={pledged.byShip} deposits={deposits} />
+        <Checkbox checked={auto} onChange={setAuto}>
+          <span className="text-xs">Automatic quotes: banks&apos; lending lines may quote at once (and the Goldsmiths, on a ship lien with recourse left unquoted an hour)</span>
+        </Checkbox>
         {kind === "ship_lien" && fleet.ships.has(pledge.shipId) && (
           <WarnBox>The fleet autopilot sails this ship. A lien doesn&apos;t stop it sailing, but it can&apos;t be sold, listed or pledged again until repaid.</WarnBox>
         )}
@@ -754,14 +783,21 @@ function MyRequestsPanel({
   const [showClosed, setShowClosed] = useState(false);
   useLearnCompanies((data ?? []).flatMap((r) => (r.quotes ?? []).map((q) => [q.lender_company_id, q.lender_name] as [string, string])));
   const rows = (data ?? []).filter((r) => showClosed || r.status === "open");
+  // A quote stands until its own expires_at (a line's or the Goldsmiths' at most 6 game hours): approving after is refused (409).
+  const live = rows.some((r) => r.status === "open" && (r.quotes ?? []).some((q) => q.status === "open"));
+  const now = useNow(live);
 
   function approve(r: S.LoanRequestView, q: S.LoanQuote) {
+    if (Date.parse(q.expires_at) <= Date.now()) return;
     const ap = fleet.isAutopilotRequest(r.id)
       ? "\n\nThe fleet autopilot posted this request to refinance one of its Goldsmiths' loans and approves a cheaper quote itself. Approved by hand, the loan is yours: the autopilot repays it only in its last 2 game days, and repays its own Goldsmiths' loan as usual."
       : "";
+    const line = q.lending_line_id
+      ? `\n\nQuoted on its own by ${names.label(q.lender_company_id)}'s lending line: at approval the line must still be open, your pledge must still carry the principal at its loan-to-value, and your record must still pass its filters.`
+      : "";
     if (
       !confirm(
-        `Approve ${names.label(q.lender_company_id)}'s quote: ${fmtCr(q.principal_pence)} at ${pctText(q.annual_rate_bps)} for ${q.term_game_days} game days, ${q.repayment}${q.repayment === "amortised" ? ` (${fmtCr(q.installment_pence ?? 0)} every ${LOAN.installmentEveryDays} game days)` : ""}, ${fmtCr(q.total_repayable_pence)} repaid in all, into your ${regionName(r.banking_region)} vault? Every other quote is released and the request closes.${ap}\n\n${DEFAULT_WARNING}`,
+        `Approve ${names.label(q.lender_company_id)}'s quote: ${fmtCr(q.principal_pence)} at ${pctText(q.annual_rate_bps)} for ${q.term_game_days} game days, ${q.repayment}${q.repayment === "amortised" ? ` (${fmtCr(q.installment_pence ?? 0)} every ${LOAN.installmentEveryDays} game days)` : ""}, ${fmtCr(q.total_repayable_pence)} repaid in all, into your ${regionName(r.banking_region)} vault? Every other quote is released and the request closes. It expires ${fmtIn(q.expires_at)}.${line}${ap}\n\n${DEFAULT_WARNING}`,
       )
     )
       return;
@@ -797,6 +833,11 @@ function MyRequestsPanel({
                       autopilot
                     </Badge>
                   )}
+                  {!r.auto_quote && (
+                    <Badge variant="outline" size="sm" title="Posted with auto_quote off: no lending line or Goldsmiths' answer quotes on it">
+                      no auto quotes
+                    </Badge>
+                  )}
                   <span className="text-muted-foreground text-xs">
                     Goldsmiths {pctText(r.goldsmiths_rate_bps)} · {r.status === "open" ? `lapses ${fmtIn(r.expires_at)}` : fmtDateTime(r.expires_at)}
                   </span>
@@ -804,13 +845,27 @@ function MyRequestsPanel({
                 {open.length === 0 && closed.length === 0 ? (
                   <p className="text-muted-foreground text-xs">No quote yet.</p>
                 ) : (
-                  <Table head={["Lender", "Rate", "Repaid in all", "Lapses", "Status", ""]}>
+                  <Table head={["Lender", "Rate", "Repaid in all", "Expires", "Status", ""]}>
                     {[...open, ...closed].map((q) => {
                       const cheaper = q.annual_rate_bps < r.goldsmiths_rate_bps;
+                      const expired = q.status === "open" && Date.parse(q.expires_at) <= now;
                       return (
                         <tr key={q.id}>
                           <td>
-                            <CompanyLabel id={q.lender_company_id} companyId={companyId} ourIds={ourIds} />
+                            <span className="inline-flex flex-wrap items-center gap-1">
+                              <CompanyLabel id={q.lender_company_id} companyId={companyId} ourIds={ourIds} />
+                              {q.lending_line_id ? (
+                                <Badge variant="outline" size="sm" title={`Quoted on its own by the bank's lending line ${shortId(q.lending_line_id)} (guide 3.13.8)`}>
+                                  auto · line {shortId(q.lending_line_id)}
+                                </Badge>
+                              ) : (
+                                q.auto && (
+                                  <Badge variant="outline" size="sm" title="Quoted on its own, not by hand (the Goldsmiths answer an unquoted ship lien with recourse after a game hour, at their rate)">
+                                    auto
+                                  </Badge>
+                                )
+                              )}
+                            </span>
                           </td>
                           <td>
                             <AnnualRateText bps={q.annual_rate_bps} />
@@ -820,7 +875,9 @@ function MyRequestsPanel({
                             {fmtCr(q.total_repayable_pence)}
                             {q.repayment === "amortised" && q.installment_pence != null && <div className="text-muted-foreground text-xs">{fmtCr(q.installment_pence)} / {LOAN.installmentEveryDays} days</div>}
                           </td>
-                          <td className="whitespace-nowrap text-xs">{fmtIn(q.expires_at)}</td>
+                          <td className={`whitespace-nowrap text-xs tabular-nums ${expired ? "text-destructive" : ""}`} title={fmtDateTime(q.expires_at)}>
+                            {q.status !== "open" ? fmtDateTime(q.expires_at) : expired ? "expired" : fmtIn(q.expires_at)}
+                          </td>
                           <td className="text-xs">{q.status}</td>
                           <td>
                             <div className="flex justify-end gap-1.5">
@@ -828,7 +885,12 @@ function MyRequestsPanel({
                                 Credit
                               </Button>
                               {q.status === "open" && r.status === "open" && (
-                                <Button size="sm" disabled={act.busy} onClick={() => approve(r, q)}>
+                                <Button
+                                  size="sm"
+                                  disabled={act.busy || expired}
+                                  title={expired ? "Expired: a quote can be approved only before its own expiry (refused after); it is released shortly" : undefined}
+                                  onClick={() => approve(r, q)}
+                                >
                                   Approve
                                 </Button>
                               )}
@@ -845,8 +907,10 @@ function MyRequestsPanel({
         </div>
       )}
       <p className="mt-3 text-muted-foreground text-xs">
-        A lender&apos;s principal is escrowed while its quote stands; approving one pays it into your vault and starts the term. A request nobody beats just
-        lapses (there is no withdrawing one).
+        A lender&apos;s principal is escrowed while its quote stands; approving one pays it into your vault and starts the term. A bank&apos;s lending line may quote
+        at once (auto), and a ship lien with recourse still unquoted after a game hour may draw the Goldsmiths&apos; quote at their rate. Those stand{" "}
+        {LOAN.quoteGameHours} game hours at most: approve a quote before it expires (refused after). A request nobody beats just lapses (there is no withdrawing
+        one).
       </p>
     </Panel>
   );
@@ -1232,7 +1296,7 @@ export default function LoansPage() {
     <div className="space-y-5 pb-8 sm:space-y-6">
       <PageHeader
         title="Loans"
-        subtitle="Loans by quote: the Goldsmiths' Company quotes at once against one of your ships; players quote on requests for quotes. Fixed annual rates, terms up to 360 game days, balloon or amortised."
+        subtitle="Loans by quote: the Goldsmiths' Company quotes at once against one of your ships; players quote on requests for quotes, and banks' lending lines on matching requests the moment they are posted. Fixed annual rates, terms up to 360 game days, balloon or amortised."
         badges={
           <>
             {defaulted.length > 0 && <Badge variant="error">{defaulted.length} defaulted</Badge>}

@@ -1,16 +1,22 @@
 /**
  * Passengers (guide 3.20) in the spare hold of voyages the fleet sails anyway: never a lane of their own, never a detour.
  *
- * Pure logic, no calls. What to ask per head: the median fare groups accepted on the route lately (by kind), else the world's
- * fares per sea mile times this passage; a little under it (cheaper wins), less for a slow hull (a group counts its days at sea
- * against the fare), nudged by what our offers on the route won or left unfilled; never under what the weight's extra sailing
- * time costs the ship. Which waiting groups an offer can take (whole, before they give up), how many berths the free hold
- * gives, what a late arrival is guessed to pay, and whether holding a ship for the next game-hour round is worth its time.
+ * Pure logic, no calls. Fares are an auction (guide 3.20 item 9): what a route paid is what the cheapest ship there asked, so
+ * like is compared with like. The reference per head: the median fare groups accepted on the route lately (by kind), else the
+ * median of its route-length band on the fares summary (the band a fare on the route counted in, or our sea distance mapped into
+ * one), else the world's fares per sea mile times this passage. Where others offer (a contested route), a little under it
+ * (cheaper wins); where groups keep giving up unboarded (an uncontested route: `route_unmet_groups` on a waiting group, or the
+ * route on the summary's `unmet` list), opened well above a band's or the world's median (PAX_OPEN_HIGH), or at the route's own
+ * median once it has one (the fares groups took there: ours), on a level of its own learned across visits: stepped down faster
+ * after each unfilled round, up again after a boarding, so the route settles at the first fare taken. Less for a slow hull either
+ * way (a group counts its days at sea against the fare); never under what the weight's extra sailing time costs the ship. Which
+ * waiting groups an offer can take (whole, before they give up), how many berths the free hold gives, what a late arrival is
+ * guessed to pay, and whether holding a ship for the next game-hour round is worth its time.
  *
  * Berths are not a lane Part (a Part is a good bought and carried): the agent keeps its offers and the groups aboard itself.
  */
 
-import type { AboardGroupView, FareRecordView, PassengerKind, WaitingGroupView } from "../schema";
+import type { AboardGroupView, FareBandView, FareRecordView, PassengerKind, WaitingGroupView } from "../schema";
 
 /** Fewest recent accepted fares on a route (or in the world, per sea mile) for their median to stand. */
 export const PAX_MIN_RECORDS = 3;
@@ -26,6 +32,14 @@ export const PAX_ADJ_UP = 1.05;
 export const PAX_ADJ_DOWN = 0.96;
 export const PAX_ADJ_MIN = 0.6;
 export const PAX_ADJ_MAX = 1.6;
+/**
+ * An uncontested route (guide 3.20 item 9: groups giving up unboarded, nobody competing): the opening ask over a band's median or
+ * the world's per sea mile ("well above the band's median"; never over the route's own median, which is the fares groups took
+ * there, our learned asks already), and the faster step down of its level after a round it stood unfilled ("a step lower"). A
+ * high opening costs only a little time: groups that won't pay it stay ashore.
+ */
+export const PAX_OPEN_HIGH = 1.5;
+export const PAX_ADJ_DOWN_OPEN = 0.9;
 /** Least asked per head (pence): the server wants a positive fare. */
 export const PAX_MIN_FARE_PENCE = 100;
 /** Our speed against the catalog's middling hull, weighted into the ask: the most a fast hull asks over, a slow one under. */
@@ -70,11 +84,20 @@ export interface PaxOffer {
   until: number;
   /** Share of the fares expected to land (pirates and storms take the rest; Lloyd's never insures fares). */
   kept: number;
+  /**
+   * Priced as uncontested (fareFor): its rounds teach the route's uncontested level (`adjOpen`, an unfilled one a faster step down),
+   * never the contested nudge. Absent on older saves: not.
+   */
+  open?: boolean;
 }
 
-/** What the pricer learned on one route (`from>to`): its nudge, and the game-hour rounds our offers won and stood unfilled. */
+/**
+ * What the pricer learned on one route (`from>to`): its nudge on a contested ask (`adj`), its level on an uncontested one
+ * (`adjOpen`; absent on older saves and until an uncontested round: 1), and the game-hour rounds our offers won and stood unfilled.
+ */
 export interface PaxRoute {
   adj: number;
+  adjOpen?: number;
   won: number;
   lost: number;
   /** Server ms of the last round counted. */
@@ -113,6 +136,18 @@ export function routeReference(records: FareRecordView[], from: string, to: stri
   if (xs.length < PAX_MIN_RECORDS) return null;
   const m = median(xs);
   return m !== null && m > 0 ? { perHead: m, n: xs.length } : null;
+}
+
+/**
+ * The median fare per head of a route's length band on the fares summary (guide 3.20: like compared with like), if enough fares
+ * counted in it: the band a fare record on the route counted in (`band`), else the band whose `[min_nm, max_nm)` holds `nm` (our
+ * sea distance for the passage). Null: no such band, or too few fares in it.
+ */
+export function bandReference(bands: readonly FareBandView[], band: string | null, nm: number): { perHead: number; band: string } | null {
+  const b = (band ? bands.find((x) => x.band === band) : undefined) ?? (nm > 0 ? bands.find((x) => nm >= x.min_nm && (x.max_nm == null || nm < x.max_nm)) : undefined);
+  const m = b?.median_fare_per_head_pence;
+  if (!b || !(b.fares >= PAX_MIN_RECORDS) || typeof m !== "number" || !(m > 0)) return null;
+  return { perHead: m, band: b.band };
 }
 
 /** Distinct routes (`from>to`) of the newest fare records (of `kind`, if given), up to `max`: the ones whose length to read. */
@@ -173,35 +208,52 @@ export function weightMs(nm: number, knots: number, fill: number, addFill: numbe
 }
 
 export interface FareInput {
-  /** Reference fare per head by kind (pence): the route's, or the world's per sea mile times this passage. */
+  /** Reference fare per head by kind (pence): the route's, its length band's, or the world's per sea mile times this passage. */
   refs: Map<PassengerKind, number>;
   /** Waiting groups the offer could take (fittingGroups). */
   groups: WaitingGroupView[];
   berths: number;
   /** Least per head: what the weight's extra sailing time costs the ship, per head. */
   floor: number;
-  /** The route's learned nudge, and the factor for our speed. */
+  /** The route's learned nudge on a contested ask, its level on an uncontested one (absent: 1), and the factor for our speed. */
   adj: number;
+  adjOpen?: number;
   speed: number;
+  /** Kinds the route is uncontested for (groups of it gave up unboarded lately): priced on `adjOpen`, not undercut. Absent: none. */
+  open?: ReadonlySet<PassengerKind>;
+  /** Kinds whose reference is the route's own median (fares groups took there): an uncontested ask doesn't open high over it. */
+  own?: ReadonlySet<PassengerKind>;
+  /** The odds our offer wins a round on the route (winChance): the share of an opening ask's heads expected to board. */
+  win?: number;
 }
 
 /**
- * The fare per head to ask (one per offer): for each kind waiting, a little under its reference (nudged, speed weighed); the
- * ask that boards the most fare wins, a group taken to accept while the ask is within its kind's reference as nudged and
- * speed-weighed. Null: no group would take an ask over the floor.
+ * The fare per head to ask (one per offer): for each kind waiting, a little under its reference on the contested nudge (speed
+ * weighed), or for a kind the route is uncontested for, on the route's uncontested level: PAX_OPEN_HIGH over a band's or the
+ * world's median, the route's own median as it is; the ask that is expected to board the most fare wins. A group is taken to
+ * accept while the ask is within its kind's reference as nudged and speed-weighed, or, for an uncontested kind, within our own
+ * ask (a probe: never thrown away by the model that set it), its heads then weighed by the route's odds of a round won.
+ * Null: no group would take an ask over the floor.
  */
-export function fareFor(x: FareInput): { perHead: number; heads: number; ref: number; kind: PassengerKind } | null {
-  const limit = (kind: PassengerKind) => (x.refs.get(kind) ?? 0) * x.adj * x.speed;
-  let best: { perHead: number; heads: number; ref: number; kind: PassengerKind; take: number } | null = null;
+export function fareFor(x: FareInput): { perHead: number; heads: number; ref: number; kind: PassengerKind; open: boolean } | null {
+  const open = x.open ?? new Set<PassengerKind>();
+  const own = x.own ?? new Set<PassengerKind>();
+  const adjOpen = Number.isFinite(x.adjOpen) && x.adjOpen! > 0 ? x.adjOpen! : 1;
+  // Over the reference: uncontested, on its own level (high over a median not the route's); contested, under it on the nudge.
+  const mult = (kind: PassengerKind) => (open.has(kind) ? (own.has(kind) ? 1 : PAX_OPEN_HIGH) * adjOpen : PAX_UNDERCUT * x.adj);
+  // A pence of slack: an uncontested ask is this figure rounded, and must stand within it.
+  const limit = (kind: PassengerKind) => (x.refs.get(kind) ?? 0) * (open.has(kind) ? mult(kind) : x.adj) * x.speed + 1;
+  const win = Number.isFinite(x.win) ? Math.min(1, Math.max(0, x.win!)) : 0.5;
+  let best: { perHead: number; heads: number; ref: number; kind: PassengerKind; open: boolean; take: number } | null = null;
   for (const [kind, ref] of x.refs) {
     if (!(ref > 0)) continue;
-    const ask = Math.max(PAX_MIN_FARE_PENCE, Math.ceil(x.floor), Math.round(ref * PAX_UNDERCUT * x.adj * x.speed));
+    const ask = Math.max(PAX_MIN_FARE_PENCE, Math.ceil(x.floor), Math.round(ref * mult(kind) * x.speed));
     const heads = fillHeads(x.groups.filter((g) => ask <= limit(g.kind)), x.berths);
     if (heads <= 0) continue;
-    const take = ask * heads;
-    if (!best || take > best.take) best = { perHead: ask, heads, ref, kind, take };
+    const take = ask * heads * (open.has(kind) ? win : 1);
+    if (!best || take > best.take) best = { perHead: ask, heads, ref, kind, open: open.has(kind), take };
   }
-  return best ? { perHead: best.perHead, heads: best.heads, ref: best.ref, kind: best.kind } : null;
+  return best ? { perHead: best.perHead, heads: best.heads, ref: best.ref, kind: best.kind, open: best.open } : null;
 }
 
 /** Share of a fare a landing at server time `at` is guessed to pay, promised by `promisedAt` (ISO; none: in full). */
@@ -218,10 +270,13 @@ export function winChance(r: PaxRoute | undefined): number {
   return ((r?.won ?? 0) + 1) / ((r?.won ?? 0) + (r?.lost ?? 0) + 2);
 }
 
-/** The route's nudge after a round: up when a group boarded, down when none did. */
-export function nudged(adj: number, won: boolean): number {
+/**
+ * A route's nudge (or uncontested level) after a round: up when a group boarded, down when none did (`open`: our offer was priced
+ * as uncontested, a step lower each unfilled round, PAX_ADJ_DOWN_OPEN).
+ */
+export function nudged(adj: number, won: boolean, open = false): number {
   const a = Number.isFinite(adj) && adj > 0 ? adj : 1;
-  return Math.min(PAX_ADJ_MAX, Math.max(PAX_ADJ_MIN, a * (won ? PAX_ADJ_UP : PAX_ADJ_DOWN)));
+  return Math.min(PAX_ADJ_MAX, Math.max(PAX_ADJ_MIN, a * (won ? PAX_ADJ_UP : open ? PAX_ADJ_DOWN_OPEN : PAX_ADJ_DOWN)));
 }
 
 /** Whether holding the ship `waitMs` for the next round is worth it: the fares expected (`value`) against her time and dues. */

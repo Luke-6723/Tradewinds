@@ -25,12 +25,14 @@ import type {
   RoutePlan,
   ZoneClass,
 } from "../types";
-import type { FareRecordView, LloydsListNotice, MonopolyResult, UnderwritingFigures, WorldEventResult, WorldEventType } from "../schema";
+import type { FareBandView, FareRecordView, LloydsListNotice, MonopolyResult, PassengerKind, UnderwritingFigures, UnmetRouteView, WorldEventResult, WorldEventType } from "../schema";
 
 /** Passenger fares (guide 3.20, public): pages of 200 read world-wide a game day at a time, a route's own up to this many, and routes learned kept. */
 const FARE_PAGES = 3;
 const ROUTE_FARE_LIMIT = 200;
 const PAX_ROUTES_KEPT = 300;
+/** The fares board's summary (guide 3.20: band medians, routes where groups gave up unboarded) is read again after this many game hours. */
+const FARE_SUMMARY_GAME_H = 3;
 /** After a passenger offer refused for the key's sake (403), none is tried for this long (real ms). */
 const PAX_BLOCK_MS = 60 * 60_000;
 
@@ -497,6 +499,17 @@ export interface FreightInfo {
   collateral: number;
   expiresAt: number | null;
   issuer: string | null;
+  /**
+   * Return freight (guide 3.8: the Merchant Adventurers' "Return freight to <port>", paid by the Crown, `funded_by: crown`): its
+   * sealed cargo is worth nothing (no insurance, prize, salvage or forfeit value; storms and pirates leave it alone, though it
+   * goes down with the ship), so it draws no raid; only the collateral and the reward are lost with the hull. Absent: an ordinary lot.
+   */
+  ret?: boolean;
+}
+
+/** Whether a freight listing is return freight (guide 3.8): Crown-funded (`funded_by: crown`, or so in its raw record). */
+export function isReturnFreight(c: Pick<ContractListing, "contract_type" | "funded_by" | "metadata">): boolean {
+  return c.contract_type === "freight" && (c.funded_by === "crown" || c.metadata?.funded_by === "crown");
 }
 
 function toFreight(list: ContractListing[]): FreightInfo[] {
@@ -512,7 +525,21 @@ function toFreight(list: ContractListing[]): FreightInfo[] {
       collateral: c.collateral_pence,
       expiresAt: c.expires_at ? Date.parse(c.expires_at) : null,
       issuer: c.issuer_company_id ?? null,
+      ...(isReturnFreight(c) ? { ret: true } : {}),
     }));
+}
+
+/** What a freight lot aboard is worth to pirates (pence): ordinary sealed cargo at about three times its collateral; return freight nothing. */
+export function freightLoot(f: { collateral?: number; ret?: boolean }): number {
+  return f.ret ? 0 : 3 * (f.collateral ?? 0);
+}
+
+/**
+ * What a return lot stakes on the hull (pence): its reward and its collateral, lost with her when she sinks or is taken (guide 3.8:
+ * it goes down with the ship), though no raid or storm touches it otherwise. An ordinary lot: 0 here (its goods' value stands for it).
+ */
+export function returnLotStake(f: { reward?: number; collateral?: number; ret?: boolean }): number {
+  return f.ret ? Math.max(0, f.reward ?? 0) + Math.max(0, f.collateral ?? 0) : 0;
 }
 
 export interface PriceObs {
@@ -648,6 +675,11 @@ export class World {
   charters: CharterInfo[] = [];
   /** Open freight lots we can see, at ports where we have presence. */
   freight: FreightInfo[] = [];
+  /**
+   * One owner's companies may carry only a few return lots at a time (guide 3.8: `409` beyond): after one refused for it, no ship
+   * of ours plans or takes another until one of ours is delivered, or a game day passes (local ms; 0: not blocked).
+   */
+  private retBlockedUntil = 0;
   /** Our company (to skip freight we posted ourselves). */
   companyId: string | null = null;
   /** Every company of our player (the manager fills it): their charters and freight are never ours to deliver or carry. */
@@ -755,6 +787,14 @@ export class World {
   private faresAt = 0;
   /** A route's own accepted fares (`from>to`), read when an offer there is priced (local ms). */
   private readonly routeFareRecs = new Map<string, { at: number; items: FareRecordView[] }>();
+  /**
+   * The fares board's summary as last read (guide 3.20): per route-length band the recent fares and their median per head, and the
+   * routes where groups gave up waiting unboarded (`from>to|kind`); when read and last tried (local ms; a failed read keeps the last).
+   */
+  private fareBands: FareBandView[] = [];
+  private fareUnmet = new Map<string, UnmetRouteView>();
+  private fareSummaryAt = 0;
+  private fareSummaryTried = 0;
   /** The passenger pricer's nudge and the rounds won and lost per route (`from>to`). */
   private readonly paxRoutes = new Map<string, PaxRoute>();
   /** Active trading companies (expansion board), or null before the first read. */
@@ -938,7 +978,10 @@ export class World {
     }
     if (Array.isArray(s.prizePools)) this.prizePools = s.prizePools.filter((x) => Number.isFinite(x) && x > 0).slice(-PRIZE_POOLS_KEPT);
     for (const [k, v] of Array.isArray(s.paxRoutes) ? s.paxRoutes.slice(-PAX_ROUTES_KEPT) : []) {
-      if (typeof k === "string" && v && Number.isFinite(v.adj) && v.adj > 0) this.paxRoutes.set(k, { adj: v.adj, won: v.won || 0, lost: v.lost || 0, at: v.at || 0 });
+      // An older save has no uncontested level: it starts at 1 (its one nudge stays the contested one).
+      if (typeof k === "string" && v && Number.isFinite(v.adj) && v.adj > 0) {
+        this.paxRoutes.set(k, { adj: v.adj, ...(Number.isFinite(v.adjOpen) && v.adjOpen! > 0 ? { adjOpen: v.adjOpen } : {}), won: v.won || 0, lost: v.lost || 0, at: v.at || 0 });
+      }
     }
     this.updateBidHaircut();
   }
@@ -991,8 +1034,10 @@ export class World {
       this.client.monopolyPages().catch(() => null),
       // Our own resting orders now and again: the news' anonymous best levels may be ours.
       this.refreshOwnOrders(),
-      // Passenger fares accepted world-wide, a game day at a time (the pricer's reference where a route has too few of its own).
+      // Passenger fares accepted world-wide, a game day at a time (the pricer's reference where a route has too few of its own),
+      // and the board's summary every few game hours (band medians, routes nobody serves).
       this.refreshFares(),
+      this.refreshFareSummary(),
     ]);
     const list = listing.items;
     if (freight) this.freight = toFreight(freight.items);
@@ -1800,6 +1845,21 @@ export class World {
     this.freight = this.freight.filter((f) => f.id !== id);
   }
 
+  /** A return lot was refused for the cap (409): none planned or taken fleet-wide for a game day, or until one of ours is delivered. */
+  noteReturnCap(): void {
+    this.retBlockedUntil = Date.now() + 24 * 60 * this.gameMinuteMs;
+  }
+
+  /** One of our return lots was delivered (or left us): there is room under the cap again. */
+  noteReturnDelivered(): void {
+    this.retBlockedUntil = 0;
+  }
+
+  /** Whether return lots are left alone now (the cap was hit lately). */
+  returnBlocked(): boolean {
+    return Date.now() < this.retBlockedUntil;
+  }
+
   /**
    * A charter was filled or closed: drop it now and ignore it in listings already in flight. One
    * that only `lapsed` and is an expansion posting may come back under the same id when re-posted,
@@ -2315,6 +2375,32 @@ export class World {
   }
 
   /**
+   * The fares board's summary (guide 3.20 item 9), every FARE_SUMMARY_GAME_H while passengers are on (with the world refresh): the
+   * route-length bands' medians and every route where groups gave up waiting unboarded. A failed read keeps the last.
+   */
+  private async refreshFareSummary(): Promise<void> {
+    if (!this.usePassengers || Date.now() - this.fareSummaryTried < FARE_SUMMARY_GAME_H * 60 * this.gameMinuteMs) return;
+    this.fareSummaryTried = Date.now();
+    const s = await this.client.passengerFaresSummary().catch(() => null);
+    if (!s || !Array.isArray(s.bands)) return;
+    this.fareBands = s.bands.filter((b) => b && typeof b.band === "string" && Number.isFinite(b.min_nm));
+    this.fareUnmet = new Map(
+      (Array.isArray(s.unmet) ? s.unmet : []).filter((u) => u && u.origin_port_id && u.dest_port_id && u.kind).map((u): [string, UnmetRouteView] => [`${routeKey(u.origin_port_id, u.dest_port_id)}|${u.kind}`, u]),
+    );
+    this.fareSummaryAt = Date.now();
+  }
+
+  /** The fares summary's bands as last read (shortest first; empty: never read), and when (local ms; 0: never). */
+  get fareSummary(): { bands: readonly FareBandView[]; unmet: number; at: number } {
+    return { bands: this.fareBands, unmet: this.fareUnmet.size, at: this.fareSummaryAt };
+  }
+
+  /** Groups of `kind` on `from` → `to` that gave up waiting unboarded lately, as the summary listed them (undefined: none listed). */
+  paxUnmet(from: string, to: string, kind: PassengerKind): UnmetRouteView | undefined {
+    return this.fareUnmet.get(`${routeKey(from, to)}|${kind}`);
+  }
+
+  /**
    * The fares groups accepted on `from` → `to` (newest first), read when an offer there is priced and kept a game day; unread,
    * the world-wide ones on that route. Never throws but on a dead key, a frozen company or a paused world.
    */
@@ -2354,11 +2440,16 @@ export class World {
     return [...this.paxRoutes];
   }
 
-  /** A game-hour round our offer on a route stood through: a group boarded (`won`), or none did with groups it could take waiting. */
-  notePaxRound(key: string, won: boolean, at = this.now()): void {
+  /**
+   * A game-hour round our offer on a route stood through: a group boarded (`won`), or none did with groups it could take waiting.
+   * `open`: the offer was priced as uncontested, so the round moves the route's uncontested level (a faster step down), never the
+   * contested nudge: the two asks never share one.
+   */
+  notePaxRound(key: string, won: boolean, at = this.now(), open = false): void {
     const r = this.paxRoutes.get(key) ?? { adj: 1, won: 0, lost: 0, at: 0 };
     this.paxRoutes.delete(key);
-    this.paxRoutes.set(key, { adj: nudged(r.adj, won), won: r.won + (won ? 1 : 0), lost: r.lost + (won ? 0 : 1), at });
+    const adjOpen = open ? nudged(r.adjOpen ?? 1, won, true) : r.adjOpen;
+    this.paxRoutes.set(key, { adj: open ? r.adj : nudged(r.adj, won), ...(adjOpen !== undefined ? { adjOpen } : {}), won: r.won + (won ? 1 : 0), lost: r.lost + (won ? 0 : 1), at });
     if (this.paxRoutes.size > PAX_ROUTES_KEPT) this.paxRoutes.delete(this.paxRoutes.keys().next().value!);
   }
 

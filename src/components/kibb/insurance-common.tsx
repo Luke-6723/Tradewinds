@@ -70,12 +70,12 @@ export function InsurableCap({ cap, valueCr, onUseMax }: { cap: InsurableValue; 
 export const isHullOnly = (p: { insured_value_pence: number; hull_value_pence: number }) => p.insured_value_pence <= p.hull_value_pence;
 
 /**
- * Lloyd's writes only if premium ≥ ceil(2.5 × expected loss) + 25 bps, or ceil(1.75 × expected loss) + 25 when the hull
- * is rated for the water of every leg (guide 3.6), so a premium it accepted bounds the expected loss (bps). Which rule
- * applied isn't on the listing, so the smaller multiplier, 1.75, gives the bound that holds either way. Only where a
- * listing doesn't carry Lloyd's own estimate (`lloyds_expected_loss_bps`).
+ * Lloyd's writes only if premium ≥ ceil(1.25 × expected loss) + 25 bps, or expected loss + 25 when the hull is rated for
+ * the water of every leg (guide 3.6), so a premium it accepted bounds the expected loss (bps). Which rule applied isn't on
+ * the listing, so the smaller multiplier, 1, gives the bound that holds either way. Only where a listing doesn't carry
+ * Lloyd's own estimate (`lloyds_expected_loss_bps`).
  */
-export const impliedMaxEl = (premiumBps: number) => Math.max(0, (premiumBps - 25) / 1.75);
+export const impliedMaxEl = (premiumBps: number) => Math.max(0, (premiumBps - 25) / 1);
 
 /**
  * A partial loss's share of the declared cargo, for the worst-hit figure: pirates who let the ship go claim what they

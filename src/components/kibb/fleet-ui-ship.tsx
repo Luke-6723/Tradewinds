@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, NativeSelect, Panel, Table } from "@/components/kibb/bits";
+import { ReturnFreightBadge, isReturnFreight } from "@/components/kibb/deals-common";
 import { Field, PortSelect } from "@/components/kibb/pickers";
 import {
   InsurableCap,
@@ -725,7 +726,14 @@ export function ContractsPanel({ r, blocked, onDone }: Props) {
                 const there = inPort && port === c.dest_port_id;
                 return (
                   <tr key={c.id}>
-                    <td>{goodName(c.commodity_id)}</td>
+                    <td>
+                      {goodName(c.commodity_id)}
+                      {isReturnFreight(c) && (
+                        <div className="mt-0.5">
+                          <ReturnFreightBadge />
+                        </div>
+                      )}
+                    </td>
                     <td className="tabular-nums">{c.quantity_required}</td>
                     <td>{portName(c.dest_port_id)}</td>
                     <td className="tabular-nums">{fmtCr(c.reward_pence)}</td>
@@ -812,7 +820,14 @@ export function ContractsPanel({ r, blocked, onDone }: Props) {
                 <Table head={["Good", "Tons", "To", "Reward", "Collateral", "Expires", ""]}>
                   {freight.map((c) => (
                     <tr key={c.id}>
-                      <td>{goodName(c.commodity_id)}</td>
+                      <td>
+                        {goodName(c.commodity_id)}
+                        {isReturnFreight(c) && (
+                          <div className="mt-0.5">
+                            <ReturnFreightBadge />
+                          </div>
+                        )}
+                      </td>
                       <td className="tabular-nums">{c.quantity_required}</td>
                       <td>{portName(c.dest_port_id)}</td>
                       <td className="tabular-nums">{fmtCr(c.reward_pence)}</td>
@@ -837,6 +852,7 @@ export function ContractsPanel({ r, blocked, onDone }: Props) {
               )}
               <p className="text-muted-foreground text-xs">
                 Accepting needs the ship berthed with room ({fmtTons(free)} free). The cargo is sealed and the collateral escrowed until delivery.
+                {freight.some(isReturnFreight) && " Return freight (Crown) is a sealed token worth nothing, carried for its fixed pay: only a few such lots at a time."}
               </p>
             </div>
           </>

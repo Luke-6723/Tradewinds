@@ -21,10 +21,42 @@ import { usePoll } from "@/hooks/use-poll";
 import { kibbGet, kibbPost } from "@/lib/kibb/browser";
 import { fmtCr, fmtDateTime, fmtIn, fmtTons } from "@/lib/kibb/format";
 import type * as S from "@/lib/kibb/schema";
-import type { ShipResult, WorldClock } from "@/lib/kibb/types";
+import type { RoutePlan, ShipResult, WorldClock } from "@/lib/kibb/types";
 
 /** `max_berths` is 1..=10,000 heads in all. */
 export const MAX_BERTHS = 10_000;
+
+/**
+ * Fares are an auction (guide 3.20, item 9): on a route nobody else serves, open well above the band's median and step down
+ * after an unfilled round or two. The opening asked for here, as a multiple of the band median (the autopilot's too).
+ */
+export const OPEN_HIGH = 1.5;
+
+/** The fares board's summary (public; `from`/`to` narrow only its `unmet` list), every 5 minutes, never shown for other filters. */
+export function useFaresSummary(from = "", to = "", enabled = true) {
+  const { data, error, reload } = usePoll(
+    enabled ? () => kibbGet<S.FaresSummaryView>("/v1/passengers/fares/summary", { from, to }).then((summary) => ({ from, to, summary })) : null,
+    300_000,
+    [from, to, enabled],
+  );
+  return { summary: data && data.from === from && data.to === to ? data.summary : undefined, error, reload };
+}
+
+/** The length band a route of `nm` sea miles counts in (`min_nm` up to just short of `max_nm`), if any. */
+export const bandOfNm = (bands: S.FareBandView[] | undefined, nm: number | null | undefined) =>
+  nm == null ? undefined : bands?.find((b) => nm >= b.min_nm && (b.max_nm == null || nm < b.max_nm));
+
+/** Groups of one route that gave up unboarded lately, all kinds: from the summary's `unmet`, else the waiting groups' own counts. */
+export function routeUnmet(unmet: S.UnmetRouteView[] | undefined, waiting: S.WaitingGroupView[] | undefined, from: string, to: string) {
+  const rows = (unmet ?? []).filter((u) => u.origin_port_id === from && u.dest_port_id === to);
+  if (rows.length) return { groups: rows.reduce((n, u) => n + u.groups, 0), heads: rows.reduce((n, u) => n + u.heads, 0) };
+  // Every waiting group of a kind on the route carries the same counts: one per kind.
+  const byKind = new Map<string, { groups: number; heads: number }>();
+  for (const g of waiting ?? []) {
+    if (g.origin_port_id === from && g.dest_port_id === to) byKind.set(g.kind, { groups: g.route_unmet_groups ?? 0, heads: g.route_unmet_heads ?? 0 });
+  }
+  return { groups: [...byKind.values()].reduce((n, x) => n + x.groups, 0), heads: [...byKind.values()].reduce((n, x) => n + x.heads, 0) };
+}
 
 /** Why an offer closed (`close_reason`), in words. */
 export const CLOSE_REASON: Record<string, string> = {
@@ -183,6 +215,12 @@ export function PassengerRules() {
         changes hands or is lost. The fare is paid on arrival into that port&apos;s region, cut for each game day past the promised arrival; a group long overdue
         goes ashore unpaid. Lloyd&apos;s does not insure fares, and pirates ransom passengers, so a ship carrying them is a richer prize.
       </p>
+      <p>
+        Pricing is an auction: a route&apos;s fares are what the cheapest ship asked, not what the groups would have paid. Compare like with like: the median of
+        the route&apos;s length band, not a few cheap fares on short hops. Where groups keep giving up unboarded and no other ship offers for that destination,
+        open high (well above the band median), wait a game hour or two, then cancel and re-offer a step lower; stop at the first fare a group takes. Where other
+        ships offer, undercut or be faster. Long passages and emigrants pay best.
+      </p>
     </div>
   );
 }
@@ -244,6 +282,23 @@ export function OfferForm({
     [port, dest],
   );
   const fares = faresRead && faresRead.port === port && faresRead.dest === dest ? faresRead.list.filter((f) => f.origin_port_id === port && f.dest_port_id === dest) : undefined;
+  // The route's length band and its median (guide 3.20.9: compare like with like), and whether groups have been giving up on it.
+  const { summary } = useFaresSummary(port, dest, !!port && !!dest);
+  const unmetRows = (summary?.unmet ?? []).filter((u) => u.origin_port_id === port && u.dest_port_id === dest);
+  const bandName = fares?.find((x) => x.band)?.band ?? unmetRows.find((u) => u.band)?.band ?? null;
+  const knownNm = fares?.find((x) => x.route_nm != null)?.route_nm ?? unmetRows.find((u) => u.route_nm != null)?.route_nm ?? null;
+  // No fare or unmet record on the route says its length: the sea route's own distance.
+  const needRoute = !!port && !!dest && fares !== undefined && summary !== undefined && !bandName && knownNm === null;
+  const { data: routeRead } = usePoll(
+    needRoute ? () => kibbGet<RoutePlan>("/v1/world/route", { from: port, to: dest }).then((plan) => ({ port, dest, plan })) : null,
+    0,
+    [port, dest, needRoute],
+  );
+  const routeNm = knownNm ?? (routeRead && routeRead.port === port && routeRead.dest === dest ? routeRead.plan.total_distance_nm : null);
+  const band = (bandName ? summary?.bands.find((x) => x.band === bandName) : undefined) ?? bandOfNm(summary?.bands, routeNm);
+  const bandMedian = band?.median_fare_per_head_pence ?? null;
+  const unmet = routeUnmet(summary?.unmet, waiting, port, dest);
+  const uncontested = unmet.groups > 0;
   // Her insurance (guide 3.6: a policy is void when her hold draws more pirates than the cargo declared, and passengers make her a
   // richer prize, 3.20.9): the autopilot never offers berths on an insured ship (cargo_exceeds_declared); here a warning and an override.
   const { data: policyRead } = usePoll(
@@ -273,6 +328,8 @@ export function OfferForm({
     [!autopilot || override, "The autopilot sails this ship: tick the box to offer her anyway."],
   ]);
   const fits = forDest.filter((g) => g.size <= Math.min(free, Number.isFinite(b) ? b : free));
+  // Where to start: the band median, opened high on a route groups keep giving up on.
+  const hint = bandMedian !== null ? Math.round(bandMedian * (uncontested ? OPEN_HIGH : 1)) : null;
 
   function submit() {
     if (!r) return;
@@ -310,7 +367,14 @@ export function OfferForm({
       </Field>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Fare per head (Cr)">
-          <Input type="number" min={0.01} step={0.01} value={fare} onChange={(e) => setFare(e.target.value)} placeholder={ref !== null ? (ref / 100).toFixed(2) : undefined} />
+          <Input
+            type="number"
+            min={0.01}
+            step={0.01}
+            value={fare}
+            onChange={(e) => setFare(e.target.value)}
+            placeholder={hint !== null ? (hint / 100).toFixed(2) : ref !== null ? (ref / 100).toFixed(2) : undefined}
+          />
         </Field>
         <Field label={`Max berths${r ? ` (${free} fit now)` : ""}`}>
           <Input type="number" min={1} max={MAX_BERTHS} step={1} value={berths} onChange={(e) => setBerths(e.target.value)} placeholder={r ? String(Math.max(1, free)) : undefined} />
@@ -329,6 +393,15 @@ export function OfferForm({
               ? ([
                   ["Accepted fares on this route", fares === undefined ? "…" : ref !== null ? `median ${fmtCr(ref, 2)} a head (${fares.length} recent)` : "none recorded"],
                   [
+                    "Its length band",
+                    summary === undefined
+                      ? "…"
+                      : band
+                        ? `${band.band}${routeNm !== null ? ` (${routeNm.toLocaleString("en-GB")} nm)` : ""}: ${bandMedian !== null ? `median ${fmtCr(bandMedian, 2)} a head over ${band.fares} fare${band.fares === 1 ? "" : "s"}` : "no fares lately"}`
+                        : "not known",
+                  ],
+                  ["Gave up unboarded lately", summary === undefined ? "…" : unmet.groups > 0 ? `${unmet.groups} group${unmet.groups === 1 ? "" : "s"}, ${unmet.heads} heads` : "none"],
+                  [
                     `Waiting here for ${portName(dest)}`,
                     waiting === undefined ? "…" : forDest.length ? `${forDest.length} group${forDest.length === 1 ? "" : "s"} (${forDest.map((g) => `${g.size} ${g.kind}`).join(", ")}); ${fits.length} fit whole` : "none now",
                   ],
@@ -336,6 +409,25 @@ export function OfferForm({
               : []),
           ]}
         />
+      )}
+      {r && dest && bandMedian !== null && (
+        <div className="space-y-1.5 text-muted-foreground text-xs">
+          <p>
+            {uncontested
+              ? `Groups on this route keep giving up unboarded: if no other ship is offering for ${portName(dest)}, open high (about ${OPEN_HIGH}× the band median, ${fmtCr(hint, 2)}), wait a game hour or two, and if none boards cancel and re-offer a step lower; stop at the first fare a group takes.`
+              : `Compare like with like: the band median, not a few fares on the route. Where other ships offer for ${portName(dest)}, undercut them or be faster.`}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            <Button size="sm" variant="outline" onClick={() => setFare((bandMedian / 100).toFixed(2))}>
+              Band median {fmtCr(bandMedian, 2)}
+            </Button>
+            {uncontested && (
+              <Button size="sm" variant="outline" onClick={() => setFare((Math.round(bandMedian * OPEN_HIGH) / 100).toFixed(2))}>
+                Open high {fmtCr(Math.round(bandMedian * OPEN_HIGH), 2)}
+              </Button>
+            )}
+          </div>
+        </div>
       )}
       {r && Number.isFinite(b) && b > free && (
         <p className="text-muted-foreground text-xs">

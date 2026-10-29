@@ -10,6 +10,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Empty, ErrorNote, KV, Loading, Metrics, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
 import { CommissionsView } from "@/components/kibb/commissions";
 import { GUN_PENCE, atPort, bandOf, pctOf, useDeals, usePresence, type DealsView, type Presence } from "@/components/kibb/deals-common";
+import { useDeskBoard } from "@/components/kibb/desks-common";
 import {
   CompanyLabel,
   WarnBox,
@@ -181,7 +182,7 @@ function ListShipForm({
         </WarnBox>
       )}
       <Checkbox checked={unlisted} onChange={setUnlisted}>
-        <span className="text-xs">Unlisted: keep it off the Exchange, so only companies with quay presence at her port see it</span>
+        <span className="text-xs">Unlisted: keep it off the Exchange, so only companies with quay presence at her port see it (the ship broker never buys an unlisted hull)</span>
       </Checkbox>
       {autopilot && (
         <div className="space-y-1.5">
@@ -474,6 +475,9 @@ function ShipsMarketView() {
   };
   const open = (ours ?? []).filter((l) => l.status === "open");
   const sold = (ours ?? []).filter((l) => l.status === "sold");
+  // The ship broker's desk (guide 3.4, 3.16): what it bought and what players sold each other lately.
+  const { board } = useDeskBoard(30);
+  const broker = board?.desks.find((d) => d.desk === "ships");
 
   return (
     <div className="space-y-5 pb-8 sm:space-y-6">
@@ -518,6 +522,23 @@ function ShipsMarketView() {
                 <p>A listing is also posted on the Exchange for everyone to see, unless it is unlisted.</p>
                 <p>A bought ship keeps her berth or roadstead place, stores and guns. Berth dues up to the sale are the seller&apos;s, the buyer&apos;s from then on.</p>
                 <p>The Goldsmiths list the ships they foreclose on here too.</p>
+                <p>
+                  The ship broker: list a hull on the Exchange (not unlisted) at a port with an open shipyard, far below her rebuild value, and the Merchant
+                  Adventurers of that region may buy her once the listing is a game hour old (they look every couple of game hours and hold only a few hulls per
+                  region). They pay more than a break-up (35% of rebuild), though a player buyer, or a higher listing left for one, does better. Their resales, a
+                  few game days later under the cost of a new hull, are often the cheapest hulls about.
+                </p>
+                {broker && (
+                  <p>
+                    Last {board?.window_game_days ?? 30} game days: the broker bought {broker.desk_bought.count} hull{broker.desk_bought.count === 1 ? "" : "s"} (
+                    {fmtCr(broker.desk_bought.value_pence)}); players sold each other {broker.player_trades.count} ({fmtCr(broker.player_trades.value_pence)}). See every
+                    desk on the{" "}
+                    <Link href="/desks" className="hover:underline">
+                      NPC desks
+                    </Link>{" "}
+                    page.
+                  </p>
+                )}
                 {deals.running && (
                   <p>
                     The autopilot&apos;s buyer also looks at these listings{deals.deals?.shipDeals ? "" : " (ship deals are off now)"}, and buys one when it costs less than

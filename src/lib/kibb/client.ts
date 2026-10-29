@@ -403,6 +403,11 @@ export class KibbClient {
   port = (portId: string) => this.get<PortDetail>("/v1/world/port", { port_id: portId });
   /** The net-worth board and the `rising` board (growth over 7 real days), both refreshed hourly (guide 3.17). */
   leaderboard = () => this.get<LeaderboardResult>("/v1/world/leaderboard");
+  /**
+   * Public: the NPC desks' results board (guide 3.16): per desk (ships, ship_shares, envelopes, ventures, futures,
+   * admiralty_commissions, charter_filler) what the house bought and what players traded among themselves over `days` game days.
+   */
+  desks = (days?: number) => this.get<S.DeskBoard>("/v1/world/desks", { days });
   hallOfFame = () => this.get<S.HallOfFameSeason[]>("/v1/world/hall-of-fame");
   publicCompany = (name: string) => this.get<S.PublicCompanyProfile>("/v1/world/company", { name });
   ports = (filter: { phase?: number; banking_region?: BankingRegion } = {}) => this.get<S.PortCatalogEntry[]>("/v1/world/ports", filter);
@@ -588,6 +593,11 @@ export class KibbClient {
   /** Public: fares groups accepted, newest first, from and/or to a port (either may be omitted); never who carried them. */
   passengerFares = (from?: string, to?: string, page: { cursor?: string; limit?: number } = {}) =>
     this.get<S.FareRecordView[]>("/v1/passengers/fares", { from, to, ...page });
+  /**
+   * Public: the fares board's summary (guide 3.20): per route-length band the fares accepted recently and their median per head,
+   * and every route where groups gave up waiting unboarded (`unmet`, most heads first; `from`/`to` filter only that list).
+   */
+  passengerFaresSummary = (from?: string, to?: string) => this.get<S.FaresSummaryView>("/v1/passengers/fares/summary", { from, to });
   /** Every page of a fare listing (200 a page). */
   passengerFarePages = (from?: string, to?: string, maxPages = 10) =>
     pages((cursor) => this.passengerFares(from, to, { cursor, limit: 200 }), (f) => f.id, 200, maxPages);
@@ -829,6 +839,18 @@ export class KibbClient {
   clientTerms = () => this.get<S.ClientTermsResult[]>("/v1/bank/client-terms");
   /** Our bank's terms for one company: `rate_bonus_bps` (0-50) on its deposits, `exchange_discount_bps` (0-1,200) off its fees; both 0 clears them. */
   setClientTerms = (req: S.ClientTermsRequest) => this.post<S.ClientTermsResult>("/v1/bank/client-terms", req);
+
+  /**
+   * Open lending lines (guide 3.13.8), cheapest share of the Goldsmiths' rate first (one bank's: `company_id`; lending in a
+   * region: `banking_region`). A line quotes on its own on every matching loan request the moment it is posted.
+   */
+  lendingLines = (filter: { company_id?: string; banking_region?: BankingRegion } = {}) => this.get<S.LendingLine[]>("/v1/bank/lending-lines", filter);
+  /** Our open bank's standing terms, matched against loan requests on their own (public: `lending_line_posted`, on the Exchange). */
+  postLendingLine = (terms: S.LendingLineTerms) => this.post<S.LendingLine>("/v1/bank/lending-line", terms);
+  /** Replaces a line's terms in full; quotes already made stand. */
+  updateLendingLine = (req: S.UpdateLendingLine) => this.post<S.LendingLine>("/v1/bank/lending-line/update", req);
+  /** Closes a line and releases its open quotes (escrow refunded); loans it made run on. */
+  withdrawLendingLine = (lineId: string) => this.post<S.WithdrawnLine>("/v1/bank/lending-line/withdraw", { line_id: lineId });
 
   // ── Ventures (commenda) ─────────────────────────────────────────────────────
 
