@@ -621,6 +621,9 @@ export class KibbClient {
 
   futures = (filter: { port_id?: string; commodity_id?: string; status?: S.FuturesStatus; cursor?: string; limit?: number } = {}) =>
     this.get<S.FuturesContract[]>("/v1/future/list", filter);
+  /** Every page of a futures listing (cursor = last id), up to `maxPages` of 200; `complete` is false when it stopped with more to come. */
+  futurePages = (filter: { port_id?: string; commodity_id?: string; status?: S.FuturesStatus } = {}, maxPages = 10) =>
+    pages((cursor) => this.futures({ ...filter, cursor, limit: 200 }), (f) => f.id, 200, maxPages);
   createFuture = (req: S.CreateFuturesOrderRequest) => this.post<S.FuturesContract>("/v1/future/create", req);
   createFutures = (orders: S.CreateFuturesOrderRequest[]) => this.post<S.FuturesContract[]>("/v1/future/create-batch", { orders });
   acceptFuture = (futuresId: string) => this.post<S.FuturesContract>("/v1/future/accept", { futures_id: futuresId });

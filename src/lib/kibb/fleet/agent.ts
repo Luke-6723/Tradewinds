@@ -1,12 +1,17 @@
 /**
  * One ship's autopilot. Asks the fleet manager for a lane (planner.ts), then runs it:
  *
- *   at the source  → dock, trim/top up stores, buy each good of the load up to its break-even
- *                    price (main good first: if it can't be had the lane is off), accept the
- *                    lane's freight lots, take any other freight bound the same way, depart
+ *   at the source  → dock, trim/top up stores, load goods of ours waiting in our warehouse there,
+ *                    buy each good of the load up to its break-even price, ton by ton while each
+ *                    ton clears the margin at its own sale price (execution.ts; a big main load
+ *                    maybe split across a re-quote; main good first: if it can't be had the lane
+ *                    is off), accept the lane's freight lots, take any other freight bound the
+ *                    same way, depart
  *   at the dest    → deliver freight and charters (from the roadstead when the per-ton berth lock
  *                    would cost more than waiting out the base lock), sell market goods to the
- *                    port's buyers (not below a floor), re-plan, sail on
+ *                    port's buyers as far as they beat what the rest fetches otherwise (held for a
+ *                    re-quote, rested in our warehouse, carried elsewhere; never under its landed
+ *                    cost), re-plan, sail on
  *   anywhere else  → pick up freight bound the same way if it pays for its berth time, sail on
  *
  * Sealed freight pins the ship: it sails to the freight's destination before taking a new lane,
@@ -30,9 +35,13 @@ import type { BankingRegion, ContractListing, DeliverCharterResult, OrderBookLev
 import type { FleetSettings } from "./manager";
 import {
   aboardOf,
+  armChance,
+  bandOf,
   bandReference,
+  banditFare,
   berthsFor,
   fareFor,
+  fareKindOf,
   fillHeads,
   fittingGroups,
   lateShare,
@@ -51,6 +60,29 @@ import {
 } from "./passengers";
 import { cargoLane, minLoadTons, REPOST_GRACE_GAME_MIN, type FreightPick, type Lane, type Part, type StallStake } from "./planner";
 import { freightLoot, isReturnFreight, returnLotStake, type World } from "./world";
+import {
+  BERTH_EVICT_GAME_MIN,
+  extraWait,
+  ladderAt,
+  OLD_SELL_IMPACT_PER_TON,
+  planBuy,
+  planSale,
+  requoteChance,
+  requoted,
+  sampled,
+  SPLIT_EVICT_MARGIN_GAME_MIN,
+  saleCurve,
+  splitBuy,
+  SPLIT_MIN_SAVED_PENCE,
+  SPLIT_MIN_TONS,
+  SPLIT_SAFETY,
+  SPLIT_WAIT_SLACK_GAME_MIN,
+  STEP_GAME_MIN,
+  walkTons,
+  type Level,
+} from "./execution";
+import type { MarketView } from "./market-model";
+import type { ArmRef } from "./bandit";
 
 const POLL_MS              = 15_000;
 const MAX_SAIL_SLEEP_MS    = 60_000;
@@ -236,6 +268,40 @@ export interface FleetHost {
    * the next hub. A wait (real ms), or null: carry on as any ship (anything aboard from her trading days is seen to first).
    */
   courierTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null>;
+  /** Execution (execution.ts): tons our other ships are bound to sell at `port` before this one (where her sale curve starts). */
+  sellAfter(agent: ShipAgent, port: string, good: string): number;
+  /** The next NPC re-quote at `port` as learned (server ms), or null: unknown. */
+  requoteAt(port: string): number | null;
+  /** A re-quote seen at `port` between two looks (server ms): its time is learned. */
+  noteRequote(port: string, from: number, to: number): void;
+  /** A book's NPC levels as just read at a quay (each side): a re-quote since the last look there is noted (its time learned). */
+  noteLadder(port: string, good: string, asks: Level[], bids: Level[]): void;
+  /** Execution's counters: tons the marginal stop left unbought (`cut`); a load split across a re-quote, and the pence it should save (`split`). */
+  noteExec(kind: "cut" | "split", n: number): void;
+  /**
+   * Resting orders (execution.ts; manager.ts): withdraws ours on `port`/`good` that an order of ours on `side` at `limit` would meet
+   * (orders never match our own). Best effort; only a fatal error comes out.
+   */
+  restingClear(port: string, good: string, side: "bid" | "ask", limit: number): Promise<void>;
+  /**
+   * Goods of ours held in our warehouse here for resting orders (a prebuy for her, a glut, a leftover), loaded into her hold first, up
+   * to `tons`: the tons loaded, what they cost a ton, and of that the pence no ship's spend has counted yet (bought by a resting bid; a
+   * leftover's cost is already its first ship's). Our resting orders on that book are withdrawn first. Only a fatal error comes out.
+   */
+  warehouseTake(agent: ShipAgent, r: ShipResult, port: string, good: string, tons: number): Promise<{ tons: number; costPerTon: number; unbooked: number }>;
+  /**
+   * What `tons` of a leftover rested here would fetch a ton under a resting ask (the market model's re-quotes ahead, after `soldFirst`
+   * tons sold into the bids now), the rent it costs in all, and the ask's price; null: resting orders off or not possible here. No calls.
+   */
+  restQuote(port: string, good: string, tons: number, floor: number, soldFirst: number): { perTon: number; fixed: number; price: number } | null;
+  /** Rests a leftover here: unloaded into our warehouse (leased as needed) under a resting ask, never under `floor`. Tons rested. */
+  restLeftover(agent: ShipAgent, r: ShipResult, port: string, good: string, tons: number, costPerTon: number, floor: number): Promise<number>;
+  /**
+   * Insuring her voyage to `dest` (insureLevered; manager.ts, insure.ts), about to sail with her cargo and stores aboard and no passengers
+   * offered: a policy written when the Kelly view says the variance it takes off is worth its premium, and once written, a wait in port
+   * for Lloyd's cover past the berth lock while it pays. A wait (real ms), or null: sail on (any policy on her binds the voyage as ever).
+   */
+  insureVoyage(agent: ShipAgent, r: ShipResult, port: string, dest: string, plan: RoutePlan): Promise<number | null>;
 }
 
 /** What one ship's agent saves, so a restart resumes its lane, sell floors and record. */
@@ -278,10 +344,20 @@ export interface AgentSnapshot {
   aboard?: PaxAboard[];
   offers?: PaxOffer[];
   laneFares?: { lane: string; pence: number } | null;
+  /** Landed cost a ton of each good aboard (execution.ts: the hard sale floor, apart from the planned floor in minSale); absent in older saves. */
+  saleCost?: Array<[string, number]>;
 }
 
-/** A ship about to sail: alone, now in one of our convoys (joined or formed), or a convoy that couldn't be entered. */
-export type ConvoyOutcome = { kind: "alone" } | { kind: "in"; convoyId: string; departsAt: number } | { kind: "failed"; why: string };
+/**
+ * A ship about to sail: alone, now in a convoy (one of ours joined or formed, or another company's joined as an escort), asking to join
+ * another company's as an escort and waiting for its organizer until `until` (server ms; escortOthers), or a convoy that couldn't be
+ * entered.
+ */
+export type ConvoyOutcome =
+  | { kind: "alone" }
+  | { kind: "in"; convoyId: string; departsAt: number }
+  | { kind: "pending"; convoyId: string; until: number }
+  | { kind: "failed"; why: string };
 
 /** Cargo held for an expansion charter's re-post. */
 export interface HoldInfo {
@@ -426,6 +502,28 @@ interface Stay {
   paxHold?: { until: number; taken: number };
   /** A passage for fares alone was given up here (nobody boarded): none is planned again this stay (voyages.ts). */
   paxLaneFailed?: boolean;
+  /**
+   * The main good's load split across a re-quote (execution.ts splitBuy): the NPC levels at the last look (each side), when that was
+   * (server ms), when she stops waiting for the re-quote (server ms: a full step and the slack, never past the berth's eviction line),
+   * the re-quote's time as learned at the split or since (server ms; null: unknown), and whether the rest is now to be bought. Once a
+   * stay. Until the rest is aboard it counts against the fleet's cash and the source's depth (splitRest).
+   */
+  split?: { good: string; asks: Level[]; bids: Level[]; lookedAt: number; until: number; next: number | null; done: boolean };
+}
+
+/** What the rest of a cargo fetches if not sold now (agent keepValue; execution.ts planSale's keep): its value in all for `rest` tons, the best way, in words. */
+type KeepKind = "hold" | "rest" | "carry";
+interface KeepChoice {
+  kind: KeepKind;
+  /** In all (pence), net of her time, rent, passage. */
+  value: number;
+  /** Carry: the port. */
+  port?: string;
+}
+interface KeepEval {
+  value(rest: number): number;
+  best(rest: number, skip?: ReadonlySet<KeepKind>): KeepChoice | null;
+  why(rest: number): string;
 }
 
 const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
@@ -447,6 +545,10 @@ function fillableAsk(world: World, port: string, good: string, book: PortOrderBo
   return { ask, open, any: levels.length > 0 };
 }
 const cr = (pence: number) => `${(pence / 100).toLocaleString("en-GB", { maximumFractionDigits: 2 })} Cr`;
+/** A book side's NPC levels as execution.ts takes them (players' left out: they come and go between re-quotes). */
+function npcLevels(levels: readonly OrderBookLevel[] | undefined | null): Level[] {
+  return (levels ?? []).filter((l) => l.is_npc).map((l) => ({ price: l.price_pence, qty: l.remaining_quantity }));
+}
 
 export class ShipAgent {
   lane: Lane | null = null;
@@ -509,12 +611,17 @@ export class ShipAgent {
   private laneLoaded: string | null = null;
   /** Lowest price per ton each good aboard may be sold at (its landed cost, or the market floor). */
   private readonly minSale = new Map<string, number>();
+  /** Landed cost a ton of each good aboard (execution.ts): the hard floor under a sale, apart from minSale's planned floor. */
+  private readonly saleCost = new Map<string, number>();
   private readonly trips: TripRecord[] = [];
   /** Restored from a snapshot: the first tick checks the lane still fits the ship. */
   private checkRestored = false;
   /** A restored lane still at its source port: its goods aboard count as bought here. */
   private resumeAt: string | null = null;
-  /** The policy on this ship the user bought (open or active), as last read (local ms); null: not read, or an insurance event since. */
+  /**
+   * The policy on this ship (open or active: the user's, or one insureLevered wrote), as last read (local ms); null: not read, or an
+   * insurance event since.
+   */
   private policy: { p: InsurancePolicy | null; at: number } | null = null;
   /** One-off log lines already written (by key: a policy, a lane), so a waiting ship doesn't repeat them. */
   private readonly noted = new Set<string>();
@@ -608,6 +715,7 @@ export class ShipAgent {
       laneKey: this.laneKey,
       laneSince: this.laneSince,
       minSale: [...this.minSale],
+      saleCost: this.saleCost.size ? [...this.saleCost] : undefined,
       avoid: [...this.avoid],
       ratePerHour: this.ratePerHour,
       freight: [...this.freight],
@@ -639,6 +747,7 @@ export class ShipAgent {
       this.checkRestored = true;
     }
     for (const [g, p] of s.minSale ?? []) this.minSale.set(g, p);
+    for (const [g, p] of Array.isArray(s.saleCost) ? s.saleCost : []) if (typeof g === "string" && Number.isFinite(p) && p >= 0) this.saleCost.set(g, p);
     for (const [k, until] of s.avoid ?? []) this.avoid.set(k, until);
     if (s.ratePerHour > 0) this.ratePerHour = s.ratePerHour;
     for (const [id, f] of s.freight ?? []) {
@@ -798,6 +907,25 @@ export class ShipAgent {
     const r = this.last;
     if (!this.lane || !r || this.laneLoaded === this.lane.key) return [];
     return this.lane.parts.filter((p) => this.ownTons(r, p.good) === 0);
+  }
+
+  /**
+   * The rest of a main good's load split across a re-quote here (Stay.split), its first slice aboard (so not among partsToBuy): the part
+   * with the tons still to come, or null. It counts against the fleet's cash and the source's depth as any part not yet bought
+   * (FleetManager committedBy, reservations), so no other ship's load, resting bid or avenue spends what it needs meanwhile.
+   */
+  splitRest(): Part | null {
+    const r = this.last;
+    const lane = this.lane;
+    const sp = this.stay?.split;
+    if (!r || !lane || !sp || lane.kind === "freight" || this.laneLoaded === lane.key || this.stay?.port !== lane.source) return null;
+    const main = lane.parts[0];
+    if (!main || main.good !== sp.good) return null;
+    // None aboard as last read: partsToBuy counts the whole part already.
+    const own = this.ownTons(r, main.good);
+    if (own <= 0) return null;
+    const tons = Math.min(main.tons, this.liveTons(main)) - own;
+    return tons >= 1 ? { ...main, tons } : null;
   }
 
   /** The lane's freight lots not yet accepted. */
@@ -1336,8 +1464,12 @@ export class ShipAgent {
     if (this.arrest || this.host.isSmuggler(this) || this.host.retireStage(this) !== null || this.contrabandAboard(r).length > 0 || this.host.ventureShip(this) || this.host.courierShip(this)) return;
     const had = this.offers.get(dest);
     if (had && had.port === port && had.spot === r.ship.status) return;
-    // Moved since it was posted (to or from the berth, into a convoy): taken as closed by the move, and posted again below.
-    if (had) this.offers.delete(dest);
+    // Moved since it was posted (to or from the berth, into a convoy): taken as closed by the move, and posted again below. Its fare
+    // bandit trial is counted now if its groups chose already (the re-post keeps the arm, never a second trial); else the re-post goes on with it.
+    if (had) {
+      this.scoreArm(had);
+      this.offers.delete(dest);
+    }
     await this.paxCancels;
     const posts = stay.paxPosts ?? (stay.paxPosts = new Map());
     if ((posts.get(dest) ?? 0) >= PAX_MAX_POSTS_PER_STAY) return;
@@ -1361,18 +1493,25 @@ export class ShipAgent {
     let perHead: number;
     let why: string;
     let open = false;
+    // The fare bandit's arm this ask stands on (fareBandit): its round's outcome goes to it (one trial an offer).
+    let arm: ArmRef | undefined;
     if (had && had.port === port) {
       perHead = had.perHead;
       open = !!had.open;
+      // Posted again at the same fare: the same arm, its trial not counted yet (or counted once already).
+      arm = had.arm;
       why = "posted again from where she now lies";
     } else {
       const q = await this.paxFare(port, dest, groups, berths, plan, r);
       if (!q) return;
       perHead = q.perHead;
       open = q.open;
+      arm = q.arm;
       why =
         `${q.heads} of ${groups.reduce((n, g) => n + g.size, 0)} heads waiting would fit; ${q.basis} ${cr(q.ref)}/head` +
-        `${q.open ? `; groups give up unboarded on this route and nobody competes for them, so ${q.high ? "opened high over that" : "asked at that"} on the route's uncontested level, a step lower each unfilled round` : ""}`;
+        (q.arm
+          ? `; the fare bandit asks x${q.arm.m.toFixed(2)} of it${q.theta !== undefined ? ` (drew ${Math.round(q.theta * 100)}% of those heads boarding there)` : ""}${q.cap !== undefined ? `, never over the ${cr(q.cap)} this passage for fares alone was planned on` : ""}${q.open ? ", nobody competing for these groups" : ""}`
+          : `${q.open ? `; groups give up unboarded on this route and nobody competes for them, so ${q.high ? "opened high over that" : "asked at that"} on the route's uncontested level, a step lower each unfilled round` : ""}`);
     }
     // What a loss at sea costs the fares (a sinking, a capture; Lloyd's never insures them): the share expected to land.
     const value = Object.keys(r.cargo_manifest).reduce((n, g) => n + this.ownTons(r, g) * world.basePrice(g), 0) + fillHeads(groups, berths) * perHead;
@@ -1381,6 +1520,9 @@ export class ShipAgent {
       world.stormRisk(plan, cls?.hull_category ?? "coastal", knots, now, settings.stormWeightPct / 100).sink;
     const kept = Math.max(0, 1 - Math.min(1, lost));
     const until = Math.max(...groups.map((g) => Date.parse(g.board_by)));
+    // The bandit's trial: heads of the arm's kind that could board now (as banditFare valued it), against which those boarding are scored.
+    const armKind = arm ? fareKindOf(arm.key) : null;
+    const armFill = arm ? fillHeads(armKind ? groups.filter((g) => g.kind === armKind) : groups, berths) : 0;
     try {
       const o = await client.postPassengerOffer({ ship_id: this.shipId, dest_port_id: dest, fare_per_head_pence: perHead, max_berths: berths });
       this.offers.set(dest, {
@@ -1395,6 +1537,7 @@ export class ShipAgent {
         until,
         kept,
         ...(open ? { open: true } : {}),
+        ...(arm ? { arm, fill: armFill, armTaken: 0, ...(had?.arm === arm && had.scored ? { scored: true } : {}) } : {}),
       });
       this.paxKept = { dest, kept };
       this.host.persist();
@@ -1408,16 +1551,17 @@ export class ShipAgent {
         return;
       }
       // One open offer per ship and destination (409), or no answer (it may have landed): ours may stand already.
-      if ((outcomeUnknown(e) || (isApiError(e) && e.status === 409)) && (await this.adoptOffer(r, dest, until, kept, open ? perHead : undefined))) return;
+      if ((outcomeUnknown(e) || (isApiError(e) && e.status === 409)) && (await this.adoptOffer(r, dest, until, kept, open ? perHead : undefined, arm ? { arm, at: perHead, fill: armFill } : undefined))) return;
       this.logOnce(`pax-post:${stay.key}:${dest}`, `passenger offer for ${dest} not posted: ${(e as Error).message}`);
     }
   }
 
   /**
    * An open offer of ours here for `dest` found on the server (after a 409 or no answer): kept as ours. Whether one was. `openAt`:
-   * the uncontested ask just sent; the offer found at that fare is that one (its rounds teach the route's uncontested level).
+   * the uncontested ask just sent; the offer found at that fare is that one (its rounds teach the route's uncontested level). `priced`: the
+   * fare bandit's arm for the ask just sent (`at`) and its trial's heads (`fill`): the offer found at that fare stands on it.
    */
-  private async adoptOffer(r: ShipResult, dest: string, until: number, kept: number, openAt?: number): Promise<boolean> {
+  private async adoptOffer(r: ShipResult, dest: string, until: number, kept: number, openAt?: number, priced?: { arm: ArmRef; at: number; fill: number }): Promise<boolean> {
     const port = r.ship.current_port_id;
     const list = await this.host.client.passengerOffers(true, { ship_id: this.shipId }).catch((e: unknown) => {
       soft(e);
@@ -1438,6 +1582,7 @@ export class ShipAgent {
       until,
       kept,
       ...(openAt !== undefined && o.fare_per_head_pence === openAt ? { open: true } : {}),
+      ...(priced && o.fare_per_head_pence === priced.at ? { arm: priced.arm, fill: priced.fill, armTaken: 0 } : {}),
     });
     this.host.persist();
     return true;
@@ -1459,7 +1604,7 @@ export class ShipAgent {
     berths: number,
     plan: RoutePlan,
     r: ShipResult,
-  ): Promise<{ perHead: number; heads: number; ref: number; basis: string; open: boolean; high: boolean } | null> {
+  ): Promise<{ perHead: number; heads: number; ref: number; basis: string; open: boolean; high: boolean; arm?: ArmRef; theta?: number; cap?: number } | null> {
     const { world } = this.host;
     const now = world.now();
     const since = now - PAX_RECENT_GAME_DAYS * 24 * 60 * world.gameMinuteMs;
@@ -1510,6 +1655,17 @@ export class ShipAgent {
       if (groups.some((g) => g.kind === kind && (g.route_unmet_groups ?? 0) > 0) || world.paxUnmet(port, dest, kind)) open.add(kind);
     }
     const route = world.paxRoute(routeKey(port, dest));
+    // The fare bandit (fareBandit; passengers.ts banditFare): Thompson sampling over multipliers on the same references, the old learner
+    // as its prior's centre (the uncontested open-high too). No arm over the floor: the old pricer below, as with the setting off. A passage
+    // planned for fares alone (voyages.ts, on the bandit's posterior means) never asks more than the fare it was planned on: a dearer draw
+    // would leave the groups it was planned for ashore.
+    if (this.host.settings.fareBandit) {
+      const band = bandOf(world.fareSummary.bands, routeBand, plan.total_distance_nm);
+      const lane = this.lane;
+      const planned = lane?.kind === "passengers" && lane.dest === dest && lane.pax?.dest === dest && lane.pax.perHead > 0 ? lane.pax.perHead : undefined;
+      const b = banditFare({ refs, groups, berths, floor, adj: route?.adj ?? 1, adjOpen: route?.adjOpen, speed: speedFactor(knots, refKnots), open, own: ownRef, win: winChance(route), bandit: world.fareBandit, band, cap: planned });
+      if (b) return { perHead: b.perHead, heads: b.heads, ref: b.ref, basis: basis.get(b.kind) ?? "the reference", open: b.open, high: b.open && !ownRef.has(b.kind), arm: b.arm, theta: b.theta, ...(planned !== undefined ? { cap: planned } : {}) };
+    }
     const q = fareFor({ refs, groups, berths, floor, adj: route?.adj ?? 1, adjOpen: route?.adjOpen, speed: speedFactor(knots, refKnots), open, own: ownRef, win: winChance(route) });
     if (!q) {
       this.logOnce(key, `not offering berths for ${dest}: the weight's sailing time costs ${cr(floor)}/head, more than groups there have paid`);
@@ -1571,9 +1727,14 @@ export class ShipAgent {
     const free = berthsFor(r.effective_hold_capacity_tons - r.cargo_used_tons, world.shipClass(this.shipClass)?.passengers_per_ton || 1, reserve);
     const berths = Math.min(o.berths - o.taken, free);
     const groups = fittingGroups((stay.paxWaiting?.groups ?? []).filter((g) => !this.aboard.has(g.id)), dest, berths, round);
-    const heads = fillHeads(groups, berths);
+    // With the fare bandit's arm: the heads of its kind the berths left take, at the share of them its posterior expects to board (the value
+    // the ask was chosen on, banditFare); else every group's, at the odds the route's offers have won a round.
+    const arm = settings.fareBandit ? o.arm : undefined;
+    const kind = arm ? fareKindOf(arm.key) : null;
+    const heads = fillHeads(kind ? groups.filter((g) => g.kind === kind) : groups, berths);
     if (heads <= 0) return 0;
-    const value = heads * o.perHead * winChance(world.paxRoute(routeKey(o.port, dest))) * o.kept;
+    const odds = arm ? armChance(world.fareBandit, arm) : winChance(world.paxRoute(routeKey(o.port, dest)));
+    const value = heads * o.perHead * odds * o.kept;
     const dues = r.ship.status === "berthed" ? world.berthDuesFor(stay.port, waitMs, false) : 0;
     const { worth, cost } = waitWorth(value, waitMs, this.ratePerHour, dues);
     if (!worth) return 0;
@@ -1584,14 +1745,33 @@ export class ShipAgent {
 
   /**
    * A round our offer stood through with groups it could take still waiting, and none boarded: its route's fare is nudged down (for
-   * an uncontested ask its own level, a step lower and faster).
+   * an uncontested ask its own level, a step lower and faster). The fare bandit's trial on it is counted either way (scoreArm).
    */
   private settleOffer(o: PaxOffer): void {
     const { world } = this.host;
+    if (o.taken === 0 && this.roundChosen(o)) world.notePaxRound(routeKey(o.port, o.dest), false, world.now(), !!o.open);
+    this.scoreArm(o);
+  }
+
+  /** Whether a game-hour round passed (with its slack) since the offer went up, with groups it was posted for still waiting at it. */
+  private roundChosen(o: PaxOffer): boolean {
+    const { world } = this.host;
     const round = world.nextGameHour(o.at);
-    if (o.taken === 0 && round !== null && round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs <= world.now() && o.until > round) {
-      world.notePaxRound(routeKey(o.port, o.dest), false, world.now(), !!o.open);
-    }
+    return round !== null && round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs <= world.now() && o.until > round;
+  }
+
+  /**
+   * The fare bandit's trial on an offer that closed (one an offer, whatever the setting now: what was learned stays true): the share of the
+   * heads of its arm's kind that could board when it went up (`fill`) that did, at most 1, once some of them boarded or a round passed with
+   * its groups still waiting; nothing when it closed before they chose (no trial). Older offers with no `fill`: its berths.
+   */
+  private scoreArm(o: PaxOffer): void {
+    if (!o.arm || o.scored) return;
+    const heads = Math.max(0, o.armTaken ?? 0);
+    if (heads === 0 && !this.roundChosen(o)) return;
+    const fill = o.fill !== undefined && o.fill > 0 ? o.fill : Math.max(1, o.berths);
+    this.host.world.fareBandit.observe(o.arm, Math.min(1, heads / fill), this.host.world.now());
+    o.scored = true;
   }
 
   /** She sailed: the server closed our offers where she lay (each settled for the pricer). */
@@ -1637,6 +1817,7 @@ export class ShipAgent {
         return null;
       });
       if (!plan) {
+        this.scoreArm(o);
         this.offers.delete(o.dest);
         continue;
       }
@@ -1655,6 +1836,9 @@ export class ShipAgent {
       o.taken += g.size ?? 0;
       // Up the level the offer was priced on (uncontested or contested), never the other.
       world.notePaxRound(routeKey(o.port, o.dest), true, world.now(), !!o.open);
+      // The fare bandit's arm: heads of its kind boarded (a notice naming no kind taken as of it; none naming its heads, one head at least),
+      // scored as a share of those that could board when the offer closes (scoreArm), one trial an offer.
+      if (o.arm && !o.scored && (!g.kind || g.kind === fareKindOf(o.arm.key))) o.armTaken = (o.armTaken ?? 0) + (g.size && g.size > 0 ? g.size : 1);
     }
     if (!g.id || !g.dest || !(g.size && g.size > 0)) {
       this.paxSynced = false;
@@ -1853,6 +2037,7 @@ export class ShipAgent {
     if ((!this.paxSynced && Date.now() - this.paxSyncAt >= PAX_SYNC_RETRY_MS) || (arriving && pax)) await this.syncPassengers();
     if (this.checkRestored && this.freightSynced) this.checkRestoredLane(r);
     for (const good of [...this.minSale.keys()]) if (this.ownTons(r, good) <= 0) this.minSale.delete(good);
+    for (const good of [...this.saleCost.keys()]) if (this.ownTons(r, good) <= 0) this.saleCost.delete(good);
 
     if (s.status === "sailing") {
       this.stay = null;
@@ -1909,8 +2094,12 @@ export class ShipAgent {
         }
       }
       this.resumeAt = null;
-      // Offers posted somewhere else (saved before a restart, the ship since moved on) closed when she sailed.
-      for (const [dest, o] of [...this.offers]) if (o.port !== port) this.offers.delete(dest);
+      // Offers posted somewhere else (saved before a restart, the ship since moved on) closed when she sailed (the fare bandit's trial counted).
+      for (const [dest, o] of [...this.offers]) {
+        if (o.port === port) continue;
+        this.scoreArm(o);
+        this.offers.delete(dest);
+      }
       await this.syncFreight();
       await this.refreshPortCharters(port);
     } else if (world.crisisDue(port, this.stay.lookedAt)) {
@@ -1937,7 +2126,8 @@ export class ShipAgent {
     this.log(`${why}; stopping its autopilot`);
     this.activity = why;
     this.gone = true;
-    // The server closes a lost or sold ship's offers (and her passengers are lost: passengers_lost says).
+    // The server closes a lost or sold ship's offers (and her passengers are lost: passengers_lost says); the fare bandit's trials counted.
+    for (const o of this.offers.values()) this.scoreArm(o);
     this.offers.clear();
     this.host.releaseLane(this);
     this.stopRequested = true;
@@ -2216,7 +2406,7 @@ export class ShipAgent {
       }
     };
 
-    // 3. Where next. A policy the user bought for this ship decides first (rule 8: it is void if she sails
+    // 3. Where next. A policy on this ship (the user's, or insureLevered's) decides first (rule 8: it is void if she sails
     // anywhere but its port), unless sealed freight would miss its deadline by way of there; then sealed freight;
     // the AI's order only after both (and after cargo aboard).
     let order = this.host.shipOrder(this);
@@ -2578,7 +2768,7 @@ export class ShipAgent {
   }
 
   /**
-   * The policy on this ship the user bought (the autopilot never buys one), open or active and not lapsed,
+   * The policy on this ship (the user's, or one insureLevered wrote for the voyage she is about to sail), open or active and not lapsed,
    * read at most every `maxAgeMs`. A failed read keeps the last; with none to keep (never read, or an insurance
    * event since: forgetPolicy) it is unknown (undefined), and callers take the safe side (wait, don't sell).
    */
@@ -2601,6 +2791,16 @@ export class ShipAgent {
   /** An insurance event: read the policy again at the next decision (unknown until that read succeeds). */
   forgetPolicy(): void {
     this.policy = null;
+  }
+
+  /** A policy the fleet just wrote on her (insureLevered): known at once, so nothing more is loaded and she sails only for its port. */
+  notePolicy(p: InsurancePolicy): void {
+    this.policy = { p, at: Date.now() };
+  }
+
+  /** Passengers aboard, or an offer of ours open where she lies (a policy would void on them: insureLevered leaves her uninsured). */
+  paxBusy(): boolean {
+    return this.offers.size > 0 || this.paxHeads() > 0;
   }
 
   /**
@@ -2634,6 +2834,7 @@ export class ShipAgent {
       for (const p of lane.parts) {
         const floor = Math.max(p.costPerTon, kept && p.kind === "market" ? Math.round(p.pay * (1 - SELL_FLOOR_DROP)) : 0);
         if (floor > 0 && this.ownTons(r, p.good) > 0) this.minSale.set(p.good, Math.max(this.minSale.get(p.good) ?? 0, floor));
+        if (p.costPerTon > 0 && this.ownTons(r, p.good) > 0) this.saleCost.set(p.good, Math.max(this.saleCost.get(p.good) ?? 0, p.costPerTon));
       }
     }
     if (!kept) {
@@ -2802,9 +3003,26 @@ export class ShipAgent {
       // Docking costs a berth stay: only when at least a ton (or the freight's collateral) can be paid for;
       // for a load counting on cash due, the main cargo buyPart would sail with (the rest waits in the roadstead).
       const main = lane.parts[0];
+      // Out of the berth with a split load's rest still to buy (evicted past 6 game hours at a full port, guide 3.3): the wait is over, and
+      // the slice keeps the floors set when it was bought. The rest is bought at a berth again if the cash is there; else she sails with
+      // what is aboard (the lane is never given up with the slice aboard: that would leave it to be sold off at its own source).
+      const split = stay.split;
+      const splitLoad = lane.kind !== "freight" && !!split && split.good === main?.good;
+      if (split && splitLoad && !split.done) {
+        split.done = true;
+        this.log(`out of the berth at ${stay.port} before the ${split.good} ladder re-quoted: the rest of the split load is bought at a berth again, cash allowing`);
+      }
       const tons = main && this.waitsForDue(r, lane) ? Math.min(main.tons, Math.max(1, Math.ceil(this.leastMainTons(r, lane)))) : 1;
       const need = Math.max((main?.costPerTon ?? 0) * tons, lane.freight[0]?.collateral ?? 0, 1);
       if ((await this.host.withCash(() => this.host.loadBudget(this, world.region(lane.source), need))) < need) {
+        if (splitLoad && this.laneGoodsAboard(r, lane) > 0) {
+          for (const p of lane.parts) this.floorPart(p);
+          this.log(`no cash for the rest of the split ${main.good} load: sailing for ${lane.dest} with what is aboard`);
+          stay.traded.add("cargo");
+          this.laneLoaded = lane.key;
+          this.host.persist(true);
+          return this.sailTo(r, lane.dest, stay);
+        }
         this.host.releaseLane(this);
         this.activity = "waiting for cash to buy a load";
         return NO_CASH_WAIT_MS;
@@ -2867,6 +3085,11 @@ export class ShipAgent {
       }
     } else {
       const main = lane.parts[0];
+      // The rest of a load split across a re-quote (execution.ts): only once the ladder shows it re-quoted.
+      if (stay.split && !stay.split.done && stay.split.good === main.good) {
+        const wait = await this.splitWait(stay, lane.source);
+        if (wait !== null) return wait;
+      }
       const res = await this.buyPart(r, lane, main, stay);
       if (res.stop) return this.stopLoading(stay, res.stop.p);
       // Bought on an earlier tick of this stay (a later step failed): carry on loading. Surplus stores trimStores just
@@ -2894,11 +3117,16 @@ export class ShipAgent {
       const res = await this.buyPart(await this.reread(), lane, p, stay);
       if (res.stop) return this.stopLoading(stay, res.stop.p);
     }
-    // Never sell any of it for less than it cost to land (or, for market goods, the planned floor).
-    for (const p of lane.parts) {
-      const floor = Math.max(p.costPerTon, p.kind === "market" ? Math.round(p.pay * (1 - SELL_FLOOR_DROP)) : 0);
-      if (floor > 0) this.minSale.set(p.good, Math.max(this.minSale.get(p.good) ?? 0, floor));
+    // A main good split across a re-quote: she waits here for it (the other goods are aboard, floored now: the wait may end out of the
+    // berth), then buys the rest.
+    if (lane.kind !== "freight" && stay.split && !stay.split.done && stay.split.good === lane.parts[0]?.good) {
+      for (const p of lane.parts) this.floorPart(p);
+      const wait = await this.splitWait(stay, lane.source);
+      if (wait !== null) return wait;
+      const res = await this.buyPart(await this.reread(), lane, lane.parts[0], stay);
+      if (res.stop) return this.stopLoading(stay, res.stop.p);
     }
+    for (const p of lane.parts) this.floorPart(p);
     if (lane.kind !== "freight" && lane.freight.length > 0) {
       const got = await this.acceptLaneFreight(await this.reread(), lane, stay);
       if (got.stop) return this.stopLoading(stay, got.stop.p);
@@ -2931,6 +3159,17 @@ export class ShipAgent {
     return this.dockOrWait(r);
   }
 
+  /**
+   * A part's sale floors: never sold for less than it cost to land (or, for market goods, the planned floor: minSale); the landed cost
+   * alone (saleCost) is the hard floor under an opportunity-floor sale (execution.ts), never the planned 88%. Set once its goods are
+   * aboard (a split's first slice at once: its wait may end out of the berth).
+   */
+  private floorPart(p: Part): void {
+    const floor = Math.max(p.costPerTon, p.kind === "market" ? Math.round(p.pay * (1 - SELL_FLOOR_DROP)) : 0);
+    if (floor > 0) this.minSale.set(p.good, Math.max(this.minSale.get(p.good) ?? 0, floor));
+    if (p.costPerTon > 0) this.saleCost.set(p.good, Math.max(this.saleCost.get(p.good) ?? 0, p.costPerTon));
+  }
+
   /** Tons of a charter part its charters still have room for (all of a market part). */
   private liveTons(part: Part): number {
     if (part.kind !== "charter") return part.tons;
@@ -2947,6 +3186,9 @@ export class ShipAgent {
   /**
    * Buys one good of the lane's load, up to its break-even price and the room left for it. `self`: nothing
    * filled because the asks under the limit were our own other companies' (they never match ours, guide 3.2).
+   * Goods of ours waiting in our warehouse here (resting orders, execution.ts) go aboard first. With marginalOrders on and the
+   * depth seen, each ton must clear the margin at its own sale price and ask (buyPass), a book that moved under the IOC is looked
+   * at again (up to three passes), and the main good's load may be split across a re-quote (splitCase).
    */
   private async buyPart(
     r: ShipResult,
@@ -2954,10 +3196,9 @@ export class ShipAgent {
     part: Part,
     stay: Stay,
   ): Promise<{ bought: number; reason: string; self?: boolean; stop?: { p: InsurancePolicy | undefined } }> {
-    const { client, world, settings } = this.host;
-    const port = lane.source;
+    const { settings } = this.host;
     const good = part.good;
-    const want = Math.min(part.tons, this.liveTons(part)) - this.ownTons(r, good);
+    let want = Math.min(part.tons, this.liveTons(part)) - this.ownTons(r, good);
     if (want < 1) return { bought: 0, reason: `no room left in the ${good} charters` };
     // Cargo bought after a policy is written voids it: read afresh before every purchase.
     const policy = await this.policyNow();
@@ -2965,10 +3206,53 @@ export class ShipAgent {
     // Room for the cargo after the whole tons of stores the voyage still needs.
     const storesTarget = await this.storesTarget(lane.source, lane.dest, lane.source);
     const storesRoom = this.storesHoldNeed(r.stores.provisions_tons, storesTarget);
+    // Ours in our warehouse here first (a prebuy for her, a glut, a leftover): no spread, no customs, nothing left resting there.
+    const stored = await this.loadStored(r, lane, part, stay, Math.min(r.effective_hold_capacity_tons - r.cargo_used_tons - storesRoom, want));
+    if (stored > 0) {
+      r = await this.reread();
+      want = Math.min(part.tons, this.liveTons(part)) - this.ownTons(r, good);
+      if (want < 1) return { bought: stored, reason: "ok" };
+    }
+    const passes = settings.marginalOrders ? 3 : 1;
+    let bought = stored;
+    let last: { bought: number; reason: string; self?: boolean; again?: boolean } = { bought: 0, reason: "nothing filled" };
+    for (let pass = 0; pass < passes; pass++) {
+      if (pass > 0) {
+        r = await this.reread();
+        want = Math.min(part.tons, this.liveTons(part)) - this.ownTons(r, good);
+        if (want < 1) break;
+      }
+      last = await this.buyPass(r, lane, part, stay, want, storesRoom, pass);
+      bought += last.bought;
+      if (!last.again) break;
+    }
+    if (bought > last.bought) return { bought, reason: "ok" };
+    return { bought, reason: last.reason, ...(last.self !== undefined ? { self: last.self } : {}) };
+  }
+
+  /**
+   * One look at the source's asks and one IOC (holding the cash lock): today's rule (every ton up to the break-even limit) or, with
+   * marginalOrders on and the depth seen, execution.ts planBuy (each ton at its own ask must clear the margin at its own sale price; the
+   * IOC's limit is the dearest level wanted). `again`: filled part of what it asked while the asks it priced stood at the look (the book
+   * moved): worth another look.
+   */
+  private async buyPass(
+    r: ShipResult,
+    lane: Lane,
+    part: Part,
+    stay: Stay,
+    want: number,
+    storesRoom: number,
+    pass: number,
+  ): Promise<{ bought: number; reason: string; self?: boolean; again?: boolean }> {
+    const { client, world, settings } = this.host;
+    const port = lane.source;
+    const good = part.good;
     return this.host.withCash(async () => {
       const book = await client.book(port, good);
       world.observeBook(book);
       const b = book.books.find((x) => x.commodity_id === good);
+      if (b?.depth) this.host.noteLadder(port, good, npcLevels(b.depth.asks), npcLevels(b.depth.bids));
       // A royal monopoly another company holds in this region (guide 3.9): the Crown's asks aren't ours to take,
       // only players' resting asks (the holder's among them).
       const barred = world.monopolyBars(port, good);
@@ -2992,7 +3276,7 @@ export class ShipAgent {
       const kept = (1 - (lane.piracyBps ?? 0) / 10_000) * (1 - (lane.stormBps ?? 0) / 10_000);
       const limit = Math.floor(Math.min((part.minPay - settings.minMarginPence) * kept, part.cashPay * kept) / (customs * fee));
       if (bestAsk > limit) {
-        this.log(`${good} at ${port} asks ${cr(bestAsk)}/t, above the ${cr(limit)}/t break-even for ${lane.dest}`);
+        if (pass === 0) this.log(`${good} at ${port} asks ${cr(bestAsk)}/t, above the ${cr(limit)}/t break-even for ${lane.dest}`);
         return { bought: 0, reason: `${good} too dear at ${port}` };
       }
       let room = Math.min(r.effective_hold_capacity_tons - r.cargo_used_tons - storesRoom, want);
@@ -3003,44 +3287,94 @@ export class ShipAgent {
       // Under a monopoly only the players' asks under the limit can fill (a bid past them would be refused).
       if (barred) room = Math.min(room, Math.floor(asks.reduce((n, l) => n + l.remaining_quantity, 0)));
       if (room <= 0) return { bought: 0, reason: `${good} at ${port} is under a royal monopoly (${barred!.holder}): players offer none under the limit` };
-      const costFor = (n: number) => {
-        let left = n;
-        let cost = 0;
-        for (const l of asks) {
-          const take = Math.min(left, l.remaining_quantity);
-          cost += take * l.price_pence;
-          left -= take;
-          if (left <= 0) break;
+      // Our own resting asks here would meet this bid (orders never match ours): withdrawn first (the cash lock, then the resting one).
+      await this.host.restingClear(port, good, "bid", limit);
+
+      // Order by order (execution.ts): with the depth seen and no monopoly, each ton at its own ask and its own sale price.
+      const exec = settings.marginalOrders && !!b?.depth && !barred;
+      let qty: number;
+      let bidAt = limit;
+      let split: { now: number; saved: number; until: number; next: number | null } | null = null;
+      if (!exec) {
+        const costFor = (n: number) => {
+          let left = n;
+          let cost = 0;
+          for (const l of asks) {
+            const take = Math.min(left, l.remaining_quantity);
+            cost += take * l.price_pence;
+            left -= take;
+            if (left <= 0) break;
+          }
+          return Math.ceil((cost + Math.max(0, left) * limit) * customs);
+        };
+        // Never the cash our other ships' loads count on (FleetManager.loadBudget).
+        const cash = await this.host.loadBudget(this, world.region(port), costFor(room));
+        qty = room;
+        while (qty > 0 && costFor(qty) > cash) qty--;
+        // Cash due it counted on not here yet, and too little without it for a load worth the leg: wait for it rather than sail a sliver.
+        if (qty > 0 && qty < room && part === lane.parts[0] && this.waitsForDue(r, lane) && qty < this.leastMainTons(r, lane)) {
+          this.log(`cash covers only ${qty} of ${room} t ${good} (${cr(cash)} spare for this load): too little to sail; waiting for cash`);
+          return { bought: 0, reason: "cash" };
         }
-        return Math.ceil((cost + Math.max(0, left) * limit) * customs);
-      };
-      // Never the cash our other ships' loads count on (FleetManager.loadBudget).
-      const cash = await this.host.loadBudget(this, world.region(port), costFor(room));
-      let qty = room;
-      while (qty > 0 && costFor(qty) > cash) qty--;
-      // Cash due it counted on not here yet, and too little without it for a load worth the leg: wait for it rather than sail a sliver.
-      if (qty > 0 && qty < room && part === lane.parts[0] && this.waitsForDue(r, lane) && qty < this.leastMainTons(r, lane)) {
-        this.log(`cash covers only ${qty} of ${room} t ${good} (${cr(cash)} spare for this load): too little to sail; waiting for cash`);
-        return { bought: 0, reason: "cash" };
-      }
-      if (qty > 0 && qty < room) this.log(`cash covers ${qty} of ${room} t ${good} (${cr(cash)} spare for this load)`);
-      if (qty <= 0) {
-        this.log(`not enough cash in ${world.region(port)} for ${good} at ${port}`);
-        return { bought: 0, reason: "cash" };
+        if (qty > 0 && qty < room) this.log(`cash covers ${qty} of ${room} t ${good} (${cr(cash)} spare for this load)`);
+        if (qty <= 0) {
+          this.log(`not enough cash in ${world.region(port)} for ${good} at ${port}`);
+          return { bought: 0, reason: "cash" };
+        }
+      } else {
+        const levels: Level[] = asks.map((l) => ({ price: l.price_pence, qty: l.remaining_quantity }));
+        const sale = this.saleOf(lane, part);
+        const base = { levels, want: room, aboard: this.ownTons(r, good), customs, fee, kept, minMargin: settings.minMarginPence, cap: limit, sale };
+        const sized = planBuy({ ...base, cash: Infinity });
+        // What the break-even IOC would have taken (its cash aside): the marginal stop's cut.
+        const old = walkTons(levels, Math.floor(room)).length;
+        if (sized.qty < 1) {
+          if (pass === 0) this.log(`${good} at ${port}: the first ton at ${cr(bestAsk)}/t doesn't clear the ${cr(settings.minMarginPence)}/t margin at its sale price at ${lane.dest}`);
+          return { bought: 0, reason: `${good} too dear at ${port}` };
+        }
+        if (pass === 0 && old > sized.qty) {
+          this.host.noteExec("cut", old - sized.qty);
+          this.log(`${good} at ${port}: ${sized.qty} of the ${old} t under the break-even pay their way ton by ton (the next would clear under ${cr(settings.minMarginPence)}/t at its own ask and sale price)`);
+        }
+        // Never the cash our other ships' loads count on (FleetManager.loadBudget).
+        const cash = await this.host.loadBudget(this, world.region(port), sized.cost);
+        let plan = planBuy({ ...base, cash });
+        if (plan.qty > 0 && plan.qty < sized.qty && part === lane.parts[0] && this.waitsForDue(r, lane) && plan.qty < this.leastMainTons(r, lane)) {
+          this.log(`cash covers only ${plan.qty} of ${sized.qty} t ${good} (${cr(cash)} spare for this load): too little to sail; waiting for cash`);
+          return { bought: 0, reason: "cash" };
+        }
+        if (plan.qty > 0 && plan.qty < sized.qty) this.log(`cash covers ${plan.qty} of ${sized.qty} t ${good} (${cr(cash)} spare for this load)`);
+        if (plan.qty <= 0) {
+          this.log(`not enough cash in ${world.region(port)} for ${good} at ${port}`);
+          return { bought: 0, reason: "cash" };
+        }
+        // The main good's load split across a re-quote (once a stay): only the first slice now, the rest once the ladder re-quotes.
+        if (part === lane.parts[0] && pass === 0 && !stay.split && plan.qty >= SPLIT_MIN_TONS) {
+          split = this.splitCase(r, lane, port, good, plan.qty, walkTons(levels, plan.qty), customs);
+          if (split) plan = planBuy({ ...base, want: split.now, cash });
+          if (plan.qty < 1) {
+            split = null;
+            plan = planBuy({ ...base, cash });
+          }
+        }
+        qty = plan.qty;
+        bidAt = plan.limit;
       }
 
       try {
         const use = part.kind === "market" ? `sells ~${cr(part.pay)}/t at ${lane.dest}` : `pays ${cr(part.pay)}/t at ${lane.dest}`;
-        this.log(`bid ${qty} t ${good} at ${port} ≤ ${cr(limit)}/t (ask ${cr(bestAsk)}, ${use})`);
+        this.log(`bid ${qty} t ${good} at ${port} ≤ ${cr(bidAt)}/t (ask ${cr(bestAsk)}, ${use}${exec && bidAt < limit ? `; break-even ${cr(limit)}/t` : ""})`);
         const res = await client.placeOrder({
           port_id: port,
           commodity_id: good,
           side: "bid",
           time_in_force: "ioc",
-          price_pence: limit,
+          price_pence: bidAt,
           quantity: qty,
           ship_id: this.shipId,
         });
+        // The market model moves this book's stock by what we took (before the book is read again below).
+        world.noteFill(res);
         const paid = res.total_gross_pence + res.customs_duty_pence;
         this.noteLaneSpend(lane, paid);
         this.stats.spentPence += paid;
@@ -3053,23 +3387,50 @@ export class ShipAgent {
         }
         this.log(`bought ${res.filled_quantity}/${qty} t for ${cr(paid)} (${cr(res.filled_quantity ? paid / res.filled_quantity : 0)}/t landed)`);
         let self = false;
-        if (res.filled_quantity < qty && asks.some((l) => !l.is_npc)) {
+        const crossed = asks.filter((l) => l.price_pence <= bidAt);
+        const checkOwn = res.filled_quantity < qty && crossed.some((l) => !l.is_npc);
+        // After a first slice: the ladder as it left it, which the wait for the re-quote compares against (splitWait).
+        const after =
+          checkOwn || (split !== null && res.filled_quantity > 0)
+            ? await client.book(port, good).catch((e: unknown) => {
+                soft(e);
+                return null;
+              })
+            : null;
+        if (checkOwn) {
           // Orders never match our own other companies (guide 3.2): a player's ask under our limit still there
           // untouched after our bid crossed it is one of theirs.
-          const after = await client.book(port, good).catch((e: unknown) => {
-            soft(e);
-            return null;
-          });
           const left = after?.books.find((x) => x.commodity_id === good)?.depth?.asks ?? [];
-          const ours = asks.filter((l) => !l.is_npc && left.some((x) => x.order_id === l.order_id && x.remaining_quantity === l.remaining_quantity)).map((l) => l.order_id);
+          const ours = crossed.filter((l) => !l.is_npc && left.some((x) => x.order_id === l.order_id && x.remaining_quantity === l.remaining_quantity)).map((l) => l.order_id);
           if (ours.length) {
             world.noteUnfillable(port, good, ours);
             this.log(`${ours.length} ask${ours.length === 1 ? "" : "s"} for ${good} at ${port} can't fill our bids (our own companies'): left out from now on`);
           }
-          if (after) world.observeBook(after);
           self = res.filled_quantity === 0 && ours.length > 0;
         }
-        return { bought: res.filled_quantity, reason: res.filled_quantity ? "ok" : self ? `only our own companies' ${good} was under the limit at ${port}` : "nothing filled", self };
+        if (after) world.observeBook(after);
+        if (split && res.filled_quantity > 0) {
+          const d = after?.books.find((x) => x.commodity_id === good)?.depth;
+          stay.split = {
+            good,
+            asks: npcLevels(d?.asks),
+            bids: npcLevels(d?.bids),
+            lookedAt: world.now(),
+            // A full step and the slack at most, never past the berth's eviction line (splitCase).
+            until: split.until,
+            next: split.next,
+            // The ladder unread: nothing to tell a re-quote by, so the rest is bought on the next look.
+            done: !d,
+          };
+          // The slice aboard is floored at once (its landed cost): the wait may end out of the berth, or the lane be given up.
+          this.floorPart(part);
+          this.host.persist(true);
+          this.host.noteExec("split", split.saved);
+          this.log(`split the ${good} load across the next re-quote: ${res.filled_quantity} t now, the rest once the ladder refills (~${cr(split.saved)} saved net of her wait)`);
+        }
+        // The book moved under the IOC (it filled less than the asks seen held): look again for what still pays.
+        const again = exec && !split && res.filled_quantity > 0 && res.filled_quantity < qty && !self;
+        return { bought: res.filled_quantity, reason: res.filled_quantity ? "ok" : self ? `only our own companies' ${good} was under the limit at ${port}` : "nothing filled", self, again };
       } catch (e) {
         if (isApiError(e) && e.status === 400) {
           this.log(`buy refused: ${e.message}`);
@@ -3085,6 +3446,141 @@ export class ShipAgent {
         throw e;
       }
     });
+  }
+
+  /**
+   * Goods of ours waiting in our warehouse at the source for resting orders (manager.ts warehouseTake: a prebuy for her, a glut, a
+   * leftover), loaded into her hold first, up to `room`: booked as bought here at their cost (what no ship's spend has counted yet goes
+   * into hers). Tons loaded.
+   */
+  private async loadStored(r: ShipResult, lane: Lane, part: Part, stay: Stay, room: number): Promise<number> {
+    const n = Math.floor(room);
+    if (n < 1 || r.ship.status !== "berthed" || r.ship.current_port_id !== lane.source) return 0;
+    const took = await this.host.warehouseTake(this, r, lane.source, part.good, n);
+    if (!(took.tons > 0)) return 0;
+    const pence = Math.round(took.tons * took.costPerTon);
+    this.noteLaneSpend(lane, pence);
+    if (took.unbooked > 0) this.stats.spentPence += took.unbooked;
+    stay.boughtHere.set(part.good, (stay.boughtHere.get(part.good) ?? 0) + took.tons);
+    const trip = this.ensureTrip(r, lane);
+    trip.spent += pence;
+    trip.tons += took.tons;
+    this.log(`loaded ${took.tons} t ${part.good} of ours from our warehouse at ${lane.source} (${cr(took.costPerTon)}/t landed there)`);
+    this.host.persist(true);
+    return took.tons;
+  }
+
+  /** Per ton delivered, what the n-th ton of a part fetches at the lane's destination (execution.ts saleCurve; a charter part: its lowest pay). */
+  private saleOf(lane: Lane, part: Part): (n: number) => number {
+    if (part.kind !== "market") return () => part.minPay;
+    const { world } = this.host;
+    const at = lane.deliverAt > 0 ? Math.max(lane.deliverAt, world.now()) : world.now();
+    return saleCurve(part.pay, part.tons, this.host.sellAfter(this, lane.dest, part.good), world.marketView(lane.dest, part.good, "bid", at));
+  }
+
+  /**
+   * Whether to buy only a slice of the main good now and the rest after the next re-quote (execution.ts splitBuy): with the market
+   * model's ask curve here (the ladder seen, its refill per re-quote, its drift to then), the slippage saved (customs in, times the chance
+   * the re-quote comes before her wait ends) must beat her time and berth dues waiting past her lock (extraWait: the re-quote's time
+   * learned, else anywhere in the step; never past the wait's end) by SPLIT_SAFETY, and nothing she carries (a charter's expiry, sealed
+   * freight, passengers' promise) may come within a step of being late. Her wait ends a full step and the slack on at most, and never
+   * past the berth's eviction line (BERTH_EVICT_GAME_MIN berthed less SPLIT_EVICT_MARGIN_GAME_MIN: a ship docking at a full port may
+   * evict her then, guide 3.3); a re-quote known to come after it is no case. Never in the season's endgame. The tons now, the saving
+   * net of the wait, when the wait ends and the re-quote's time as known (server ms; null: unknown), or null.
+   */
+  private splitCase(
+    r: ShipResult,
+    lane: Lane,
+    port: string,
+    good: string,
+    qty: number,
+    walked: number[],
+    customs: number,
+  ): { now: number; saved: number; until: number; next: number | null } | null {
+    const { world } = this.host;
+    if (world.seasonMode() !== "normal") return null;
+    const mv = world.marketView(port, good, "ask");
+    if (!mv) return null;
+    const now = world.now();
+    const gm = world.gameMinuteMs;
+    const step = STEP_GAME_MIN * gm;
+    // Berthed since (unknown: taken as now); the rest is bought at the berth before the eviction line.
+    const berthed = Date.parse(r.ship.berthed_at ?? "");
+    const evictAt = (Number.isFinite(berthed) ? Math.min(berthed, now) : now) + (BERTH_EVICT_GAME_MIN - SPLIT_EVICT_MARGIN_GAME_MIN) * gm;
+    const until = Math.min(now + step + SPLIT_WAIT_SLACK_GAME_MIN * gm, evictAt);
+    const cap = until - now;
+    if (cap <= 2 * gm) return null;
+    const due = this.deliverDeadline();
+    if (due !== null && Math.max(lane.deliverAt, now) + cap + step > due) return null;
+    const next = this.host.requoteAt(port);
+    const tau = next !== null ? Math.max(0, next - now) : null;
+    // The rest is bought once the re-quote is past (2 game minutes on, when its time is known): only a saving if that is before the end.
+    const chance = requoteChance(tau !== null ? tau + 2 * gm : null, cap, step);
+    if (!(chance > 0)) return null;
+    const then = world.marketView(port, good, "ask", now + (tau ?? step / 2) + gm);
+    const drift = then && mv.price > 0 ? then.price / mv.price : 1;
+    const last = walked.length ? walked[walked.length - 1] : mv.price;
+    const scale = last / Math.max(1, mv.marginal(Math.max(0, walked.length - 0.5)));
+    const s = splitBuy(ladderAt(walked, (u) => mv.marginal(u) * scale), qty, world.market.refill(port, good, "ask").r, drift);
+    if (!s) return null;
+    const lockLeft = r.ship.turnaround_unlocks_at ? Math.max(0, Date.parse(r.ship.turnaround_unlocks_at) - now) : 0;
+    const wait = extraWait(tau, lockLeft + s.now * world.handlingMsPerTon(port), step, cap);
+    const cost = (wait / 3_600_000) * this.ratePerHour + world.berthDuesFor(port, wait, false);
+    const saved = chance * s.saved * customs;
+    if (saved < Math.max(SPLIT_MIN_SAVED_PENCE, SPLIT_SAFETY * cost)) return null;
+    return { now: s.now, saved: Math.round(saved - cost), until, next };
+  }
+
+  /**
+   * A load split across a re-quote (stay.split): null once the rest is to be bought (the ladder showed it re-quoted: an NPC level grown,
+   * new, or better than the best since the last look, execution.ts requoted; the re-quote's known time 2 game minutes past, whatever the
+   * ladder shows; or her wait's end, a full step and the slack on or the berth's eviction line), else a wait. Each look teaches the
+   * re-quote's time here (FleetHost.noteRequote). She waits at the berth: the rest is bought berthed.
+   */
+  private async splitWait(stay: Stay, port: string): Promise<number | null> {
+    const sp = stay.split;
+    if (!sp || sp.done) return null;
+    const { client, world } = this.host;
+    const now = world.now();
+    const gm = world.gameMinuteMs;
+    if (now >= sp.until) {
+      sp.done = true;
+      this.log(`no re-quote seen for ${sp.good} at ${port} before her wait's end: buying the rest of the load as the ladder stands`);
+      return null;
+    }
+    // Unknown at the split, the re-quote's time may have been learned since (another look here, another ship's).
+    sp.next ??= this.host.requoteAt(port);
+    const book = await client.book(port, sp.good).catch((e: unknown) => {
+      soft(e);
+      return null;
+    });
+    if (book) {
+      world.observeBook(book);
+      const d = book.books.find((x) => x.commodity_id === sp.good)?.depth;
+      if (d) {
+        const asks = npcLevels(d.asks);
+        const bids = npcLevels(d.bids);
+        if (requoted(sp.asks, asks, "ask") || requoted(sp.bids, bids, "bid")) {
+          this.host.noteRequote(port, sp.lookedAt, now);
+          sp.done = true;
+          this.log(`the ${sp.good} ladder at ${port} re-quoted: buying the rest of the split load`);
+          return null;
+        }
+        // Bought or sold into by others meanwhile: the next look compares against this one.
+        sp.asks = asks;
+        sp.bids = bids;
+        sp.lookedAt = now;
+      }
+    }
+    // The re-quote's time is known and past: it re-quoted, whatever the ladder shows (a refill the look can't tell from what it saw).
+    if (sp.next !== null && now >= sp.next + 2 * gm) {
+      sp.done = true;
+      this.log(`the ${sp.good} ladder at ${port} re-quoted at its known time: buying the rest of the split load`);
+      return null;
+    }
+    this.activity = `waiting at ${port} for the ${sp.good} ladder to re-quote, to buy the rest of the load (split)`;
+    const end = Math.min(sp.until, sp.next !== null ? sp.next + 2 * gm : Infinity);
+    return Math.min(15_000, Math.max(3_000, end - now));
   }
 
   /**
@@ -3205,17 +3701,19 @@ export class ShipAgent {
     for (const p of parts) {
       const tons = this.ownTons(r, p.good) - (stay.boughtHere.get(p.good) ?? 0);
       // In the season's final hours goods held count at base in net worth (guide 3.11): never sold for less.
-      const floor = Math.max(
-        this.minSale.get(p.good) ?? 0,
-        Math.round(p.pay * (1 - SELL_FLOOR_DROP)),
-        Math.round(world.basePrice(p.good) * (world.seasonMode() === "final" ? 1 : 0.5)),
-      );
+      const baseFloor = Math.round(world.basePrice(p.good) * (world.seasonMode() === "final" ? 1 : 0.5));
+      const floor = Math.max(this.minSale.get(p.good) ?? 0, Math.round(p.pay * (1 - SELL_FLOOR_DROP)), baseFloor);
+      // Order by order (execution.ts): down the bids only as far as what the rest fetches otherwise, never under its landed cost; the
+      // flat floor above where the market model can't say.
+      const hardFloor = Math.max(this.saleCost.get(p.good) ?? this.minSale.get(p.good) ?? 0, baseFloor);
+      const plan = await this.salePlan(r, stay.port, p.good, tons, { hardFloor, oldFloor: floor, holds: true });
       const before = this.stats.rewardPence;
-      const sold = await this.sellHere(stay.port, p.good, tons, floor);
+      const sold = plan ? (plan.qty > 0 ? await this.sellHere(stay.port, p.good, plan.qty, plan.limit) : 0) : await this.sellHere(stay.port, p.good, tons, floor);
       const got = this.stats.rewardPence - before;
       if (this.trip?.goods.has(p.good)) this.trip.reward += got;
-      if (sold > 0) this.log(`sold ${sold}/${tons} t ${p.good} at ${stay.port} for ${cr(got)} (expected ~${cr(p.pay)}/t, floor ${cr(floor)}/t)`);
-      else this.log(`${p.good} at ${stay.port} bids under the ${cr(floor)}/t floor; keeping the ${tons} t for now`);
+      const why = plan ? `down to ${cr(plan.qty > 0 ? plan.limit : hardFloor)}/t: the rest is worth more ${plan.keep.why(tons - sold)}` : `floor ${cr(floor)}/t`;
+      if (sold > 0) this.log(`sold ${sold}/${tons} t ${p.good} at ${stay.port} for ${cr(got)} (expected ~${cr(p.pay)}/t, ${why})`);
+      else this.log(`${p.good} at ${stay.port}: ${plan ? `no bid beats what it fetches otherwise (${plan.keep.why(tons)})` : `bids under the ${cr(floor)}/t floor`}; keeping the ${tons} t for now`);
     }
     if (parts.length) this.host.cashArrived();
     return null;
@@ -3643,9 +4141,7 @@ export class ShipAgent {
     // Contraband is never offered on a market or to a charter (both refuse it, guide 3.18): atPort holds it.
     if (world.isContraband(good)) return null;
     const tons = this.ownTons(r, good);
-    const cls = world.shipClass(this.shipClass);
-    const hull = cls?.hull_category ?? "coastal";
-    const knots = (cls?.base_speed_centiknots ?? 800) / 100;
+    const knots = (world.shipClass(this.shipClass)?.base_speed_centiknots ?? 800) / 100;
     const now = world.now();
     const base = world.basePrice(good);
 
@@ -3659,12 +4155,8 @@ export class ShipAgent {
       bids = (book?.books.find((b) => b.commodity_id === good)?.depth?.bids ?? []).filter((l) => !world.isUnfillable(port, good, l.order_id, "bid"));
     }
 
-    // Stores this ship could carry for a leg: what it has, plus free hold, plus provisions cargo it could eat.
-    const stockable = r.stores.provisions_tons + Math.max(0, r.effective_hold_capacity_tons - r.cargo_used_tons) + this.ownTons(r, STORES_GOOD);
-    // A detour never lands passengers aboard after their promise (guide 3.20: late cuts the fare; the pin sends her to theirs first).
-    const promised = this.paxDue();
-    const reachable = (plan: RoutePlan) =>
-      world.routeRated(plan, hull) && plan.safe_provisions_tons <= stockable && now + world.sailMs(plan.total_distance_nm, knots * 0.8) + 30 * world.gameMinuteMs <= promised;
+    // Where she may go with it (rated water, stores she can stock, passengers' promises kept).
+    const reachable = this.reachFrom(r);
 
     let best: { c: (typeof world.charters)[number]; take: number; value: number } | null = null;
     for (const c of world.charters) {
@@ -3692,16 +4184,75 @@ export class ShipAgent {
     // and not under what it cost to land until it has been held for a few NPC re-quotes.
     const refusedHere = world.charters.some((c) => c.good === good && stay.refused.has(c.id));
     let floor = this.minSale.get(good) ?? 0;
+    // The landed cost alone (execution.ts' hard floor): the planned floor where it wasn't kept apart (older saves).
+    let costFloor = this.saleCost.get(good) ?? floor;
     if (floor > 0 && this.holds > MAX_HOLDS * 2) {
       this.log(`no buyer for ${good} at its ${cr(floor)}/t cost after ${this.holds} holds; selling at what it fetches`);
       this.minSale.delete(good);
+      this.saleCost.delete(good);
       floor = 0;
+      costFloor = 0;
     }
     // In the season's final hours goods held count at base in net worth (guide 3.11): never sold for less.
     if (world.seasonMode() === "final") floor = Math.max(floor, base);
-    if (localBid >= Math.max(base * 0.5, floor) && !refusedHere && !this.contrabandBarred(r, `selling ${good}`) && !(await this.coverCut(port))) {
+    const sellable = localBid > 0 && !refusedHere && !this.contrabandBarred(r, `selling ${good}`) && !(await this.coverCut(port));
+    const residue = tons <= Math.max(2, 0.05 * Math.max(r.hold_capacity_tons, 1));
+
+    // Order by order (execution.ts; marginalOrders, the market model here): sold here only as far as its bids beat what the rest fetches
+    // otherwise (rested in our warehouse under a resting ask, carried to another port, held for the next re-quote: each net of her time,
+    // rent and passage), never under its landed cost; the rest goes the best of those ways. Today's fair-bid rule where the model can't say.
+    if (sellable) {
+      const hardFloor = Math.max(costFloor, Math.round(base * (world.seasonMode() === "final" ? 1 : 0.5)));
+      const plan = await this.salePlan(r, port, good, tons, { hardFloor, oldFloor: Math.max(floor, base * 0.5), holds: this.holds < MAX_HOLDS });
+      if (plan) {
+        if (plan.qty > 0) {
+          if (r.ship.status !== "berthed") return this.dockOrWait(r);
+          const before = this.stats.rewardPence;
+          const sold = await this.sellHere(port, good, plan.qty, plan.limit);
+          if (sold > 0) {
+            this.holds = 0;
+            this.host.cashArrived();
+            this.log(`sold ${sold}/${tons} t leftover ${good} at ${port} for ${cr(this.stats.rewardPence - before)} (down to ${cr(plan.limit)}/t: the rest is worth more ${plan.keep.why(tons - sold)})`);
+            return 2_000;
+          }
+        }
+        // A small residue (part of a load a charter couldn't take) rides along rather than idling the ship.
+        if (residue) return null;
+        const skip = new Set<KeepKind>();
+        for (let c = plan.keep.best(tons, skip); c; c = plan.keep.best(tons, skip)) {
+          if (c.kind === "rest") {
+            if (r.ship.status !== "berthed") return this.dockOrWait(r);
+            const n = await this.host.restLeftover(this, r, port, good, tons, costFloor > 0 ? costFloor : Math.round(base * 0.5), hardFloor);
+            if (n > 0) {
+              this.holds = 0;
+              this.log(`rested ${n} t of leftover ${good} in our warehouse at ${port} under a resting ask (${plan.keep.why(tons)}): she sails on`);
+              return 2_000;
+            }
+            skip.add("rest");
+            continue;
+          }
+          if (c.kind === "carry" && c.port) {
+            this.log(`taking ${tons} t ${good} to ${c.port} to sell (${plan.keep.why(tons)})`);
+            this.holds = 0;
+            return this.sailTo(r, c.port, stay);
+          }
+          break;
+        }
+        // Held for the ladder's next re-quote here (as soon as it is due, when its time is known).
+        this.holds++;
+        const gm = world.gameMinuteMs;
+        const next = this.host.requoteAt(port);
+        this.activity = `holding ${tons} t ${good}: its bids at ${port} pay less than waiting for the next re-quote`;
+        await this.park(r);
+        return next !== null ? Math.min(HOLD_WAIT_GAME_MIN * gm, Math.max(5_000, next - world.now() + 3 * gm)) : HOLD_WAIT_GAME_MIN * gm;
+      }
+    }
+
+    if (sellable && localBid >= Math.max(base * 0.5, floor)) {
       if (r.ship.status !== "berthed") return this.dockOrWait(r);
       try {
+        // Our own resting bids here would meet this ask (orders never match ours): withdrawn first.
+        await this.host.restingClear(port, good, "ask", localBid);
         const res = await client.placeOrder({
           port_id: port,
           commodity_id: good,
@@ -3711,6 +4262,7 @@ export class ShipAgent {
           quantity: tons,
           ship_id: this.shipId,
         });
+        world.noteFill(res);
         if (res.filled_quantity > 0) {
           this.stats.rewardPence += res.total_gross_pence;
           // Paid into this port's vault (like sellHere): ships waiting for cash may have it now.
@@ -3730,11 +4282,51 @@ export class ShipAgent {
     }
 
     // A small residue (part of a load a charter couldn't take) rides along rather than idling the ship.
-    if (tons <= Math.max(2, 0.05 * Math.max(r.hold_capacity_tons, 1))) return null;
+    if (residue) return null;
 
     // The best market elsewhere: known bids net of the voyage, after holding here a while.
     this.holds++;
     let market: { port: string; value: number } | null = null;
+    for (const m of await this.marketsElsewhere(port, good, tons, floor, reachable)) {
+      const value = tons * m.bid - (m.sailMs / 3_600_000) * this.ratePerHour;
+      if (!market || value > market.value) market = { port: m.port, value };
+    }
+    if (market && (market.value > tons * localBid || this.holds > MAX_HOLDS)) {
+      this.log(`taking ${tons} t ${good} to ${market.port} to sell`);
+      this.holds = 0;
+      return this.sailTo(r, market.port, stay);
+    }
+    this.activity = `holding ${tons} t ${good}: no fair bid at ${port}`;
+    await this.park(r);
+    return HOLD_WAIT_GAME_MIN * world.gameMinuteMs;
+  }
+
+  /** Whether a route from where she lies may be taken with cargo aboard: water rated for her hull, stores she can stock, passengers' promises kept. */
+  private reachFrom(r: ShipResult): (plan: RoutePlan) => boolean {
+    const { world } = this.host;
+    const cls = world.shipClass(this.shipClass);
+    const hull = cls?.hull_category ?? "coastal";
+    const knots = (cls?.base_speed_centiknots ?? 800) / 100;
+    const now = world.now();
+    // Stores this ship could carry for a leg: what it has, plus free hold, plus provisions cargo it could eat.
+    const stockable = r.stores.provisions_tons + Math.max(0, r.effective_hold_capacity_tons - r.cargo_used_tons) + this.ownTons(r, STORES_GOOD);
+    // A detour never lands passengers aboard after their promise (guide 3.20: late cuts the fare; the pin sends her to theirs first).
+    const promised = this.paxDue();
+    return (plan: RoutePlan) =>
+      world.routeRated(plan, hull) && plan.safe_provisions_tons <= stockable && now + world.sailMs(plan.total_distance_nm, knots * 0.8) + 30 * world.gameMinuteMs <= promised;
+  }
+
+  /**
+   * Lawful buyers of `good` elsewhere she can reach from `port` (`reachable`), the AI's bans and the season allowing (landed and handled
+   * before it ends), with the bid expected there on landing (as seen, an importer unseen at 90% of base, a shortage's spike counted) at
+   * or over `floor`, and the sail (real ms).
+   */
+  private async marketsElsewhere(port: string, good: string, tons: number, floor: number, reachable: (plan: RoutePlan) => boolean): Promise<Array<{ port: string; bid: number; sailMs: number }>> {
+    const { world } = this.host;
+    const knots = (world.shipClass(this.shipClass)?.base_speed_centiknots ?? 800) / 100;
+    const now = world.now();
+    const base = world.basePrice(good);
+    const out: Array<{ port: string; bid: number; sailMs: number }> = [];
     for (const p of world.catalog.ports) {
       // Lawful buyers only: never a cove's stores market (guide 3.18).
       if (p.id === port || !world.isOpen(p.id) || p.is_cove || !world.trades(p.id, good)) continue;
@@ -3747,17 +4339,143 @@ export class ShipAgent {
       // A shortage there lifts the bid expected when we land (not once a book since shows the real one).
       const bid = Math.max(seen?.bid ?? ((p.imports ?? []).includes(good) ? base * 0.9 : 0), world.shortageBid(p.id, good, now + sail, seen?.at ?? null) ?? 0);
       if (bid < floor) continue;
-      const value = tons * bid - (sail / 3_600_000) * this.ratePerHour;
-      if (!market || value > market.value) market = { port: p.id, value };
+      out.push({ port: p.id, bid, sailMs: sail });
     }
-    if (market && (market.value > tons * localBid || this.holds > MAX_HOLDS)) {
-      this.log(`taking ${tons} t ${good} to ${market.port} to sell`);
-      this.holds = 0;
-      return this.sailTo(r, market.port, stay);
-    }
-    this.activity = `holding ${tons} t ${good}: no fair bid at ${port}`;
-    await this.park(r);
-    return HOLD_WAIT_GAME_MIN * world.gameMinuteMs;
+    return out;
+  }
+
+  /**
+   * A sale here planned ton by ton (execution.ts planSale): the tons to sell now and the IOC's limit (the last ton's bid), the rest kept
+   * for what it fetches otherwise (keepValue). Null: today's flat floor stands (marginalOrders off, no depth seen, contraband, or the
+   * market model has nothing to go on here).
+   */
+  private async salePlan(
+    r: ShipResult,
+    port: string,
+    good: string,
+    tons: number,
+    o: { hardFloor: number; oldFloor: number; holds: boolean },
+  ): Promise<{ qty: number; limit: number; keep: KeepEval } | null> {
+    const { world, client, settings } = this.host;
+    if (!settings.marginalOrders || tons < 1 || world.isContraband(good) || !world.trades(port, good)) return null;
+    const book = await client.book(port, good).catch((e: unknown) => {
+      soft(e);
+      return null;
+    });
+    if (!book) return null;
+    world.observeBook(book);
+    const d = book.books.find((x) => x.commodity_id === good)?.depth;
+    if (d) this.host.noteLadder(port, good, npcLevels(d.asks), npcLevels(d.bids));
+    const mv = world.marketView(port, good, "bid");
+    if (!d || !mv) return null;
+    const bids: Level[] = d.bids
+      .filter((l) => !world.isUnfillable(port, good, l.order_id, "bid"))
+      .sort((x, y) => y.price_pence - x.price_pence)
+      .map((l) => ({ price: l.price_pence, qty: l.remaining_quantity }));
+    const markets = (await this.marketsElsewhere(port, good, tons, o.hardFloor, this.reachFrom(r))).filter((m) => m.bid > 0);
+    const keep = this.keepValue(r, port, good, tons, bids, mv, { ...o, markets });
+    const plan = planSale(bids, tons, o.hardFloor, (rest) => keep.value(rest));
+    return { qty: plan.qty, limit: plan.limit, keep };
+  }
+
+  /**
+   * What the rest of a cargo here fetches if not sold into these bids now (execution.ts planSale's keep), in all, for `rest` tons of the
+   * `total`: the best of
+   *   - hold: sold after the next re-quote here (the ladder seen, refilled `r` of what the sale now took, moved by the forecast's drift),
+   *     less her time waiting past her lock and a berth stay's dues;
+   *   - rest: unloaded into our warehouse under a resting ask (FleetHost.restQuote: the market model's re-quotes ahead, priced by backward
+   *     induction), less the rent and her time unloading;
+   *   - carry: sold at the best market elsewhere (its bid seen, falling ton by ton as the model's curve there says), less her passage;
+   * and nothing below 0. Leaned on by the market model's confidence here; the rest of the weight at today's flat floor (`oldFloor`).
+   */
+  private keepValue(
+    r: ShipResult,
+    port: string,
+    good: string,
+    total: number,
+    bids: Level[],
+    mv: MarketView,
+    o: { hardFloor: number; oldFloor: number; holds: boolean; markets: Array<{ port: string; bid: number; sailMs: number }> },
+  ): KeepEval {
+    const { world } = this.host;
+    const now = world.now();
+    const gm = world.gameMinuteMs;
+    const step = STEP_GAME_MIN * gm;
+    const perMs = this.ratePerHour / 3_600_000;
+    const h = world.handlingMsPerTon(port);
+    const lockLeft = r.ship.turnaround_unlocks_at ? Math.max(0, Date.parse(r.ship.turnaround_unlocks_at) - now) : 0;
+    const next = this.host.requoteAt(port);
+    const tau = next !== null ? Math.max(0, next - now) : null;
+    const walked = walkTons(bids, Math.max(1, Math.floor(total)));
+    const last = walked.length ? walked[walked.length - 1] : mv.price;
+    const scale = last / Math.max(1, mv.marginal(Math.max(0, walked.length - 0.5)));
+    const bidAt = ladderAt(walked, (u) => mv.marginal(u) * scale);
+    const then = world.marketView(port, good, "bid", now + (tau ?? step / 2) + gm);
+    const drift = then && mv.price > 0 ? then.price / mv.price : 1;
+    const rBid = world.market.refill(port, good, "bid").r;
+    const hold = (R: number): number => {
+      if (!o.holds || R < 1) return -Infinity;
+      const k = total - R;
+      let v = 0;
+      for (let i = 0; i < R; i++) v += bidAt(k * (1 - rBid) + i + 0.5);
+      // She waits in the roadstead past her lock, then a berth stay (its minimum dues) to sell.
+      const wait = extraWait(tau, lockLeft + k * h, step) + 2 * gm;
+      return drift * v - wait * perMs - world.berthDuesFor(port, 0);
+    };
+    const restS = sampled(total, (R) => {
+      const q = this.host.restQuote(port, good, R, o.hardFloor, total - R);
+      return q ? R * q.perTon - q.fixed - R * h * perMs : -Infinity;
+    });
+    // Each market's buyers as the model expects them when she lands there (looked up once: only the tons vary below).
+    const markets = o.markets.map((m) => ({ ...m, mvp: world.marketView(m.port, good, "bid", now + m.sailMs), dues: world.berthDuesFor(m.port, 0) }));
+    const carry = (R: number): { v: number; port: string } | null => {
+      let best: { v: number; port: string } | null = null;
+      for (const m of markets) {
+        const mvp = m.mvp;
+        const old = m.bid * Math.max(0, 1 - OLD_SELL_IMPACT_PER_TON * (R / 2));
+        const model = mvp && mvp.price > 0 ? (m.bid * mvp.avg(R)) / mvp.price : old;
+        const avg = mvp ? mvp.conf * model + (1 - mvp.conf) * old : old;
+        const v = R * avg - m.sailMs * perMs - m.dues;
+        if (!best || v > best.v) best = { v, port: m.port };
+      }
+      return best;
+    };
+    const options = (R: number, skip?: ReadonlySet<KeepKind>): KeepChoice[] => {
+      const out: KeepChoice[] = [];
+      if (!skip?.has("hold")) {
+        const v = hold(R);
+        if (Number.isFinite(v)) out.push({ kind: "hold", value: v });
+      }
+      if (!skip?.has("rest")) {
+        const v = restS(R);
+        if (Number.isFinite(v)) out.push({ kind: "rest", value: v });
+      }
+      if (!skip?.has("carry")) {
+        const c = carry(R);
+        if (c && Number.isFinite(c.v)) out.push({ kind: "carry", value: c.v, port: c.port });
+      }
+      return out;
+    };
+    const conf = Math.min(1, Math.max(0, mv.conf));
+    const best = (R: number, skip?: ReadonlySet<KeepKind>): KeepChoice | null => {
+      const xs = options(R, skip);
+      return xs.length ? xs.reduce((a, b) => (b.value > a.value ? b : a)) : null;
+    };
+    return {
+      value: (R: number) => {
+        if (R <= 0) return 0;
+        const vm = Math.max(0, ...options(R).map((c) => c.value));
+        return conf * vm + (1 - conf) * R * o.oldFloor;
+      },
+      best,
+      why: (R: number) => {
+        if (R < 1) return "";
+        const b = best(R);
+        const per = b ? cr(Math.max(0, b.value) / R) : "";
+        const how = !b ? "kept" : b.kind === "rest" ? `resting it in our warehouse here, ~${per}/t net` : b.kind === "carry" ? `carried to ${b.port}, ~${per}/t net` : `after the next re-quote here, ~${per}/t net`;
+        return conf < 0.5 ? `(${how}; leaning on the old ${cr(o.oldFloor)}/t floor: the market model is unsure here)` : `(${how})`;
+      },
+    };
   }
 
   // ── Stores ──────────────────────────────────────────────────────────────────
@@ -3891,8 +4609,11 @@ export class ShipAgent {
       const bid = fillable.length ? Math.max(...fillable.map((l) => l.price_pence)) : depthBids.length ? 0 : (b?.best_bid?.price_pence ?? 0);
       limit = floor ?? bid;
       if (bid < Math.max(limit, world.basePrice(good) * 0.5)) return 0;
+      // Our own resting bids here would meet this ask (orders never match ours): withdrawn first.
+      await this.host.restingClear(port, good, "ask", limit);
       before = this.ownTons(await this.reread(), good);
       const res = await client.placeOrder({ port_id: port, commodity_id: good, side: "ask", time_in_force: "ioc", price_pence: limit, quantity: tons, ship_id: this.shipId });
+      world.noteFill(res);
       this.stats.rewardPence += res.total_gross_pence;
       world.vaults.set(world.region(port), world.vault(world.region(port)) + res.total_gross_pence);
       if (res.filled_quantity < tons) await this.noteOwnBids(port, good, fillable.filter((l) => l.price_pence >= limit));
@@ -3973,6 +4694,7 @@ export class ShipAgent {
           ship_id: this.shipId,
           into_stores: true,
         });
+        world.noteFill(res);
         const paid = res.total_gross_pence + res.customs_duty_pence;
         this.stats.spentPence += paid;
         world.vaults.set(region, world.vault(region) - paid);
@@ -4063,7 +4785,7 @@ export class ShipAgent {
     const port = stay.port;
     const hull = world.shipClass(this.shipClass)?.hull_category ?? "coastal";
 
-    // Rule 8: a policy the user bought on this ship is void if she sails anywhere but its port (unknown: not sailing yet).
+    // Rule 8: a policy on this ship (the user's, or insureLevered's) is void if she sails anywhere but its port (unknown: not sailing yet).
     const policy = opts.voidsPolicy ? null : await this.insuredPolicy();
     if (policy === undefined) {
       this.activity = `reading this ship's insurance policy failed; not sailing to ${dest} yet`;
@@ -4230,6 +4952,12 @@ export class ShipAgent {
     if (!this.host.settings.usePassengers) this.dropOffers("passengers switched off");
     await this.offerBerths(r, dest, stay, plan, paxReserve);
 
+    // Her own voyage insured (insureLevered; insure.ts): with the cargo and stores aboard and no passengers offered, a policy is written
+    // only when the Kelly view says the variance it takes off is worth its premium (the berth lock gives Lloyd's its hour); once written,
+    // she waits for its cover past the lock only while that pays. Nothing is loaded after it (policyNow) and she sails only for its port.
+    const cover = await this.host.insureVoyage(this, r, port, dest, plan);
+    if (cover !== null) return cover;
+
     if (this.locked(r)) {
       const wait = Date.parse(r.ship.turnaround_unlocks_at!) - world.now();
       this.activity = `berth lock: leaving for ${dest} in ${secs(wait)}`;
@@ -4279,6 +5007,12 @@ export class ShipAgent {
       if (c.kind === "in") {
         this.activity = `in convoy to ${dest}, sails in ${secs(c.departsAt - world.now())}`;
         return 1_500;
+      }
+      // Asked to join another company's convoy as an escort (escortOthers): its organizer decides; looked at again shortly (the
+      // approval's notice wakes her sooner), withdrawn by the fleet if no answer comes in time.
+      if (c.kind === "pending") {
+        this.activity = `asked to join a convoy to ${dest} as an escort: waiting up to ${secs(c.until - world.now())} for its organizer`;
+        return Math.min(10_000, Math.max(1_500, c.until - world.now() + 500));
       }
     }
 

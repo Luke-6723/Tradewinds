@@ -9,7 +9,8 @@
  *
  * What we charge: about half what pooling with our ships is expected to save a joiner per ton of its hold (in a convoy of n ships
  * pirates board one per interception, so a ship's expected piracy loss falls to about 1/n of sailing alone), between a floor and the
- * game's cap. Who we admit (`approval`): ships no slower than our slowest member's base speed (our check only: no
+ * game's cap; with the fareBandit setting, a multiplier on that fee learned by Thompson sampling from whether a paying ship joined
+ * (bandit.ts ESCORT_GRID; FleetManager.escortFeeArm). Who we admit (`approval`): ships no slower than our slowest member's base speed (our check only: no
  * `min_speed_centiknots` is set on the convoy, since the game may compare a laden joiner, up to a fifth slower, and refuse our own
  * ships, the forming one included), escorts only with guns, a few outsiders at most, and none while a ship of ours in it holds a
  * policy Lloyd's may have priced on its consorts. A ship of ours with a policy (or one that can't be read) never forms or joins a

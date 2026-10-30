@@ -10,7 +10,9 @@
  * term leaves 2 game days before maturity on top (when it is always repaid in full). Lender: the Goldsmiths' instant
  * quote against a lien on one of our ships (at most 40% of its rebuild value and 7,500 Cr a loan, with recourse; 45% a
  * year up to 30 game days, sliding to 30% at 360), balloon repayment; a request posted alongside lets a player lender
- * refinance it for less.
+ * refinance it for less. A load's loan is sized by the same rule as the load (allocation.ts; kellySizing): the bigger load it would
+ * fund is planned under the Kelly/RCK stake cap first, so a loan never takes a load past min(RCK, half-Kelly) of the bankroll (the
+ * smallest load worth a leg once that is at or under 0), and never past the caps here.
  *
  * Ship mortgages (guide 3.4): a turnkey build our cash can't fund may have the yard region's Goldsmiths pay 60% of its
  * price (80% for an oceanic hull), amortised over 180 game days with an installment every 10, one at a time, within the

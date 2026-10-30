@@ -16,6 +16,12 @@
  * Whatever room and cash the first choice leaves is filled ("mixed loads") with other goods S sells
  * that D's charters or buyers want, best margin per ton first, and with freight lots from S to D.
  *
+ * The market model (market-model.ts, the `marketModel` setting; World.marketView): where it has data, the bid at D and the ask at
+ * S are its forecasts for when the ship gets there (each port's stock reverting by its own measured pace, our own fills and our other
+ * ships' reserved tons counted), and each further ton bought or sold is priced off its scarcity curve (the stock less, or plus, the
+ * tons taken before it) in place of the fixed impact per ton and the assumed 40 t of buyers; its bid depth is the NPC depth seen at
+ * quays, refilling at re-quotes. Blended with the old rules by its confidence, so thin data leaves the old rules standing.
+ *
  * Costs per ton: the ask (with the impact of what we and our other ships buy there), customs at S,
  * the fee to bring the money from D's region back to S's, and the share of the load pirates are
  * expected to take on the way (more for a richer load: pirates go for the richest prizes). The
@@ -39,6 +45,15 @@
  * money a load ties up is charged at the fleet's own return on cash, so thin-margin loads that lock
  * up a lot of it rank lower.
  *
+ * Scoring and sizing (`opts.terminal`, `opts.kelly`: the kellySizing setting; allocation.ts): what comes after a leg is D's learned
+ * terminal value (the best lane profit an hour our own passes found from D, per ton of hold, over the hours such a leg takes) where
+ * it is known and shows a paying lane, in place of the one optimistic onward leg (never above the empty sail back's charge otherwise);
+ * the best few lanes are then judged on scenarios (the loss model's states, the market model's forecast sds), scored by the certainty
+ * equivalent of the bankroll's expected log-growth in place of the expected profit, and their loads cut to min(RCK, half-Kelly), with
+ * our other ships in the same zones or markets sharing the cap (a sale with no confident forecast: sized on the loss states alone).
+ * Never larger than the old sizing, never under the smallest load worth a leg (a bankroll at or under 0: that floor alone); a lane
+ * with a stake that was never judged ranks under every judged one.
+ *
  * World events move prices: a shortage's bid and a glut's ask are expected from the shocks seen so
  * far, fading by the news' lapse, and a shortage's crisis charter (listed only on its quay or as
  * gossip later) is planned on before it is listed, at the share found when looked for.
@@ -60,6 +75,8 @@ import type { RoutePlan, ZoneClass } from "../types";
 import { paxDests, paxValue, PAX_ONLY_MIN_HEADS, PAX_ONLY_MIN_PENCE, PAX_ROUND_SLACK_GAME_MIN, type LanePax, type PaxLanes } from "./voyages";
 import { weightMs } from "./passengers";
 import { BID_HAIRCUT_BASE, freightLoot, PROVISIONAL_PREFIX, type CharterInfo, type World } from "./world";
+import type { MarketView } from "./market-model";
+import { certainty, KELLY_MIN_CONF, outcomes, riskGroups, SAA_TOP, stakeCap, stakeFraction, TERMINAL_TOP, type RiskPart, type RiskProfile } from "./allocation";
 
 export interface ShipSpec {
   shipClass: string;
@@ -178,6 +195,13 @@ export interface Lane {
    * itself is posted at sail time as ever.
    */
   pax?: LanePax;
+  /**
+   * Judged on scenarios (kellySizing; allocation.ts): `ce` the certainty equivalent of the leg's profit on the bankroll (it stood for the
+   * expected profit in `profitPerHour`), `frac` the stake fraction allowed (min(RCK, half-Kelly); absent: no cap, e.g. no downside within
+   * reach), `cap` the stake that left after our other ships in the same zones and markets (never under the floor), `from` the stake
+   * before the cap when it cut the load, `b` the bankroll (pence; at or under 0: the floor alone). Absent: not judged (older saves too).
+   */
+  kelly?: { ce: number; b: number; frac?: number; cap?: number; from?: number };
 }
 
 /** The AI's hard bans for its horizon (ai/directives.ts): no planned load touches them. */
@@ -270,15 +294,42 @@ export interface PlanOptions {
   bans?: Bans;
   /** Passengers waiting where the ship lies (passengerVoyages; voyages.ts): their fares counted in her own legs out of that port. */
   pax?: PaxLanes;
+  /**
+   * Escorting other companies' convoys (escortOthers; escort-join.ts): what an armed ship loading where she lies could expect, lightly
+   * weighed (pence), from a fee-charging convoy forming there for `dest` that sails once she is ready (`readyAt`, server ms). Added to the
+   * leg's profit only (never its cash), on top of a cargo that pays by itself.
+   */
+  escortIncome?: (from: string, dest: string, readyAt: number, guns: number) => number;
   /** Market goods only (a venture's load: guide 3.13.5): no charter parts, no freight, no provisions. */
   marketOnly?: boolean;
+  /**
+   * Terminal values (allocation.ts TerminalValues): `value` (kellySizing on) gives D's learned value per real hour per ton of hold and
+   * its hours, null where unknown (the old onward estimate then, as where it shows no paying lane); `observe` takes this pass's best legs
+   * cash didn't stop short from where the ship lies (her own unrestricted plan) and from the destinations estimated onward (half weight).
+   */
+  terminal?: {
+    value?: (port: string) => { v: number; h: number } | null;
+    observe?: (port: string, perTonHour: number, hours: number, weight: number) => void;
+  };
+  /**
+   * Scenario scoring and Kelly sizing (kellySizing on, a ship's own plan): the bankroll (pence; at or under 0: every load the floor)
+   * and our other ships' stakes per correlation group (allocation.ts riskGroups). Absent: today's ranking and sizing.
+   */
+  kelly?: { bankroll: number; exposure: ReadonlyMap<string, number> };
+  /** Only legs filling this charter (its current id): a deadline charter weighed for a ship after her current leg. */
+  onlyCharter?: string;
+  /** Plan as from this server time (a ship's next leg after her current one); default now. */
+  startAt?: number;
 }
 
-/** Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). */
+/**
+ * Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). The market model's curve replaces it as
+ * far as its confidence goes (World.marketView); this stands for the rest and wherever it has no data.
+ */
 const IMPACT_PER_TON = 0.0013;
-/** Estimated bid fall per ton sold into a port's buyers. */
+/** Estimated bid fall per ton sold into a port's buyers (the market model's curve in its place, as above). */
 const SELL_IMPACT_PER_TON = 0.0015;
-/** Tons one port's buyers are assumed to take of one good per visit when their depth isn't visible. */
+/** Tons one port's buyers are assumed to take of one good per visit when their depth isn't visible (the model's NPC depth in its place, as above). */
 const MARKET_MAX_TONS = 40;
 /** Market pairs tried per good: the best few buyers by bid and sellers by ask. */
 const MARKET_TOP = 3;
@@ -335,6 +386,8 @@ interface Ctx {
   /** Goods each port wants: charters for them there, or a recent bid. */
   wanted: Map<string, Set<string>>;
   legs: Map<string, Promise<Leg[]>>;
+  /** The market model's views read this pass (modelSide), by `port|good|side|game minute`: most are asked for again and again. */
+  views: Map<string, MarketView | null>;
 }
 
 interface Leg {
@@ -342,16 +395,28 @@ interface Leg {
   /** Expected profit: margins (bonus included) on tons expected to arrive, plus freight rewards. */
   profit: number;
   ms: number;
+  /** What it was built for (built again, smaller, when the Kelly cap cuts it; absent: a passage for fares alone). */
+  primary?: Primary;
+  /** Its laden passage for the scenarios (opts.kelly, full legs only). */
+  risk?: RiskProfile;
+  /** Cash, not the hold, the books or the stock, stopped the load short (the terminal values don't learn from it). */
+  cashBound?: boolean;
 }
 
 const rate = (profit: number, ms: number) => (profit * 3_600_000) / Math.max(ms, 1);
 
 // ── Prices ────────────────────────────────────────────────────────────────────
 
+/** The market model's figure leaned on as far as its confidence goes, the old rule's for the rest. */
+const blend = (mv: MarketView, model: number, old: number) => mv.conf * model + (1 - mv.conf) * old;
+
 /**
  * The bid a sale at `port` can count on when the load lands at `at`: a live book as seen, older news
  * marked down, a shock's share easing as it fades; a shortage's expected spike when no book since it
  * began shows the real one. Null with nothing to go on (or only a bid from before an import slump).
+ * Where the market model has data (World.marketView), its forecast of the NPC bid then (the stock's
+ * reversion from the reading, our own fills counted) is blended in by its confidence, in place of the
+ * age haircut as far as it goes; it never stands where the old rule has no bid.
  */
 function expectedBid(ctx: Ctx, port: string, good: string, at = ctx.now): number | null {
   const { world } = ctx;
@@ -364,9 +429,24 @@ function expectedBid(ctx: Ctx, port: string, good: string, at = ctx.now): number
     const fresh = obs.live && age < 60 * world.gameMinuteMs;
     const haircut = fresh ? 0 : BID_HAIRCUT_BASE + world.bidHaircutPerDay * (age / ctx.gameDayMs);
     bid = world.easeShock(port, good, "demand_shortage", obs.bid, obs.at, at) * Math.max(0, 1 - haircut);
+    const mv = modelSide(ctx, port, good, "bid", at);
+    if (mv) bid = blend(mv, mv.price, bid);
   }
   const spike = world.shortageBid(port, good, at, obs?.at ?? null);
   return spike !== null ? Math.max(bid ?? 0, spike) : bid;
+}
+
+/**
+ * The market model's view of the NPC ladder a load is bought from (`ask`, at the buy) or sold into (`bid`, on landing), or null
+ * where the old constants stand alone (World.marketView: the setting off, no data, a shock or shift, a royal monopoly). Read once
+ * per pass for each port, good, side and game minute (every port's bid now, each leg's sale after its expectedBid, each source's
+ * ask for every buyer of it).
+ */
+function modelSide(ctx: Ctx, port: string, good: string, side: "bid" | "ask", at: number): MarketView | null {
+  const k = `${port}|${good}|${side}|${Math.round(at / ctx.world.gameMinuteMs)}`;
+  let v = ctx.views.get(k);
+  if (v === undefined) ctx.views.set(k, (v = ctx.world.marketView(port, good, side, at)));
+  return v;
 }
 
 /** 1 for a live charter; for gossip, the chance it is still open (one expected from the news: at most the share found). */
@@ -480,23 +560,39 @@ interface PartArgs {
 
 type AskEst = NonNullable<ReturnType<World["estAsk"]>>;
 
-/** Tons the source's asks can supply beyond what our other ships will buy there: all of it, unless only players' asks count (a royal monopoly). */
-function offered(est: { maxTons?: number }, reserved: number): number {
-  return est.maxTons === undefined ? Infinity : Math.max(0, Math.floor(est.maxTons - reserved));
+/** The market model's stock cap on a source counts only at this confidence or more (sizing on its curve keeps well clear of it anyway). */
+const MODEL_CAP_CONF = 0.5;
+
+/**
+ * Tons the source's asks can supply beyond what our other ships will buy there: all of it, unless only players' asks count (a royal
+ * monopoly); with the market model confident there, no more than the stock it expects then, one sd over (guide 3.1: the NPC ask
+ * ladder offers the stock, a tenth a tranche), plus a players' level in the news.
+ */
+function offered(est: AskEst, reserved: number, mv?: MarketView | null): number {
+  if (est.maxTons !== undefined) return Math.max(0, Math.floor(est.maxTons - reserved));
+  if (!mv || mv.conf < MODEL_CAP_CONF) return Infinity;
+  return Math.max(0, Math.floor(mv.stock + mv.stockSd + (est.player?.tons ?? 0) - reserved));
 }
 
 /**
  * Average ask per ton for `tons` more bought at the source after the `reserved` tons our other ships buy there: a
  * players' resting ask in the news below the ladder (its tons, what the others leave of them) first, then the
- * ladder's ask rising with what is bought from it.
+ * ladder's ask rising with what is bought from it. With the market model (`mv`, the source's asks at the buy), the
+ * ladder's best is its forecast and each further ton is priced off its curve (the stock less the tons before it),
+ * both blended with the old fixed impact by its confidence.
  */
-function askFor(est: AskEst, reserved: number, tons: number): number {
+function askFor(est: AskEst, reserved: number, tons: number, mv?: MarketView | null): number {
+  const top = mv ? blend(mv, mv.price, est.ask) : est.ask;
+  /** Average over `n` tons off the ladder after `after` taken from it, as a factor on its best. */
+  const ladder = (after: number, n: number) => {
+    const old = 1 + IMPACT_PER_TON * (after + Math.max(0, n) / 2);
+    return top * (mv ? blend(mv, mv.avg(n, after) / mv.price, old) : old);
+  };
   const p = est.player;
-  if (!p || p.ask >= est.ask || tons <= 0) return est.ask * (1 + IMPACT_PER_TON * (reserved + Math.max(0, tons) / 2));
+  if (!p || p.ask >= top || tons <= 0) return ladder(reserved, tons);
   const fromPlayer = Math.min(tons, Math.max(0, p.tons - reserved));
   const rest = tons - fromPlayer;
-  const ladder = est.ask * (1 + IMPACT_PER_TON * (Math.max(0, reserved - p.tons) + rest / 2));
-  return (fromPlayer * p.ask + rest * ladder) / tons;
+  return (fromPlayer * p.ask + rest * ladder(Math.max(0, reserved - p.tons), rest)) / tons;
 }
 
 /** The cheapest an ask can be at the source (the best case, for a quick test): a cheaper players' level, else the ladder's. */
@@ -523,12 +619,14 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   const { world, res, opts } = ctx;
   const est = world.estAsk(a.source, a.good, a.buyAt);
   if (!est || a.room < MIN_PART_TONS) return null;
+  // The market model's view of the source's asks at the buy (players' levels only under a royal monopoly: none).
+  const mv = est.maxTons === undefined ? modelSide(ctx, a.source, a.good, "ask", a.buyAt) : null;
   const reserved = res.sourceTons.get(`${a.source}|${a.good}`) ?? 0;
   // Re-posted charters outlive their expiry; the rest must still be open when the load lands.
   let usable = charters.filter((c) => c.expiresAt === null || c.expiresAt >= a.deliverBy || renewing(ctx, c));
   const t = new Map(usable.map((c) => [c.id, terms(ctx, c, a.arriveAt)]));
-  const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, askFor(est, reserved, a.room)).cash, 1));
-  const cap = Math.min(a.room, cashTons, offered(est, reserved));
+  const cashTons = Math.floor(a.cash / Math.max(costs(ctx, a, askFor(est, reserved, a.room, mv)).cash, 1));
+  const cap = Math.min(a.room, cashTons, offered(est, reserved, mv));
   // The premium taper counts the delivery itself: about what this part could put into the charter.
   const cashOf = (c: CharterInfo) => charterCash(ctx, c, t.get(c.id)!.pay, a.arriveAt, Math.max(1, Math.min(cap, t.get(c.id)!.remaining)));
   // The bonus per ton is ranked at about the tons this part can put into the tier (the split's returns diminish).
@@ -559,7 +657,7 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
     return Math.max(0, Math.floor(Math.max(room * 0.4, room * share - (rivalTake.get(c.id) ?? 0))));
   };
   const avail = Math.min(cap, usable.reduce((n, c) => n + roomOf(c), 0));
-  const fullCost = costs(ctx, a, askFor(est, reserved, avail)).landed;
+  const fullCost = costs(ctx, a, askFor(est, reserved, avail, mv)).landed;
 
   let tons = 0;
   let cashTotal = 0;
@@ -595,7 +693,7 @@ function charterPart(ctx: Ctx, a: PartArgs, charters: CharterInfo[]): Part | nul
   const intoTier = bonusFills.reduce((n, [, b]) => n + b, 0);
   const bonusTotal = intoTier > 0 ? bonusFills.reduce((n, [c, b]) => n + b * charterBonus(ctx, c, intoTier, a.bonusExtra), 0) : 0;
   const bonus = bonusTotal / tons;
-  const ask = askFor(est, reserved, tons);
+  const ask = askFor(est, reserved, tons, mv);
   const costPerTon = costs(ctx, a, ask).landed;
   const margin = pay + bonus - costPerTon;
   if (margin < opts.minMargin || pay < costPerTon) return null;
@@ -624,26 +722,36 @@ function marketPart(ctx: Ctx, a: PartArgs): Part | null {
   const bid = Math.max(npcBid ?? 0, player?.price ?? 0);
   const est = world.estAsk(a.source, a.good, a.buyAt);
   if (!bid || !est || a.room < MIN_PART_TONS) return null;
+  // The market model's ladders where it has data: the buyers' at D on landing, the sellers' at S at the buy (none under a monopoly).
+  const mvBid = npcBid === null ? null : modelSide(ctx, a.dest, a.good, "bid", a.arriveAt);
+  const mvAsk = est.maxTons === undefined ? modelSide(ctx, a.source, a.good, "ask", a.buyAt) : null;
   // Cheap test before any sizing: the best case must clear the margin.
-  if (bid - costs(ctx, a, bestAsk(est)).landed < opts.minMargin) return null;
+  if (bid - costs(ctx, a, Math.min(bestAsk(est), askFor(est, 0, 0, mvAsk))).landed < opts.minMargin) return null;
 
   const reserved = res.sourceTons.get(`${a.source}|${a.good}`) ?? 0;
   const sold = res.sellTons.get(`${a.dest}|${a.good}`) ?? 0;
-  // A live book shows how much its buyers take; otherwise assume a modest depth. The players' level adds its tons
-  // (what our other ships sell there takes it first).
-  const ladderDepth = npcBid === null ? 0 : (world.price(a.dest, a.good)?.bidDepth ?? MARKET_MAX_TONS);
-  const max = Math.min(a.room, ladderDepth + (player?.tons ?? 0) - sold, offered(est, reserved));
-  /** Average sale per ton for `tons` sold after our other ships' `sold`: the players' level first, then the buyers' falling bid. */
+  // A live book shows how much its buyers take; otherwise assume a modest depth; the market model's NPC bid depth (seen at quays,
+  // less what we sold since, refilling at re-quotes) as far as its confidence goes. The players' level adds its tons (what our
+  // other ships sell there takes it first).
+  const oldDepth = npcBid === null ? 0 : (world.price(a.dest, a.good)?.bidDepth ?? MARKET_MAX_TONS);
+  const ladderDepth = mvBid && mvBid.depth !== null ? Math.floor(blend(mvBid, mvBid.depth, oldDepth)) : oldDepth;
+  const max = Math.min(a.room, ladderDepth + (player?.tons ?? 0) - sold, offered(est, reserved, mvAsk));
+  /**
+   * Average sale per ton for `tons` sold after our other ships' `sold`: the players' level first, then the buyers' falling bid (the
+   * fixed impact, or the model's curve relative to its own best, the stock plus the tons before it, blended by its confidence).
+   */
   const saleFor = (tons: number) => {
     const fromPlayer = player ? Math.min(tons, Math.max(0, player.tons - sold)) : 0;
     const rest = tons - fromPlayer;
-    const ladder = (npcBid ?? 0) * (1 - SELL_IMPACT_PER_TON * (Math.max(0, sold - (player?.tons ?? 0)) + rest / 2));
+    const after = Math.max(0, sold - (player?.tons ?? 0));
+    const old = 1 - SELL_IMPACT_PER_TON * (after + rest / 2);
+    const ladder = (npcBid ?? 0) * (mvBid ? blend(mvBid, mvBid.avg(rest, after) / mvBid.price, old) : old);
     return (fromPlayer * (player?.price ?? 0) + rest * ladder) / tons;
   };
   // Profit falls per ton on both books: find the size that earns most.
   let best: { tons: number; sale: number; ask: number; landed: number; profit: number } | null = null;
   for (let tons = max; tons >= MIN_PART_TONS; tons -= Math.max(1, Math.round(max / 12))) {
-    const ask = askFor(est, reserved, tons);
+    const ask = askFor(est, reserved, tons, mvAsk);
     const c = costs(ctx, a, ask);
     if (c.cash * tons > a.cash) continue;
     const sale = saleFor(tons);
@@ -704,7 +812,8 @@ function freightPicks(ctx: Ctx, source: string, dest: string, room: number, cash
 
 type Primary = { kind: "charter"; good: string; charters: CharterInfo[] } | { kind: "market"; good: string } | { kind: "freight" };
 
-async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, primary: Primary, cheap: boolean): Promise<Leg | null> {
+/** `cashCap`: at most this much cash for the load (the Kelly cap: the leg built again, smaller). */
+async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, primary: Primary, cheap: boolean, cashCap?: number): Promise<Leg | null> {
   const { world, ship, opts } = ctx;
   // Lawful lanes never load or land at a smugglers' cove, nor carry contraband (guide 3.18); a ship may sail from one.
   if (world.isCove(source) || world.isCove(dest) || (primary.kind !== "freight" && world.isContraband(primary.good))) return null;
@@ -750,6 +859,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   let room = ship.cap;
   // Bought once at the source: cash due by then may count (onward legs: cash in hand only).
   let cash = !cheap && opts.cashAt ? opts.cashAt(buyAt, source) : (opts.cash ?? Number.MAX_SAFE_INTEGER);
+  if (cashCap !== undefined) cash = Math.min(cash, Math.max(0, cashCap));
   const parts: Part[] = [];
   let freight: FreightPick[] = [];
   const args = (good: string): PartArgs => ({ source, dest, good, room, cash, piracy, storm: storm.cargoShare, deliverBy, arriveAt, buyAt, bonusTons, bonusExtra });
@@ -814,6 +924,11 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const freightTons = freight.reduce((n, f) => n + f.tons, 0);
   const tons = goodsTons + freightTons;
   if (tons < minLoadTons(ship.cap)) return null;
+  // Cash stopped it short: room for another part is left and the cash left wouldn't fill it at the load's cheapest ton (the terminal
+  // values learn only from legs it didn't: a cash-starved plan says nothing of what the port offers).
+  const cashLeft = cash - (primary.kind === "freight" ? 0 : freight.reduce((n, f) => n + f.collateral, 0));
+  const perTon = parts.length > 0 ? Math.min(...parts.map((p) => costs(ctx, args(p.good), p.estAsk).cash)) : freightTons > 0 ? freight.reduce((n, f) => n + f.collateral, 0) / freightTons : 0;
+  const cashBound = room >= MIN_PART_TONS && cashLeft < room * perTon;
 
   const fill = tons / Math.max(ship.cap, 1);
   const marketTons = parts.filter((p) => p.kind === "market").reduce((n, p) => n + p.tons, 0);
@@ -885,7 +1000,9 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       }
     }
   }
-  const total = profit + (pax?.value ?? 0);
+  // Escort fees another company's convoy here would share with her (opts.escortIncome; escortOthers), lightly: only loading where she lies.
+  const escortFee = !cheap && opts.escortIncome && !opts.marketOnly && from === source && ship.guns > 0 ? Math.max(0, opts.escortIncome(source, dest, ctx.now + loadMs, ship.guns)) : 0;
+  const total = profit + (pax?.value ?? 0) + escortFee;
   const allMs = ms + paxMs;
 
   const main = parts[0];
@@ -898,9 +1015,63 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const costPerTon = sum((p) => p.costPerTon) / tons;
   const capital = parts.reduce((n, p) => n + costs(ctx, args(p.good), p.estAsk).cash * p.tons, 0) + freight.reduce((n, f) => n + f.collateral, 0);
 
+  // The laden passage for the scenarios (allocation.ts outcomes; opts.kelly only): each good's sale spread from the market model's forecast
+  // at landing (none confident: no spread, the load sized on the loss states alone), a gossiped charter's chance of still being open, and
+  // the loss model as states: the ship lost (captured or sunk), else a raid that lets her go, storm damage. The forecast sd is counted
+  // there once (no shrinkage on top: allocation.ts stakeFraction).
+  let riskProfile: RiskProfile | undefined;
+  if (opts.kelly && !cheap && !opts.marketOnly) {
+    const riskParts: RiskPart[] = parts.map((p) => {
+      let rel = 0;
+      let open = 1;
+      let low = 0;
+      if (p.kind === "market") {
+        const mv = modelSide(ctx, dest, p.good, "bid", arriveAt);
+        if (mv && mv.conf >= KELLY_MIN_CONF && mv.price > 0 && mv.sd >= 0) rel = mv.sd / mv.price;
+      } else {
+        // Gossiped charters: their chance of still being open, the goods worth their salvage if not (charterCash's terms).
+        const known = charterAt(p.good);
+        let t = 0;
+        let n = 0;
+        for (const [id, tons] of p.fills) {
+          const c = known.find((x) => x.id === id);
+          t += tons * (c ? trust(ctx, c) : 1);
+          n += tons;
+        }
+        open = n > 0 ? t / n : 1;
+        if (open < 1) low = Math.min(p.pay, expectedBid(ctx, dest, p.good, arriveAt) ?? world.basePrice(p.good) * SALVAGE_OF_BASE);
+      }
+      return { tons: p.tons, pay: p.pay, bonus: p.bonus, rel, open, low };
+    });
+    const capturePerRaid = risk.raids > 0 ? risk.capture / risk.raids : 0;
+    const lost = Math.min(0.95, risk.capture + storm.sink);
+    const survive = Math.max(0.05, 1 - lost);
+    // A storm hit (Poisson in hits) and the share of the cargo it destroys: what stormRisk's cargo share holds beyond the sinking.
+    const hit = 1 - Math.exp(-storm.hits);
+    const stormTake = hit > 0 ? (1 - Math.exp(-storm.hits * world.stormTake)) / hit : 0;
+    riskProfile = {
+      stake: capital,
+      cost: parts.reduce((n, p) => n + p.tons * paid(p), 0),
+      parts: riskParts,
+      freightReward: freightPay,
+      freightCollateral: freight.reduce((n, f) => n + f.collateral, 0),
+      pax: pax?.value ?? 0,
+      fixed: captureCost + sinkCost + dues,
+      lost,
+      raid: Math.min(1, (risk.raids * (1 - capturePerRaid)) / survive),
+      raidTake: world.raidTake,
+      storm: Math.min(1, hit / survive),
+      stormTake,
+      kept,
+    };
+  }
+
   return {
     profit: total,
     ms: allMs,
+    primary,
+    ...(riskProfile ? { risk: riskProfile } : {}),
+    ...(cashBound ? { cashBound } : {}),
     lane: {
       key: kind === "freight" ? `freight:${source}>${dest}:${freight.map((f) => f.id.slice(0, 8)).join(",")}` : `${kind === "market" ? "market:" : ""}${good}:${source}>${dest}`,
       kind,
@@ -1042,11 +1213,14 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   const bans = ctx.opts.bans;
   const portOk = (p: string) => !bans?.ports.has(p);
   const jobs: Array<Promise<Leg | null>> = [];
+  // A deadline charter weighed for a ship after her current leg: its legs alone (onward estimates from them are unrestricted).
+  const onlyCharter = cheap ? undefined : ctx.opts.onlyCharter;
 
   // Charters (live and gossip) at each port, by good, from every port selling the good (never a venture's load: it is sold through it).
   for (const [k, charters] of ctx.opts.marketOnly ? [] : ctx.charters) {
     const [dest, good] = k.split("|");
     if (onlyDest && dest !== onlyDest) continue;
+    if (onlyCharter && !charters.some((c) => world.currentId(c.id) === onlyCharter)) continue;
     for (const source of world.sellersOf(good)) {
       if (source !== dest && (!only || source === only) && portOk(source)) jobs.push(buildLeg(ctx, from, source, dest, { kind: "charter", good, charters }, cheap));
     }
@@ -1055,7 +1229,7 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   // Markets: for each good, the best few buyers (by bid) against the cheapest few sellers, plus ports
   // in a shortage or glut of it (tried on top of the best few, never in place of one: the shock may
   // fade before a ship gets there).
-  for (const c of world.catalog.commodities) {
+  for (const c of onlyCharter ? [] : world.catalog.commodities) {
     // Contraband has no lawful market anywhere; a cove buys nothing for a lane (guide 3.18).
     if (bans?.goods.has(c.id) || world.isContraband(c.id)) continue;
     const bids = world.catalog.ports
@@ -1089,7 +1263,7 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   }
 
   // Freight listed here, by destination.
-  if (ctx.opts.freight && !ctx.opts.marketOnly && portOk(from)) {
+  if (ctx.opts.freight && !ctx.opts.marketOnly && !onlyCharter && portOk(from)) {
     for (const dest of new Set(world.freight.filter((f) => f.origin === from).map((f) => f.dest))) {
       if (dest !== from && world.isOpen(dest) && portOk(dest) && (!onlyDest || dest === onlyDest) && (!only || from === only)) jobs.push(buildLeg(ctx, from, from, dest, { kind: "freight" }, cheap));
     }
@@ -1097,7 +1271,7 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
 
   // Passages for fares alone (passengerVoyages; voyages.ts): to the few ports most heads waiting here are bound for (only from where
   // she lies, never on an onward estimate, nor while re-sizing a load).
-  const px = cheap || ctx.opts.marketOnly ? undefined : ctx.opts.pax;
+  const px = cheap || ctx.opts.marketOnly || onlyCharter ? undefined : ctx.opts.pax;
   if (px?.only && px.from === from && portOk(from)) {
     for (const dest of paxDests(px.groups, from, ctx.now)) {
       if (portOk(dest) && (!onlyDest || dest === onlyDest) && (!only || from === only)) jobs.push(buildPaxLeg(ctx, from, dest));
@@ -1146,7 +1320,7 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     ship,
     res,
     opts,
-    now: world.now(),
+    now: opts.startAt ?? world.now(),
     baseLockMs: 30 * world.gameMinuteMs,
     gameDayMs: 24 * 60 * world.gameMinuteMs,
     bonusTons: Math.max(0, world.expansionTonsLeft - reservedExpansion),
@@ -1155,6 +1329,7 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     charters: new Map(),
     wanted: new Map(),
     legs: new Map(),
+    views: new Map(),
   };
   const want = (port: string, good: string) => {
     let set = ctx.wanted.get(port);
@@ -1180,38 +1355,140 @@ export async function rankLanes(world: World, ship: ShipSpec, from: string, res:
     }
   }
 
-  const legs = await legsFrom(ctx, from, false);
-  // Fetched together: return routes for every leg, onward legs from the best legs' destinations.
+  // A copy: the Kelly cap may put a smaller leg in a place (the memo's list stays as built).
+  const legs = [...(await legsFrom(ctx, from, false))];
+  const tv = opts.terminal;
+  // The terminal values learn from a ship's own unrestricted plan where she lies (a load re-sized at its source, an insured voyage,
+  // a deadline charter after her leg, a venture's load say nothing of the port's best).
+  const learn = tv?.observe && !opts.onlySource && !opts.onlyDest && !opts.onlyCharter && !opts.marketOnly && opts.startAt === undefined ? tv.observe : undefined;
+  if (learn) observeLegs(learn, from, legs, ship.cap, 1);
+  // A learned value stands for what comes after only as evidence of a paying lane there: a next leg earning less than the least the
+  // planner plans one for (the minimum margin on the smallest load) is none, and the old onward estimate or the empty sail back stands
+  // (a near-zero V over a short h would otherwise beat charging that sail back).
+  const paysMin = Math.max(1, opts.minMargin) * minLoadTons(ship.cap);
+  const valueAt = (port: string) => {
+    const e = tv?.value?.(port) ?? null;
+    return e && e.v * ship.cap * e.h >= paysMin ? e : null;
+  };
+  // Onward estimates only from the best legs' destinations whose terminal value isn't known.
+  const onward = [...new Set(legs.slice(0, ONWARD_TOP).map((l) => l.lane.dest))].filter((d) => !valueAt(d));
+  // Fetched together: return routes for every leg, onward legs from those destinations.
   const [backs] = await Promise.all([
     Promise.all(legs.map((l) => world.route(l.lane.dest, l.lane.source, ship.shipClass).catch(() => null))),
-    Promise.all([...new Set(legs.slice(0, ONWARD_TOP).map((l) => l.lane.dest))].map((d) => legsFrom(ctx, d, true))),
+    Promise.all(onward.map((d) => legsFrom(ctx, d, true))),
   ]);
-  const lanes: Lane[] = [];
-  for (const [i, leg] of legs.entries()) {
-    // What comes after: an empty sail back to the source, or (for the best legs) the best leg seen
-    // from the destination that doesn't just redo this one, whichever rates higher.
+  if (learn) for (const d of onward) observeLegs(learn, d, await legsFrom(ctx, d, true), ship.cap, 0.5);
+  /**
+   * Leg `i`'s lane with what comes after it (`profit`: its expected profit, or the scenarios' certainty equivalent): an empty sail
+   * back to the source, or the destination's learned terminal value (the hold's earnings an hour from there over the hours such a
+   * leg takes), whichever rates higher; with none learned, for the best legs, the best leg seen from the destination that doesn't
+   * just redo this one.
+   */
+  const finish = async (leg: Leg, i: number, profit = leg.profit): Promise<Lane> => {
     const back = backs[i];
-    let profit = leg.profit;
+    let total = profit;
     let ms = leg.ms + (back ? world.sailMs(back.total_distance_nm, ship.knots) : leg.ms);
     let next: string | null = null;
-    if (i < ONWARD_TOP) {
-      const onward = (await legsFrom(ctx, leg.lane.dest, true)).find((l) => l.profit > 0 && !overlaps(leg.lane, l.lane) && !(opts.noSpeculativeOnward && l.lane.speculative));
-      if (onward && rate(leg.profit + onward.profit, leg.ms + onward.ms) > rate(profit, ms)) {
-        profit = leg.profit + onward.profit;
-        ms = leg.ms + onward.ms;
-        next = describe(onward.lane);
+    const after = valueAt(leg.lane.dest);
+    if (after) {
+      const hMs = after.h * 3_600_000;
+      const earned = after.v * ship.cap * after.h;
+      if (rate(profit + earned, leg.ms + hMs) > rate(total, ms)) {
+        total = profit + earned;
+        ms = leg.ms + hMs;
+        next = `~${Math.round((after.v * ship.cap) / 100).toLocaleString("en-GB")} Cr/h from ${leg.lane.dest} (learned)`;
+      }
+    } else if (i < ONWARD_TOP) {
+      const o = (await legsFrom(ctx, leg.lane.dest, true)).find((l) => l.profit > 0 && !overlaps(leg.lane, l.lane) && !(opts.noSpeculativeOnward && l.lane.speculative));
+      if (o && rate(profit + o.profit, leg.ms + o.ms) > rate(total, ms)) {
+        total = profit + o.profit;
+        ms = leg.ms + o.ms;
+        next = describe(o.lane);
       }
     }
-    lanes.push({ ...leg.lane, loopMs: ms, profitPerHour: Math.round(rate(profit, ms)), next });
-  }
-  // Scarce cash: what a load ties up is charged at the fleet's return on cash.
-  const charge = opts.capitalRate ?? 0;
-  // The AI's bias scales only lanes that score above zero, so it can't turn a loser into a pick.
-  const score = (l: Lane) => {
-    const base = l.profitPerHour - charge * l.capital;
-    return base > 0 && opts.bias ? base * Math.min(1.5, Math.max(0.5, opts.bias(l))) : base;
+    return { ...leg.lane, loopMs: ms, profitPerHour: Math.round(rate(total, ms)), next };
   };
-  return lanes.sort((a, b) => score(b) - score(a));
+  const lanes: Lane[] = [];
+  for (const [i, leg] of legs.entries()) lanes.push(await finish(leg, i));
+  const score = (l: Lane) => laneScore(l, opts);
+  const order = lanes.map((_, i) => i).sort((a, b) => score(lanes[b]) - score(lanes[a]));
+
+  // Scenarios and Kelly (allocation.ts): the best few lanes judged, cut to their stake cap and scored by the certainty equivalent of the
+  // bankroll's log-growth, re-sorted until every lane in the top few has been judged (at most twice that many). A bankroll at or under 0
+  // leaves each load the floor alone (the cap only tightens as debt grows); a lane with a stake the judging never reached (so never cut)
+  // then ranks under every judged one, so no load slips past the cap.
+  const k = opts.kelly;
+  if (k && !opts.marketOnly) {
+    const judged = new Set<number>();
+    for (let round = 0; round < 2 * SAA_TOP; round++) {
+      const i = order.slice(0, SAA_TOP).find((x) => !judged.has(x));
+      if (i === undefined) break;
+      judged.add(i);
+      const leg = legs[i];
+      if (!leg.risk) continue;
+      let use = leg;
+      let o = outcomes(leg.risk);
+      const kelly: NonNullable<Lane["kelly"]> = { ce: 0, b: Math.round(k.bankroll) };
+      // The bankroll its certainty equivalent is taken on.
+      let ceB = k.bankroll;
+      // min(RCK, half-Kelly) on its scenarios (a sale with no confident forecast: the loss states alone, no price spread), our other ships
+      // in its zones and markets sharing the cap.
+      const st = stakeFraction(o, leg.risk.stake);
+      if (Number.isFinite(st.frac)) {
+        const cap = stakeCap(st.frac, k.bankroll, riskGroups(leg.lane), k.exposure);
+        // Never under the smallest load worth a leg (a ton over it, for the rebuild's rounding): the cap shrinks a load, it never idles a ship.
+        const floor = leg.lane.capital * Math.min(1, (minLoadTons(ship.cap) + 1) / Math.max(1, leg.lane.tons));
+        const allowed = Math.max(cap, floor);
+        kelly.frac = Math.round(st.frac * 10_000) / 10_000;
+        kelly.cap = Math.round(allowed);
+        // A load the floor holds over its cap (a small or negative bankroll, full groups) is judged on the bankroll that would make the
+        // stake allowed its share (never under the real one): a floor bet, not ruin, so the lanes cut to it keep their order.
+        if (st.frac > 0) ceB = Math.max(k.bankroll, allowed / st.frac);
+        if (leg.lane.capital > allowed * 1.02 && leg.primary) {
+          // Built again with no more cash than the cap: smaller, never larger than the old sizing.
+          const smaller = await buildLeg(ctx, from, leg.lane.source, leg.lane.dest, leg.primary, false, Math.floor(allowed));
+          if (smaller?.risk && smaller.lane.capital < leg.lane.capital) {
+            use = smaller;
+            o = outcomes(smaller.risk);
+            kelly.from = Math.round(leg.lane.capital);
+          }
+        }
+      }
+      const ce = certainty(o, ceB);
+      kelly.ce = Math.round(ce);
+      legs[i] = use;
+      lanes[i] = { ...(await finish(use, i, ce)), kelly };
+      order.sort((a, b) => score(lanes[b]) - score(lanes[a]));
+    }
+    const unsized = (i: number) => (judged.has(i) || !legs[i].risk ? 0 : 1);
+    order.sort((a, b) => unsized(a) - unsized(b) || score(lanes[b]) - score(lanes[a]));
+  }
+  const ranked = order.map((i) => lanes[i]);
+  // A deadline charter weighed for a ship after her current leg: only lanes that do fill it.
+  return opts.onlyCharter ? ranked.filter((l) => l.fills.some(([id]) => world.currentId(id) === opts.onlyCharter)) : ranked;
+}
+
+/**
+ * A lane's rank: its profit per hour less the charge on the cash it ties up while cash is scarce, times the AI's bias (which scales
+ * only lanes scoring above zero, so it can't turn a loser into a pick). The fleet's assignment by regret weighs lanes by it too.
+ */
+export function laneScore(l: Lane, opts: Pick<PlanOptions, "capitalRate" | "bias">): number {
+  const base = l.profitPerHour - (opts.capitalRate ?? 0) * l.capital;
+  return base > 0 && opts.bias ? base * Math.min(1.5, Math.max(0.5, opts.bias(l))) : base;
+}
+
+/**
+ * One pass's best legs from `port` for the terminal values: their mean rate per ton of hold and hours. Only legs cash didn't stop
+ * short (a cash-starved plan says nothing of what the port offers); none: nothing is learned (no evidence that nothing pays there).
+ */
+function observeLegs(observe: (port: string, perTonHour: number, hours: number, weight: number) => void, port: string, legs: Leg[], cap: number, weight: number): void {
+  if (!(cap > 0)) return;
+  // Already best first (enumerateLegs).
+  const top = legs.filter((l) => !l.cashBound).slice(0, TERMINAL_TOP);
+  if (top.length === 0) return;
+  const v = top.reduce((n, l) => n + Math.max(0, rate(l.profit, l.ms)), 0) / top.length / cap;
+  const h = top.reduce((n, l) => n + l.ms, 0) / top.length / 3_600_000;
+  observe(port, v, h, weight);
 }
 
 /** A lane for cargo already aboard (restart at sea, leftovers): carry it to one charter. */

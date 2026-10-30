@@ -20,10 +20,16 @@
  *                         value stops the CLI with an error, as for the other new switches below)
  *   KIBB_PAX_VOYAGES=0    don't count waiting passengers' fares in lane choice nor sail for fares alone (on by default, with
  *                         KIBB_PASSENGERS on: a passage for fares alone nobody boarded is never sailed empty; strict 1|true / 0|false)
+ *   KIBB_FARE_BANDIT=0    price passenger fares (and our convoys' escort fee) by the old up/down nudge (on by default: Thompson
+ *                         sampling over multipliers on the same reference fare, per route-length band, kind and competition, the old
+ *                         learner as its prior, capacity-aware; strict 1|true / 0|false)
  *   KIBB_CONVOYS=0        don't sail in convoys with our other ships
  *   KIBB_ESCORT_FEES=0    keep our convoys private (on by default: one formed by an armed ship of ours is announced public, by
  *                         approval, at our slowest member's speed, charging other companies' ships an escort fee per ton of hold
  *                         that our escorts share on arrival; joiners no slower than us only; strict 1|true / 0|false)
+ *   KIBB_ESCORT_OTHERS=0  never join other companies' convoys as an escort (on by default, with KIBB_CONVOYS on: an armed ship of ours
+ *                         about to sail joins another company's public fee-charging convoy forming there for her port when her share of
+ *                         its fee pool beats the wait and the pace; never insured; strict 1|true / 0|false)
  *   KIBB_RIVAL_INTEL=0    rival intel from quay sightings only (no public policies, convoys or leaderboard)
  *   KIBB_BYOM=0           always build turnkey (not from materials bought at the yard)
  *   KIBB_GUNS             auto (refit each ship to its lane's piracy, default) | full | off
@@ -36,7 +42,26 @@
  *   KIBB_RESIZE=0         don't size each load again at its source (and spend as before)
  *   KIBB_CASH_DUE         % of the cash our ships at sea are due to be paid that loads may count on (default 60; 0: cash in hand only)
  *   KIBB_WORLD_EVENTS=0   don't plan on world events' prices or on crisis charters not yet listed
- *   KIBB_LEVERAGE=0       never borrow (on by default: bridge a new ship or a load cash can't fund, when it clearly pays,
+ *   KIBB_MARKET_MODEL=0   plan on the old rules alone (on by default: each port's prices fitted as a bounded curve of the stock quays
+ *                         and gossip show, the stock reverting at its own measured pace, our fills moving it; the bid and ask expected on
+ *                         arrival, each further ton off the curve and the NPC bid depth seen at quays, blended with the old haircut and
+ *                         fixed impact by the data behind them; strict 1|true / 0|false)
+ *   KIBB_MARGINAL_ORDERS=0  one IOC at the break-even limit and sales down to a flat 88% of the price expected, as before (on by default:
+ *                         each ton bought must clear the margin at its own ask and sale price, the IOC limited to the dearest level
+ *                         wanted; sales walk the bids only as far as the rest fetches otherwise; big loads split across a re-quote when
+ *                         it pays; leaned on by the market model's confidence; strict 1|true / 0|false)
+ *   KIBB_RESTING_ORDERS=0 no resting (GTC) orders (on by default: leftovers rested under a resting ask in our warehouse, small prebuys
+ *                         at a source a ship of ours reaches after two re-quotes, a confident glut bought to sell after it reverts;
+ *                         priced on the market model, withdrawn when a ship waits for cash and before the season ends; strict 1|true / 0|false)
+ *   KIBB_RESTING_BUDGET_CR  most in resting bids' escrow plus goods held for them (default 15000)
+ *   KIBB_KELLY_SIZING=0   score and size as before (on by default: what comes after a lane is its destination's learned terminal
+ *                         value; the best lanes judged on scenarios by the bankroll's log-growth; each load and its loan cut to
+ *                         min(risk-constrained Kelly, half Kelly) x a shrinkage for forecast uncertainty, ships in one zone or market
+ *                         sharing the cap; never above the old sizing; strict 1|true / 0|false)
+ *   KIBB_ASSIGN_BY_REGRET=0  serve ships first come, as before (on by default: ships asking together served by greatest regret, a lane
+ *                         another commit made stale planned again; a deadline charter held for a ship at sea when she gains clearly
+ *                         more from it after her current leg; strict 1|true / 0|false)
+ *   KIBB_LEVERAGE=0      never borrow (on by default: bridge a new ship or a load cash can't fund, when it clearly pays,
  *                         on the Goldsmiths' instant quote, refinanced by a cheaper player quote; the key needs treasury_remit.
  *                         A default on a Goldsmiths' instant loan takes the ship at 35% of her rebuild value, no surplus,
  *                         the rest still owed; after any walk-away they lend nothing for a real day, nor does the autopilot)
@@ -58,7 +83,27 @@
  *   KIBB_BANK_MIN_WORTH_CR  net worth our bank waits for before it is chartered (default 150000)
  *   KIBB_BANK_LENDING_CR  most our bank's lending line has out (default 20000)
  *   KIBB_SHIP_DEALS=0     don't buy ships for sale under building cost, nor build commissions to order
+ *   KIBB_ORDER_HULLS=0    never order the buyer's hull from a builder (on by default: a commission under our own cheapest build,
+ *                         priced by Thompson sampling on the odds a builder takes it, when the wait still pays; one at a time, its
+ *                         price escrowed; strict 1|true / 0|false)
  *   KIBB_ENVELOPES=0      don't sell sealed news (intelligence envelopes) from our quays
+ *   KIBB_BUY_ENVELOPES=0  never buy envelopes (on by default: one covering the best lanes' ports is bought when half its value of
+ *                         information beats its price; strict 1|true / 0|false)
+ *   KIBB_ENVELOPE_BUDGET_CR  most spent on envelopes in any 24 real hours (default 2000)
+ *   KIBB_POST_CHARTERS=0  never post player charters (on by default: at a port of ours, a charter at 1.6x base for a good the region makes
+ *                         elsewhere, when the market model's bid there on landing beats the reward by a wide margin net of rent and
+ *                         capital; the goods sold from our warehouse through resting asks; at most 3 open; strict 1|true / 0|false)
+ *   KIBB_CHARTER_BUDGET_CR  most in our charters' escrow plus the goods they landed (default 5000)
+ *   KIBB_ISSUE_FREIGHT=0  never issue freight (on by default: goods held in a warehouse no ship of ours calls at for, carried to a port of
+ *                         ours that bids clearly better, when the gain beats the reward, rent and the carrier's risk; strict 1|true / 0|false)
+ *   KIBB_INSURE=0         never insure our own ships (on by default, strict: only when hull and cargo are a large share of net worth and
+ *                         the log-growth of net worth with the policy at Lloyd's price clearly beats it without; strict 1|true / 0|false)
+ *   KIBB_FUTURES=1        hub futures (OFF by default; strict 1|true / 0|false): listings accepted or posted only where the market
+ *                         model's forecast beats the strike by a wide edge, a quarter of Kelly, forward sales only covered at once
+ *   KIBB_FUTURES_BUDGET_CR  most in futures at once: forward buys' strikes, goods held for forward sales, margins (default 3000)
+ *   KIBB_MONOPOLIES=1     buy royal monopolies (OFF by default; strict 1|true / 0|false; never refunded): only when other players' buying
+ *                         resold at a 15% markup beats 1.5x the price, never where our fleet is the main buyer
+ *   KIBB_MONOPOLY_BUDGET_CR  most one royal monopoly may cost (default 10000)
  *   KIBB_NEWS_PACKETS=0   never build or run a news packet (on by default: only when Lloyd's news desk has bought enough envelopes
  *                         lately that one packet's share beats her upkeep and pays her hull back within KIBB_MAX_PAYBACK_H, one packet
  *                         under the buyer's rules, sealed, shuttling between hubs selling her news; sold if her sales don't cover her
@@ -119,8 +164,11 @@ function smugglingEnv(v: string | undefined): boolean | undefined {
 
 /**
  * The switches added with passengers, mortgages, housekeeping, banks, passenger voyages, ventures, escort fees, news packets, components,
- * research and ship shares are read strictly too: only 1/true turn one on and 0/false off;
- * anything else (a typo) is refused, never guessed. (The older flags keep their loose reading: anything but "0" is on.)
+ * research, ship shares, the market model, marginal orders, resting orders, Kelly sizing, assignment by regret, the fare bandit,
+ * escorting others, ordering hulls, buying envelopes, posting charters, issuing freight, insuring our ships, futures and monopolies are
+ * read strictly too:
+ * only 1/true turn one on and 0/false off; anything else (a typo) is refused, never guessed. (The older flags keep their loose reading:
+ * anything but "0" is on.)
  */
 function switchEnv(name: string, v: string | undefined): boolean | undefined {
   if (v === undefined || v.trim() === "") return undefined;
@@ -146,6 +194,8 @@ try {
       passengerVoyages: switchEnv("KIBB_PAX_VOYAGES", env.KIBB_PAX_VOYAGES),
       convoys: env.KIBB_CONVOYS ? env.KIBB_CONVOYS !== "0" : undefined,
       escortFees: switchEnv("KIBB_ESCORT_FEES", env.KIBB_ESCORT_FEES),
+      escortOthers: switchEnv("KIBB_ESCORT_OTHERS", env.KIBB_ESCORT_OTHERS),
+      fareBandit: switchEnv("KIBB_FARE_BANDIT", env.KIBB_FARE_BANDIT),
       rivalIntel: env.KIBB_RIVAL_INTEL ? env.KIBB_RIVAL_INTEL !== "0" : undefined,
       byomBuilds: env.KIBB_BYOM ? env.KIBB_BYOM !== "0" : undefined,
       guns: env.KIBB_GUNS ? (env.KIBB_GUNS as FleetSettings["guns"]) : undefined,
@@ -158,6 +208,12 @@ try {
       resizeLoads: env.KIBB_RESIZE ? env.KIBB_RESIZE !== "0" : undefined,
       cashDuePct: env.KIBB_CASH_DUE ? Number(env.KIBB_CASH_DUE) : undefined,
       actOnEvents: env.KIBB_WORLD_EVENTS ? env.KIBB_WORLD_EVENTS !== "0" : undefined,
+      marketModel: switchEnv("KIBB_MARKET_MODEL", env.KIBB_MARKET_MODEL),
+      marginalOrders: switchEnv("KIBB_MARGINAL_ORDERS", env.KIBB_MARGINAL_ORDERS),
+      restingOrders: switchEnv("KIBB_RESTING_ORDERS", env.KIBB_RESTING_ORDERS),
+      restingBudgetPence: env.KIBB_RESTING_BUDGET_CR ? cr(env.KIBB_RESTING_BUDGET_CR) : undefined,
+      kellySizing: switchEnv("KIBB_KELLY_SIZING", env.KIBB_KELLY_SIZING),
+      assignByRegret: switchEnv("KIBB_ASSIGN_BY_REGRET", env.KIBB_ASSIGN_BY_REGRET),
       leverage: env.KIBB_LEVERAGE ? env.KIBB_LEVERAGE !== "0" : undefined,
       mortgages: switchEnv("KIBB_MORTGAGES", env.KIBB_MORTGAGES),
       maxDebtPct: env.KIBB_MAX_DEBT_PCT ? Number(env.KIBB_MAX_DEBT_PCT) : undefined,
@@ -171,6 +227,17 @@ try {
       bankLendingBudgetPence: env.KIBB_BANK_LENDING_CR ? cr(env.KIBB_BANK_LENDING_CR) : undefined,
       shipDeals: env.KIBB_SHIP_DEALS ? env.KIBB_SHIP_DEALS !== "0" : undefined,
       envelopes: env.KIBB_ENVELOPES ? env.KIBB_ENVELOPES !== "0" : undefined,
+      orderHulls: switchEnv("KIBB_ORDER_HULLS", env.KIBB_ORDER_HULLS),
+      buyEnvelopes: switchEnv("KIBB_BUY_ENVELOPES", env.KIBB_BUY_ENVELOPES),
+      envelopeBudgetPence: env.KIBB_ENVELOPE_BUDGET_CR ? cr(env.KIBB_ENVELOPE_BUDGET_CR) : undefined,
+      postCharters: switchEnv("KIBB_POST_CHARTERS", env.KIBB_POST_CHARTERS),
+      charterBudgetPence: env.KIBB_CHARTER_BUDGET_CR ? cr(env.KIBB_CHARTER_BUDGET_CR) : undefined,
+      issueFreight: switchEnv("KIBB_ISSUE_FREIGHT", env.KIBB_ISSUE_FREIGHT),
+      insureLevered: switchEnv("KIBB_INSURE", env.KIBB_INSURE),
+      futures: switchEnv("KIBB_FUTURES", env.KIBB_FUTURES),
+      futuresBudgetPence: env.KIBB_FUTURES_BUDGET_CR ? cr(env.KIBB_FUTURES_BUDGET_CR) : undefined,
+      monopolies: switchEnv("KIBB_MONOPOLIES", env.KIBB_MONOPOLIES),
+      monopolyBudgetPence: env.KIBB_MONOPOLY_BUDGET_CR ? cr(env.KIBB_MONOPOLY_BUDGET_CR) : undefined,
       newsPackets: switchEnv("KIBB_NEWS_PACKETS", env.KIBB_NEWS_PACKETS),
       components: switchEnv("KIBB_COMPONENTS", env.KIBB_COMPONENTS),
       componentBudgetPence: env.KIBB_COMPONENT_BUDGET_CR ? cr(env.KIBB_COMPONENT_BUDGET_CR) : undefined,

@@ -20,6 +20,8 @@ import type {
   CharterFunding,
   ContractListing,
   ExpansionTier,
+  GossipReport,
+  PlaceOrderResult,
   PortDetail,
   PortOrderBook,
   RoutePlan,
@@ -27,6 +29,10 @@ import type {
 } from "../types";
 import type { FareBandView, FareRecordView, LloydsListNotice, MonopolyResult, PassengerKind, UnderwritingFigures, UnmetRouteView, WaitingGroupView, WorldEventResult, WorldEventType } from "../schema";
 import { PAX_WAITING_PORTS_KEPT, PAX_WAITING_TTL_GAME_MIN } from "./voyages";
+import { MarketModel, type BookSide, type LadderLevel, type MarketModelSummary, type MarketSnapshot, type MarketView } from "./market-model";
+import { JournalPart } from "./journal";
+import { PostedPrices, type BanditSnapshot } from "./bandit";
+import type { EnvelopePortReport } from "../schema";
 
 /** Passenger fares (guide 3.20, public): pages of 200 read world-wide a game day at a time, a route's own up to this many, and routes learned kept. */
 const FARE_PAGES = 3;
@@ -287,6 +293,32 @@ export interface WorldSnapshot {
   prizePools?: number[];
   /** The passenger pricer's nudge and rounds won and lost per route (`from>to`); absent in older saves. */
   paxRoutes?: Array<[string, PaxRoute]>;
+  /** Posted prices learned by Thompson sampling (bandit.ts: fares, escort fees, hull commissions); absent in older saves. */
+  bandit?: BanditSnapshot;
+  /**
+   * The market model's books, structural shifts and scorecard (market-model.ts); absent in older saves. Saved apart from the rest,
+   * every MARKET_SAVE_EVERY_MS (JournalPart): the journal puts it back here on load.
+   */
+  market?: MarketSnapshot | JournalPart<MarketSnapshot>;
+}
+
+/**
+ * Another company's public forming convoy that charges escort fees (guide 3.10: a quay's `convoy_notices`, live at its own port), as the
+ * news stood: route, departure (server ms), fee per ton of a paying member's hold, members and escorts mustered and the escorts' guns,
+ * admission, and when we read it (local ms).
+ */
+export interface EscortOffer {
+  convoyId: string;
+  from: string;
+  dest: string;
+  departsAt: number;
+  feePerTon: number;
+  members: number;
+  escorts: number;
+  escortGuns: number;
+  admission: string;
+  newsAt: number;
+  seenAt: number;
 }
 
 /**
@@ -319,6 +351,16 @@ const BID_HAIRCUT_DEFAULT = 0.03;
 export const BID_HAIRCUT_BASE = 0.03;
 const BID_SAMPLES_MIN = 10;
 const BID_SAMPLES_MAX = 200;
+/**
+ * The market model's scorecard (market-model.ts): a live book read where a price was remembered this long at least and at most
+ * (game hours) scores the model's forecast of it against the old rule's. Fresher, both are trivially right; older, the old rule drops it.
+ */
+const MODEL_SCORE_MIN_GAME_H = 1;
+const MODEL_SCORE_MAX_GAME_H = 72;
+/** The market model's part of the snapshot is built and written at most this often (real ms; a restart loses at most this much). */
+const MARKET_SAVE_EVERY_MS = 5 * 60_000;
+/** Cheap bulk goods (guide 3.1: grain, coal, quarry stone, rough timber, iron ore, crude salt): deeper markets, slower to recover. By id or name. */
+const BULK_GOODS = /^(grain|coal|quarry[_ ]stone|rough[_ ]timber|iron[_ ]ore|crude[_ ]salt)$/i;
 /** World events are re-read this far back (game days): a shortage's crisis charter stays open at least 10. */
 const EVENT_LOOKBACK_GAME_DAYS = 11;
 /** One page of the feed; a full page may be cut short (links for older events are then kept). */
@@ -568,6 +610,27 @@ export interface PriceObs {
    */
   playerBid?: number | null;
   playerBidQty?: number;
+  /**
+   * The NPC ladder's best bid and ask at that read (a live book's depth; gossip's best where no players' level was on top), so the
+   * market model's scorecard compares like with like. Null: none there, or a players' level hid it; absent: not known (no depth).
+   */
+  npcBid?: number | null;
+  npcAsk?: number | null;
+}
+
+/** A coffee-house report's best bid and ask where they are the NPC ladder's (null: none, or a players' resting level at or past it). */
+function gossipNpc(c: GossipReport["commodities"][number]): { bid: number | null; ask: number | null } {
+  return {
+    bid: c.best_bid_pence && !(c.best_player_bid_pence != null && c.best_player_bid_pence >= c.best_bid_pence) ? c.best_bid_pence : null,
+    ask: c.best_ask_pence && !(c.best_player_ask_pence != null && c.best_player_ask_pence <= c.best_ask_pence) ? c.best_ask_pence : null,
+  };
+}
+
+/** The NPC ladder's best on one side of a book's depth (null: no NPC level there). */
+function npcBest(levels: Array<{ price_pence: number; is_npc: boolean }>, side: "bid" | "ask"): number | null {
+  let best: number | null = null;
+  for (const l of levels) if (l.is_npc && (best === null || (side === "bid" ? l.price_pence > best : l.price_pence < best))) best = l.price_pence;
+  return best;
 }
 
 /** Our own company's resting order (GET /v1/market/orders), as the gossip's anonymous best levels may show it. */
@@ -757,6 +820,29 @@ export class World {
   /** bidHaircutPerDay, recomputed when a sample comes in (read thousands of times per plan). */
   private bidHaircut = BID_HAIRCUT_DEFAULT;
   /**
+   * The market model (market-model.ts): each port's prices as a function of its stock, the stock's reversion, our own fills' effect
+   * and the ladders' refill, fed from every book and coffee-house report read here and from our fills (noteFill). The planner reads
+   * it through marketView (gated by the setting and the old rules' own cut-offs).
+   */
+  readonly market = new MarketModel({
+    now: () => this.now(),
+    gameMinuteMs: () => this.gameMinuteMs,
+    basePrice: (good) => (this.catalog ? this.basePrice(good) : 0),
+    goodClass: (good) => this.goodClass(good),
+  });
+  /** Plan with the market model (the `marketModel` setting; set by the manager): off, the old constants and haircut alone. */
+  marketModel = true;
+  /**
+   * Posted prices learned by Thompson sampling (bandit.ts): passenger fares per route-length band × kind (fareBandit), our convoys' escort
+   * fee, the commissions we post for hulls (orderHulls). Saved with the snapshot; it learns whatever the switches say.
+   */
+  readonly fareBandit = new PostedPrices(() => this.gameMinuteMs);
+  /**
+   * Other companies' public forming convoys that charge escort fees, from the quays' convoy notices (guide 3.10: live at their own port):
+   * where an armed ship of ours could earn a share as an escort (escortOthers). By convoy id; dropped once due.
+   */
+  private readonly escortOffers = new Map<string, EscortOffer>();
+  /**
    * Rival ships due at (or just in at) each port, from the rival analysis: they may take charter
    * room before we land, or end a stall.
    */
@@ -911,6 +997,9 @@ export class World {
       seizures: this.seizures.map((x) => ({ ...x })),
       prizePools: [...this.prizePools],
       paxRoutes: [...this.paxRoutes].map(([k, v]): [string, PaxRoute] => [k, { ...v }]),
+      ...(this.fareBandit.list().length ? { bandit: this.fareBandit.snapshot() } : {}),
+      // Hundreds of KB: built and written apart, every few minutes, not with every save.
+      market: new JournalPart("market", MARKET_SAVE_EVERY_MS, () => this.market.snapshot()),
     };
   }
 
@@ -987,6 +1076,9 @@ export class World {
       }
     }
     this.updateBidHaircut();
+    this.market.restore(s.market instanceof JournalPart ? s.market.build() : s.market);
+    // Posted prices learned (bandit.ts): malformed keys, or keys whose grid changed since, start again.
+    this.fareBandit.restore(s.bandit);
   }
 
   /** Clock, charters, fees, vaults and world events (and the catalog now and again). */
@@ -1918,6 +2010,12 @@ export class World {
     this.events = [...list].sort((a, b) => b.startsAt - a.startsAt);
     this.indexEvents();
     for (const e of this.events) if (!known.has(e.id)) this.noteFresh(e);
+    // A lasting shift in a port's output or imports: the market model's readings before it no longer set that stock's level or
+    // its reversion, and its curve points count for less (idempotent: the latest start is kept).
+    for (const e of this.events) {
+      const shift = e.structural || e.type === "production_collapse" || e.type === "production_boom" || e.type === "import_slump";
+      if (shift && (e.port || e.good) && e.startsAt <= this.now()) this.market.structural(e.port, e.good, e.startsAt);
+    }
     // Gone from the window: their links and outcomes no longer matter (a full page may be cut short: keep them then).
     if (complete) {
       const ids = new Set(list.map((e) => e.id));
@@ -2940,6 +3038,7 @@ export class World {
       }
       // The best ask our bids can fill: our own other companies' resting asks left out (noteUnfillable).
       const ask = this.fillable(book.port_id, b, "ask");
+      if (live) this.modelBook(book.port_id, b, at, prev);
       this.sampleShock(book.port_id, b.commodity_id, bid, ask?.price_pence ?? null, at);
       // Players' asks alone (a royal monopoly leaves only those to non-holders): known only from the depth.
       const players = b.depth?.asks.filter((l) => !l.is_npc && !this.isUnfillable(book.port_id, b.commodity_id, l.order_id)) ?? null;
@@ -2955,8 +3054,117 @@ export class World {
         at,
         live,
         ...(players ? { playerAsk, playerAskQty: players.filter((l) => l.price_pence === playerAsk).reduce((n, l) => n + l.remaining_quantity, 0) } : {}),
+        ...(b.depth ? { npcBid: npcBest(b.depth.bids, "bid"), npcAsk: npcBest(b.depth.asks, "ask") } : {}),
       });
     }
+  }
+
+  /**
+   * A live book for the market model (market-model.ts). First its scorecard: where a price was remembered (MODEL_SCORE_MIN_GAME_H
+   * to MODEL_SCORE_MAX_GAME_H old, no shortage or glut over it), the model's forecast of what the book now shows is scored against
+   * the old rule's (the remembered bid less the planner's haircut for its age; the remembered ask as it was). Both against the same
+   * mark, the NPC best the depth now shows (what the model forecasts), and only where the remembered price was the NPC best then too:
+   * a players' level on either read would score the old rule on a price the model doesn't forecast. Then a quay's depth and stock go
+   * in (guide 3.1: `npc_current_stock`), our own other companies' levels left out (they never fill ours).
+   */
+  private modelBook(port: string, b: PortOrderBook["books"][number], at: number, prev: PriceObs | undefined): void {
+    const good = b.commodity_id;
+    if (!this.catalog || this.isCove(port) || !this.trades(port, good)) return;
+    const gm = this.gameMinuteMs;
+    const d = b.depth ?? null;
+    const shocked = this.shockCovers(port, good, at);
+    const age = prev ? at - prev.at : 0;
+    if (d && prev && age >= MODEL_SCORE_MIN_GAME_H * 60 * gm && age <= MODEL_SCORE_MAX_GAME_H * 60 * gm && !shocked && !this.shockCovers(port, good, prev.at)) {
+      const nowBid = npcBest(d.bids, "bid");
+      const nowAsk = npcBest(d.asks, "ask");
+      // As marketView forecasts: the remembered price anchors the level where it is newer than the model's own reading.
+      if (nowBid && prev.bid && prev.npcBid === prev.bid) {
+        const v = this.market.view(port, good, "bid", at, { price: prev.bid, at: prev.at });
+        const old = prev.bid * Math.max(0, 1 - (BID_HAIRCUT_BASE + this.bidHaircut * (age / (24 * 60 * gm))));
+        if (v && v.data > 0) this.market.scoreForecast("bid", nowBid, old, v.price);
+      }
+      if (nowAsk && prev.ask && prev.npcAsk === prev.ask) {
+        const v = this.market.view(port, good, "ask", at, { price: prev.ask, at: prev.at });
+        if (v && v.data > 0) this.market.scoreForecast("ask", nowAsk, prev.ask, v.price);
+      }
+    }
+    if (!d || !Number.isFinite(d.npc_current_stock)) return;
+    const level = (side: "ask" | "bid") => (l: { order_id: string; price_pence: number; remaining_quantity: number; is_npc: boolean }): LadderLevel | null =>
+      this.isUnfillable(port, good, l.order_id, side) ? null : { price: l.price_pence, qty: l.remaining_quantity, npc: l.is_npc };
+    const keep = (x: LadderLevel | null): x is LadderLevel => x !== null;
+    this.market.observeQuay(port, good, at, d.npc_current_stock, d.asks.map(level("ask")).filter(keep), d.bids.map(level("bid")).filter(keep), shocked);
+  }
+
+  /**
+   * A coffee-house report for the market model: the port's stock and its best bid and ask as of then (guide 3.1). A side whose best
+   * is a players' resting level (the report's `best_player_*` at or past it) isn't the NPC ladder: left out of the curve.
+   */
+  private modelGossip(port: string, c: GossipReport["commodities"][number], at: number): void {
+    const good = c.commodity_id;
+    if (!this.catalog || this.isCove(port) || !this.trades(port, good) || typeof c.current_stock !== "number" || !Number.isFinite(c.current_stock)) return;
+    const { bid, ask } = gossipNpc(c);
+    this.market.observeTop(port, good, at, c.current_stock, bid, ask, this.shockCovers(port, good, at));
+  }
+
+  /**
+   * One of our own orders traded (the order's result: a bid of ours took from the port's asks, an ask of ours sold into its bids):
+   * the market model moves that book's stock by the NPC tons it took (guide 3.1), so the next plan there prices the ladder we left.
+   * Call it straight after the order, before any book read after it.
+   */
+  noteFill(res: Pick<PlaceOrderResult, "port_id" | "commodity_id" | "side" | "filled_quantity">): void {
+    if (res.filled_quantity > 0) this.market.noteOwnTrade(res.port_id, res.commodity_id, res.side, res.filled_quantity, this.now());
+  }
+
+  /** A shortage or glut of `good` at `port` was on at server ms `t` (the market model defers to the old rules' shock handling then). */
+  shockCovers(port: string, good: string, t: number): boolean {
+    return !!this.shockIndex.get(`${port}|${good}`)?.some((e) => (e.type === "demand_shortage" || e.type === "supply_boom") && e.startsAt <= t && t < e.expiresAt);
+  }
+
+  /** A good's class for the market model's pooled priors: `bulk` for the cheap bulk goods (guide 3.1), else its catalog category. */
+  goodClass(good: string): string {
+    const c = this.catalog?.commodities.find((x) => x.id === good);
+    if (BULK_GOODS.test(good) || (c && BULK_GOODS.test(c.name.trim()))) return "bulk";
+    return c?.category ?? "other";
+  }
+
+  /**
+   * The market model's forecast of one side of a book at server ms `at` (market-model.ts: the NPC best expected then, the price of
+   * further tons, the stock), or null where the old rules stand alone: the setting off; no lawful market there (a cove, contraband, a
+   * port that doesn't trade it); the Crown's asks barred by a royal monopoly; a structural shift since the model's latest reading
+   * (the old rules drop such a price too); a shortage or glut over that reading or over `at` (the old rules price shocks); or no
+   * confidence (a single reading, or a scorecard that found it worse than the old rules). A price seen since the model's own latest
+   * reading (a counting house's live top, a storage snapshot) sets its level.
+   */
+  marketView(port: string, good: string, side: BookSide, at = this.now()): MarketView | null {
+    if (!this.marketModel || !this.catalog || this.isCove(port) || !this.trades(port, good)) return null;
+    if (side === "ask" && this.monopolyBars(port, good)) return null;
+    const p = this.price(port, good);
+    const seen = side === "bid" ? p?.bid : p?.ask;
+    const v = this.market.view(port, good, side, at, p && seen ? { price: seen, at: p.at } : null);
+    if (!v || !(v.conf > 0)) return null;
+    if (this.shiftedSince(port, good, side === "ask" ? "production_collapse" : "import_slump", v.seenAt)) return null;
+    if (this.shockCovers(port, good, v.seenAt) || this.shockCovers(port, good, at)) return null;
+    return v;
+  }
+
+  /**
+   * The NPC price the market model expects on one side of a book at server ms `at` (asks: what we'd pay; bids: what we'd get), the
+   * first ton after `after` tons taken by others, with its sd and the confidence to lean on it by. Gated as marketView (null: the
+   * old rules stand).
+   */
+  marketForecast(port: string, good: string, side: BookSide, at = this.now(), after = 0): { price: number; sd: number; conf: number } | null {
+    const v = this.marketView(port, good, side, at);
+    return v ? { price: after > 0 ? v.marginal(0, after) : v.price, sd: v.sd, conf: v.conf } : null;
+  }
+
+  /** The market model's price of the `tons`-th ton bought (asks) or sold (bids) at `at`, after `after` tons taken by others. Gated as marketView. */
+  marketMarginal(port: string, good: string, side: BookSide, tons: number, at = this.now(), after = 0): number | null {
+    return this.marketView(port, good, side, at)?.marginal(tons, after) ?? null;
+  }
+
+  /** The market model's coverage and calibration (digest, panel). */
+  marketSummary(rows?: number): MarketModelSummary {
+    return this.market.summary(rows);
   }
 
   /**
@@ -3014,29 +3222,109 @@ export class World {
     }
     this.noteBerthDues(detail.id, detail.berth_dues_per_day_pence);
     this.noteCustoms(detail.id, detail.customs_bps, this.now());
+    this.noteEscortOffers(detail.convoy_notices);
     for (const g of detail.coffee_house_gossip ?? []) {
       const at = this.now() - g.age_seconds * 1000;
-      for (const c of g.commodities) {
-        const key = `${g.subject_port_id}|${c.commodity_id}`;
-        this.sampleShock(g.subject_port_id, c.commodity_id, c.best_bid_pence ?? null, c.best_ask_pence ?? null, at);
-        const prev = this.prices.get(key);
-        if (prev && prev.at >= at) continue;
-        this.prices.set(key, {
-          ask: c.best_ask_pence ?? null,
-          askQty: 0,
-          bid: c.best_bid_pence ?? null,
-          bidQty: 0,
-          bidDepth: null,
-          stock: c.current_stock,
-          customsBps: prev?.customsBps ?? null,
-          at,
-          live: false,
-          // The best players' resting ask and bid in the news (anonymous: playerLevel leaves ours out); absent from older boards.
-          ...(c.best_player_ask_pence !== undefined ? { playerAsk: c.best_player_ask_pence, playerAskQty: c.best_player_ask_quantity ?? 0 } : {}),
-          ...(c.best_player_bid_pence !== undefined ? { playerBid: c.best_player_bid_pence, playerBidQty: c.best_player_bid_quantity ?? 0 } : {}),
-        });
+      for (const c of g.commodities) this.takeReport(g.subject_port_id, c, at);
+    }
+  }
+
+  /** One good's row of a coffee-house report on `port` as of server ms `at` (gossip, or an envelope's port report). */
+  private takeReport(port: string, c: GossipReport["commodities"][number], at: number): void {
+    const key = `${port}|${c.commodity_id}`;
+    this.sampleShock(port, c.commodity_id, c.best_bid_pence ?? null, c.best_ask_pence ?? null, at);
+    // Older reports than the price kept still teach the market model (its fits; a reading older than its state isn't fused).
+    this.modelGossip(port, c, at);
+    const prev = this.prices.get(key);
+    if (prev && prev.at >= at) return;
+    const npc = gossipNpc(c);
+    this.prices.set(key, {
+      ask: c.best_ask_pence ?? null,
+      askQty: 0,
+      bid: c.best_bid_pence ?? null,
+      bidQty: 0,
+      bidDepth: null,
+      stock: c.current_stock,
+      customsBps: prev?.customsBps ?? null,
+      at,
+      live: false,
+      // The best players' resting ask and bid in the news (anonymous: playerLevel leaves ours out); absent from older boards.
+      ...(c.best_player_ask_pence !== undefined ? { playerAsk: c.best_player_ask_pence, playerAskQty: c.best_player_ask_quantity ?? 0 } : {}),
+      ...(c.best_player_bid_pence !== undefined ? { playerBid: c.best_player_bid_pence, playerBidQty: c.best_player_bid_quantity ?? 0 } : {}),
+      npcBid: npc.bid,
+      npcAsk: npc.ask,
+    });
+  }
+
+  /**
+   * An envelope we bought (guide 3.11: copied from game data with its original timestamps): its port reports taken in like gossip, each
+   * row at its own `snapshot_at` (never fresher than it was: a row older than the price kept only teaches the market model), and its
+   * sailing notices like a quay's (rival intel). Rows on a cove, or with no readable time, are left out. The rows taken in.
+   */
+  observeEnvelope(reports: readonly EnvelopePortReport[] | null | undefined, sailings?: Parameters<RivalTracker["addNotices"]>[0]): number {
+    let n = 0;
+    const now = this.now();
+    for (const r of reports ?? []) {
+      if (!r || typeof r.subject_port_id !== "string" || !Array.isArray(r.commodities)) continue;
+      const whole = Date.parse(r.snapshot_at ?? "");
+      for (const c of r.commodities) {
+        const at = Date.parse(c?.snapshot_at ?? "") || whole;
+        // A time in the future (clock skew) is taken as now: never fresher than the present.
+        if (!c || typeof c.commodity_id !== "string" || !Number.isFinite(at)) continue;
+        this.takeReport(r.subject_port_id, c, Math.min(at, now));
+        n++;
       }
     }
+    if (sailings?.length) this.rivals.addNotices(sailings);
+    return n;
+  }
+
+  /** The newest time we hold a price for any good at `port` (server ms; 0: none), for weighing what an envelope's report adds. */
+  priceSeenAt(port: string): number {
+    let at = 0;
+    for (const [k, v] of this.prices) if (k.startsWith(`${port}|`) && v.at > at) at = v.at;
+    return at;
+  }
+
+  /** Other companies' public forming convoys that charge escort fees, from a quay's notices (escortOffers). */
+  private noteEscortOffers(list: PortDetail["convoy_notices"]): void {
+    const now = this.now();
+    for (const [id, o] of [...this.escortOffers]) if (o.departsAt < now) this.escortOffers.delete(id);
+    for (const n of list ?? []) {
+      if (!n?.convoy_id || !(n.escort_fee_pence_per_ton > 0) || n.admission === "invite_only") continue;
+      if (this.ourCompanyIds.has(n.organizer_company_id) || n.organizer_company_id === this.companyId) continue;
+      const departsAt = Date.parse(n.departs_at);
+      if (!Number.isFinite(departsAt) || departsAt < now) continue;
+      const newsAt = Date.parse(n.news_as_of);
+      const prev = this.escortOffers.get(n.convoy_id);
+      if (prev && Number.isFinite(newsAt) && prev.newsAt > newsAt) continue;
+      this.escortOffers.set(n.convoy_id, {
+        convoyId: n.convoy_id,
+        from: n.origin_port_id,
+        dest: n.dest_port_id,
+        departsAt,
+        feePerTon: n.escort_fee_pence_per_ton,
+        members: n.members ?? 0,
+        escorts: n.escorts ?? 0,
+        escortGuns: n.escort_cannons ?? 0,
+        admission: n.admission,
+        newsAt: Number.isFinite(newsAt) ? newsAt : now,
+        seenAt: Date.now(),
+      });
+    }
+    while (this.escortOffers.size > 100) this.escortOffers.delete(this.escortOffers.keys().next().value!);
+  }
+
+  /** Others' fee-charging convoys the notices show forming still (sailing at or after server ms `now`): for the report. */
+  escortOffersCount(now = this.now()): number {
+    let n = 0;
+    for (const o of this.escortOffers.values()) if (o.departsAt >= now) n++;
+    return n;
+  }
+
+  /** Others' fee-charging convoys forming at `from` for `dest` that sail between `after` and `before` (server ms), as the notices showed. */
+  escortOffersAt(from: string, dest: string, after: number, before: number): EscortOffer[] {
+    return [...this.escortOffers.values()].filter((o) => o.from === from && o.dest === dest && o.departsAt >= after && o.departsAt <= before);
   }
 
   /**

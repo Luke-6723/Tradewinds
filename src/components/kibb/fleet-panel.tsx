@@ -19,14 +19,24 @@ import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
 import type {
   BankReport,
+  CharterPostReport,
   DealsReport,
   DepositsReport,
+  EnvelopeBuyReport,
+  EscortJoinReport,
   EscortReport,
+  FareBanditReport,
   FinanceLoanRow,
   FinanceReport,
   FleetSettings,
+  FleetState,
+  FreightIssueReport,
+  FuturesReport,
   GunPolicy,
   HousekeepingReport,
+  HullOrderReport,
+  InsureReport,
+  MonopolyReport,
   NewsReport,
   OurBankStatus,
   PassengerReport,
@@ -104,7 +114,12 @@ function SettingsForm({
       | "bankLendingBudgetPence"
       | "componentBudgetPence"
       | "rndBudgetPence"
-      | "sharesBudgetPence",
+      | "sharesBudgetPence"
+      | "restingBudgetPence"
+      | "envelopeBudgetPence"
+      | "charterBudgetPence"
+      | "futuresBudgetPence"
+      | "monopolyBudgetPence",
     disabled = false,
   ) => (
     <div className="space-y-1">
@@ -137,6 +152,26 @@ function SettingsForm({
           !confirm(
             `Let the autopilot start research projects, up to ${fmtCr(d.rndBudgetPence)} each? A project draws a random design (it may disappoint), its start fee ` +
               "is never refunded, and it costs upkeep every game day for two to three real days.",
+          )
+        )
+          return;
+        if (
+          patch.futures &&
+          !confirm(
+            `Let the autopilot trade hub futures, up to ${fmtCr(d.futuresBudgetPence)} in contracts at once? It is speculation on the market model's ` +
+              "forecasts: a forward purchase loses when the hub's bids at maturity come in under the strike, each side escrows a 25% margin until " +
+              "maturity, the whole lot must be paid for in the hub's region when it settles, and the game has no cancel (an untaken listing of ours " +
+              "ties its margin up until it matures). Contracts already entered settle even if you switch it off again.",
+          )
+        )
+          return;
+        if (
+          patch.monopolies &&
+          !confirm(
+            `Let the autopilot buy royal monopolies, up to ${fmtCr(d.monopolyBudgetPence)} each? A grant's price is never refunded, and on the ` +
+              "guide's own figures (a tenth of the Crown's sales for the price, a ~15% markup) one rarely pays: it is bought only when other players' " +
+              "buying from the Crown there, resold at the markup, beats 1.5 times its price, so expect few or none. Up to half the budget may be " +
+              "held as resale stock at cost.",
           )
         )
           return;
@@ -261,7 +296,7 @@ function SettingsForm({
           className="flex items-center gap-1.5"
           title="On by default. Only when the forming ship mounts guns and holds no policy; joiners admitted only when no slower than our slowest, a few at most. Off here is off for Claude too: it may switch it off, never on"
         >
-          <input type="checkbox" checked={d.escortFees} disabled={!d.convoys} onChange={(e) => setD({ ...d, escortFees: e.target.checked })} />
+          <input type="checkbox" checked={d.escortFees} disabled={!d.convoys && !d.escortFees} onChange={(e) => setD({ ...d, escortFees: e.target.checked })} />
           Escort fees (needs convoys): open convoys we form with an armed ship to other companies&apos; ships for a fee per ton, our armed ships escorting
         </label>
         <label className="flex items-center gap-1.5">
@@ -362,6 +397,76 @@ function SettingsForm({
           stalls seen, rival deliveries there, laden rivals inbound), against what waiting costs. While it lets one lapse, no ship delivers into it (once learned safe: only a whole load that keeps it under 80% of the pace line), the tons a load plans into it that land early wait in the roadstead, and ships take other work until a
           run lands just after the lapse; if a rival delivers, holders deliver at once. Once the tier is 90% done or due within 2 hours,
           and for an hour after it turns over, the buyer leaves the kept-back share of spare cash for the next tier&apos;s charters.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <div className="font-medium text-muted-foreground text-xs">Market model &amp; execution</div>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off: the old rules alone (it keeps learning either way). Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.marketModel} onChange={(e) => setD({ ...d, marketModel: e.target.checked })} />
+          Market model: forecast the bids and asks a ship meets on arrival from each port&apos;s stock and fitted price curve, in place of fixed haircuts (on by default)
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off: today's break-even buy limit and flat sale floor exactly. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.marginalOrders} onChange={(e) => setD({ ...d, marginalOrders: e.target.checked })} />
+          Marginal orders: buy ton by ton only while each still clears the minimum margin, sell only as far as keeping the rest doesn&apos;t pay more
+          (on by default; leans on the market model{d.marketModel ? "" : ": with it off, only the tighter buy limit is left"})
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Priced on the market model, so it needs it. Off: everything resting is withdrawn and the goods held are sold or loaded. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.restingOrders} disabled={!d.marketModel} onChange={(e) => setD({ ...d, restingOrders: e.target.checked })} />
+          Resting orders (needs the market model): leftovers under resting asks in our warehouses, bids ahead of a ship&apos;s load, small gluts bought
+          to sell after they revert (on by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most in resting bids and goods held (Cr)", "restingBudgetPence", !d.restingOrders || !d.marketModel)}</div>
+        <p className="text-muted-foreground text-xs">
+          Market model: per port and good, prices are fitted as a bounded power law of the stock quays and gossip show (bids and asks apart, robust
+          to stray readings), the stock reverting towards its usual level at a pace measured there (bulk goods slower), our own fills moving it and
+          the uncertainty growing at each 6-game-hour re-quote. The planner blends it with the old rules by its confidence: none on one reading,
+          and trust cut when its forecasts of books read later score worse than the old rules&apos;; a shortage, glut or structural news at a book
+          hands that book back to the old rules. Marginal orders: a buy&apos;s limit is the dearest ask still worth buying (a book that moved fills
+          less instead of eating the margin, and a second look buys what still pays), a big load may be split across a re-quote when the slippage
+          saved beats her time waiting, and a sale stops where holding, resting or carrying the rest fetches more, never under its landed cost.
+          Resting orders: each priced over the re-quotes it rests through, a bid never within a forecast sd of what the goods are worth, its fill
+          chance calibrated on our own fills; escrow and the goods held count against the budget and are never spent elsewhere. Bids are withdrawn
+          when a ship waits for cash, her plan changes or news reshapes the market, and everything resting is withdrawn in the season&apos;s
+          endgame. Needs presence there (a lease, a ship or a factor); space is leased as needed and given back once unused. Off here is off for
+          Claude too: it may switch any of them off or lower the budget, never more.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <div className="font-medium text-muted-foreground text-xs">Allocation</div>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off: the old onward estimate, expected profit and sizing (the terminal values keep learning). Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.kellySizing} onChange={(e) => setD({ ...d, kellySizing: e.target.checked })} />
+          Kelly sizing: score lanes by the bankroll&apos;s growth across what can go wrong, and cut each load (and its loan) to a safe Kelly stake (on by default)
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off: ships are served first come, first served. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.assignByRegret} onChange={(e) => setD({ ...d, assignByRegret: e.target.checked })} />
+          Assign by regret: ships asking together are served by what each would lose without her best lane, and a deadline charter may be held for a
+          ship at sea that gains clearly more (on by default)
+        </label>
+        <p className="text-muted-foreground text-xs">
+          Kelly sizing: what comes after a lane is its destination&apos;s learned terminal value (the best profit an hour our own plans found from
+          there, per ton of hold); the best few lanes of each plan are judged on scenarios (the ship lost, raided or storm-damaged; each sale&apos;s
+          forecast spread; a gossiped charter&apos;s odds) by the certainty equivalent of the bankroll&apos;s log-growth, and each load is cut to the
+          smaller of risk-constrained Kelly (the bankroll falling below 70% with odds under 10%) and half Kelly, ships in the same zones or selling
+          into the same market sharing one cap. The bankroll is spare cash and deposits plus cargo at sea, less what our loans take; at or under
+          nothing every load is the smallest worthwhile one until it recovers. Never larger than the old sizing. Regret: within a time box (past
+          it, first come as before), a lane another commit made stale is planned again before it is committed; a deadline charter is held for a
+          ship at sea only when she gains 1.5&times; and 500 Cr over what the ship in port loses. Off here is off for Claude too: it may switch
+          either off, never on.
         </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -598,6 +703,150 @@ function SettingsForm({
           her dispatches, shuttles between the hubs and posts one envelope of the newer reports she carries at each, and is sold down the ship
           broker&apos;s ladder if 3 game days after her first envelope her sales don&apos;t cover her upkeep (then no packet for 6 real hours, nor that season unless the desk&apos;s spend doubles). Off here is off for Claude too: it may switch either off or
           lower the shares budget, never more.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <div className="font-medium text-muted-foreground text-xs">Auctions &amp; convoys</div>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off: the old up/down nudge on the reference fare (it keeps learning either way). Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input
+            type="checkbox"
+            checked={d.fareBandit}
+            disabled={!d.usePassengers && !(d.convoys && d.escortFees) && !d.fareBandit}
+            onChange={(e) => setD({ ...d, fareBandit: e.target.checked })}
+          />
+          Fare bandit (needs passengers or escort fees): price passenger fares and our convoys&apos; escort fee by learning which multipliers get taken (on by default)
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Never an insured ship, contraband, a venture or passengers bound elsewhere. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.escortOthers} disabled={!d.convoys && !d.escortOthers} onChange={(e) => setD({ ...d, escortOthers: e.target.checked })} />
+          Escort others (needs convoys): an armed ship about to sail joins another company&apos;s public convoy for the same port as an escort, for a share
+          of its fees, when that beats the wait (on by default)
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off here is off for Claude too: it may switch it off or lower the budget, never more"
+        >
+          <input type="checkbox" checked={d.buyEnvelopes} onChange={(e) => setD({ ...d, buyEnvelopes: e.target.checked })} />
+          Buy intelligence envelopes whose port reports could change the choice of lane by twice their price (on by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most on envelopes in any 24 h (Cr)", "envelopeBudgetPence", !d.buyEnvelopes)}</div>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Off: the buyer builds as before, and an untaken commission is withdrawn. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.orderHulls} disabled={!d.autoBuy && !d.orderHulls} onChange={(e) => setD({ ...d, orderHulls: e.target.checked })} />
+          Order hulls (needs the buyer): post a commission for the ship the buyer would build, under our own cost to build her, when the saving beats
+          the wait (on by default)
+        </label>
+        <p className="text-muted-foreground text-xs">
+          Fare bandit: the fare a head is chosen by Thompson sampling over multipliers of 0.7&times;-2&times; on the same reference fare as before, one
+          posterior on &ldquo;a group boards this round&rdquo; per arm, per route-length band, kind and whether anyone competes; its prior is what the old
+          pricer implies, old data fades so a moving market is followed, the arm worth the most fares in the berths there are is posted, never under
+          the weight&apos;s sailing-time floor. Our convoys&apos; escort fee is priced the same way. Escort others: only for a port she sails for anyway,
+          a convoy forming where she lies within 3 game hours with a positive fee pool, its pace no slower than 85% of hers, when her share (the pool
+          by her guns&apos; share of the escorts&apos;, the odds she arrives) and part of the pooled protection beat her wait and the slower passage; a
+          request left pending is withdrawn after 20 game minutes, and she leaves before departure if her plan, the pace, a policy or the pool
+          changes. Envelopes: at ports where we have presence, port reports covering the planner&apos;s best lanes, newer than ours, bought when half
+          the value of information (the forecast spread they would cut, through the best lane against each alternative) beats the price; never our
+          own. Hull orders: only when the buyer builds on our own cash and isn&apos;t in a hurry; priced at 0.6&times;-0.94&times; of our cheapest build
+          by Thompson sampling on the odds a builder takes it (learned per class), a 5% collateral asked of the builder, 36 game hours to deliver;
+          the price escrowed, one at a time, withdrawn while untaken when the plan changes. Off here is off for Claude too: it may switch any of
+          them off or lower the envelope budget, never more.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <div className="font-medium text-muted-foreground text-xs">Contracts &amp; hedges</div>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Priced on the market model and sold through resting orders, so it needs both. Off: open charters are withdrawn. Off here is off for Claude too: it may switch it off or lower the budget, never more"
+        >
+          <input
+            type="checkbox"
+            checked={d.postCharters}
+            disabled={!d.marketModel || !d.restingOrders}
+            onChange={(e) => setD({ ...d, postCharters: e.target.checked })}
+          />
+          Post charters (needs resting orders and the market model): ask the Merchant Adventurers&apos; filler to bring goods to our warehouse where
+          the bids will pay clearly more than the reward (on by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {crField("Most in our charters' escrow and goods they landed (Cr)", "charterBudgetPence", !d.postCharters || !d.marketModel || !d.restingOrders)}
+        </div>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default. Works on goods our resting orders hold. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.issueFreight} onChange={(e) => setD({ ...d, issueFreight: e.target.checked })} />
+          Issue freight: offer goods held in our warehouses that haven&apos;t sold to carriers bound for a port of ours that pays clearly more (on by default)
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="On by default; strict, so it fires rarely. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.insureLevered} onChange={(e) => setD({ ...d, insureLevered: e.target.checked })} />
+          Insure our own voyage when hull and cargo are a quarter of net worth or more and the cover is worth its premium to the bankroll (on by default; rare)
+        </label>
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="OFF by default: speculative, its margin at risk. Priced on the market model, so it needs it. Off here is off for Claude too: it may switch it off or lower the budget, never more"
+        >
+          <input type="checkbox" checked={d.futures} disabled={!d.marketModel} onChange={(e) => setD({ ...d, futures: e.target.checked })} />
+          Hub futures (needs the market model): forward contracts at hubs of ours where the forecast clears the strike by a wide edge (OFF by default:
+          speculative, a contract&apos;s margin and the price move at maturity are at risk)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most in futures at once (Cr)", "futuresBudgetPence", !d.futures || !d.marketModel)}</div>
+        {initial.futures && !d.futures && (
+          <p className="text-warning-foreground text-xs">
+            Turning it off enters no new contract, but those already entered are still seen through to maturity (goods bought for a forward sale are
+            delivered; a forward purchase lands in our warehouse and is sold).
+          </p>
+        )}
+        <label
+          className="flex items-center gap-1.5 text-sm"
+          title="OFF by default: a grant is never refunded and rarely pays. Its stock is resold through resting orders on the market model's prices, so it needs both. Off here is off for Claude too: it may switch it off or lower the budget, never more"
+        >
+          <input
+            type="checkbox"
+            checked={d.monopolies}
+            disabled={!d.marketModel || !d.restingOrders}
+            onChange={(e) => setD({ ...d, monopolies: e.target.checked })}
+          />
+          Royal monopolies (needs resting orders and the market model): buy the sole right to a good&apos;s Crown sales in a region and resell at a
+          markup (OFF by default: the price is never refunded, and one rarely pays)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {crField("Most one monopoly may cost (Cr)", "monopolyBudgetPence", !d.monopolies || !d.marketModel || !d.restingOrders)}
+        </div>
+        {initial.monopolies && !d.monopolies && (
+          <p className="text-warning-foreground text-xs">
+            Turning it off buys no new grant, but one already bought stands its term (its price is never refunded): its stock is still resold while it
+            stands, then sold as any goods we hold.
+          </p>
+        )}
+        <p className="text-muted-foreground text-xs">
+          Charters: at a port where we have presence, for a good the region makes elsewhere, at 1.6&times; its base price a ton (the filler acts only on
+          charters some game days old paying well over base, and players may deliver first), when the market model&apos;s bid there five game days on,
+          less a forecast sd, beats the reward by 30% and the minimum margin a ton, and the expected gain at the fill share learned from our own
+          charters, less rent and the escrow&apos;s capital, clears 300 Cr. Space is leased and the reward escrowed; public, 10 game days; the goods are
+          sold through resting asks, never under what they cost; withdrawn when the bids no longer pay half the edge or the season nears its end; at
+          most 3 open. Freight: a lot at a port no ship of ours calls at for it, which its resting asks haven&apos;t sold, offered to carriers bound for
+          a port of ours whose bid on landing (less an sd) beats where it lies by 25% and pays the reward (12% of its value there times a multiplier
+          learned from our listings), the rent there and the carrier&apos;s risk (40% collateral asked) by 300 Cr and half the reward; untaken in 5
+          game days it is ours where it lay again; at most 2 out. Insurance: on our own loss model&apos;s odds, the certainty equivalent of net
+          worth&apos;s log-growth with Lloyd&apos;s policy at its posted price on the whole sum must beat it without by 500 Cr and a quarter of the
+          premium; written in port once the cargo and stores are aboard and no passengers offered; never a smuggler, contraband, a venture, the
+          courier or a ship being retired; everything the fleet does for a policy then applies. Futures: at hubs where we have presence, a listing
+          selling forward is accepted when the bid expected at maturity beats the strike by 8% and half a forecast sd a ton, at most a quarter of
+          Kelly; one buying forward only covered at once (the lot bought into our warehouse) when the strike beats that cost by 3%; our own
+          forward buys posted at a strike giving the Goldsmiths&apos; desk its edge; never past the season&apos;s normal days; it never hedges a cargo at
+          sea. Monopolies: 10 game days, only when other players&apos; Crown buying there over the term, at the share our resting asks would
+          capture and a 15% markup net of customs, beats 1.5&times; the price; never when our fleet buys 30% or more of the Crown&apos;s sales there;
+          at most 2. Off here is off for Claude too: it may switch any of them off or lower the budgets, never more.
         </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -886,7 +1135,7 @@ export function FleetPanel() {
             if (
               m === "live" &&
               !confirm(
-                `Let Claude steer the autopilot for its horizon: any setting within your ceilings (ship limit and budgets never above yours, the reserve and the bank's net-worth bar only raised, borrowing, lending, deposits, our bank and the other money avenues never on while yours are off), ` +
+                `Let Claude steer the autopilot for its horizon: any setting within your ceilings (ship limit and budgets never above yours, the reserve and the bank's net-worth bar only raised, borrowing, lending, deposits, our bank, the market model, its orders, Kelly sizing and the other money avenues never on while yours are off), ` +
                   `bans on ports, zones, goods and charters, lane bias, stall calls, orders to single ships (a lane, a charter, a port, hold, release), ` +
                   `the ship buyer (hold, one build, classes forbidden), marques or patrols within your marque budget (${fmtCr(view.settings.marqueBudgetPence)} a day; an issued one can't be withdrawn), ` +
                   `money orders, and housekeeping orders (break up a ship, move the home port; never while yours are off)? ` +
@@ -1035,6 +1284,19 @@ export function FleetPanel() {
 
         {st?.worldEvents && <WorldEventsView w={st.worldEvents} />}
 
+        {/* Planning and execution (Update 6): absent from older managers, each renders only with its report. */}
+        {st?.market && (st.market.enabled || st.market.books > 0) && <MarketModelView m={st.market} />}
+
+        {st?.resting &&
+          (st.resting.enabled || st.resting.marginal || st.resting.orders.length > 0 || st.resting.lots.length > 0 || st.resting.stats.placed > 0) && (
+            <RestingView r={st.resting} />
+          )}
+
+        {st?.allocation &&
+          (st.allocation.kelly.on || st.allocation.regret.on || st.allocation.stats.batches > 0 || st.allocation.stats.kellyCapped > 0 || st.allocation.terminal.ports > 0) && (
+            <AllocationView a={st.allocation} />
+          )}
+
         {st?.underwriting && (
           <details className="text-sm">
             <summary className="cursor-pointer text-muted-foreground text-xs">
@@ -1086,6 +1348,14 @@ export function FleetPanel() {
 
         {st?.deals && <DealsView d={st.deals} />}
 
+        {st?.hullOrders && (st.hullOrders.enabled || !!st.hullOrders.open || st.hullOrders.recent.length > 0 || st.hullOrders.stats.posted > 0) && (
+          <HullOrdersView h={st.hullOrders} />
+        )}
+
+        {st?.envelopeBuys && (st.envelopeBuys.enabled || st.envelopeBuys.recent.length > 0 || st.envelopeBuys.stats.bought > 0) && (
+          <EnvelopeBuysView e={st.envelopeBuys} />
+        )}
+
         {st?.news && (st.news.enabled || !!st.news.courier || st.news.stats.posted > 0 || !!st.news.givenUp) && <NewsView n={st.news} />}
 
         {st?.shares && (st.shares.enabled || st.shares.holdings.length > 0 || st.shares.stats.bought > 0) && <SharesView s={st.shares} />}
@@ -1098,9 +1368,36 @@ export function FleetPanel() {
           <PaxVoyagesView v={st.passengerVoyages} />
         )}
 
+        {st?.fareBandit && (st.fareBandit.enabled || st.fareBandit.keys > 0) && <FareBanditView b={st.fareBandit} />}
+
         {st?.ventures && (st.ventures.enabled || !!st.ventures.active || st.ventures.recent.length > 0) && <VenturesView v={st.ventures} />}
 
         {st?.escort && (st.escort.enabled || st.escort.open.length > 0 || st.escort.stats.offered > 0 || st.escort.recent.length > 0) && <EscortView e={st.escort} />}
+
+        {st?.escortOthers && (st.escortOthers.enabled || st.escortOthers.active.length > 0 || st.escortOthers.recent.length > 0 || st.escortOthers.stats.asked > 0) && (
+          <EscortOthersView e={st.escortOthers} />
+        )}
+
+        {st?.charterPosts &&
+          (st.charterPosts.enabled || st.charterPosts.open.length > 0 || st.charterPosts.recent.length > 0 || st.charterPosts.stats.posted > 0 || st.charterPosts.heldPence > 0) && (
+            <CharterPostsView c={st.charterPosts} />
+          )}
+
+        {st?.freightIssues && (st.freightIssues.enabled || st.freightIssues.open.length > 0 || st.freightIssues.recent.length > 0 || st.freightIssues.stats.issued > 0) && (
+          <FreightIssuesView f={st.freightIssues} />
+        )}
+
+        {st?.ownInsurance && (st.ownInsurance.enabled || st.ownInsurance.open.length > 0 || st.ownInsurance.recent.length > 0 || st.ownInsurance.stats.written > 0) && (
+          <OwnInsuranceView i={st.ownInsurance} />
+        )}
+
+        {st?.futures && (st.futures.enabled || st.futures.open.length > 0 || st.futures.recent.length > 0 || st.futures.stats.accepted + st.futures.stats.posted > 0) && (
+          <FuturesView f={st.futures} />
+        )}
+
+        {st?.monopolies && (st.monopolies.enabled || st.monopolies.held.length > 0 || st.monopolies.recent.length > 0 || st.monopolies.stats.bought > 0) && (
+          <MonopoliesView m={st.monopolies} />
+        )}
 
         {st?.rnd &&
           (st.rnd.components.enabled || st.rnd.research.enabled || st.rnd.components.fits.length > 0 || !!st.rnd.components.job || !!st.rnd.research.project || st.rnd.research.patents.length > 0 || st.rnd.research.grants.length > 0) && (
@@ -1186,9 +1483,11 @@ export function FleetPanel() {
               <div className="space-y-1.5">
                 <div className="text-muted-foreground text-xs">Ships bought</div>
                 <ul className="space-y-1 text-xs">
-                  {[...st.purchases].reverse().map((p) => (
-                    <li key={p.shipId}>
-                      <span className="text-muted-foreground">{fmtTime(p.at)}</span> {shipClassName(p.shipClass)} “{p.name}” {p.bought ? "bought for sale" : "built"} at{" "}
+                  {[...st.purchases].reverse().map((p, i) => (
+                    <li key={p.shipId || `${p.at}|${i}`}>
+                      <span className="text-muted-foreground">{fmtTime(p.at)}</span> {shipClassName(p.shipClass)}
+                      {p.name ? ` “${p.name}”` : ""}{" "}
+                      {p.commissioned ? "ordered from a builder, delivered" : p.bought ? "bought for sale" : "built"} at{" "}
                       {portName(p.port)} for {fmtCr(p.costPence)} · payback ~{p.paybackHours} h
                     </li>
                   ))}
@@ -1775,7 +2074,15 @@ function PassengersView({ p }: { p: PassengerReport }) {
               <td className="text-xs">
                 {portName(o.port)} → {portName(o.dest)}
               </td>
-              <td className="whitespace-nowrap tabular-nums">{fmtCr(o.perHead)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(o.perHead)}
+                {/* (banditM: absent when the old pricer set it, or from a manager older than the fare bandit) */}
+                {o.banditM !== undefined && (
+                  <div className="text-muted-foreground text-xs" title="Priced by the fare bandit: this multiplier on the route's reference fare">
+                    bandit &times;{o.banditM.toFixed(2)}
+                  </div>
+                )}
+              </td>
               <td className="whitespace-nowrap tabular-nums">
                 {o.berths}
                 {o.taken > 0 ? ` (${o.taken} taken)` : ""}
@@ -2667,6 +2974,868 @@ function WorldEventsView({ w }: { w: NonNullable<FleetView["state"]>["worldEvent
   );
 }
 
+// ── Update 6: market model, execution, allocation, auctions, contracts and hedges ──
+
+/** "40%" from a share (0-1). */
+const shareText = (x: number) => `${Math.round(x * 100)}%`;
+
+/** "12.5 t": tons to a tenth. */
+const tons1 = (x: number) => `${x.toLocaleString("en-GB", { maximumFractionDigits: 1 })} t`;
+
+/** Server ms as ISO (for fmtAgo / fmtIn / fmtDateTime). */
+const isoOf = (ms: number) => new Date(ms).toISOString();
+
+/** A record's status in Update 6's avenues: under way (info), ended well (success), ended otherwise. */
+const REC_VARIANT: Record<string, "success" | "info" | "warning" | "destructive" | "secondary"> = {
+  sending: "info",
+  posting: "info",
+  issuing: "info",
+  writing: "info",
+  buying: "info",
+  joining: "info",
+  pending: "info",
+  open: "info",
+  cancelling: "info",
+  carried: "info",
+  taken: "info",
+  joined: "info",
+  sailed: "info",
+  active: "info",
+  unknown: "warning",
+  refused: "warning",
+  claimed: "warning",
+  delivered: "success",
+  settled: "success",
+  done: "success",
+  bought: "success",
+  cancelled: "secondary",
+  withdrawn: "secondary",
+  expired: "secondary",
+  lapsed: "secondary",
+  closed: "secondary",
+  ended: "secondary",
+  void: "secondary",
+  failed: "destructive",
+  defaulted: "destructive",
+  breach: "destructive",
+};
+
+function RecBadge({ status }: { status: string }) {
+  return (
+    <Badge variant={REC_VARIANT[status] ?? "secondary"} size="sm">
+      {status.replace(/_/g, " ")}
+    </Badge>
+  );
+}
+
+/** "a>b" as "A → B". */
+function useRoute() {
+  const { portName } = useCatalog();
+  return (r: string) => r.split(">").map(portName).join(" → ");
+}
+
+/** The market model (guide 3.1, 3.2; market-model.ts): what it models, stock half-lives, elasticities, refill after our sweeps, the scorecard, the books read last. */
+function MarketModelView({ m }: { m: NonNullable<FleetState["market"]> }) {
+  const { portName, goodName } = useCatalog();
+  const rows = m.rows.slice(0, 12);
+  const err = (x: number) => `${(x * 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%`;
+  const hrs = (h: number | null) => (h === null ? "—" : `${h.toLocaleString("en-GB", { maximumFractionDigits: 1 })} game h`);
+  const el = (x: number | null) => (x === null ? "—" : x.toFixed(2));
+  const refill = (x: number | null) => (x === null ? "none measured yet" : shareText(x));
+  const lowTrust = Math.min(m.score.bid.trust, m.score.ask.trust) < 0.5;
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Market model: {m.enabled ? "on" : "off (the old rules alone; still learning)"} · {m.modelled} of {plural(m.books, "book")} modelled, {m.confident}{" "}
+        confident
+        {m.halfLifeH !== null && ` · stock half-life ~${hrs(m.halfLifeH)}`}
+        <span className={lowTrust ? "text-warning-foreground" : undefined}>{` · trust: bids ${shareText(m.score.bid.trust)}, asks ${shareText(m.score.ask.trust)}`}</span>
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        Median stock half-life {hrs(m.halfLifeH)} (bulk goods {hrs(m.bulkHalfLifeH)}). Elasticity (how far the price moves with the stock: a 1% fall lifts
+        it about e%): bids {el(m.eBid)}, asks {el(m.eAsk)}. Share of a ladder we swept that refills at the next re-quote: asks {refill(m.refillAsk)}, bids{" "}
+        {refill(m.refillBid)}, from {plural(m.sweeps, "sweep")} of ours.
+      </p>
+      <Table head={["Scorecard", "Books scored", "Old rules' error", "Model's error", "Trust"]} className="mt-2">
+        {(["bid", "ask"] as const).map((side) => {
+          const s = m.score[side];
+          return (
+            <tr key={side}>
+              <td className="text-xs">{side === "bid" ? "Bids (what we sell into)" : "Asks (what we buy from)"}</td>
+              <td className="tabular-nums">{s.n}</td>
+              <td className="tabular-nums">{s.n ? err(s.oldErr) : "—"}</td>
+              <td className={`tabular-nums ${s.n && s.modelErr > s.oldErr ? "text-warning-foreground" : ""}`}>{s.n ? err(s.modelErr) : "—"}</td>
+              <td className={`tabular-nums ${s.trust < 0.5 ? "text-warning-foreground" : ""}`}>{shareText(s.trust)}</td>
+            </tr>
+          );
+        })}
+      </Table>
+      {rows.length > 0 && (
+        <Table head={["Book read lately", "Stock now / usual", "Half-life", "Elasticity bid / ask", "Refill ask / bid", "Readings", "Data confidence"]} className="mt-2">
+          {rows.map((b) => (
+            <tr key={`${b.port}|${b.good}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">
+                  {goodName(b.good)} at {portName(b.port)}
+                </div>
+                read {fmtAgo(isoOf(b.seenAt))}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtTons(b.stock)} / {fmtTons(b.mu)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{hrs(b.halfLifeH)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {el(b.eBid)} / {el(b.eAsk)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {shareText(b.refillAsk)} / {shareText(b.refillBid)}
+                <div className="text-muted-foreground text-xs">{b.sweeps > 0 ? plural(b.sweeps, "sweep") : "class prior"}</div>
+              </td>
+              <td className="tabular-nums">{b.readings}</td>
+              <td className={`tabular-nums ${b.conf === 0 ? "text-muted-foreground" : ""}`}>{shareText(b.conf)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {m.rows.length > rows.length && <p className="mt-1 text-muted-foreground text-xs">and {m.rows.length - rows.length} more read lately.</p>}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Each time a book is read again within 72 game hours, the scorecard compares the model&apos;s forecast and the old rules&apos; (the aged bid haircut,
+        the ask as remembered) with the NPC best then seen (the average error of each, in price); after 12 books scored on a side, its trust falls from
+        full at the old rules&apos; error to none at 1.25&times; it. A book&apos;s data confidence grows with distinct readings (none on one, full on six) and
+        is none once its latest reading is 72 game hours old; the planner&apos;s weight on it is that times the side&apos;s trust. Stock and its usual level
+        are the NPC tons the model expects there now and the level it reverts to. The model keeps learning and scoring with the setting off.
+      </p>
+    </details>
+  );
+}
+
+const REST_PURPOSE: Record<string, string> = {
+  leftover: "leftover",
+  prebuy: "bought ahead for a ship",
+  glut: "glut, held to revert",
+  sell: "for sale",
+  landed: "landed for us",
+  held: "held for a forward sale",
+  monopoly: "monopoly stock",
+};
+
+/** Execution and resting orders (guide 3.1, 3.2; execution.ts): the switches, the budget, our resting orders and goods held, leases, counters, fill calibration, the last events. */
+function RestingView({ r }: { r: NonNullable<FleetState["resting"]> }) {
+  const { portName, goodName } = useCatalog();
+  const st = r.stats;
+  const live = r.orders.filter((o) => o.status !== "closed");
+  const orders = [...r.orders].sort((a, b) => Number(a.status === "closed") - Number(b.status === "closed")).slice(0, 12);
+  const byKind = new Map<string, number>();
+  for (const l of r.lots) byKind.set(l.purpose, (byKind.get(l.purpose) ?? 0) + l.tons);
+  const kinds = [...byKind].map(([k, t]) => `${tons1(t)} ${REST_PURPOSE[k] ?? k}`).join(", ");
+  const lots = [...r.lots].sort((a, b) => a.purpose.localeCompare(b.purpose) || a.port.localeCompare(b.port));
+  const recent = [...r.recent].reverse().slice(0, 10);
+  const kappa = (s: "bid" | "ask") => `κ ${r.calib[s].kappa.toFixed(2)} over ${plural(r.calib[s].n, "trial")}`;
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Execution: marginal orders {r.marginal ? "on" : "off"} · resting orders {r.enabled ? "on" : "off"}
+        {` · ${plural(live.length, "order")} resting`}
+        {r.lots.length > 0 && ` · held: ${kinds}`}
+        {` · ${fmtCr(r.escrowPence + r.heldPence)} of the ${fmtCr(r.budgetPence)} budget in use`}
+        {st.splits > 0 && ` · ${plural(st.splits, "load")} split across a re-quote`}
+        {r.enabled && r.blocked && " · blocked"}
+      </summary>
+      {r.blocked && <p className="mt-2 text-muted-foreground text-xs">Nothing new rests for now: {r.blocked}.</p>}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Budget: {fmtCr(r.escrowPence)} in resting bids&apos; escrow and {fmtCr(r.heldPence)} of goods held at cost, of {fmtCr(r.budgetPence)} (goods charters,
+        freight, futures or monopolies land count in those avenues&apos; budgets). {plural(st.placed, "order")} placed, {st.cancelled} withdrawn; resting bids
+        bought {tons1(st.filledBidTons)} for {fmtCr(st.boughtPence)}, resting asks sold {tons1(st.filledAskTons)} for {fmtCr(st.soldPence)};{" "}
+        {tons1(st.restedTons)} of leftovers rested, {tons1(st.loadedTons)} loaded from our warehouses ({fmtCr(st.loadedPence)}), {tons1(st.iocSoldTons)} sold
+        from them straight into the bids ({fmtCr(st.iocSoldPence)}). Loads split across a re-quote: {st.splits} (~{fmtCr(st.splitSavedPence)} of slippage
+        saved); tons the marginal stop left unbought that the break-even limit would have bought: {tons1(st.marginalCutTons)}. Fill chance calibrated on our
+        own fills: bids {kappa("bid")}, asks {kappa("ask")}. Re-quote time known at {plural(r.phasesKnown, "port")}. Warehouse rent{" "}
+        {r.rentPerTonDay === null ? "~1 Cr (the prior: not measured yet)" : fmtCr(r.rentPerTonDay, 2)} a leased ton a game day.
+      </p>
+      {orders.length > 0 && (
+        <Table head={["Resting order", "Price", "Tons", "Fill chance", "State"]} className="mt-2">
+          {orders.map((o, i) => (
+            <tr key={o.id ?? `${o.port}|${o.good}|${o.at}|${i}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">
+                  {o.side === "bid" ? "Bid" : "Ask"}: {goodName(o.good)} at {portName(o.port)}
+                </div>
+                {REST_PURPOSE[o.purpose] ?? o.purpose}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(o.price)}/t</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {tons1(o.filled)} of {tons1(o.qty)} filled
+                {o.status !== "closed" && o.left > 0 && <div className="text-muted-foreground text-xs">{tons1(o.left)} resting</div>}
+              </td>
+              <td className="tabular-nums" title="The share expected to fill at its first re-quote, calibrated on our own fills">
+                {shareText(o.pFill)}
+              </td>
+              <td className="text-xs">
+                <RecBadge status={o.status} />
+                <div className="text-muted-foreground">
+                  placed {fmtAgo(o.at)}
+                  {o.status !== "closed" ? `, withdrawn ${fmtIn(o.until)}` : ""}
+                </div>
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {r.orders.length > orders.length && <p className="mt-1 text-muted-foreground text-xs">and {r.orders.length - orders.length} more closed lately.</p>}
+      {lots.length > 0 && (
+        <Table head={["Goods held", "Tons", "Cost /t", "Floor /t", "Since", "Asks posted"]} className="mt-2">
+          {lots.map((l, i) => (
+            <tr key={`${l.port}|${l.good}|${l.purpose}|${l.at}|${i}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">
+                  {goodName(l.good)} at {portName(l.port)}
+                </div>
+                {REST_PURPOSE[l.purpose] ?? l.purpose}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{tons1(l.tons)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(l.cost)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(l.floor)}</td>
+              <td className="whitespace-nowrap text-xs">{fmtAgo(l.at)}</td>
+              <td className="tabular-nums">{l.rounds}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {r.leases.length > 0 && (
+        <p className="mt-2 text-muted-foreground text-xs">
+          Warehouse space we leased for them (given back once nothing uses it): {r.leases.map((l) => `${portName(l.port)} ${fmtTons(l.tons)}`).join(", ")}.
+        </p>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`}>
+              {fmtDateTime(x.at)}: {x.kind.replace(/_/g, " ")}
+              {x.tons > 0 ? ` ${tons1(x.tons)}` : ""}
+              {x.good ? ` ${goodName(x.good)}` : ""}
+              {x.port ? ` at ${portName(x.port)}` : ""}
+              {x.price > 0 ? `, ${fmtCr(x.price)}/t` : ""}
+              {x.note ? `: ${x.note}` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Leftovers rest under asks for two re-quotes, re-posted lower (to half of base after 3 rounds) and at last sold from the warehouse; bids bought
+        ahead are loaded by their ship on arrival (kept 12 game hours for her if her lane changes); a glut is sold once it has reverted or the bids pay
+        cost and 5%. A ship at a lane&apos;s source loads our goods of that kind there first. Orders and warehouses by hand on the{" "}
+        <Link href="/market" className="underline">
+          Market
+        </Link>{" "}
+        and{" "}
+        <Link href="/warehouses" className="underline">
+          Warehouses
+        </Link>{" "}
+        pages.
+      </p>
+    </details>
+  );
+}
+
+const ALLOC_KIND: Record<string, string> = { kelly: "Kelly cut", regret: "regret", claim: "charter held", claim_kept: "hold taken", claim_lapsed: "hold lapsed" };
+
+/** Scoring and allocation (allocation.ts): Kelly's bankroll and cuts, assignment by regret, charters held for ships at sea, terminal values. */
+function AllocationView({ a }: { a: NonNullable<FleetState["allocation"]> }) {
+  const { portName, goodName } = useCatalog();
+  const k = a.kelly;
+  const s = a.stats;
+  const t = a.terminal;
+  const sw = (x: { on: boolean; user: boolean }) => (x.on ? "on" : x.user ? "off for now (Claude)" : "off");
+  // The bankroll Kelly sizes on: null with Kelly on is exactly nothing; at or under nothing every load is the floor (it may be negative).
+  const bankroll = k.on ? (k.bankroll ?? 0) : null;
+  const recent = [...a.recent].reverse().slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Allocation: Kelly sizing {sw(k)}
+        {bankroll !== null && (
+          <span className={bankroll <= 0 ? "text-destructive" : undefined}>{` · bankroll ${fmtCr(bankroll)}${bankroll <= 0 ? ": floor loads" : ""}`}</span>
+        )}
+        {` · ${plural(s.kellyCapped, "load")} cut by the cap`}
+        {` · assignment by regret ${sw(a.regret)}: ${plural(s.batches, "pass", "passes")}, ${s.reordered} reordered`}
+        {a.claims.length > 0 && ` · ${plural(a.claims.length, "charter")} held for ships at sea`}
+        {t.known > 0 && ` · terminal values at ${plural(t.known, "port")}`}
+      </summary>
+      {bankroll !== null && bankroll <= 0 && (
+        <p className="mt-2 rounded-md bg-destructive/10 px-3 py-2 text-destructive text-xs">
+          The bankroll (spare cash and deposits plus cargo at sea, less what our loans take) is {bankroll < 0 ? `${fmtCr(bankroll)}, under nothing` : "nothing"}:
+          every load (and any loan for it) is the smallest worthwhile one until it recovers.
+        </p>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Kelly sizing {sw(k)}
+        {bankroll !== null ? ` on a bankroll of ${fmtCr(bankroll)}` : ""}: {plural(s.kellyCapped, "load")} cut by the Kelly cap, {fmtCr(s.kellyCutPence)} of stake
+        cut in all. Assignment by regret {sw(a.regret)}: {plural(s.batches, "pass", "passes")} over {plural(s.batchedShips, "ship")}, {s.reordered} served before
+        one that asked first, {plural(s.reranked, "lane")} planned again before their commit, {plural(s.timeouts, "pass", "passes")} cut short by the time box.
+        Deadline charters weighed for a ship at sea: {s.insertChecks}; held {s.claims}, taken by her {s.claimsKept}, lapsed {s.claimsLapsed}.
+      </p>
+      {a.claims.length > 0 && (
+        <Table head={["Charter held", "For", "Tons", "Gain to her / to the ship in port", "Held until"]} className="mt-2">
+          {a.claims.map((c) => (
+            <tr key={c.charter} className="align-top">
+              <td className="text-xs">
+                {goodName(c.good)} → {portName(c.port)}
+              </td>
+              <td className="text-xs">{c.ship}</td>
+              <td className="tabular-nums">{fmtTons(c.tons)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                ~{fmtCr(c.gain)} / ~{fmtCr(Math.max(0, c.here))}
+              </td>
+              <td className="whitespace-nowrap text-xs">{fmtIn(c.until)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Terminal values (the best lane profit an hour our own plans found from a port, per ton of hold; what a lane ending there is worth after it):{" "}
+        {t.known} of {plural(t.ports, "port")} known
+        {t.medianV !== null ? `, median ${fmtCr(t.medianV, 2)}/h a ton of hold over legs of ~${t.medianH !== null && t.medianH !== undefined ? t.medianH.toFixed(1) : "?"} h` : ""}.
+      </p>
+      {t.top.length > 0 && (
+        <Table head={["Port", "Cr/h a ton of hold", "Leg hours", "Weight", "Learned"]} className="mt-2">
+          {t.top.map((x) => (
+            <tr key={x.port}>
+              <td className="text-xs">{portName(x.port)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.v, 2)}</td>
+              <td className="tabular-nums">{x.h}</td>
+              <td className="tabular-nums">{x.n}</td>
+              <td className="whitespace-nowrap text-xs">{fmtAgo(isoOf(x.at))}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`}>
+              {fmtDateTime(x.at)}: {ALLOC_KIND[x.kind] ?? x.kind}, {x.ship}: {x.text}
+            </li>
+          ))}
+        </ul>
+      )}
+    </details>
+  );
+}
+
+/** Posted prices learned by Thompson sampling (bandit.ts): per key the trials, the arm the posterior means favour, the odds per arm. */
+function FareBanditView({ b }: { b: FareBanditReport }) {
+  const { shipClassName } = useCatalog();
+  const mode: Record<string, string> = { contested: "contested", open: "uncontested (over a band's median)", own: "uncontested (over the route's own)" };
+  const keyText = (r: FareBanditReport["rows"][number]) => {
+    const p = r.key.split("|");
+    if (r.kind === "escort") return "Our convoys' escort fee";
+    if (r.kind === "hull") return `Hull commission: ${shipClassName(p[1] ?? "?")}`;
+    return `Fares: ${p[1] ?? "?"} band, ${(p[2] ?? "?").replace(/_/g, " ")}, ${mode[p[3] ?? ""] ?? p[3] ?? "?"}`;
+  };
+  const of: Record<string, string> = { fare: "the reference fare", escort: "the fee the loss model sets", hull: "our cheapest build" };
+  const odds: Record<string, string> = { fare: "a group boards this round", escort: "a paying ship joins", hull: "a builder takes it" };
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Posted prices (fare bandit): {b.enabled ? "on" : "off (fares by the old nudge; hull orders still use it)"} · {plural(b.keys, "price")} learned over{" "}
+        {plural(b.trials, "trial")}
+      </summary>
+      {b.rows.length > 0 && (
+        <Table head={["Price learned", "Trials", "Favoured", "Odds by multiplier (posterior means)"]} className="mt-2">
+          {b.rows.map((r) => (
+            <tr key={r.key} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{keyText(r)}</div>
+                &times; {of[r.kind]}; odds {odds[r.kind]} · {fmtAgo(isoOf(r.at))}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {r.trials}
+                <div className="text-muted-foreground text-xs">weight {r.weight}</div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{r.bestM === null ? "—" : `×${r.bestM} at ${shareText(r.bestP ?? 0)}`}</td>
+              <td className="text-xs">
+                <span className="flex flex-wrap gap-x-2 gap-y-0.5 tabular-nums">
+                  {r.arms.map((x) => (
+                    <span key={x.m} className={x.m === r.bestM ? "font-medium" : "text-muted-foreground"}>
+                      &times;{x.m} {shareText(x.p)}
+                    </span>
+                  ))}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Each posted price is a draw: per arm (a multiplier) a posterior on the odds it is taken, its prior what the old pricer implies, old data fading
+        (fares 3% a trial and by half every 7 game days; escort fees and hull commissions 1% a trial and 30 game days), the drawn odds kept falling as the
+        price rises, and the arm worth the most posted. Favoured is the arm the posterior means favour (fares and fees: the price times the odds, in the
+        berths there are; hull orders: the saving times the odds), not always the one drawn last. A trial is one offer, convoy or commission; the weight is
+        the data left after fading.
+      </p>
+    </details>
+  );
+}
+
+/** Escorting other companies' convoys (guide 3.10; escort-join.ts): ours asking, in or sailing, the last ones, the fees. */
+function EscortOthersView({ e }: { e: EscortJoinReport }) {
+  const route = useRoute();
+  const st = e.stats;
+  const recent = [...e.recent].reverse().slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Escorting others: {fmtCr(st.feesPence)} in fees ({st.settled} settled; ~{fmtCr(st.expectedPence)} expected) · {st.asked} asked, {st.joined} joined,{" "}
+        {st.refused} refused, {st.withdrawn} withdrawn
+        {e.active.length > 0 && ` · ${e.active.length} escorting now`}
+        {` · ${plural(e.offers, "convoy")} with fees forming on our quays' notices`}
+        {!e.enabled && " · off"}
+      </summary>
+      {e.blocked && <p className="mt-2 text-muted-foreground text-xs">No convoy joined for now: {e.blocked}.</p>}
+      {e.active.length > 0 && (
+        <Table head={["Escorting", "Convoy", "Departs", "Fee pool", "Her share expected", "State"]} className="mt-2">
+          {e.active.map((x) => (
+            <tr key={`${x.convoyId}|${x.ship}`} className="align-top">
+              <td className="whitespace-nowrap">{x.ship}</td>
+              <td className="text-xs">{route(x.route)}</td>
+              <td className="whitespace-nowrap text-xs">{fmtIn(x.departsAt)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.poolPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">~{fmtCr(x.expectedPence)}</td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.status === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {x.ship}, {route(x.route)}: {x.status}
+              {x.pence !== null ? `, paid ${fmtCr(x.pence)}` : ""} (~{fmtCr(x.expectedPence)} expected)
+              {x.why ? `: ${x.why}` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        An armed ship of ours about to sail, with no convoy of ours forming there, asks to join another company&apos;s public convoy for the same port as an
+        escort (paying nothing; the escorts that arrive split the paying members&apos; fees by guns) when her share and part of the pooled protection beat
+        her wait and the slower passage. Never insured, with contraband, on a venture or with passengers bound elsewhere. Convoys by hand on the{" "}
+        <Link href="/convoys" className="underline">
+          Convoys page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Envelopes bought (guide 3.11; envelope-voi.ts): the budget and the last 24 h, the last pass's best case, the last buys. */
+function EnvelopeBuysView({ e }: { e: EnvelopeBuyReport }) {
+  const { portName } = useCatalog();
+  const st = e.stats;
+  const recent = [...e.recent].reverse().slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Envelopes bought: {plural(st.bought, "envelope")} for {fmtCr(st.spentPence)} · {fmtCr(e.spent24hPence)} of {fmtCr(e.budgetPence)} in the last 24 h ·{" "}
+        {plural(st.rows, "report row")} taken in
+        {!e.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {e.blocked ? `No buy for now: ${e.blocked}. ` : ""}Last pass: {e.action}.
+        {e.best && ` Best case: an envelope at ${portName(e.best.port)} for ${fmtCr(e.best.pricePence)}, worth ~${fmtCr(e.best.worthPence)} after the haircut.`}{" "}
+        {plural(st.weighed, "pass", "passes")} found one worth weighing.
+      </p>
+      {recent.length > 0 && (
+        <Table head={["Envelope", "Price", "Value of information", "Report rows", "State"]} className="mt-2">
+          {recent.map((x, i) => (
+            <tr key={`${x.at}-${i}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{portName(x.port)}</div>
+                {fmtDateTime(x.at)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.pricePence)}</td>
+              <td className="whitespace-nowrap tabular-nums">~{fmtCr(x.voiPence)}</td>
+              <td className="tabular-nums">{x.rows ?? "—"}</td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+                {x.why && <div className="text-muted-foreground">{x.why}</div>}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        The value of information is what the reports could gain by changing the choice between the planner&apos;s best lanes (the forecast spread they
+        would cut on each lane&apos;s sales and buys); one is bought when half of it beats the price. Its reports go into prices and the market model at
+        their own times, its sailings into rival intel. Envelopes by hand on the{" "}
+        <Link href="/envelopes" className="underline">
+          Envelopes page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Hulls ordered from builders (guide 3.4; hull-orders.ts): the commission open, the last ones, the counters. */
+function HullOrdersView({ h }: { h: HullOrderReport }) {
+  const { portName, shipClassName } = useCatalog();
+  const st = h.stats;
+  const o = h.open;
+  const recent = [...h.recent].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Hull orders: {o ? `a ${shipClassName(o.cls)} at ${portName(o.yard)} for ${fmtCr(o.pricePence)} (${o.status})` : "none open"} · {st.posted} posted,{" "}
+        {st.taken} taken, {st.delivered} delivered ({fmtCr(st.savedPence)} saved on building)
+        {st.expired + st.cancelled > 0 && ` · ${st.expired} untaken, ${st.cancelled} withdrawn`}
+        {st.defaulted > 0 && <span className="text-destructive">{` · ${st.defaulted} defaulted by the builder`}</span>}
+        {!h.enabled && " · off"}
+      </summary>
+      {h.blocked && <p className="mt-2 text-muted-foreground text-xs">No hull ordered for now: {h.blocked}.</p>}
+      {o && (
+        <p className="mt-2 text-xs">
+          <RecBadge status={o.status} /> A {shipClassName(o.cls)} at {portName(o.yard)} for {fmtCr(o.pricePence)} (escrowed) against {fmtCr(o.ourCostPence)} to build
+          her ourselves; {fmtCr(o.collateralPence)} collateral asked of the builder; to be delivered {fmtIn(o.deadline)}. The buyer builds nothing while it is open.
+        </p>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.status === "defaulted" || x.status === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: a {shipClassName(x.cls)} at {portName(x.yard)} for {fmtCr(x.pricePence)} (our build {fmtCr(x.ourCostPence)}): {x.status}
+              {x.why ? ` (${x.why})` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Delivered hulls show under Ships bought as ordered from a builder. Commissions by hand on the{" "}
+        <Link href="/ships-market" className="underline">
+          Ships market page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Charters we posted for the Merchant Adventurers' filler (guide 3.7; charter-posts.ts): the budget, ours open and the last ones. */
+function CharterPostsView({ c }: { c: CharterPostReport }) {
+  const { portName, goodName } = useCatalog();
+  const st = c.stats;
+  const recent = [...c.recent].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Charters posted: {c.open.length} open · escrow {fmtCr(c.escrowPence)} and landed goods {fmtCr(c.heldPence)} of {fmtCr(c.budgetPence)} · fill share ~
+        {shareText(c.fillShare)} · {fmtTons(st.deliveredTons)} delivered ({fmtCr(st.deliveredPence)})
+        {!c.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {c.blocked ? `Nothing posted for now: ${c.blocked}. ` : ""}Last pass: {c.action}. {plural(st.posted, "charter")} posted, {st.done} filled, {st.expired}{" "}
+        lapsed, {st.cancelled} withdrawn; {st.dispatched} lots the filler said it sent. The fill share is learned from our own charters (tons delivered of
+        tons posted).
+      </p>
+      {c.open.length > 0 && (
+        <Table head={["Our charter", "Reward /t", "Sale /t expected", "Delivered", "State", "Lapses"]} className="mt-2">
+          {c.open.map((x, i) => (
+            <tr key={x.id ?? `${x.port}|${x.good}|${i}`} className="align-top">
+              <td className="text-xs">
+                {goodName(x.good)} → {portName(x.port)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.rewardPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.salePence)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {tons1(x.delivered)} of {fmtTons(x.qty)}
+              </td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+              </td>
+              <td className="whitespace-nowrap text-xs">{fmtIn(x.expiresAt)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.status === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {fmtTons(x.qty)} {goodName(x.good)} → {portName(x.port)} at {fmtCr(x.rewardPence)}/t, {tons1(x.delivered)} delivered: {x.status}
+              {x.why ? ` (${x.why})` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        What a charter lands goes into our warehouse there and is sold through resting asks, never under its cost. Charters by hand on the{" "}
+        <Link href="/contracts" className="underline">
+          Contracts page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Freight we issued for goods held in our warehouses (guide 3.8; freight-issue.ts): ours out and the last ones, the reward multiplier. */
+function FreightIssuesView({ f }: { f: FreightIssueReport }) {
+  const route = useRoute();
+  const { goodName } = useCatalog();
+  const st = f.stats;
+  const recent = [...f.recent].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Freight issued: {f.open.length} out · {st.issued} issued, {st.carried} taken, {st.delivered} delivered, {st.expired} lapsed untaken
+        {st.defaulted > 0 && <span className="text-destructive">{` · ${st.defaulted} defaulted`}</span>}
+        {` · rewards paid ${fmtCr(st.rewardsPence)} · reward ×${f.rewardX.toFixed(2)}`}
+        {!f.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {f.blocked ? `Nothing issued for now: ${f.blocked}. ` : ""}Last pass: {f.action}. The reward is 12% of the goods&apos; value where they land times
+        a multiplier learned from our listings (up after one lapses untaken, a little down after one is taken), now ×{f.rewardX.toFixed(2)}
+        {st.collateralPence > 0 ? `; collateral paid to us on defaults ${fmtCr(st.collateralPence)}` : ""}.
+      </p>
+      {f.open.length > 0 && (
+        <Table head={["Our freight", "Goods", "Reward", "Collateral", "State", "Until"]} className="mt-2">
+          {f.open.map((x, i) => (
+            <tr key={x.id ?? `${x.route}|${x.good}|${i}`} className="align-top">
+              <td className="text-xs">{route(x.route)}</td>
+              <td className="whitespace-nowrap text-xs">
+                {tons1(x.tons)} {goodName(x.good)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.rewardPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.collateralPence)}</td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+              </td>
+              <td className="whitespace-nowrap text-xs" title="Untaken: when the listing lapses; taken: the delivery deadline">
+                {fmtIn(x.until)}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.status === "defaulted" || x.status === "breach" || x.status === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {tons1(x.tons)} {goodName(x.good)}, {route(x.route)}, reward {fmtCr(x.rewardPence)} (gain ~{fmtCr(x.gainPence)} expected): {x.status}
+              {x.why ? ` (${x.why})` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Delivered goods land in our warehouse there and are sold through resting asks; untaken ones are ours where they lay again. Freight by hand on the{" "}
+        <Link href="/contracts" className="underline">
+          Contracts page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Our own voyages insured (guide 3.6; insure.ts): the last voyage weighed, our policies and the last ones. */
+function OwnInsuranceView({ i }: { i: InsureReport }) {
+  const route = useRoute();
+  const st = i.stats;
+  const recent = [...i.recent].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Our voyages insured: {st.written} written{i.open.length > 0 ? ` (${i.open.length} open)` : ""} · premiums {fmtCr(st.premiumPence)}, claims paid us{" "}
+        {fmtCr(st.claimsPence)} · {plural(st.weighed, "voyage")} weighed, {st.quoted} quoted
+        {!i.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {i.blocked ? `None written for now: ${i.blocked}. ` : ""}Last voyage weighed: {i.action}. {st.settled} settled safe, {st.claimed} claimed,{" "}
+        {st.voided} void.
+      </p>
+      {i.open.length > 0 && (
+        <Table head={["Our policy", "Voyage", "Sum insured", "Premium", "Cover written", "State"]} className="mt-2">
+          {i.open.map((x, n) => (
+            <tr key={`${x.ship}|${x.at}|${n}`} className="align-top">
+              <td className="whitespace-nowrap">{x.ship}</td>
+              <td className="text-xs">{route(x.route)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.sumPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtBps(x.premiumBps)}</td>
+              <td className="whitespace-nowrap tabular-nums">{x.coveredBps === null ? "—" : fmtBps(x.coveredBps)}</td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <Table head={["Policy", "Sum insured", "Premium", "Gain expected", "Share of net worth", "Outcome"]} className="mt-2">
+          {recent.map((x, n) => (
+            <tr key={`${x.at}-${n}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{x.ship}</div>
+                {route(x.route)} · {fmtDateTime(x.at)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.sumPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.premiumPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">~{fmtCr(x.gainPence)}</td>
+              <td className="tabular-nums">{shareText(x.share)}</td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+                {x.claimsPence > 0 && <div className="text-muted-foreground">claims {fmtCr(x.claimsPence)}</div>}
+                {x.why && <div className="text-muted-foreground">{x.why}</div>}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Hull and cargo declared in full (so nothing voids it), at Lloyd&apos;s posted price; the gain is the certainty equivalent of net worth&apos;s
+        log-growth with the policy over without, on our own loss model&apos;s odds. While a policy stands her port is pinned, nothing is loaded after it and
+        consorts are kept. Policies by hand on the{" "}
+        <Link href="/insurance" className="underline">
+          Insurance page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Hub futures (guide 3.16; futures.ts): the budget and what is in it, our contracts and the last ones. */
+function FuturesView({ f }: { f: FuturesReport }) {
+  const { portName, goodName } = useCatalog();
+  const st = f.stats;
+  const recent = [...f.recent].reverse().slice(0, 8);
+  const role = (r: string) => (r === "long" ? "we buy" : "we deliver");
+  const how = (h: string) => (h === "posted" ? "our listing" : "another's listing");
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Futures: {f.open.length} live · {fmtCr(f.exposurePence)} of the {fmtCr(f.budgetPence)} budget tied up · {st.accepted} accepted, {st.posted} posted (
+        {st.taken} taken), {st.settled} settled
+        {st.lapsed > 0 && `, ${st.lapsed} lapsed`}
+        {st.defaulted > 0 && <span className="text-destructive">{` · ${st.defaulted} defaulted`}</span>}
+        {st.ourShort > 0 && <span className="text-destructive">{` · ${st.ourShort} short at maturity on our side`}</span>}
+        {` · expected value ~${fmtCr(st.evPence)}`}
+        {!f.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {f.blocked ? `Nothing new for now: ${f.blocked}. ` : ""}Last pass: {f.action}.
+      </p>
+      {f.open.length > 0 && (
+        <Table head={["Contract", "Lot", "Strike /t", "Goods held", "State", "Matures"]} className="mt-2">
+          {f.open.map((x, i) => (
+            <tr key={x.id ?? `${x.port}|${x.good}|${i}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">
+                  {goodName(x.good)} at {portName(x.port)}
+                </div>
+                {role(x.role)} at maturity · {how(x.how)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtTons(x.lot)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.strikePence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{x.role === "short" ? tons1(x.held ?? 0) : "—"}</td>
+              <td className="text-xs">
+                <RecBadge status={x.status} />
+              </td>
+              <td className="whitespace-nowrap text-xs">{fmtIn(x.maturesAt)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.status === "defaulted" || x.status === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {role(x.role)} {fmtTons(x.lot)} {goodName(x.good)} at {portName(x.port)} at {fmtCr(x.strikePence)}/t (~{fmtCr(x.evPence)} expected):{" "}
+              {x.status}
+              {x.why ? ` (${x.why})` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Each side escrows a 25% margin; settled from our hub warehouse at maturity (goods bought forward land there and are sold through resting asks;
+        goods held for a forward sale are delivered). The budget counts our forward buys&apos; strikes and our forward sales&apos; margins and goods held.
+        Futures by hand on the{" "}
+        <Link href="/futures" className="underline">
+          Futures page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Royal monopolies (guide 3.9; monopolies.ts): the best case weighed, our grants and their resale. */
+function MonopoliesView({ m }: { m: MonopolyReport }) {
+  const { goodName } = useCatalog();
+  const st = m.stats;
+  const recent = [...m.recent].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Royal monopolies: {m.held.length ? m.held.map((h) => `${goodName(h.good)} in ${regionName(h.region)}`).join(", ") : "none held"} · {st.bought} bought for{" "}
+        {fmtCr(st.spentPence)} · resold {fmtTons(st.resoldTons)} for {fmtCr(st.resoldPence)} · {st.quoted} quoted
+        {!m.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {m.blocked ? `None bought for now: ${m.blocked}. ` : ""}Last pass: {m.action}. Budget {fmtCr(m.budgetPence)} a grant (half of it at most held as resale
+        stock at cost).
+        {m.best &&
+          ` Best case weighed: ${goodName(m.best.good)} in ${regionName(m.best.region)} at ${fmtCr(m.best.pricePence)} against ~${fmtCr(m.best.valuePence)} of resale value; our fleet ${shareText(m.best.oursShare)} of the Crown's sales there; ${m.best.why}.`}
+      </p>
+      {m.held.length > 0 && (
+        <Table head={["Grant", "Price", "Ends", "Stock bought", "Resold", "State"]} className="mt-2">
+          {m.held.map((h) => (
+            <tr key={`${h.region}|${h.good}`} className="align-top">
+              <td className="text-xs">
+                {goodName(h.good)} in {regionName(h.region)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(h.pricePence)}</td>
+              <td className="whitespace-nowrap text-xs">{fmtIn(h.expiresAt)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtTons(h.boughtTons)}</td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtTons(h.soldTons)}
+                <div className="text-muted-foreground text-xs">{fmtCr(h.soldPence)}</div>
+              </td>
+              <td className="text-xs">
+                <RecBadge status={h.status} />
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.status === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {goodName(x.good)} in {regionName(x.region)} for {fmtCr(x.pricePence)}, resold {fmtCr(x.soldPence)}: {x.status}
+              {x.why ? ` (${x.why})` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        A grant is the sole right to buy the good from the Crown at every port of the region for its term, never refunded; while it stands a small stock is
+        bought from the Crown&apos;s asks at region ports where we have presence and offered under resting asks at the markup, and what is left when it ends
+        is sold as any goods we hold. Monopolies by hand on the{" "}
+        <Link href="/monopolies" className="underline">
+          Monopolies page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
 const usd = (n: number) => `$${n.toFixed(n < 1 ? 3 : 2)}`;
 
 /** A setting's value as the user would read it. */
@@ -2786,9 +3955,11 @@ function AiPanel({
       </div>
       <p className="text-muted-foreground text-xs">
         Shadow: Claude advises and every answer is logged, nothing changes. Live: its directives apply until they lapse (15-180 min): any
-        setting but its own within your ceilings (max ships, the marque, underwriting, deposit, bank lending, component, research and ship-share
-        budgets, the debt cap and the cash due counted never above yours, the reserve and the bank&apos;s net-worth bar only raised, borrowing,
-        mortgages, idle-cash lending, deposits, our bank, passengers, passenger voyages, ventures, escort fees, the news packet, components,
+        setting but its own within your ceilings (max ships, the marque, underwriting, deposit, bank lending, component, research, ship-share,
+        resting-order, envelope, charter, futures and monopoly budgets, the debt cap and the cash due counted never above yours, the reserve and
+        the bank&apos;s net-worth bar only raised, borrowing, mortgages, idle-cash lending, deposits, our bank, passengers, passenger voyages, the fare
+        bandit, ventures, escort fees, escorting others, the market model, marginal and resting orders, Kelly sizing, assignment by regret, ordering
+        hulls, buying envelopes, posting charters, issuing freight, insuring our voyages, futures, monopolies, the news packet, components,
         research, ship shares, break-ups and moving home never switched on while yours are off), bans on ports, sea zones, goods and charters, a bias on lane ranks, calls on stalled expansion charters, orders to single
         ships (a lane, a charter, a port, hold in the roadstead, drop a planned lane), the ship buyer (hold, one build, classes forbidden),
         marques or patrols within your marque budget (set it to 0 to forbid them; an issued one runs its term and can&apos;t be withdrawn), and

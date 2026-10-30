@@ -6,8 +6,8 @@
  * Ranges (the user's decisions): every setting in its full valid range, with hard floors: max ships, the
  * marque, underwriting, deposit and bank-lending budgets, the debt cap, the cash due counted on and the smuggling loads never above the
  * user's values (and the component, research and ship-shares budgets), leverage, idle-cash lending, bank deposits, our own bank,
- * passengers, passenger voyages, ventures, escort fees, news packets, components, research, ship shares and smuggling only ever switched
- * off (the user's "off" is a
+ * passengers, passenger voyages, ventures, escort fees, news packets, components, research, ship shares, the market model and smuggling
+ * only ever switched off (the user's "off" is a
  * ceiling), the home reserve, a loan's required return and the net worth our bank waits for only ever raised, and the AI's own settings not even nameable (they are not in the
  * schema's enum). Money orders (borrow for a load or a hull, repay a loan early, build a commission to order) and
  * housekeeping orders (break up a ship, move the home port) refer only to what the digest listed and are carried out
@@ -75,6 +75,11 @@ export const NUMBER_KEYS = [
   "componentBudgetPence",
   "rndBudgetPence",
   "sharesBudgetPence",
+  "restingBudgetPence",
+  "envelopeBudgetPence",
+  "charterBudgetPence",
+  "futuresBudgetPence",
+  "monopolyBudgetPence",
 ] as const satisfies readonly KeysOfType<FleetSettings, number>[];
 export const SWITCH_KEYS = [
   "autoBuy",
@@ -83,15 +88,22 @@ export const SWITCH_KEYS = [
   "useFreight",
   "usePassengers",
   "passengerVoyages",
+  "fareBandit",
   "ventures",
   "convoys",
   "escortFees",
+  "escortOthers",
   "rivalIntel",
   "byomBuilds",
   "yardFactor",
   "holdForRepost",
   "captureEscalations",
   "actOnEvents",
+  "marketModel",
+  "marginalOrders",
+  "restingOrders",
+  "kellySizing",
+  "assignByRegret",
   "resizeLoads",
   "leverage",
   "mortgages",
@@ -99,7 +111,14 @@ export const SWITCH_KEYS = [
   "deposits",
   "runBank",
   "shipDeals",
+  "orderHulls",
   "envelopes",
+  "buyEnvelopes",
+  "postCharters",
+  "issueFreight",
+  "insureLevered",
+  "futures",
+  "monopolies",
   "newsPackets",
   "components",
   "rndResearch",
@@ -118,12 +137,26 @@ export const CEILING_SWITCHES = [
   "smuggling",
   "usePassengers",
   "passengerVoyages",
+  "fareBandit",
   "ventures",
   "escortFees",
+  "escortOthers",
+  "orderHulls",
+  "buyEnvelopes",
+  "postCharters",
+  "issueFreight",
+  "insureLevered",
+  "futures",
+  "monopolies",
   "newsPackets",
   "components",
   "rndResearch",
   "shipShares",
+  "marketModel",
+  "marginalOrders",
+  "restingOrders",
+  "kellySizing",
+  "assignByRegret",
   "autoBreakUp",
   "autoRelocate",
 ] as const satisfies readonly SwitchKey[];
@@ -174,6 +207,15 @@ const RANGES: Record<NumberKey, (v: number) => { min: number; max: number; int: 
   componentBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
   rndBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
   sharesBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  // A ceiling: never more in resting bids' escrow and goods held for them than the user allows (guide 3.2).
+  restingBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  // A ceiling: never more on envelopes in any 24 real hours than the user allows (guide 3.11).
+  envelopeBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  // Ceilings: never more in our charters' escrow and the goods they landed, in futures, nor on one royal monopoly, than the user allows
+  // (guide 3.7, 3.16, 3.9).
+  charterBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  futuresBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  monopolyBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
 };
 
 export function aiRange(k: NumberKey, user: FleetSettings): { min: number; max: number; int: boolean } {

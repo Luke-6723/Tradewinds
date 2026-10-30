@@ -14,9 +14,14 @@
  * guessed to pay, and whether holding a ship for the next game-hour round is worth its time.
  *
  * Berths are not a lane Part (a Part is a good bought and carried): the agent keeps its offers and the groups aboard itself.
+ *
+ * With the fareBandit setting the ask is chosen by Thompson sampling instead (banditFare; bandit.ts): multipliers on the same reference,
+ * the learner above as the prior's centre and fallback, one trial an offer scored when it closes as the share of the heads that could
+ * board that did (armChance reads that share for the hold decision; the planner prices on the posterior means, voyages.ts).
  */
 
 import type { AboardGroupView, FareBandView, FareRecordView, PassengerKind, WaitingGroupView } from "../schema";
+import { FARE_GRID, type ArmRef, type PostedPrices, type Prior } from "./bandit";
 
 /** Fewest recent accepted fares on a route (or in the world, per sea mile) for their median to stand. */
 export const PAX_MIN_RECORDS = 3;
@@ -89,6 +94,18 @@ export interface PaxOffer {
    * never the contested nudge. Absent on older saves: not.
    */
   open?: boolean;
+  /**
+   * Priced by the fare bandit (fareBandit; banditFare): the arm its outcome teaches; `scored` once its trial was counted (one an offer, when
+   * it closed). Absent: priced by fareFor (older saves, the setting off).
+   */
+  arm?: ArmRef;
+  scored?: boolean;
+  /**
+   * The bandit's trial: heads of the arm's kind that could board when it was posted (the groups waiting fitted whole into its berths), and
+   * those of them that boarded on it; the share boarded (at most 1) is the outcome. Absent on older saves: its berths, and none.
+   */
+  fill?: number;
+  armTaken?: number;
 }
 
 /**
@@ -254,6 +271,105 @@ export function fareFor(x: FareInput): { perHead: number; heads: number; ref: nu
     if (!best || take > best.take) best = { perHead: ask, heads, ref, kind, open: open.has(kind), take };
   }
   return best ? { perHead: best.perHead, heads: best.heads, ref: best.ref, kind: best.kind, open: best.open } : null;
+}
+
+/**
+ * The fare bandit (the fareBandit setting; bandit.ts, research u6 §1): Thompson sampling over FARE_GRID multipliers on the reference
+ * (as fareFor's: the route's own median by kind, else its band's, else the world's per sea mile; speed-weighed), one key per route-length
+ * band × kind × how it is priced: `contested` (others offer), `open` (nobody competes, a band's or the world's median: the old open-high
+ * 1.5x is the prior's centre), `own` (nobody competes, the route's own median: our accepted asks already). The prior is what the old
+ * learner implies: centre at its multiplier (the nudge, or the uncontested level), the odds there between the nudge's own fixed point
+ * and the route's record of rounds won (winChance), PAX_BANDIT_PRIOR_N trials an arm, falling off as a logistic in log-price.
+ */
+export type FareMode = "contested" | "open" | "own";
+export const PAX_BANDIT_PRIOR_N = 3;
+export const PAX_BANDIT_PRIOR_SLOPE = 3;
+
+export const fareKey = (band: string, kind: PassengerKind, mode: FareMode) => `pax|${band}|${kind}|${mode}`;
+
+/** The passenger kind a fare key is for (null: not a fare key). */
+export function fareKindOf(key: string): string | null {
+  const parts = key.split("|");
+  return parts[0] === "pax" && parts.length >= 4 ? parts[parts.length - 2] : null;
+}
+
+/** The route-length band a passage counts in (a fare on the route's, else the band holding `nm`, else a log-bucket of `nm`). */
+export function bandOf(bands: readonly FareBandView[], band: string | null, nm: number): string {
+  if (band) return band;
+  const b = nm > 0 ? bands.find((x) => nm >= x.min_nm && (x.max_nm == null || nm < x.max_nm)) : undefined;
+  return b ? b.band : `nm${Math.round(Math.log2(Math.max(1, nm)))}`;
+}
+
+/**
+ * The prior on a fare key's acceptance from the old learner: centred on its multiplier (contested: PAX_UNDERCUT × the nudge; uncontested:
+ * PAX_OPEN_HIGH × the level over a band's median, the level alone over the route's own), the odds there halfway between the nudge's fixed
+ * point (about 45% of rounds won contested, 60% uncontested) and the route's record.
+ */
+export function farePrior(mode: FareMode, adj: number, adjOpen: number | undefined, win: number): Prior {
+  const a = Number.isFinite(adj) && adj > 0 ? adj : 1;
+  const o = Number.isFinite(adjOpen) && adjOpen! > 0 ? adjOpen! : 1;
+  const centre = mode === "contested" ? PAX_UNDERCUT * a : (mode === "open" ? PAX_OPEN_HIGH : 1) * o;
+  const fixed = mode === "contested" ? 0.45 : 0.6;
+  const w = Number.isFinite(win) ? Math.min(1, Math.max(0, win)) : 0.5;
+  return {
+    centre: Math.min(FARE_GRID[FARE_GRID.length - 1], Math.max(FARE_GRID[0], centre)),
+    p: Math.min(0.9, Math.max(0.1, 0.5 * fixed + 0.5 * w)),
+    slope: PAX_BANDIT_PRIOR_SLOPE,
+    n: PAX_BANDIT_PRIOR_N,
+    dir: "down",
+  };
+}
+
+/**
+ * The fare per head to ask, by the bandit: per kind waiting, θ drawn per arm (monotone: dearer never boards more; θ the share of the heads
+ * that could board that do, learned so from each offer's outcome) and each arm's price (ref × multiplier × speed, never under the floor or
+ * PAX_MIN_FARE_PENCE: arms under it are left out) valued at price × θ × the heads of that kind the berths take whole (`heads` in the
+ * answer, the trial's `fill`): where more wait than she can carry, their share boarding is learned against those berths, never the queue.
+ * The best kind's arm, with its reference for the learner's record; null: no arm clears the floor for any kind waiting. `mean`: on the
+ * posterior means, no draw (what the planner counts on); `cap`: no arm dearer per head (a passage planned for fares alone at that ask).
+ */
+export function banditFare(
+  x: FareInput & { bandit: PostedPrices; band: string; rng?: () => number; mean?: boolean; cap?: number },
+): { perHead: number; heads: number; ref: number; kind: PassengerKind; open: boolean; arm: ArmRef; theta: number } | null {
+  const open = x.open ?? new Set<PassengerKind>();
+  const own = x.own ?? new Set<PassengerKind>();
+  const win = Number.isFinite(x.win) ? x.win! : 0.5;
+  const cap = Number.isFinite(x.cap) && x.cap! > 0 ? x.cap! : Infinity;
+  let best: { perHead: number; heads: number; ref: number; kind: PassengerKind; open: boolean; arm: ArmRef; theta: number; value: number } | null = null;
+  for (const [kind, ref] of x.refs) {
+    if (!(ref > 0)) continue;
+    const groups = x.groups.filter((g) => g.kind === kind);
+    const fill = fillHeads(groups, x.berths);
+    if (fill <= 0) continue;
+    const mode: FareMode = open.has(kind) ? (own.has(kind) ? "own" : "open") : "contested";
+    const pr = farePrior(mode, x.adj, x.adjOpen, win);
+    const key = fareKey(x.band, kind, mode);
+    const price = (k: number) => Math.max(PAX_MIN_FARE_PENCE, Math.round(ref * FARE_GRID[k] * x.speed));
+    const floor = Math.max(PAX_MIN_FARE_PENCE, Math.ceil(x.floor));
+    const value = (k: number, th: number) => price(k) * th * fill;
+    const ok = (k: number) => price(k) >= floor && price(k) <= cap;
+    const pick = x.mean ? x.bandit.best(key, FARE_GRID, pr, value, ok) : x.bandit.choose(key, FARE_GRID, pr, value, ok, x.rng);
+    if (!pick || !(pick.value > 0)) continue;
+    if (!best || pick.value > best.value) {
+      best = {
+        perHead: price(pick.k),
+        heads: fill,
+        ref,
+        kind,
+        open: open.has(kind),
+        arm: { key, k: pick.k, m: FARE_GRID[pick.k], c: pr.centre, p: pr.p },
+        theta: pick.theta[pick.k],
+        value: pick.value,
+      };
+    }
+  }
+  return best ? { perHead: best.perHead, heads: best.heads, ref: best.ref, kind: best.kind, open: best.open, arm: best.arm, theta: best.theta } : null;
+}
+
+/** The bandit's posterior mean share of the heads that could board on this arm that do (no draw; the prior as the arm was priced). */
+export function armChance(bandit: PostedPrices, arm: ArmRef): number {
+  const pr: Prior = { centre: arm.c ?? arm.m, p: arm.p ?? 0.5, slope: PAX_BANDIT_PRIOR_SLOPE, n: PAX_BANDIT_PRIOR_N, dir: "down" };
+  return bandit.mean(arm.key, FARE_GRID, pr, arm.k);
 }
 
 /** Share of a fare a landing at server time `at` is guessed to pay, promised by `promisedAt` (ISO; none: in full). */

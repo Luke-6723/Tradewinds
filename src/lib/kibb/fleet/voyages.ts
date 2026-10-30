@@ -13,7 +13,10 @@
  *     summary, open high where nobody competes, the route's learned levels; only cached data here, never the world's per sea mile,
  *     which needs routes read) × the odds our offer wins a round on the route (winChance; on every kind, the safe side) × the share
  *     of the passage expected to land (pirates taking the ship, a storm sinking her: fares are never insured) × the late cut at our
- *     landing against the promise the boarding round would give (a direct passage lands on it);
+ *     landing against the promise the boarding round would give (a direct passage lands on it); with the fareBandit setting, the
+ *     fare and its odds as the bandit would post them instead (passengers.ts banditFare on its posterior means, no draw: the ask
+ *     × the share of the heads that could board expected to, the value the posted ask is chosen on), and a passage planned for
+ *     fares alone never asks more than that fare when it is posted (ShipAgent.paxFare);
  *   - the weight of the berths (passengers weigh like cargo) slows her: the extra sailing time is a floor on the fare (as the
  *     sail-time pricer has it) and is added to the leg's time.
  *
@@ -25,7 +28,8 @@
  */
 
 import type { FareBandView, FareRecordView, PassengerKind, WaitingGroupView } from "../schema";
-import { bandReference, berthsFor, fareFor, fittingGroups, lateShare, routeReference, winChance, type PaxRoute } from "./passengers";
+import type { PostedPrices } from "./bandit";
+import { bandOf, bandReference, banditFare, berthsFor, fareFor, fittingGroups, lateShare, routeReference, winChance, type PaxRoute } from "./passengers";
 
 /** A passenger-only voyage is planned only for at least this much expected in fares (pence; 500 Cr) and this many heads. */
 export const PAX_ONLY_MIN_PENCE = 50_000;
@@ -53,6 +57,8 @@ export interface PaxPricing {
   adj: number;
   adjOpen?: number;
   win: number;
+  /** The route-length band the fare bandit keys it in (passengers.ts bandOf, as the sail-time pricer has it). */
+  band: string;
 }
 
 /** What the planner is given to value passengers waiting where the ship lies (built by the manager for one planning pass). */
@@ -76,6 +82,8 @@ export interface PaxLanes {
   pricing: (dest: string, nm: number) => PaxPricing | null;
   /** Passenger-only voyages may be planned (no hold for a round decided this stay, none given up here). */
   only: boolean;
+  /** The fare bandit's beliefs, with the fareBandit setting on: fares priced as it would post them (absent: as fareFor would). */
+  bandit?: PostedPrices;
 }
 
 /** The fares a passage is expected to bring (one offer: one fare per head), for the lane and the log. */
@@ -146,7 +154,7 @@ export function paxPricing(x: {
   for (const kind of refs.keys()) {
     if (x.groups.some((g) => g.dest_port_id === x.dest && g.kind === kind && (g.route_unmet_groups ?? 0) > 0) || x.unmet(kind)) open.add(kind);
   }
-  return { refs, open, own, adj: x.route?.adj ?? 1, adjOpen: x.route?.adjOpen, win: winChance(x.route) };
+  return { refs, open, own, adj: x.route?.adj ?? 1, adjOpen: x.route?.adjOpen, win: winChance(x.route), band: bandOf(x.bands, routeBand, x.nm) };
 }
 
 /**
@@ -154,6 +162,8 @@ export function paxPricing(x: {
  * (less the stores reserve) and still wait at the first round after `postAt`, at the ask the pricer would post, weighed by the
  * odds of winning the round, the share `kept` landing and the late cut at `landsAt` against the promise that round would give
  * (`passageMs` after it). `weightMs(addFill)`: real ms the passage gains with `addFill` more of the hold filled. Null: nothing.
+ * With the fare bandit (`p.bandit`): its ask on the posterior means and the share of the kind's heads expected to board in place of
+ * fareFor's ask and the route's odds (fareFor still when no arm clears the floor, as at sail time).
  */
 export function paxValue(
   p: PaxLanes,
@@ -172,14 +182,19 @@ export function paxValue(
   // The weight's extra sailing time, at what her time is worth, is the least asked per head (as the sail-time pricer has it).
   const fullMs = a.weightMs(berths / Math.max(p.perTon, 1) / cap);
   const floor = ((fullMs / 3_600_000) * Math.max(0, p.ratePerHour)) / Math.max(berths, 1);
-  const q = fareFor({ refs: pricing.refs, groups, berths, floor, adj: pricing.adj, adjOpen: pricing.adjOpen, speed: p.speed, open: pricing.open, own: pricing.own, win: pricing.win });
+  const input = { refs: pricing.refs, groups, berths, floor, adj: pricing.adj, adjOpen: pricing.adjOpen, speed: p.speed, open: pricing.open, own: pricing.own, win: pricing.win };
+  // The fare bandit's ask as it would be posted, on its posterior means (no draw): the share of the kind's heads expected to board is its
+  // odds. Else (the setting off, or no arm over the floor) the old pricer's ask at the route's odds of a round won.
+  const b = p.bandit ? banditFare({ ...input, bandit: p.bandit, band: pricing.band, mean: true }) : null;
+  const q = b ?? fareFor(input);
   if (!q || q.heads <= 0) return null;
   // Promised at boarding: the passage at our pace from the round, plus leeway (unpublished: none counted, the safe side).
   const late = lateShare(new Date(round + Math.max(0, a.passageMs)).toISOString(), a.landsAt, p.dayMs);
-  const win = Math.min(1, Math.max(0, pricing.win));
+  const win = Math.min(1, Math.max(0, b ? b.theta : pricing.win));
   const value = q.perHead * q.heads * win * Math.min(1, Math.max(0, a.kept)) * late;
   if (!(value > 0)) return null;
-  const smallest = Math.min(...groups.map((g) => g.size));
+  // The pessimistic case: the smallest group the ask was set for (the bandit's kind; fareFor's, any waiting).
+  const smallest = Math.min(...(b ? groups.filter((g) => g.kind === b.kind) : groups).map((g) => g.size));
   return {
     dest: a.dest,
     heads: q.heads,
