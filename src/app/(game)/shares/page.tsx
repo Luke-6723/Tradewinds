@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, Metrics, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
+import { useDeskBoard } from "@/components/kibb/desks-common";
 import {
   CompanyLabel,
   WarnBox,
@@ -133,7 +134,7 @@ function ListForm({
       {pick && (
         <KV
           rows={[
-            ["A 64th of the rebuild value", sixtyFourth !== undefined ? fmtCr(sixtyFourth, 2) : pick.owned ? "…" : "not known for another company's ship"],
+            ["A 64th of the rebuild value (components included)", sixtyFourth !== undefined ? fmtCr(sixtyFourth, 2) : pick.owned ? "…" : "not known for another company's ship"],
             ["Allowed price", band ? `${fmtCr(band.min, 2)} – ${fmtCr(band.max, 2)}` : "50%–150% of that, checked by the game"],
             ["Total", Number.isFinite(p) && Number.isFinite(n) ? fmtCr(p * n, 2) : "—"],
           ]}
@@ -143,6 +144,13 @@ function ListForm({
         <p className="text-muted-foreground text-xs">
           As owner you sell from the 64ths nobody else holds and keep the rest. Holders are paid a dividend every game day from the ship&apos;s realised profit (sales
           from its hold less cargo bought into it, freight rewards, its berth dues, its venture shares), from your home vault.
+        </p>
+      )}
+      {pick && (
+        <p className="text-muted-foreground text-xs">
+          Buyer of last resort: once the listing is a game hour old, the Merchant Adventurers of the {regionName(at)} region may buy it, but only priced well below
+          both a 64th of the rebuild value and what the ship has earned lately per 64th (a ship that hasn&apos;t earned lately gets no bid). A player who rates her
+          earnings higher buys first and pays more.
         </p>
       )}
       <ErrorNote error={act.error ?? (shipId ? why : null)} />
@@ -178,6 +186,9 @@ export default function SharesPage() {
   const act = useAction<S.ShareListing>(() => refresh());
   const homeRegion = regionOf(profile?.company.home_port_id) ?? "channel";
   const options = listables(ships, holdings, allListings, companyId);
+  // The share desk (guide 3.13.6, 3.16): what the Merchant Adventurers bought, beside what players sold each other.
+  const { board } = useDeskBoard(30);
+  const shareDesk = board?.desks.find((d) => d.desk === "ship_shares");
 
   function refresh() {
     void reloadHoldings();
@@ -327,8 +338,9 @@ export default function SharesPage() {
               </Table>
             )}
             <p className="mt-3 text-muted-foreground text-xs">
-              Buying needs no presence at any port; the price band (50%–150% of a 64th of the rebuild value) is checked again when you buy. A buy takes the whole
-              listing.
+              Buying needs no presence at any port; the price band (50%–150% of a 64th of the rebuild value, fitted components included) is checked again when
+              you buy. A buy takes the whole listing. A seller shown only by id may be the Merchant Adventurers relisting 64ths they bought, a little above what
+              they paid.
             </p>
           </Panel>
         </div>
@@ -341,6 +353,17 @@ export default function SharesPage() {
             <p>
               Ship shares count toward net worth. Your home port is {portName(profile?.company.home_port_id)}, so dividends on your own ships come from your{" "}
               {regionName(homeRegion)} vault.
+            </p>
+            <p>
+              The share desk: the Merchant Adventurers of a listing&apos;s region buy 64ths as a last resort, once the listing is a game hour old and priced well
+              below both a 64th of the rebuild value and the ship&apos;s recent earnings per 64th. They hold only a limited part of any ship, spend only so much per
+              region each game day, draw dividends like any holder and relist some game days later a little above cost. So 64ths of an earning ship can always be
+              sold; a player buyer pays more.
+              {shareDesk &&
+                ` Last ${board?.window_game_days ?? 30} game days: they bought ${shareDesk.desk_bought.count} listing${shareDesk.desk_bought.count === 1 ? "" : "s"} (${fmtCr(shareDesk.desk_bought.value_pence)}); players sold each other ${shareDesk.player_trades.count} (${fmtCr(shareDesk.player_trades.value_pence)}).`}{" "}
+              <Link href="/desks" className="hover:underline">
+                NPC desks
+              </Link>
             </p>
           </WarnBox>
         </div>

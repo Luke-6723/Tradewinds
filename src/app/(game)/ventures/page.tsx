@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Empty, ErrorNote, KV, Loading, Metrics, NativeSelect, PageHeader, Panel, Table } from "@/components/kibb/bits";
+import { useDeskBoard } from "@/components/kibb/desks-common";
 import {
   CashLine,
   CompanyLabel,
@@ -137,12 +138,24 @@ function TradeForm({
   const free = ship ? ship.effective_hold_capacity_tons - ship.cargo_used_tons : undefined;
   const spend = Number.isFinite(q) && Number.isFinite(limit) ? Math.round(q * limit) : NaN;
   const cash = vaults.cash(venture.banking_region);
+  // The investors' money never buys the merchant's own goods (guide 3.13.5): venture/buy is refused (409) while an ask of ours
+  // rests at or under the limit for that good at the origin. A linked company's asks count too, but aren't ours to read.
+  const { data: ownAsks } = usePoll(
+    side === "buy" && good ? () => kibbGet<S.OrderBook[]>("/v1/market/orders", { port_id: port, commodity_id: good, side: "ask", limit: 200 }).then((rows) => ({ good, rows })) : null,
+    30_000,
+    [side, port, good],
+  );
+  const blocking = ownAsks && ownAsks.good === good && limit > 0 ? ownAsks.rows.filter((o) => o.commodity_id === good && o.price_pence <= limit) : [];
   const why = firstProblem([
     [!!good, "Choose a good."],
     [q > 0, "Enter the tons."],
     [limit > 0, side === "buy" ? "Enter the most you'll pay per ton." : "Enter the least you'll take per ton."],
     [side === "buy" || q <= aboard, `The venture has ${fmtTons(aboard, 2)} of it aboard.`],
     [side === "sell" || free === undefined || q <= free, `Only ${fmtTons(free ?? 0)} free in the hold.`],
+    [
+      blocking.length === 0,
+      `You have an ask for ${goodName(good)} resting here at ${fmtCr(Math.min(...blocking.map((o) => o.price_pence)), 2)}/t, at or under your limit: the investors' money never buys your own goods, so the game refuses this. Cancel the ask (Market page) or set a lower limit.`,
+    ],
   ]);
 
   function submit() {
@@ -193,7 +206,13 @@ function TradeForm({
         <WarnBox>At that limit the buy could cost more than the {fmtCr(venture.cash_pence)} the venture holds.</WarnBox>
       )}
       {side === "buy" && <CashLine region={venture.banking_region} cash={cash} need={spend} />}
-      <ErrorNote error={act.error ?? (qty || price ? why : null)} />
+      {side === "buy" && (
+        <p className="text-muted-foreground text-xs">
+          The investors&apos; money never buys your own goods: the buy is refused while an ask from you, or a company linked to you, rests here at or under your
+          limit for this good.
+        </p>
+      )}
+      <ErrorNote error={act.error ?? (qty || price || blocking.length ? why : null)} />
       {act.result && (
         <p className="text-sm">
           Venture cash {fmtCr(act.result.cash_pence)}; aboard: {act.result.cargo.map((c) => `${fmtTons(c.tons, 2)} ${goodName(c.commodity_id)}`).join(", ") || "nothing"}.
@@ -266,17 +285,28 @@ function VentureDetail({
         ]}
       />
       {venture.stakes.length > 0 && (
-        <Table head={["Investor", "Capital", "Payout"]}>
-          {venture.stakes.map((s) => (
-            <tr key={s.investor_company_id}>
-              <td>
-                <CompanyLabel id={s.investor_company_id} companyId={companyId} />
-              </td>
-              <td className="tabular-nums">{fmtCr(s.capital_pence)}</td>
-              <td className="tabular-nums">{s.payout_pence ? fmtCr(s.payout_pence) : "—"}</td>
-            </tr>
-          ))}
-        </Table>
+        <div className="space-y-1">
+          <Table head={["Investor", "Capital", "Share", "Payout"]}>
+            {venture.stakes.map((s) => (
+              <tr key={s.investor_company_id}>
+                <td>
+                  <CompanyLabel id={s.investor_company_id} companyId={companyId} />
+                </td>
+                <td className="tabular-nums">{fmtCr(s.capital_pence)}</td>
+                <td className="tabular-nums" title="Of the capital raised: the investors' share of the profit (or loss) is split pro rata">
+                  {venture.capital_pence > 0 ? `${((s.capital_pence / venture.capital_pence) * 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}%` : "—"}
+                </td>
+                <td className="tabular-nums">{s.payout_pence ? fmtCr(s.payout_pence) : "—"}</td>
+              </tr>
+            ))}
+          </Table>
+          {!venture.unlisted && (
+            <p className="text-muted-foreground text-xs">
+              An investor shown only by id may be the Merchant Adventurers, who put a modest, capped stake late in the raise of a generous venture on the
+              Exchange.
+            </p>
+          )}
+        </div>
       )}
       {venture.status === "raising" && <InvestForm venture={venture} companyId={companyId} vaults={vaults} onDone={onDone} />}
       {merchant && venture.status === "raising" && (
@@ -395,11 +425,18 @@ function OpenVenture({
         </Field>
       </div>
       <Checkbox checked={unlisted} onChange={setUnlisted}>
-        <span className="text-xs">Unlisted: keep it off the Exchange, so only companies with quay presence at the origin see it</span>
+        <span className="text-xs">
+          Unlisted: keep it off the Exchange, so only companies with quay presence at the origin see it (the Merchant Adventurers then never co-invest)
+        </span>
       </Checkbox>
       <p className="text-muted-foreground text-xs">
         Capital is raised in {origin ? `the ${regionName(regionOf(origin))} region` : "the origin's region"}. Profit: investors get their capital plus their
         share pro rata, you the rest; a loss is shared pro rata; if the ship is lost only unspent cash comes back.
+      </p>
+      <p className="text-muted-foreground text-xs">
+        Backer of last resort: on the Exchange, a venture giving investors a large share of the profit draws a modest, capped stake from the region&apos;s
+        Merchant Adventurers late in its raise, if your credit record shows no default and no walk-away, and never into two of your open ventures at once.
+        Players who invest earlier, or more, take the rest of the investors&apos; share.
       </p>
       <ErrorNote error={act.error ?? (shipId ? why : null)} />
       {act.result && <p className="text-sm">Opened: raising until {fmtDateTime(act.result.raise_by)}.</p>}
@@ -428,6 +465,11 @@ export default function VenturesPage() {
     30_000,
     [port],
   );
+  // With no port chosen: every venture raising on the Exchange (guide 3.21), world-wide; picking one opens its origin's list.
+  const { data: listed, error: listedError } = usePoll(port ? null : () => kibbGet<S.ExchangePage>("/v1/exchange", { kind: "venture", limit: 200 }), 60_000);
+  // The venture co-investor's desk (guide 3.13.5, 3.16): what the Merchant Adventurers put in, beside what players invested.
+  const { board } = useDeskBoard(30);
+  const coInvestor = board?.desks.find((d) => d.desk === "ventures");
   useLearnCompanies([...(mine ?? []), ...(raising ?? [])].map((v) => [v.merchant_company_id, v.merchant_name] as [string, string]));
   const [selected, setSelected] = useState<string | null>(null);
   const venture = [...(mine ?? []), ...(raising ?? [])].find((v) => v.id === selected);
@@ -512,19 +554,57 @@ export default function VenturesPage() {
             {!mine ? !error && <Loading /> : mine.length === 0 ? <Empty>No ventures you run or hold a stake in.</Empty> : <Table head={head}>{mine.map(row)}</Table>}
           </Panel>
           <Panel
-            title="Raising capital at a port"
+            title={port ? `Raising capital at ${portName(port)}` : "Raising capital on the Exchange"}
             action={
               <div className="w-full sm:w-48">
-                <PortSelect value={port} onChange={setPort} placeholder="Choose a port…" />
+                <PortSelect value={port} onChange={setPort} placeholder="Exchange (any port)" />
               </div>
             }
           >
-            <ErrorNote error={raisingError} />
+            <ErrorNote error={port ? raisingError : listedError} />
             {!port ? (
-              <Empty>
-                Choose a port to see the ventures raising there
-                {portsWithShips.size > 0 ? ` (your ships lie at ${[...portsWithShips].filter(Boolean).map(portName).join(", ")})` : ""}.
-              </Empty>
+              <>
+                {!listed ? (
+                  !listedError && <Loading />
+                ) : listed.entries.length === 0 ? (
+                  <Empty>No ventures raising on the Exchange.</Empty>
+                ) : (
+                  <Table head={["Voyage", "Investors", "Raised", "Raises", "Region", ""]}>
+                    {listed.entries.map((e) => {
+                      const d = e.details as S.VentureDetails;
+                      return (
+                        <tr key={e.id}>
+                          <td className="whitespace-nowrap text-xs">
+                            {portName(d.origin_port_id)} → {portName(d.dest_port_id)}
+                            {e.note && <div className="max-w-64 whitespace-normal text-muted-foreground">“{e.note}”</div>}
+                          </td>
+                          <td className="tabular-nums">{fmtBps(d.investor_share_bps)}</td>
+                          <td className="tabular-nums">{fmtCr(d.capital_raised_pence)}</td>
+                          <td className="whitespace-nowrap text-xs">{fmtIn(d.raise_by)}</td>
+                          <td className="capitalize">{regionName(e.banking_region)}</td>
+                          <td className="text-right">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => {
+                                setPort(d.origin_port_id);
+                                setSelected(e.id);
+                              }}
+                            >
+                              View
+                            </Button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </Table>
+                )}
+                <p className="mt-3 text-muted-foreground text-xs">
+                  Every venture raising on the Exchange, world-wide (unlisted ones are seen only at their origin: choose the port). Choose a port to see the ventures
+                  raising there
+                  {portsWithShips.size > 0 ? ` (your ships lie at ${[...portsWithShips].filter(Boolean).map(portName).join(", ")})` : ""}.
+                </p>
+              </>
             ) : !raising ? (
               !raisingError && <Loading />
             ) : raising.length === 0 ? (
@@ -552,6 +632,19 @@ export default function VenturesPage() {
               <p>
                 The ship sails alone, only to the declared port, before the raise deadline. There the merchant sells and settles (automatic a game day after arrival;
                 leftovers go into the bids at no less than half the Crown merchants&apos; bid). It can&apos;t sail again before settling.
+              </p>
+              <p>
+                The investors&apos; money never buys the merchant&apos;s own goods: a venture buy is refused while an ask from the merchant, or a company linked to
+                it, rests at or under its limit for that good there.
+              </p>
+              <p>
+                The Merchant Adventurers co-invest as a backer of last resort: a modest, capped stake late in the raise of a venture on the Exchange that gives
+                investors a large share, if the merchant&apos;s credit record shows no default or walk-away, and never in two open ventures of one merchant.
+                {coInvestor &&
+                  ` Last ${board?.window_game_days ?? 30} game days: they put ${fmtCr(coInvestor.desk_bought.value_pence)} into ${coInvestor.desk_bought.count} venture${coInvestor.desk_bought.count === 1 ? "" : "s"}; players invested ${fmtCr(coInvestor.player_trades.value_pence)} in ${coInvestor.player_trades.count} of each other's.`}{" "}
+                <Link href="/desks" className="hover:underline">
+                  NPC desks
+                </Link>
               </p>
               <p>Stakes count in your net worth, so the wealth levy (net worth over 1,000,000 Cr) applies to them as to cash.</p>
             </div>

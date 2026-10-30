@@ -45,9 +45,20 @@
  *
  * The AI's bans (ports, sea zones, goods, charters, public charters rivals are due at first) keep lanes
  * touching them out of every plan, onward legs included; its bias only reorders lanes that pass.
+ *
+ * Passengers (guide 3.20; `opts.pax`, voyages.ts, the passengerVoyages setting): with the groups waiting where the ship lies, a
+ * leg's first passage out of her port counts the fares of those bound where it goes (the lane's port, or its source when she
+ * sails there empty first) in the hold the cargo leaves, the weight's sailing time added; the cargo must still pay by itself. A
+ * "passengers" lane is a passage for fares alone (no cargo, no freight) to a port enough waiting groups are bound for. Onward
+ * legs never count passengers (nobody knows who will wait there).
+ *
+ * `opts.marketOnly` (a venture's load, guide 3.13.5: sold only through the venture): market goods only, never charters, freight
+ * or provisions.
  */
 
 import type { RoutePlan, ZoneClass } from "../types";
+import { paxDests, paxValue, PAX_ONLY_MIN_HEADS, PAX_ONLY_MIN_PENCE, PAX_ROUND_SLACK_GAME_MIN, type LanePax, type PaxLanes } from "./voyages";
+import { weightMs } from "./passengers";
 import { BID_HAIRCUT_BASE, freightLoot, PROVISIONAL_PREFIX, type CharterInfo, type World } from "./world";
 
 export interface ShipSpec {
@@ -62,7 +73,8 @@ export interface ShipSpec {
   hullValue?: number;
 }
 
-export type LaneKind = "charter" | "market" | "freight";
+/** `passengers`: a passage for fares alone (voyages.ts): no parts, no freight, the fares in `pax`. */
+export type LaneKind = "charter" | "market" | "freight" | "passengers";
 
 /** One good bought at the source: delivered to charters at the destination, or sold to its buyers. */
 export interface Part {
@@ -128,6 +140,11 @@ export interface Lane {
   askKnown: boolean;
   /** Expected cash profit of this leg (the phase bonus is paid later and isn't in it). */
   cashProfit: number;
+  /**
+   * Of `cashProfit`'s costs, the ship's own (pence): the hull's expected loss to pirates and storms, and the berth dues. Kept on a
+   * venture's load only (PlanOptions.marketOnly): the venture's P&L is its cargo's, these are the merchant's alone. Absent: not kept.
+   */
+  shipCost?: number;
   /** Cash the load ties up at the source: goods and freight collateral. */
   capital: number;
   /** Real ms planned waiting at the destination for a re-post (0 when delivering on arrival). */
@@ -155,6 +172,12 @@ export interface Lane {
    * once taken. Absent: none.
    */
   borrow?: { pence: number; gain: number; paybackDays: number; state: "planned" | "taken" | "failed"; loanId?: string };
+  /**
+   * Passengers waiting where the ship lay when it was planned (voyages.ts): the fares counted in the profit, for the port they are
+   * bound for (the lane's, or its source's when she sails there empty first). Absent: none counted (older saves too). The offer
+   * itself is posted at sail time as ever.
+   */
+  pax?: LanePax;
 }
 
 /** The AI's hard bans for its horizon (ai/directives.ts): no planned load touches them. */
@@ -245,6 +268,10 @@ export interface PlanOptions {
   noSpeculativeOnward?: boolean;
   /** The AI's bans in force: lanes touching them aren't planned (onward legs included). */
   bans?: Bans;
+  /** Passengers waiting where the ship lies (passengerVoyages; voyages.ts): their fares counted in her own legs out of that port. */
+  pax?: PaxLanes;
+  /** Market goods only (a venture's load: guide 3.13.5): no charter parts, no freight, no provisions. */
+  marketOnly?: boolean;
 }
 
 /** Estimated ask rise per ton bought, before the ladder re-quotes (~4% for a 30 t hoy load). */
@@ -263,6 +290,8 @@ const EXPIRY_SLACK_MS = 10 * 60_000;
 const LEG_OVERHEAD_MS = 60_000;
 /** Smallest amount of one good worth a separate purchase. */
 const MIN_PART_TONS = 3;
+/** Never in a venture's load (opts.marketOnly): the stores' good, which the ship's provisioning moves in and out of the hold. */
+const MARKET_ONLY_NEVER = "provisions";
 /** Smallest load (goods and freight, tons) worth a leg for a ship with this much room; the buyer keeps to it too. */
 export const minLoadTons = (cap: number) => Math.min(10, cap * 0.5);
 /** Bids seen longer ago than this (game hours) aren't planned on. */
@@ -679,6 +708,8 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const { world, ship, opts } = ctx;
   // Lawful lanes never load or land at a smugglers' cove, nor carry contraband (guide 3.18); a ship may sail from one.
   if (world.isCove(source) || world.isCove(dest) || (primary.kind !== "freight" && world.isContraband(primary.good))) return null;
+  // A venture's load (guide 3.13.5): market goods sold through the venture only, never provisions (the stores' good).
+  if (opts.marketOnly && (primary.kind !== "market" || primary.good === MARKET_ONLY_NEVER)) return null;
   let out: RoutePlan, dead: RoutePlan | null;
   try {
     [out, dead] = await Promise.all([
@@ -760,8 +791,8 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
     const done = new Set(parts.map((p) => p.good));
     const options: Part[] = [];
     for (const good of world.goodsAt(source)) {
-      if (done.has(good) || !wanted.has(good) || opts.bans?.goods.has(good)) continue;
-      const c = charterPart(ctx, args(good), charterAt(good));
+      if (done.has(good) || !wanted.has(good) || opts.bans?.goods.has(good) || (opts.marketOnly && good === MARKET_ONLY_NEVER)) continue;
+      const c = opts.marketOnly ? null : charterPart(ctx, args(good), charterAt(good));
       const m = marketPart(ctx, args(good));
       const pick = c && m ? (c.margin >= m.margin ? c : m) : (c ?? m);
       if (pick) options.push(pick);
@@ -774,7 +805,7 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       if (p && p.tons <= room) take(p);
     }
   }
-  if (!cheap && primary.kind !== "freight" && room > 0) {
+  if (!cheap && primary.kind !== "freight" && room > 0 && !opts.marketOnly) {
     freight = freightPicks(ctx, source, dest, room, cash);
     for (const f of freight) room -= f.tons;
   }
@@ -821,6 +852,42 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const cashProfit = parts.reduce((n, p) => n + p.tons * (kept * p.pay - paid(p)), 0) + freightReward - captureCost - sinkCost - dues;
   // Pirates taking the ship can make a load not worth carrying at all.
   if (profit <= 0) return null;
+
+  // Passengers waiting where she lies (opts.pax; voyages.ts): the fares of those bound where this leg's first passage goes (the
+  // source, sailing there empty; else the destination, in the hold the cargo leaves), at the share of that passage expected to
+  // land, the weight's extra sailing time added. Only her own legs out of that port (never an onward estimate), and only on top:
+  // the cargo above paid by itself.
+  let pax: LanePax | undefined;
+  let paxMs = 0;
+  const px = !cheap && opts.pax && opts.pax.from === from ? opts.pax : undefined;
+  if (px) {
+    const empty = from !== source;
+    const leg = empty ? dead : out;
+    if (leg) {
+      const nm = leg.total_distance_nm;
+      const knots = ship.knots;
+      const before = empty ? 0 : fill;
+      const shipLoss = empty ? world.piracyRisk(leg, ship.guns, ship.knots, 0).capture + deadSink : risk.capture + storm.sink;
+      const v = paxValue(px, {
+        dest: empty ? source : dest,
+        nm,
+        cap: ship.cap,
+        freeTons: empty ? ship.cap : ship.cap - tons,
+        postAt: empty ? ctx.now : ctx.now + loadMs,
+        landsAt: empty ? ctx.now + deadMs : landAt,
+        passageMs: empty ? deadMs : ladenMs,
+        kept: 1 - Math.min(1, shipLoss),
+        weightMs: (add) => weightMs(nm, knots, before, add, (n, k) => world.sailMs(n, k)),
+      });
+      if (v) {
+        pax = { dest: v.dest, heads: v.heads, perHead: v.perHead, value: v.value };
+        paxMs = v.extraMs;
+      }
+    }
+  }
+  const total = profit + (pax?.value ?? 0);
+  const allMs = ms + paxMs;
+
   const main = parts[0];
   const good = main?.good ?? freight[0]?.good ?? "";
   const kind: LaneKind = primary.kind;
@@ -832,8 +899,8 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
   const capital = parts.reduce((n, p) => n + costs(ctx, args(p.good), p.estAsk).cash * p.tons, 0) + freight.reduce((n, f) => n + f.collateral, 0);
 
   return {
-    profit,
-    ms,
+    profit: total,
+    ms: allMs,
     lane: {
       key: kind === "freight" ? `freight:${source}>${dest}:${freight.map((f) => f.id.slice(0, 8)).join(",")}` : `${kind === "market" ? "market:" : ""}${good}:${source}>${dest}`,
       kind,
@@ -854,13 +921,102 @@ async function buildLeg(ctx: Ctx, from: string, source: string, dest: string, pr
       cashProfit: Math.round(cashProfit),
       capital: Math.round(capital),
       holdMs: Math.round(holdMs),
+      deliverAt: Math.round(ctx.now + allMs - LEG_OVERHEAD_MS),
+      deliverMs: allMs,
+      loopMs: allMs,
+      profitPerHour: Math.round(rate(total, allMs)),
+      next: null,
+      speculative: parts.some((p) => p.fills.some(([id]) => id.startsWith(PROVISIONAL_PREFIX))) || undefined,
+      zones,
+      ...(pax ? { pax } : {}),
+      ...(opts.marketOnly ? { shipCost: Math.round(captureCost + sinkCost + dues) } : {}),
+    },
+  };
+}
+
+/**
+ * A passage for fares alone (opts.pax.only; voyages.ts): no cargo, no freight, from where she lies to `dest`, which waiting groups
+ * are bound for. The offer goes up as she lies (berthed or in the roadstead), she waits for the next game-hour round, then sails
+ * (ShipAgent.sailTo; nobody boarded: she doesn't sail). Planned only over rated water no ban touches, for at least
+ * PAX_ONLY_MIN_HEADS heads and PAX_ONLY_MIN_PENCE expected after the odds of winning the round and of losing the ship (the hull's
+ * value charged too), landing before the season ends, and only when even the smallest group that fits, boarding alone, pays the
+ * passage's cost (her time at her rate and the hull's risk: one group aboard commits her).
+ */
+async function buildPaxLeg(ctx: Ctx, from: string, dest: string): Promise<Leg | null> {
+  const { world, ship, opts } = ctx;
+  const px = opts.pax;
+  if (!px || px.from !== from || dest === from || world.isCove(dest) || !world.isOpen(dest)) return null;
+  if (opts.bans?.ports.has(dest) || opts.bans?.ports.has(from) || (opts.onlyDest && opts.onlyDest !== dest) || (opts.onlySource && opts.onlySource !== from)) return null;
+  let out: RoutePlan;
+  try {
+    out = await world.route(from, dest, ship.shipClass);
+  } catch {
+    return null;
+  }
+  if (!world.routeRated(out, ship.hull)) return null;
+  const zones = [...new Set(out.legs.map((l) => world.hazardZone(l.to_node)?.id).filter((z): z is string => !!z))];
+  if (opts.bans?.zones.size && zones.some((z) => opts.bans!.zones.has(z))) return null;
+  const round = px.nextRound(ctx.now);
+  if (round === null) return null;
+  // She sails just after the round the groups choose in.
+  const sailsAt = round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs;
+  const nm = out.total_distance_nm;
+  const passageMs = world.sailMs(nm, ship.knots);
+  const capture = world.piracyRisk(out, ship.guns, ship.knots, 0).capture;
+  const sink = world.stormRisk(out, ship.hull, ship.knots, sailsAt, opts.stormWeight ?? 1).sink;
+  const v = paxValue(px, {
+    dest,
+    nm,
+    cap: ship.cap,
+    freeTons: ship.cap,
+    postAt: ctx.now,
+    landsAt: sailsAt + passageMs,
+    passageMs,
+    kept: 1 - Math.min(1, capture + sink),
+    weightMs: (add) => weightMs(nm, ship.knots, 0, add, (n, k) => world.sailMs(n, k)),
+  });
+  if (!v || v.heads < PAX_ONLY_MIN_HEADS || v.value < PAX_ONLY_MIN_PENCE) return null;
+  // The pessimistic case: groups never split and can't be put ashore, so the smallest group that fits, boarding alone, pins her to the
+  // passage. Planned only when even that pays its cost by itself: her time to the landing at what it is worth, and the hull's risk.
+  const hullRisk = Math.min(1, capture + sink) * (ship.hullValue ?? 0);
+  const passageCost = ((Math.max(0, sailsAt - ctx.now) + passageMs) / 3_600_000) * Math.max(0, px.ratePerHour) + hullRisk;
+  if (v.least < passageCost) return null;
+  // The wait for the round, the passage at the berths' weight, arrival.
+  const ms = Math.max(0, sailsAt - ctx.now) + passageMs + v.extraMs + LEG_OVERHEAD_MS;
+  if (!world.beforeSeasonEnd(ctx.now + ms - LEG_OVERHEAD_MS)) return null;
+  const profit = v.value - Math.min(1, capture + sink) * (ship.hullValue ?? 0);
+  if (profit <= 0) return null;
+  const pax: LanePax = { dest, heads: v.heads, perHead: v.perHead, value: v.value };
+  return {
+    profit,
+    ms,
+    lane: {
+      key: `passengers:${from}>${dest}`,
+      kind: "passengers",
+      source: from,
+      dest,
+      good: "",
+      parts: [],
+      freight: [],
+      fills: [],
+      tons: 0,
+      pay: 0,
+      bonus: 0,
+      costPerTon: 0,
+      margin: 0,
+      piracyBps: 0,
+      stormBps: 0,
+      askKnown: true,
+      cashProfit: Math.round(profit),
+      capital: 0,
+      holdMs: 0,
       deliverAt: Math.round(ctx.now + ms - LEG_OVERHEAD_MS),
       deliverMs: ms,
       loopMs: ms,
       profitPerHour: Math.round(rate(profit, ms)),
       next: null,
-      speculative: parts.some((p) => p.fills.some(([id]) => id.startsWith(PROVISIONAL_PREFIX))) || undefined,
       zones,
+      pax,
     },
   };
 }
@@ -887,8 +1043,8 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   const portOk = (p: string) => !bans?.ports.has(p);
   const jobs: Array<Promise<Leg | null>> = [];
 
-  // Charters (live and gossip) at each port, by good, from every port selling the good.
-  for (const [k, charters] of ctx.charters) {
+  // Charters (live and gossip) at each port, by good, from every port selling the good (never a venture's load: it is sold through it).
+  for (const [k, charters] of ctx.opts.marketOnly ? [] : ctx.charters) {
     const [dest, good] = k.split("|");
     if (onlyDest && dest !== onlyDest) continue;
     for (const source of world.sellersOf(good)) {
@@ -933,9 +1089,18 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
   }
 
   // Freight listed here, by destination.
-  if (ctx.opts.freight && portOk(from)) {
+  if (ctx.opts.freight && !ctx.opts.marketOnly && portOk(from)) {
     for (const dest of new Set(world.freight.filter((f) => f.origin === from).map((f) => f.dest))) {
       if (dest !== from && world.isOpen(dest) && portOk(dest) && (!onlyDest || dest === onlyDest) && (!only || from === only)) jobs.push(buildLeg(ctx, from, from, dest, { kind: "freight" }, cheap));
+    }
+  }
+
+  // Passages for fares alone (passengerVoyages; voyages.ts): to the few ports most heads waiting here are bound for (only from where
+  // she lies, never on an onward estimate, nor while re-sizing a load).
+  const px = cheap || ctx.opts.marketOnly ? undefined : ctx.opts.pax;
+  if (px?.only && px.from === from && portOk(from)) {
+    for (const dest of paxDests(px.groups, from, ctx.now)) {
+      if (portOk(dest) && (!onlyDest || dest === onlyDest) && (!only || from === only)) jobs.push(buildPaxLeg(ctx, from, dest));
     }
   }
 
@@ -950,6 +1115,7 @@ async function enumerateLegs(ctx: Ctx, from: string, cheap: boolean): Promise<Le
 }
 
 function describe(l: Lane): string {
+  if (l.kind === "passengers") return `${l.pax?.heads ?? 0} passengers ${l.source} → ${l.dest}`;
   return `${l.kind === "freight" ? "freight" : `${l.tons} t ${l.good}${l.kind === "market" ? " to sell" : ""}`} ${l.source} → ${l.dest}`;
 }
 

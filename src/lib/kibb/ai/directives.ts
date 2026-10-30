@@ -4,9 +4,11 @@
  * in force) and the manager (the settings overlay and its hard floors).
  *
  * Ranges (the user's decisions): every setting in its full valid range, with hard floors: max ships, the
- * marque and underwriting budgets, the debt cap, the cash due counted on and the smuggling loads never above the user's
- * values, leverage, idle-cash lending and smuggling only ever switched off (the user's "off" is a ceiling), the home reserve and a
- * loan's required return only ever raised, and the AI's own settings not even nameable (they are not in the
+ * marque, underwriting, deposit and bank-lending budgets, the debt cap, the cash due counted on and the smuggling loads never above the
+ * user's values (and the component, research and ship-shares budgets), leverage, idle-cash lending, bank deposits, our own bank,
+ * passengers, passenger voyages, ventures, escort fees, news packets, components, research, ship shares and smuggling only ever switched
+ * off (the user's "off" is a
+ * ceiling), the home reserve, a loan's required return and the net worth our bank waits for only ever raised, and the AI's own settings not even nameable (they are not in the
  * schema's enum). Money orders (borrow for a load or a hull, repay a loan early, build a commission to order) and
  * housekeeping orders (break up a ship, move the home port) refer only to what the digest listed and are carried out
  * through the autopilot's own checks.
@@ -67,6 +69,12 @@ export const NUMBER_KEYS = [
   "minLoanReturnX",
   "smuggleMaxTons",
   "smuggleMaxPence",
+  "depositBudgetPence",
+  "bankMinNetWorthPence",
+  "bankLendingBudgetPence",
+  "componentBudgetPence",
+  "rndBudgetPence",
+  "sharesBudgetPence",
 ] as const satisfies readonly KeysOfType<FleetSettings, number>[];
 export const SWITCH_KEYS = [
   "autoBuy",
@@ -74,7 +82,10 @@ export const SWITCH_KEYS = [
   "underwrite",
   "useFreight",
   "usePassengers",
+  "passengerVoyages",
+  "ventures",
   "convoys",
+  "escortFees",
   "rivalIntel",
   "byomBuilds",
   "yardFactor",
@@ -85,14 +96,37 @@ export const SWITCH_KEYS = [
   "leverage",
   "mortgages",
   "idleCash",
+  "deposits",
+  "runBank",
   "shipDeals",
   "envelopes",
+  "newsPackets",
+  "components",
+  "rndResearch",
+  "shipShares",
   "autoBreakUp",
   "autoRelocate",
   "smuggling",
 ] as const satisfies readonly KeysOfType<FleetSettings, boolean>[];
 /** Risky switches the user's "off" is a ceiling for: the AI may only turn them off. */
-export const CEILING_SWITCHES = ["leverage", "mortgages", "idleCash", "smuggling", "usePassengers", "autoBreakUp", "autoRelocate"] as const satisfies readonly SwitchKey[];
+export const CEILING_SWITCHES = [
+  "leverage",
+  "mortgages",
+  "idleCash",
+  "deposits",
+  "runBank",
+  "smuggling",
+  "usePassengers",
+  "passengerVoyages",
+  "ventures",
+  "escortFees",
+  "newsPackets",
+  "components",
+  "rndResearch",
+  "shipShares",
+  "autoBreakUp",
+  "autoRelocate",
+] as const satisfies readonly SwitchKey[];
 /** Never the AI's: its mode, caps, model, effort and cadence. */
 export const AI_KEYS = ["ai", "aiDailyCapUsd", "aiTotalCapUsd", "aiModel", "aiEffort", "aiIntervalMin"] as const satisfies readonly (keyof FleetSettings)[];
 
@@ -131,6 +165,15 @@ const RANGES: Record<NumberKey, (v: number) => { min: number; max: number; int: 
   // Ceilings: a smuggling run never buys more, nor spends more, than the user allows (guide 3.18).
   smuggleMaxTons: (v) => ({ min: 1, max: Math.max(1, v), int: true }),
   smuggleMaxPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  // Ceilings: never more on bank deposit, nor out in our bank's lending line, than the user allows (guide 3.13.4, 3.13.8).
+  depositBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  bankLendingBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  // A floor it can only raise: our bank is never chartered on less net worth than the user's.
+  bankMinNetWorthPence: (v) => ({ min: v, max: Math.max(4 * v, v + 10_000_000), int: true }),
+  // Ceilings: never more on components in a day, on one research project, nor in ship shares, than the user allows (guide 3.19, 3.13.6).
+  componentBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  rndBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
+  sharesBudgetPence: (v) => ({ min: 0, max: Math.max(0, v), int: true }),
 };
 
 export function aiRange(k: NumberKey, user: FleetSettings): { min: number; max: number; int: boolean } {

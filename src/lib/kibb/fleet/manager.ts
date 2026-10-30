@@ -38,7 +38,33 @@
  * same way, one taken at a time. Envelopes (runEnvelopes): fresh news at our quays sealed and sold, never bought.
  *
  * Remittances (ensureCash) go by bank draft when a bank undercuts the Crown's fee and has the cash there (guide 3.12: the game
- * chooses; never auto-remit): the fee as charged is booked, and what drafts saved is counted.
+ * chooses; never auto-remit): the fee as charged is booked, and what drafts saved is counted. A region short of cash takes our
+ * bank deposits there back first (free), or elsewhere when the bank's exchange beats the Crown's fee, else into their own region
+ * for the remittance to carry on (pullForRegion).
+ *
+ * Banks (deposits.ts, bank.ts; runDeposits, runBank; guide 3.13.4): cash the fleet doesn't need, beyond a liquid buffer and the
+ * buyer's next hull, goes on demand deposit with healthy banks (insured first, small per bank), pulled back when the fleet needs it
+ * or a bank turns unhealthy (one not open is frozen: owed later); counted in net worth and, at healthy banks, as cash every spend
+ * may use (spendable, spareWithDeposits): parked idle cash never holds the fleet back nor stops a loan, which covers only what
+ * deposits can't. With runBank on (off by default) our own bank is chartered once rich enough, takes no deposits, posts exchange
+ * fees under the Crown's for drafts out of surplus vaults and one conservative lending line (its room fenced from deposits, and
+ * withdrawn first when a spend needs it); it is never wound down by the autopilot.
+ *
+ * Passenger voyages (voyages.ts; paxLanes, guide 3.20): the fares of groups waiting where a ship lies (her own port's, cached) count
+ * in the lanes she could sail from there, and a passage for fares alone may be planned; the offer is still posted at sail time with
+ * one round's wait at most, and one nobody boarded isn't sailed. Commenda ventures (ventures.ts; ventureStart, ventureTurn, guide
+ * 3.13.5): a load its source finds cash-limited with no loan planned may raise outside capital instead, our own cash in as a stake,
+ * judged again at the buy, sailed alone and settled; one at a time, every call saved before it is sent. Escort fees (escort.ts;
+ * escortTerms, escortRequests, guide 3.10): a convoy we form from an armed ship is announced public at our slowest's speed with a fee
+ * per ton, our armed ships its escorts; only joiners no slower than us are admitted.
+ *
+ * Components (rnd.ts; fitComponents, guide 3.19): berthed at a yard on her way, a ship is fitted with a component whose readable strengths
+ * repay twice its licence, materials, labour and 4% fee over the season left (permanent: never on an insured ship), within a day's budget;
+ * research (runRnd, off by default) starts a project only within its budget, makes a disappointing grant public, licenses a good one. News
+ * packets (news.ts; runNews, courierTurn, guide 3.11): when Lloyd's envelope desk pays enough, one packet is built under the buyer's rules,
+ * sealed, and shuttles between hubs selling the news its boards lack; sold down the broker's ladder when its sales don't cover its
+ * upkeep. Ship shares (shares.ts; runShares, guide 3.13.6): only more 64ths of ships we hold, on the earnings our holdings show; ours of a
+ * ship that stopped earning listed. Every spend of theirs is gated as the buyer's (avenueCash: spendable, our line, ensureCash).
  *
  * Stalls: for each stalled expansion posting the fleet makes one call (stallStakes): let it lapse for
  * its richer re-post (no ship delivers into it, beyond what fits under the pace line once re-posts showed
@@ -88,11 +114,17 @@ import {
   type ZoneTraffic,
 } from "../rivals";
 import type {
+  BankResult,
   BreakUpShipResult,
+  ClientTermsResult,
+  ComponentItemView,
+  ConvoyMemberInfo,
+  ConvoyMembershipResult,
   ConvoyResult,
   ConvoyStatus,
   CoveBookResult,
   CreditReport,
+  DepositResult,
   EnvelopeCategory,
   EnvelopeDetail,
   EnvelopeStatus,
@@ -100,17 +132,25 @@ import type {
   InsurancePolicyListing,
   LedgerEntry,
   LendingLine,
+  LendingLineTerms,
   LetterOfMarque,
   Loan,
   LoanRepayment,
   LoanRequestView,
   MarqueQuote,
+  MaterialLine,
   NavalPatrol,
+  OwnPatentView,
   PatrolQuote,
+  ProjectView,
   RelocateHomePortResult,
+  RndStatus,
   SeaZonePiracyResult,
+  ShareHolding,
+  ShareListing,
   ShipListingResult,
   UnderwritingFigures,
+  Venture,
   WantsResult,
 } from "../schema";
 import {
@@ -165,7 +205,210 @@ import {
   REQUEST_OPEN_GAME_H,
   type MortgagePlan,
 } from "./finance";
+import {
+  annualOf,
+  bankCap,
+  bankFrozen,
+  bankRefusal,
+  bankTrouble,
+  depositBuffer,
+  depositRec,
+  depositTarget,
+  DEPOSIT_BUYER_HEADROOM,
+  DEPOSIT_DEFAULT_BUDGET_PENCE,
+  DEPOSIT_FROZEN_RETRY_MS,
+  DEPOSIT_HOLD_MS,
+  DEPOSIT_HYSTERESIS_PENCE,
+  DEPOSIT_INSURED_AGE_GAME_DAYS,
+  DEPOSIT_MIN_PENCE,
+  DEPOSIT_PENDING_MS,
+  DEPOSIT_PULLS_KEPT,
+  DEPOSIT_REC_KEEP_MS,
+  DEPOSIT_SETTLE_GAME_H,
+  exchangeFee,
+  freeBalance,
+  frozenKey,
+  grossFor,
+  isOpen,
+  pullAmount,
+  pullOrder,
+  rankBanks,
+  restoreDeposits,
+  type DepositPull,
+  type DepositRec,
+  type DepositsReport,
+  type DepositStats,
+  type PendingDeposit,
+} from "./deposits";
+import {
+  BANK_CHARTER_FEE_PENCE,
+  BANK_CHECK_MS,
+  BANK_DEFAULT_LENDING_PENCE,
+  BANK_DEFAULT_MIN_WORTH_PENCE,
+  BANK_DEPOSIT_RATE_BPS,
+  BANK_LINE_LOANS_KEPT,
+  BANK_NOTICE_GAME_H,
+  BANK_OWN_FUNDS_PENCE,
+  BANK_PENDING_MS,
+  BANK_RATES_TTL_MS,
+  BANK_REFUSED_RETRY_MS,
+  BANK_RETRY_MS,
+  BANK_TERMS_GAP_GAME_H,
+  charterBlock,
+  draftRegions,
+  draftSchedule,
+  emptyBank,
+  lineChange,
+  lineRegions,
+  lineSize,
+  lineTermDays,
+  lineTerms,
+  medianFeeInto,
+  postedSchedule,
+  restoreBank,
+  scheduleDiff,
+  statusOf,
+  type BankMemory,
+  type BankReport,
+  type OurBankStatus,
+} from "./bank";
+import {
+  addGoods,
+  COMPONENT_DEFAULT_BUDGET_PENCE,
+  COMPONENT_HORIZON_MS,
+  COMPONENT_PENDING_MS,
+  componentGain,
+  DESIGNS_TTL_MS,
+  disappointing,
+  effectsOf,
+  emptyRnd,
+  fitCase,
+  FITS_KEPT,
+  fittingFee,
+  LEARNED_KEPT,
+  LEFTOVER_FLOOR_SHARE,
+  LEFTOVER_GIVE_UP_MS,
+  LICENCE_OFFER_GAME_H,
+  LICENCE_OFFER_UNITS,
+  LICENCE_UNIT_PENCE,
+  MATERIALS_BID_MARKUP,
+  restoreRnd,
+  RND_CHECK_MS,
+  RND_DEFAULT_BUDGET_PENCE,
+  RND_PENDING_MS,
+  rndAbandonCase,
+  rndPick,
+  rndStartCase,
+  slotFree,
+  spentLastDay,
+  trialHullOk,
+  unitPrice,
+  type DesignOption,
+  type FitJob,
+  type FitRec,
+  type GrantRec,
+  type LeftoverRec,
+  type RndMemory,
+  type RndProjectRec,
+  type RndReport,
+  type ShipUse,
+} from "./rnd";
+import {
+  emptyNews,
+  envelopeDesk,
+  freshNews,
+  learnStep,
+  NEWS_CALLS_KEPT,
+  NEWS_CHECK_MS,
+  NEWS_DESK_DAYS,
+  NEWS_LIFE_GAME_H,
+  NEWS_MAX_AGE_GAME_H,
+  NEWS_SALES_KEPT,
+  NEWS_SILENT_GAME_DAYS,
+  NEWS_STALE_GAME_H,
+  NEWS_TRIAL_GAME_DAYS,
+  newsPrice,
+  nextPort,
+  ordinaryCap,
+  PACKET_CLASS,
+  packetCase,
+  packetCooldown,
+  restoreNews,
+  type DeskRead,
+  type NewsMemory,
+  type NewsReport,
+} from "./news";
+import {
+  addSample,
+  buyCase,
+  collapsed,
+  earnRate,
+  emptyShares,
+  paidLately,
+  restoreShares,
+  sellPrice,
+  SHARES_CHECK_MS,
+  SHARES_COLLAPSE_GAME_DAYS,
+  SHARES_DEFAULT_BUDGET_PENCE,
+  SHARES_EVENTS_KEPT,
+  SHARES_MAX_PER_SHIP,
+  SHARES_PENDING_MS,
+  SHARES_SELL_LADDER,
+  SHARES_SELL_STEP_GAME_H,
+  type HoldingRec,
+  type ShareEvent,
+  type ShareMemory,
+  type SharesReport,
+} from "./shares";
 import { judgePolicies, type UnderwriteRow } from "./underwriter";
+import { median, PAX_RECENT_GAME_DAYS, routeKey, speedFactor } from "./passengers";
+import { paxPricing, PAX_VOYAGES_KEPT, restorePaxVoyages, type PaxLanes, type PaxVoyageRec, type PaxVoyagesReport, type PaxVoyageStats } from "./voyages";
+import {
+  buyTime,
+  cargoTons,
+  emptyVentures,
+  learnOutside,
+  learnShare,
+  lockGameMin,
+  ourTake,
+  payoutOf,
+  raiseHours,
+  restoreVentures,
+  sellLimit,
+  stakeOf,
+  tonsInTime,
+  ventureActive,
+  ventureCase,
+  VENTURE_BUYS_PER_GOOD,
+  VENTURE_DOCK_LOCK_GAME_MIN,
+  VENTURE_MIN_GAIN_PENCE,
+  VENTURE_MIN_STAKE_PENCE,
+  VENTURE_PENDING_GAME_MIN,
+  VENTURE_READ_MS,
+  VENTURE_TOPUP_MIN_PENCE,
+  VENTURE_SELL_PATIENCE_GAME_H,
+  VENTURE_SELL_RETRY_GAME_MIN,
+  VENTURE_SKIP_MS,
+  VENTURES_KEPT,
+  viewOf,
+  type VentureMemory,
+  type VenturePart,
+  type VentureRec,
+  type VenturesReport,
+} from "./ventures";
+import {
+  escortFee,
+  escortShare,
+  ESCORT_DECIDED_MS,
+  ESCORT_EVENTS_KEPT,
+  ESCORT_FEE_FLOOR_PENCE_PER_TON,
+  ESCORT_FEE_MAX_PENCE_PER_TON,
+  joinVerdict,
+  restoreEscort,
+  type EscortEvent,
+  type EscortReport,
+  type EscortStats,
+} from "./escort";
 import {
   asRegion,
   breakUpCase,
@@ -237,7 +480,18 @@ import {
   type SeizureModel,
 } from "./smuggle";
 import type { StreamEvent } from "../schema";
-import type { BankingRegion, BuildMode, BuildQuote, CatalogPort, CatalogShipClass, ContractListing, LeaderboardResult, PlaceOrderResult, RoutePlan, ShipResult } from "../types";
+import type { AchRate, BankingRegion, BuildMode, BuildQuote, CatalogPort, CatalogShipClass, ContractListing, LeaderboardResult, PlaceOrderResult, PortOrderBook, RoutePlan, ShipResult } from "../types";
+/** Bank deposits and our own bank for the panel (the dashboard imports them from here, with FleetState). */
+export type { DepositsReport } from "./deposits";
+export type { BankReport, OurBankStatus } from "./bank";
+/** Passenger voyages, commenda ventures and convoy escort fees for the panel (with FleetState). */
+export type { PaxVoyagesReport, PaxVoyageRec } from "./voyages";
+export type { VenturesReport, VentureView } from "./ventures";
+export type { EscortReport, EscortEvent } from "./escort";
+/** Components and research, news packets and ship shares for the panel (with FleetState). */
+export type { RndReport, FitRec, GrantRec } from "./rnd";
+export type { NewsReport } from "./news";
+export type { SharesReport, ShareEvent } from "./shares";
 import { ShipAgent, STORES_BUFFER_DAYS, type AgentSnapshot, type AgentState, type AgentStats, type ConvoyOutcome, type FleetHost, type HoldInfo, type TripRecord } from "./agent";
 import { openJournal, type Journal } from "./journal";
 import { Advisor, AI_MODES, type AdvisorSnapshot, type AiMode, type AiReport } from "../ai/advisor";
@@ -337,10 +591,42 @@ export interface FleetSettings {
    */
   usePassengers: boolean;
   /**
+   * Passenger voyages (guide 3.20; voyages.ts), with usePassengers on (it gates everything about passengers): the planner counts the
+   * fares of groups waiting where a ship lies in the lanes she could sail from there (those bound where her first passage goes, in
+   * the hold the cargo leaves, at the pricer's ask × the odds of winning the round × the share expected to land, the weight's sailing
+   * time added; the cargo must still pay by itself), so a lane carrying them ranks for them; and plans a passage for fares alone
+   * where enough groups wait for one port (at least 500 Cr expected). The offer is posted at sail time as ever, with one round's wait
+   * at most; a passage for fares alone nobody boarded is never sailed empty. Never a smuggler, contraband aboard, an insured ship or
+   * one being retired. Off: the spare hold of voyages sailed anyway only. On by default; the user's "off" is a ceiling.
+   */
+  passengerVoyages: boolean;
+  /**
+   * Commenda ventures (guide 3.13.5; ventures.ts): a load its source finds cash-limited, with no load loan planned for it, may raise
+   * outside capital instead: a venture on the ship to the lane's port (market goods only, nothing of ours aboard, not in a convoy,
+   * not liened or insured, the season normal), the investors' share learned from 40% (lower when outsiders came, higher when none
+   * did), a short raising window (3-6 game hours: the Merchant Adventurers' look plus the buy's lock), our own cash for the load in
+   * as our stake. Opened only when our part of the bigger load's cargo profit, less the hull's risk and the berth dues (ours alone),
+   * beats the cash-limited load and the ship's time by a margin; the buy as late as the deadline and its lock allow, judged again on
+   * what was raised and bounded by the tons whose lock clears before the deadline (too little: cancelled, our stake back, the load
+   * bought as ever). Bought through the venture (money raised after the buy too, while the lock allows), sailed alone to its port
+   * before the deadline, sold through it, settled. One at a time; every call saved before it is sent. Needs resizeLoads. On by
+   * default; the user's "off" is a ceiling the AI can't lift.
+   */
+  ventures: boolean;
+  /**
    * Sail in convoys with our other ships bound the same way soon (pirates board just one ship of a
    * convoy; guns are pooled), when the risk avoided outweighs the wait.
    */
   convoys: boolean;
+  /**
+   * Convoy escort fees (guide 3.10; escort.ts), with convoys on: a convoy we form whose ship mounts guns (and no policy on her that
+   * consorts could void) is announced public, admission by approval (no speed floor given to the game: it may judge laden ships and
+   * refuse our own; refused, a private convoy as before), charging other companies' ships about half what pooling with us saves them
+   * per ton of hold (3 Cr to 1,000 Cr a ton); our armed ships join it as escorts, so the fees (escrowed on joining, paid on arrival)
+   * come to us. Requests are approved only for ships no slower than our slowest (escorts with guns too, a few outsiders at most, none
+   * while a ship of ours in it holds a policy); an insured ship of ours never joins one. On by default; the user's "off" is a ceiling.
+   */
+  escortFees: boolean;
   /**
    * Use rival intel beyond quay sightings (public insurance policies, public convoys, expansion
    * deliveries, the leaderboard) in charter crowding, stall holds and marques. On by default; off
@@ -431,6 +717,33 @@ export interface FleetSettings {
    */
   idleCash: boolean;
   /**
+   * Demand deposits for idle cash (guide 3.13.4; deposits.ts): cash the fleet doesn't need (beyond its loads, our loans and
+   * commissions, a 25,000 Cr buffer or two game days of bills, and the cheapest hull while the buyer may build), once it has had
+   * nothing to fund for 6 game hours, goes on demand deposit where it lies with healthy banks (open, nothing overdue, reserves at the
+   * Crown's 20%, a rate above nothing and not mispriced, never our own), insured first; at most 2,500 Cr a bank (the Crown's insured
+   * cover) unless it is insured with reserves twice the Crown's 20%, never over a tenth of a bank's deposits plus reserves, within
+   * `depositBudgetPence`. A region short of cash takes ours back before anything is remitted; a bank in trouble has ours withdrawn
+   * at once; all come back when the fleet needs the cash, we owe on a dearer loan, or in the season's final hours. Deposits count in
+   * net worth, never as spendable cash. On by default; the user's "off" is a ceiling the AI can't lift.
+   */
+  deposits: boolean;
+  /** Most kept on deposit at once, every bank together (pence). */
+  depositBudgetPence: number;
+  /**
+   * Run our own bank (guide 3.13.4, 3.13.8, 3.12; bank.ts), a conservative first version. OFF by default: the charter costs a
+   * 10,000 Cr fee to the Crown (never refunded) and needs 50,000 Cr of our own funds. Chartered only when net worth is at least
+   * `bankMinNetWorthPence` and the fee, the funds and a buffer are spare beyond the fleet's needs, the season normal; deposit rates
+   * 0 / 0, uninsured (no depositors' money taken on purpose). It posts exchange fees a margin under the Crown's into regions where
+   * our vault keeps a clear surplus (drafts: fee income) and one lending line (ship liens, balloon, 70% of the Goldsmiths' rate, 50%
+   * loan-to-value, clean borrowers, 5,000 Cr each, `bankLendingBudgetPence` in all), both withdrawn when the fleet needs the cash. Never
+   * wound down by the autopilot. The user's "off" is a ceiling the AI can't lift.
+   */
+  runBank: boolean;
+  /** Least net worth before our bank is chartered (pence). */
+  bankMinNetWorthPence: number;
+  /** Most our bank's lending lines have out at once: loans' principal, open quotes and the room left (pence). */
+  bankLendingBudgetPence: number;
+  /**
    * Ship deals (guide 3.4): the buyer also weighs ships for sale at ports where we have quay presence, and buys one priced
    * under building its class (through every check a build passes); and at yards where we have presence the autopilot
    * builds commissions to order when the price beats our cheapest build by a clear margin after the collateral's risk,
@@ -444,6 +757,52 @@ export interface FleetSettings {
    * stale ones withdrawn unsold; sales booked. Never buys any. On by default.
    */
   envelopes: boolean;
+  /**
+   * News packets (guide 3.11, 3.16; news.ts): when Lloyd's news desk has been buying enough envelopes that one packet's share (a quarter
+   * of what the house spends a game day, never more than an envelope a call at its average price, half of them sold) beats her upkeep
+   * and pays her hull back within maxPaybackHours, ONE packet is built under the buyer's rules (autoBuy, maxShips, the season, cash after
+   * loads), or a packet of ours afloat is taken. She seals her dispatches and shuttles between the hubs nearest her; at each she posts one
+   * envelope of the other ports' reports she carries that are newer than the board there, priced at the desk's average per envelope
+   * times a step learned from her sales, withdrawn unsold after 6 game hours. After 3 game days, if what she sold doesn't cover her
+   * upkeep, she is given up and sold down the ship broker's ladder. Ordinary envelopes are capped at what envelopes sell for. On by
+   * default; the user's "off" is a ceiling the AI can't lift.
+   */
+  newsPackets: boolean;
+  /**
+   * Components (guide 3.19; rnd.ts): at a yard call, berthed (never a detour), a component that pays is fitted: one we made lying there,
+   * one of our licences, our own patents or public designs whose make materials we know, or a licence unit bought from an offer (per
+   * unit, or a one-unit lot), its materials bought into our warehouse there. Effect words are read conservatively (unreadable, or any
+   * weakness: never fitted; sizes are small priors by grade, or what our fits measured); the gain to her own recent net a real hour over
+   * the season left (two weeks at most) must be twice the licence, materials, labour and the 4% fitting fee. Fitting is permanent: never
+   * on an insured ship, a smuggler, one being retired or under a venture. Within `componentBudgetPence` in any 24 real hours. On by
+   * default; the user's "off" is a ceiling the AI can't lift.
+   */
+  components: boolean;
+  /** Most spent on components (licences, materials, labour, fitting fees) in any 24 real hours (pence). */
+  componentBudgetPence: number;
+  /**
+   * Research (guide 3.19; rnd.ts). OFF by default: a project draws a random design and costs a start fee never refunded plus upkeep
+   * every game day for two to three real days. Started only when the game allows one, its whole expected cost fits `rndBudgetPence`
+   * and the season leaves time to use the grant; the slot by priority (hold, sails, hull) at the highest grade open; the trial ship the
+   * one of ours sailing the right water most; the prototype's materials bought into a yard warehouse of ours; given up when its cost
+   * would pass the budget by a quarter, its upkeep goes unpaid, or the season would end first. A grant worth having is fitted and
+   * licensed out per unit; a disappointing one is made public at once (its upkeep stops). The user's "off" is a ceiling the AI can't lift.
+   */
+  rndResearch: boolean;
+  /** Most one research project may cost: its start fee, its upkeep and its prototype materials (pence). */
+  rndBudgetPence: number;
+  /**
+   * Ship shares (guide 3.13.6; shares.ts): nothing public shows a ship's earnings, so only ships we already hold 64ths of (a holding
+   * bought by hand is where it starts) are bought more of, when what a 64th of her paid us in dividends, as our holdings show it over
+   * ten game days or more (the first payment seen left out), less 15% for her loss, pays the listing back within 20 game days (and half
+   * the season left); never our own ships, at most 8 64ths of one ship, `sharesBudgetPence` in all. Dividends are tracked per holding;
+   * 64ths the autopilot bought of a ship that paid us no dividend for 10 game days are listed for sale (down a short ladder of a 64th
+   * of her rebuild value). On by default; the
+   * user's "off" is a ceiling the AI can't lift.
+   */
+  shipShares: boolean;
+  /** Most the autopilot has paid for the 64ths it holds at once (pence). */
+  sharesBudgetPence: number;
   /**
    * Break up dead weight (guide 3.4: the yard pays 35% of her rebuild value, from its region's Crown). A ship that, for 2 game days
    * and 3 checks running, lay idle earning less than her share of the upkeep with no lane from where she lies beating it (or an
@@ -502,7 +861,10 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   underwriteMinEdgeBps: 150,
   useFreight: true,
   usePassengers: true,
+  passengerVoyages: true,
+  ventures: true,
   convoys: true,
+  escortFees: true,
   rivalIntel: true,
   byomBuilds: true,
   yardFactor: true,
@@ -517,8 +879,20 @@ export const DEFAULT_FLEET_SETTINGS: FleetSettings = {
   maxDebtPct: 25,
   minLoanReturnX: 2,
   idleCash: true,
+  deposits: true,
+  depositBudgetPence: DEPOSIT_DEFAULT_BUDGET_PENCE,
+  runBank: false,
+  bankMinNetWorthPence: BANK_DEFAULT_MIN_WORTH_PENCE,
+  bankLendingBudgetPence: BANK_DEFAULT_LENDING_PENCE,
   shipDeals: true,
   envelopes: true,
+  newsPackets: true,
+  components: true,
+  componentBudgetPence: COMPONENT_DEFAULT_BUDGET_PENCE,
+  rndResearch: false,
+  rndBudgetPence: RND_DEFAULT_BUDGET_PENCE,
+  shipShares: true,
+  sharesBudgetPence: SHARES_DEFAULT_BUDGET_PENCE,
   autoBreakUp: true,
   autoRelocate: true,
   smuggling: false,
@@ -560,7 +934,10 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   bool("autoBuy");
   bool("useFreight");
   bool("usePassengers");
+  bool("passengerVoyages");
+  bool("ventures");
   bool("convoys");
+  bool("escortFees");
   bool("rivalIntel");
   bool("byomBuilds");
   bool("marques");
@@ -585,8 +962,20 @@ export function sanitizeSettings(patch: Partial<FleetSettings>): Partial<FleetSe
   num("minLoanReturnX", 1);
   if (out.minLoanReturnX !== undefined && out.minLoanReturnX > 20) throw new FleetSettingsError("minLoanReturnX must be 1 to 20");
   bool("idleCash");
+  bool("deposits");
+  num("depositBudgetPence", 0, true);
+  bool("runBank");
+  num("bankMinNetWorthPence", 0, true);
+  num("bankLendingBudgetPence", 0, true);
   bool("shipDeals");
   bool("envelopes");
+  bool("newsPackets");
+  bool("components");
+  num("componentBudgetPence", 0, true);
+  bool("rndResearch");
+  num("rndBudgetPence", 0, true);
+  bool("shipShares");
+  num("sharesBudgetPence", 0, true);
   bool("autoBreakUp");
   bool("autoRelocate");
   bool("smuggling");
@@ -675,6 +1064,22 @@ export interface FleetState {
   passengers?: PassengerReport | null;
   /** Fleet housekeeping: dead weight judged, listed or broken up, the home port's case, the Crowns topped up (absent from older managers). */
   housekeeping?: HousekeepingReport | null;
+  /** Idle cash on demand deposit with other banks: ours by bank, the banks weighed, what was pulled back (absent from older managers). */
+  deposits?: DepositsReport | null;
+  /** Our own bank: charter status or case, exchange fees posted, drafts and fees, lending lines and their loans (absent from older managers). */
+  bank?: BankReport | null;
+  /** Passenger voyages: lanes chosen with waiting passengers' fares counted, passages for fares alone, what became of them (absent from older managers). */
+  passengerVoyages?: PaxVoyagesReport | null;
+  /** Commenda ventures: the one under way, the last ones, the investors' share offered, capital raised from outside, profit (absent from older managers). */
+  ventures?: VenturesReport | null;
+  /** Convoy escort fees: our convoys offered to others, requests approved and rejected, fees our escorts were paid (absent from older managers). */
+  escort?: EscortReport | null;
+  /** Components fitted and research: the fit under way and the last fits, designs we could make, our project, patents and grants (absent from older managers). */
+  rnd?: RndReport | null;
+  /** News packets: Lloyd's envelope desk as read, the case for a packet, our courier and her envelopes (absent from older managers). */
+  news?: NewsReport | null;
+  /** Ship shares: our 64ths of other players' ships, their dividends and yield, listings weighed and ours for sale (absent from older managers). */
+  shares?: SharesReport | null;
   /** The expansion tier as the autopilot sees it: pace, whether the buyer is keeping cash back, stalled charters. */
   expansion: ExpansionReport | null;
   /** Charge on cash a load ties up (per pence per real hour; 0 while cash isn't scarce). */
@@ -745,7 +1150,7 @@ export interface HousekeepingReport {
       ship: string;
       cls: string;
       port: string | null;
-      reason: "idle" | "obsolete";
+      reason: "idle" | "obsolete" | "news";
       why: string;
       since: string;
       checks: number;
@@ -767,7 +1172,8 @@ export interface HousekeepingReport {
       shipId: string;
       ship: string;
       stage: string;
-      reason: "idle" | "obsolete";
+      /** `news`: a news packet given up (news.ts), sold the same way. */
+      reason: "idle" | "obsolete" | "news";
       why: string;
       yard: string;
       rebuildPence: number;
@@ -1207,6 +1613,37 @@ interface FleetSnapshot {
     /** Ships we disposed of as dead weight (listed or sold by the retiring): never bought back. */
     disposed?: string[];
   };
+  /**
+   * Bank deposits the autopilot made (deposits.ts; the only ones it touches), deposit calls with no answer (still never sent again),
+   * our withdrawals, interest on records no longer kept and the totals; absent in older saves.
+   */
+  deposits?: {
+    recs?: Array<[string, DepositRec]>;
+    pending?: PendingDeposit[];
+    pulls?: DepositPull[];
+    interestBefore?: number;
+    stats?: Partial<DepositStats>;
+  };
+  /** Our own bank (bank.ts): a charter or line call with no answer, our lines and their loans, our last changes, drafts noted; absent in older saves. */
+  bank?: Partial<BankMemory>;
+  /** Passenger voyages (voyages.ts): the counters and the last voyages chosen with fares; absent in older saves. */
+  voyages?: { stats?: Partial<PaxVoyageStats>; recent?: PaxVoyageRec[] };
+  /**
+   * Commenda ventures (ventures.ts): the investors' share and outside capital learned, our ventures (one under way with a call that
+   * had no answer is still reconciled, never sent again), the totals; absent in older saves.
+   */
+  ventures?: Partial<VentureMemory>;
+  /** Convoy escort fees (escort.ts): the counters and the last events; absent in older saves. */
+  escort?: { stats?: Partial<EscortStats>; recent?: EscortEvent[] };
+  /**
+   * Components and research (rnd.ts): a fit under way (a call with no answer still reconciled, never sent again), our fits, spends, what
+   * was learned, our project (a start with no answer still reconciled), grants and licence offers; absent in older saves.
+   */
+  rnd?: Partial<RndMemory>;
+  /** News packets (news.ts): our courier, her calls and sales, the price step learned; absent in older saves. */
+  news?: Partial<NewsMemory>;
+  /** Ship shares (shares.ts): our holdings (samples, dividends, our listings), a buy or listing with no answer, the totals; absent in older saves. */
+  shares?: Partial<ShareMemory>;
 }
 
 /** What retiring ships brought in (pence) since the records began. */
@@ -1279,10 +1716,13 @@ function isAdmiralty(c: ContractListing): boolean {
   return c.admiralty === true || c.metadata?.admiralty === true || (c.contract_type === "commission" && !c.issuer_company_id);
 }
 
-/** An envelope we sealed (server ms): `news` (port reports, sailings) or `charters` (non-public charters of goods we don't work). */
+/**
+ * An envelope we sealed (server ms): `news` (port reports, sailings), `charters` (non-public charters of goods we don't work) or `packet`
+ * (our news packet's reports of the other ports she called at, for Lloyd's desk: news.ts).
+ */
 interface EnvelopeRec {
   port: string;
-  kind: "news" | "charters";
+  kind: "news" | "charters" | "packet";
   price: number;
   at: number;
   expiresAt: number | null;
@@ -1296,7 +1736,7 @@ interface EnvelopeRec {
 /** An envelope post with no answer (server ms): found in envelope/mine, or not posted once PENDING_DEAL_MS is up; never posted again meanwhile. */
 interface PendingEnvelope {
   port: string;
-  kind: "news" | "charters";
+  kind: "news" | "charters" | "packet";
   price: number;
   at: number;
 }
@@ -1704,12 +2144,14 @@ const TIER_SAFETY = 1.25;
 
 const cr = (pence: number) => `${Math.round(pence / 100).toLocaleString("en-GB")} Cr`;
 
-/** "40 t cannons + 20 t timber to sell + 15 t freight": a lane's load, main good first. */
+/** "40 t cannons + 20 t timber to sell + 15 t freight + ~12 passengers": a lane's load, main good first. */
 function loadText(l: Lane): string {
   return [
     ...l.parts.map((p) => `${p.tons} t ${p.good}${p.kind === "market" ? " to sell" : ""}`),
     ...(l.freight.length ? [`${l.freight.reduce((n, f) => n + f.tons, 0)} t freight`] : []),
-  ].join(" + ");
+    // Passengers waiting where she lay (voyages.ts): for her first passage's port (the source, sailing there empty first).
+    ...(l.pax ? [`~${l.pax.heads} passengers${l.pax.dest !== l.dest ? ` to ${l.pax.dest}` : ""} (~${cr(l.pax.value)} in fares)`] : []),
+  ].join(" + ") || (l.kind === "passengers" ? "passengers" : "nothing");
 }
 
 /** A voyage_hazard event read as a storm (a convoy rescue is one that would have sunk the ship), or null. Shape not published. */
@@ -1774,7 +2216,23 @@ export class FleetManager implements FleetHost {
   /** Convoys we know of (ours forming, mostly), refreshed at most every 20 s each; `memberClasses`: joined members'. */
   private readonly convoyCache = new Map<
     string,
-    { from: string; dest: string; departsAt: number; status: ConvoyStatus; organizer: string; members: string[]; memberClasses: string[]; checkedAt: number }
+    {
+      from: string;
+      dest: string;
+      departsAt: number;
+      status: ConvoyStatus;
+      organizer: string;
+      members: string[];
+      memberClasses: string[];
+      checkedAt: number;
+      /** Escort fees (escort.ts; absent on entries without): the fee per ton, the speed floor, join requests pending (organizer only), other companies' ships in and their fees escrowed. */
+      fee?: number;
+      minSpeedCk?: number | null;
+      pending?: ConvoyMemberInfo[];
+      outsiders?: number;
+      escrow?: number;
+      ours?: number;
+    }
   >();
   private convoyQueue: Promise<unknown> = Promise.resolve();
   /** One-off log lines already written (logOnceFor), so a waiting ship doesn't repeat them. */
@@ -2059,6 +2517,115 @@ export class FleetManager implements FleetHost {
   /** The Exchequer's top-ups seen on the feed (newest last). Saved. */
   private crownTopUps: CrownTopUp[] = [];
 
+  // Bank deposits (deposits.ts; runDeposits, pullForRegion) and our own bank (bank.ts; runBank), guide 3.13.4.
+  /** Deposits the autopilot made (by id; the only ones it touches), deposit calls with no answer, our withdrawals, the totals. Saved. */
+  private readonly depositRecs = new Map<string, DepositRec>();
+  private pendingDeposits: PendingDeposit[] = [];
+  private depositPulls: DepositPull[] = [];
+  private depositInterestBefore = 0;
+  private depositStats: DepositStats = { deposited: 0, deposits: 0, pulled: 0, pulls: 0 };
+  /** Every open deposit of ours as depositor as last read (the user's too; local ms), and the banks as last listed (local ms). */
+  private depositsSeen: { at: number; list: DepositResult[] } | null = null;
+  private banksSeen: { at: number; banks: BankResult[] } | null = null;
+  /** Deposits whose withdrawal had no answer (or was refused): left alone until then (local ms), our deposits read again first. */
+  private readonly depositHold = new Map<string, number>();
+  /**
+   * Deposits of ours at a bank that isn't open (frozen: bankFrozen): the bank's state when a withdrawal was last asked of it (frozenKey)
+   * and when (local ms). Asked again only when that state changes, or after DEPOSIT_FROZEN_RETRY_MS.
+   */
+  private readonly frozenAsked = new Map<string, { key: string; at: number }>();
+  /** The cash a spend was refused for lately (local ms; the buyer, a listing, a commission): kept out of new deposits a while (depositRoom). */
+  private spendShort: { pence: number; at: number } | null = null;
+  /** Since when (local ms) spare cash has had nothing to fund (0: needed lately): deposits wait DEPOSIT_SETTLE_GAME_H of it. */
+  private depositIdleSince = 0;
+  /** No new deposit before then (local ms): one refused lately; banks that refused one are passed over until then. */
+  private depositRetryAt = 0;
+  private readonly bankSkip = new Map<string, number>();
+  private depositsDirty = false;
+  private depositAt: string | null = null;
+  private depositTargetNow = 0;
+  private depositBlocked: string | null = "not checked yet";
+  private depositAction = "not checked yet";
+  /** Our bank (saved), as last read (local ms; null: we are no bank), the Crown's fees for drafts (local ms), our bank's lines as last read. */
+  private bankMem: BankMemory = emptyBank();
+  private ownBank: { at: number; bank: BankResult | null } | null = null;
+  private crownRates: { at: number; rates: AchRate[] } | null = null;
+  private ownLines: { at: number; lines: LendingLine[] } | null = null;
+  /** Depositors' money our bank holds, per region: kept in that region's floor (floorIn), never spent. */
+  private bankOwed = new Map<BankingRegion, number>();
+  private bankDirty = false;
+  private lastBankCheck = 0;
+  private bankAt: string | null = null;
+  private bankVerdict = "not checked yet";
+  private bankAction = "not checked yet";
+  private bankWarnings: string[] = [];
+  /** Warnings about our bank already logged (by kind): logged again only after they cleared. */
+  private readonly bankWarned = new Set<string>();
+  /** No lending line posted before then (local ms): a post was refused lately. */
+  private bankLineRetryAt = 0;
+
+  // Passenger voyages (voyages.ts), commenda ventures (ventures.ts) and convoy escort fees (escort.ts): guide 3.20, 3.13.5, 3.10.
+  /** Lanes chosen with waiting passengers' fares counted (saved), and the counters. */
+  private paxVoyageStats: PaxVoyageStats = { chosen: 0, only: 0, sailed: 0, givenUp: 0, expected: 0 };
+  private paxVoyageRecent: PaxVoyageRec[] = [];
+  /** Our ventures, the investors' share and outside capital learned, the totals (saved). */
+  private ventureMem: VentureMemory = emptyVentures();
+  /** A load its source found cash-limited with no loan planned (resizeLaneNow), by ship: what ventureStart weighs (local ms). */
+  private readonly ventureCands = new Map<string, { key: string; room: number; small: number; at: number }>();
+  /** Ships no venture is tried on until then (local ms): an open refused lately. */
+  private readonly ventureSkip = new Map<string, number>();
+  /** The ship a venture is being weighed or opened for (ventureStart holds the one-at-a-time slot from before its first await). */
+  private ventureStarting: string | null = null;
+  /** Our ventures as last read (venture/list without a port: ours and those we hold a stake in; local ms). */
+  private venturesSeen: { at: number; list: Venture[] } | null = null;
+  /** Escort fees: the counters and the last events (saved); pending join requests decided (by `convoy|ship`, local ms) and convoys being decided on. */
+  private escortStats: EscortStats = { offered: 0, approved: 0, escortsApproved: 0, rejected: 0, settlements: 0, feesPence: 0 };
+  private escortRecent: EscortEvent[] = [];
+  private readonly escortDecided = new Map<string, number>();
+  private readonly escortBusy = new Set<string>();
+  /** Our convoys that charge escort fees (by id): their fee and floor, for the report and the approvals. */
+  private readonly escortConvoys = new Map<string, { from: string; dest: string; fee: number; minSpeedCk: number; departsAt: number }>();
+
+  // Components and research (rnd.ts), news packets (news.ts), ship shares (shares.ts): guide 3.19, 3.11, 3.13.6.
+  /** Our fits (one under way), spends, what our fits measured, our research project, grants and licence offers (saved). */
+  private rndMem: RndMemory = emptyRnd();
+  /** Designs we could make as last read (local ms), with what making each takes, our patents and our components lying at yards. */
+  private designsSeen: { at: number; options: DesignOption[]; items: ComponentItemView[]; patents: OwnPatentView[] } | null = null;
+  /** Our R&D standing as last read (local ms). */
+  private rndSeen: { at: number; status: RndStatus } | null = null;
+  private componentsAction = "not checked yet";
+  private componentsBlocked: string | null = "not checked yet";
+  private rndAction = "not checked yet";
+  private rndBlocked: string | null = "not checked yet";
+  private rndAt: string | null = null;
+  private rndBusy = false;
+  private fitBusy = false;
+  private lastRndCheck = 0;
+  /** No research start tried before then (local ms): one refused lately. */
+  private rndRetryAt = 0;
+  /** Our courier, her calls, sales and the price step (saved); the desk as last read; the case last weighed. */
+  private newsMem: NewsMemory = emptyNews();
+  private deskSeen: DeskRead | null = null;
+  private newsCase: NewsReport["case"] = null;
+  private newsAction = "not checked yet";
+  private newsBlocked: string | null = "not checked yet";
+  private newsAt: string | null = null;
+  private newsBusy = false;
+  private lastNewsCheck = 0;
+  /** Where the courier was last sent (the panel). */
+  private courierDest: string | null = null;
+  /** Ship shares: our holdings and calls with no answer (saved), the listings last weighed. */
+  private shareMem: ShareMemory = emptyShares();
+  private shareCands: SharesReport["candidates"] = [];
+  private sharesAction = "not checked yet";
+  private sharesBlocked: string | null = "not checked yet";
+  private sharesAt: string | null = null;
+  private sharesBusy = false;
+  private sharesDirty = false;
+  private lastSharesCheck = 0;
+  /** Ship classes the Exchange's share entries named (ship id → class; local ms read). */
+  private shareClasses: { at: number; byShip: Map<string, string> } | null = null;
+
   constructor(
     cfg: FleetConfig,
     opts: { onLog?: (line: FleetLogLine) => void; carryOver?: Pick<FleetState, "log" | "purchases">; onSmugglingHalted?: () => void } = {},
@@ -2140,6 +2707,14 @@ export class FleetManager implements FleetHost {
       smuggling: this.smuggleReport(),
       passengers: this.passengerReport(totals.passengerPence),
       housekeeping: this.housekeepingReport(),
+      deposits: this.depositsReport(),
+      bank: this.bankReport(),
+      passengerVoyages: this.paxVoyagesReport(),
+      ventures: this.venturesReport(),
+      escort: this.escortReport(),
+      rnd: this.rndReport(),
+      news: this.newsReport(),
+      shares: this.sharesReport(),
       ai: this.advisor.report(),
       expansion: this.expansionReport(),
       capitalRate: this.capitalRate(),
@@ -2225,7 +2800,7 @@ export class FleetManager implements FleetHost {
       targetPhase: w.tierTargetPhase,
       progressBps: w.tierProgressBps,
       etaMs: w.tierEtaMs,
-      phaseSoon: this.phaseSoon() && this.settings.autoBuy && this.settings.phaseChestPct > 0 && this.agents.size < this.settings.maxShips,
+      phaseSoon: this.phaseSoon() && this.settings.autoBuy && this.settings.phaseChestPct > 0 && this.shipsAfloat() < this.settings.maxShips,
       escalation: { ...w.escalation },
       charters: [...w.expansionWatch.values()].sort((a, b) => Number(b.stalled) - Number(a.stalled) || b.rate - a.rate),
       stakes,
@@ -2678,6 +3253,9 @@ export class FleetManager implements FleetHost {
     if (a.loaded) return "a loaded lane";
     if (this.advisor.shipOrder(a.shipId)) return "an AI order is in force for her";
     if (this.retiring.has(a.shipId)) return "she is being sold or broken up";
+    if (this.ventureOn(a.shipId)) return "a venture of ours is under way on her";
+    // The fleet's news packet (news.ts): her dispatches and her passages are the courier's.
+    if (this.courierOn(a.shipId)) return "she carries news for the fleet (the news packet)";
     const pledges = await this.shipPledges(60_000);
     if (!pledges) return "our loans couldn't be read";
     if (pledges.liened.has(a.shipId)) return "she is pledged to a loan";
@@ -4051,6 +4629,103 @@ export class FleetManager implements FleetHost {
       smuggling: this.digestSmuggling(now),
       passengers: this.digestPassengers(now),
       housekeeping: this.digestHousekeeping(now),
+      banking: this.digestBanking(),
+      avenues: this.digestAvenues(),
+      assets: this.digestAssets(),
+    };
+  }
+
+  /** Components, research, the news packet and ship shares for the digest (pence; no ship, company or design holder named). */
+  private digestAssets(): DigestInput["assets"] {
+    const u = this.ownSettings;
+    const rd = this.rndReport();
+    const nw = this.newsReport();
+    const sh = this.sharesReport();
+    const cp = rd.components;
+    const rs = rd.research;
+    return {
+      components: {
+        on: cp.enabled,
+        user: u.components,
+        blocked: cp.blocked,
+        budget: cp.budgetPence,
+        spent24h: cp.spent24hPence,
+        fitted: cp.stats.fitted,
+        spent: cp.stats.spentPence,
+        job: cp.job ? `${cp.job.name} (${cp.job.slot}) at ${cp.job.port}: ${cp.job.stage}` : null,
+        designs: cp.designs.length,
+      },
+      research: {
+        on: rs.enabled,
+        user: u.rndResearch,
+        blocked: rs.blocked,
+        budget: rs.budgetPence,
+        project: rs.project ? `${rs.project.slot} grade ${rs.project.grade}: ${rs.project.stageName} (${rs.project.points}/${rs.project.required}), ${Math.round(rs.project.spentPence / 100)} Cr spent` : null,
+        patents: rs.patents.filter((p) => p.status === "held").length,
+        started: rs.stats.started,
+        granted: rs.stats.granted,
+        abandoned: rs.stats.abandoned,
+        licenceIncome: rs.stats.licenceIncomePence,
+      },
+      news: {
+        on: nw.enabled,
+        user: u.newsPackets,
+        blocked: nw.blocked,
+        deskPerDay: nw.desk?.perDayPence ?? null,
+        deskAvg: nw.desk?.avgPence ?? null,
+        verdict: nw.case?.why ?? null,
+        courier: !!nw.courier,
+        givenUp: !!nw.givenUp,
+        sold: nw.stats.sold,
+        income: nw.stats.incomePence,
+      },
+      shares: {
+        on: sh.enabled,
+        user: u.shipShares,
+        blocked: sh.blocked,
+        budget: sh.budgetPence,
+        invested: sh.investedPence,
+        held: sh.holdings.filter((h) => !h.sunk && h.sixtyFourths > 0).length,
+        dividends: sh.stats.dividendsPence,
+        bought: sh.stats.bought,
+        sold: sh.stats.sold,
+      },
+    };
+  }
+
+  /** Passenger voyages, ventures and escort fees for the digest (pence; no ship or company named). */
+  private digestAvenues(): DigestInput["avenues"] {
+    const pv = this.paxVoyagesReport();
+    const vn = this.venturesReport();
+    const es = this.escortReport();
+    return {
+      voyages: { on: pv.enabled, user: this.ownSettings.passengerVoyages, blocked: pv.blocked, chosen: pv.chosen, only: pv.only, sailed: pv.sailed, givenUp: pv.givenUp, expected: pv.expectedPence },
+      ventures: {
+        on: vn.enabled,
+        user: this.ownSettings.ventures,
+        blocked: vn.blocked,
+        shareBps: vn.shareBps,
+        outsideRatio: vn.outsideRatio,
+        active: vn.active ? { stage: vn.active.stage, capital: vn.active.capitalPence, outside: vn.active.outsidePence, route: `${vn.active.origin}>${vn.active.dest}` } : null,
+        opened: vn.stats.opened,
+        settled: vn.stats.settled,
+        cancelled: vn.stats.cancelled,
+        lost: vn.stats.lost,
+        outside: vn.stats.outsidePence,
+        paid: vn.stats.merchantPence + vn.stats.payoutPence,
+        profit: vn.profitPence,
+      },
+      escort: {
+        on: es.enabled,
+        user: this.ownSettings.escortFees,
+        blocked: es.blocked,
+        offered: es.stats.offered,
+        approved: es.stats.approved,
+        rejected: es.stats.rejected,
+        settlements: es.stats.settlements,
+        fees: es.stats.feesPence,
+        open: es.open.map((o) => ({ route: `${o.from}>${o.dest}`, feePerTon: o.feePerTonPence, outsiders: o.outsiders, escrow: o.escrowPence })),
+      },
     };
   }
 
@@ -4310,6 +4985,89 @@ export class FleetManager implements FleetHost {
               disposed: this.disposedIds.size ? [...this.disposedIds] : undefined,
             }
           : undefined,
+      deposits:
+        this.depositRecs.size || this.pendingDeposits.length || this.depositPulls.length || this.depositInterestBefore || this.depositStats.deposits
+          ? {
+              recs: [...this.depositRecs].map(([id, r]) => [id, { ...r }]),
+              pending: this.pendingDeposits.map((p) => ({ ...p })),
+              pulls: this.depositPulls,
+              interestBefore: this.depositInterestBefore,
+              stats: { ...this.depositStats },
+            }
+          : undefined,
+      bank: (() => {
+        const b = this.bankMem;
+        const any = b.pendingCharter !== null || b.charteredAt !== null || b.retryAt > Date.now() || b.lineIds.length || b.pendingLine || b.lineLoans.length || b.feesAt !== null || b.lineAt !== null || b.drafts || b.offWarned;
+        return any ? { ...b, lineIds: [...b.lineIds], lineLoans: [...b.lineLoans], pendingLine: b.pendingLine ? { ...b.pendingLine } : null } : undefined;
+      })(),
+      voyages: this.paxVoyageStats.chosen || this.paxVoyageRecent.length ? { stats: { ...this.paxVoyageStats }, recent: this.paxVoyageRecent.map((r) => ({ ...r })) } : undefined,
+      ventures: (() => {
+        const v = this.ventureMem;
+        const any = v.recs.length || v.stats.opened || v.shareBps !== emptyVentures().shareBps || v.outsideRatio !== emptyVentures().outsideRatio;
+        return any
+          ? {
+              shareBps: v.shareBps,
+              outsideRatio: v.outsideRatio,
+              stats: { ...v.stats },
+              recs: v.recs.map((r) => ({ ...r, bought: { ...r.bought }, parts: r.parts.map((p) => ({ ...p })), pending: r.pending ? { ...r.pending } : null })),
+            }
+          : undefined;
+      })(),
+      escort: this.escortStats.offered || this.escortRecent.length ? { stats: { ...this.escortStats }, recent: this.escortRecent.map((e) => ({ ...e })) } : undefined,
+      rnd: (() => {
+        const r = this.rndMem;
+        const any =
+          r.job || r.fits.length || r.spends.length || r.learned.length || r.project || r.grants.length || r.offerIds.length || r.stats.fitted || r.rndStats.started || r.leftovers?.length;
+        const pairs = (xs: Array<[string, number]> | undefined) => xs?.map(([g, q]) => [g, q] as [string, number]);
+        return any
+          ? {
+              ...r,
+              job: r.job ? { ...r.job, ...(r.job.bought ? { bought: pairs(r.job.bought) } : {}) } : null,
+              fits: r.fits.map((f) => ({ ...f })),
+              spends: r.spends.map(([t, p]) => [t, p] as [number, number]),
+              learned: r.learned.map(([k, v]) => [k, v] as [string, number]),
+              stats: { ...r.stats },
+              project: r.project
+                ? {
+                    ...r.project,
+                    pending: r.project.pending ? { ...r.project.pending } : null,
+                    ...(r.project.protoNeed ? { protoNeed: pairs(r.project.protoNeed) } : {}),
+                    ...(r.project.protoBought ? { protoBought: pairs(r.project.protoBought) } : {}),
+                  }
+                : null,
+              grants: r.grants.map((g) => ({ ...g })),
+              offerIds: [...r.offerIds],
+              rndStats: { ...r.rndStats },
+              ...(r.leftovers?.length ? { leftovers: r.leftovers.map((l) => ({ ...l, goods: pairs(l.goods)! })) } : {}),
+            }
+          : undefined;
+      })(),
+      news: (() => {
+        const n = this.newsMem;
+        const any = n.packetId || n.calls.length || n.sales.length || n.stats.posted || n.stats.built || n.givenUp || n.failed || n.step !== emptyNews().step;
+        return any
+          ? {
+              ...n,
+              calls: n.calls.map((c) => ({ ...c })),
+              sales: n.sales.map(([t, p]) => [t, p] as [number, number]),
+              stats: { ...n.stats },
+              givenUp: n.givenUp ? { ...n.givenUp } : null,
+              ...(n.failed ? { failed: { ...n.failed } } : {}),
+            }
+          : undefined;
+      })(),
+      shares: (() => {
+        const h = this.shareMem;
+        const any = h.holdings.length || h.pending || h.stats.bought || h.stats.dividendsPence || h.recent.length;
+        return any
+          ? {
+              holdings: h.holdings.map((x) => ({ ...x, samples: x.samples.map(([t, p]) => [t, p] as [number, number]), listing: x.listing ? { ...x.listing } : null })),
+              pending: h.pending ? { ...h.pending } : null,
+              stats: { ...h.stats },
+              recent: h.recent.map((e) => ({ ...e })),
+            }
+          : undefined;
+      })(),
     };
   }
 
@@ -4426,6 +5184,29 @@ export class FleetManager implements FleetHost {
         if (typeof v === "number" && Number.isFinite(v)) this.retireStats[k] = v;
       }
     }
+    // Bank deposits: ours as last seen (the next read corrects them), a deposit call with no answer still looked for, never sent again.
+    const dp = restoreDeposits(s.deposits);
+    for (const [id, r] of dp.recs) this.depositRecs.set(id, r);
+    this.pendingDeposits = dp.pending;
+    this.depositPulls = dp.pulls;
+    this.depositInterestBefore = dp.interestBefore;
+    this.depositStats = dp.stats;
+    // Our bank: a charter or line call with no answer is still reconciled (never sent again), our lines and loans as saved.
+    this.bankMem = restoreBank(s.bank);
+    // Passenger voyages and escort fees: their records. Ventures: one under way carries on from where it stood (a call with no answer
+    // is still reconciled from venture/list, never sent again); what was learned.
+    const pv = restorePaxVoyages(s.voyages);
+    this.paxVoyageStats = pv.stats;
+    this.paxVoyageRecent = pv.recent;
+    this.ventureMem = restoreVentures(s.ventures);
+    const es = restoreEscort(s.escort);
+    this.escortStats = es.stats;
+    this.escortRecent = es.recent;
+    // Components and research: a fit or a start whose call had no answer is still reconciled (never sent again); news packets: our
+    // courier and what she learned; ship shares: our holdings, and a buy or listing with no answer still reconciled.
+    this.rndMem = restoreRnd(s.rnd);
+    this.newsMem = restoreNews(s.news);
+    this.shareMem = restoreShares(s.shares);
   }
 
   fatal(msg: string): void {
@@ -4784,6 +5565,33 @@ export class FleetManager implements FleetHost {
         this.log("fleet", `envelope check failed: ${(e as Error).message}`);
       });
     }
+    // Research and our patents, the news packet (Lloyd's desk, her build, her income), ship shares: each on its own clock, a failure in
+    // one never stopping the others (rnd.ts, news.ts, shares.ts).
+    if (now - this.lastRndCheck > RND_CHECK_MS) {
+      this.lastRndCheck = now;
+      await this.runRnd().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.rndAction = `the check failed: ${(e as Error).message}`;
+        this.log("fleet", `R&D check failed: ${(e as Error).message}`);
+      });
+    }
+    if (now - this.lastNewsCheck > NEWS_CHECK_MS) {
+      this.lastNewsCheck = now;
+      await this.runNews().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.newsAction = `the check failed: ${(e as Error).message}`;
+        this.log("fleet", `news packet check failed: ${(e as Error).message}`);
+      });
+    }
+    if (now - this.lastSharesCheck > SHARES_CHECK_MS || (this.sharesDirty && now - this.lastSharesCheck > DEALS_EVENT_MIN_MS)) {
+      this.lastSharesCheck = now;
+      this.sharesDirty = false;
+      await this.runShares().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.sharesAction = `the check failed: ${(e as Error).message}`;
+        this.log("fleet", `ship shares check failed: ${(e as Error).message}`);
+      });
+    }
     // An AI override may have lapsed in between.
     this.syncWorldFlags();
     if (now - this.lastRivalCheck > RIVAL_CHECK_MS || (this.rivalsDirty && now - this.lastRivalCheck > RIVAL_EVENT_MIN_MS)) {
@@ -5045,7 +5853,8 @@ export class FleetManager implements FleetHost {
   private planOptions(cash: number | null, except?: ShipAgent) {
     // A ship's own load may count on cash due before it buys; never a hull the buyer prices (no `except`).
     const flows = except && this.settings.resizeLoads && this.settings.cashDuePct > 0 ? this.cashFlows(except) : null;
-    const spare = flows ? this.spareCash() : 0;
+    // Our deposits at healthy banks count as cash in hand (spareWithDeposits): buying the load brings them back.
+    const spare = flows ? this.spareWithDeposits() : 0;
     return {
       minMargin: this.settings.minMarginPence,
       freight: this.settings.useFreight,
@@ -5079,22 +5888,23 @@ export class FleetManager implements FleetHost {
   }
 
   /**
-   * Cash a ship can spend on its next load: spare cash in every region, less loads other ships are bound to buy, what
-   * our loans will take to repay that cash due landing first doesn't cover (fenceUncovered) and the builds of
-   * commissions we owe (commissionFence). None while a repayment due can't be covered (debtShort).
+   * Cash a ship can spend on its next load: spare cash in every region with our deposits at healthy banks (spareWithDeposits:
+   * they come back when it buys), less loads other ships are bound to buy, what our loans will take to repay that cash due
+   * landing first doesn't cover (fenceUncovered) and the builds of commissions we owe (commissionFence). None while a
+   * repayment due can't be covered (debtShort).
    */
   private loadCash(except?: ShipAgent): number {
     if (this.debtShort) return 0;
     let committed = 0;
     for (const a of this.agents.values()) if (a !== except) committed += this.committedBy(a);
-    return Math.max(0, this.spareCash() - committed - this.fenceUncovered() - this.commissionFence());
+    return Math.max(0, this.spareWithDeposits() - committed - this.fenceUncovered() - this.commissionFence());
   }
 
   /**
-   * A ship's first call at its source (ownCall), within spare cash less what our loans' repayments need that cash due
-   * doesn't cover (its own load's loan aside: taken for this very load).
+   * A ship's first call at its source (ownCall), within spare cash (our deposits at healthy banks counted) less what our loans'
+   * repayments need that cash due doesn't cover (its own load's loan aside: taken for this very load).
    */
-  private ownFloor(a: ShipAgent, spare = this.spareCash()): number {
+  private ownFloor(a: ShipAgent, spare = this.spareWithDeposits()): number {
     return Math.max(0, Math.min(this.ownCall(a), spare - this.fenceUncovered(a.lane?.borrow?.loanId)));
   }
 
@@ -5142,7 +5952,8 @@ export class FleetManager implements FleetHost {
     if (policy === "off" || this.retiring.has(agent.shipId)) return undefined;
     if (policy === "full") return max;
     const lane = agent.lane;
-    if (!lane) return undefined;
+    // A passage for fares alone (voyages.ts) carries no cargo to weigh guns against: the guns stay as they are.
+    if (!lane || lane.kind === "passengers") return undefined;
     const cls = this.world.shipClass(agent.shipClass);
     const knots = ((cls?.base_speed_centiknots ?? 800) / 100) * 0.8;
     const plan = await this.world.route(lane.source, lane.dest, agent.shipClass).catch(() => null);
@@ -5299,10 +6110,51 @@ export class FleetManager implements FleetHost {
       case "convoy_disbanded":
       case "convoy_member_joined":
       case "convoy_member_detached":
-      case "convoy_member_left_behind": {
+      case "convoy_member_left_behind":
+      case "convoy_join_requested":
+      case "convoy_request_withdrawn":
+      case "convoy_request_lapsed": {
         const id = str("convoy_id");
         if (id) this.convoyCache.delete(id);
+        // A convoy of ours that charged escort fees (escort.ts) is done with: off the open list.
+        if (id && (e.event_type === "convoy_arrived" || e.event_type === "convoy_cancelled" || e.event_type === "convoy_disbanded")) this.escortConvoys.delete(id);
+        // A request to join one of ours: our ships in it read it at once and decide (convoyWait).
         for (const a of this.agents.values()) if (!id || a.last?.ship.convoy_id === id) a.nudge();
+        break;
+      }
+      case "convoy_escort_fees_settled": {
+        // The fees paid by other companies' ships, shared by the escorts that arrived (guide 3.10): ours as the notice says (its shape
+        // isn't published), the vaults read again for the money itself.
+        const id = str("convoy_id") ?? "";
+        const share = escortShare(p, (cid) => this.ourCompany(cid));
+        this.escortStats.settlements++;
+        if (share !== null && share > 0) this.escortStats.feesPence += share;
+        this.noteEscort(id, str("dest_port_id") ?? this.escortConvoys.get(id)?.dest ?? null, "settled", share !== null ? `our escorts' share ${cr(share)}` : "settled (the notice doesn't say our share)", share ?? undefined);
+        this.log("fleet", `escort fees settled on a convoy of ours${share !== null ? `: ${cr(share)} to our escorts` : ""}`);
+        void this.world.refreshVaults().catch(() => undefined);
+        this.cashArrived();
+        break;
+      }
+      case "venture_investment":
+      case "venture_settled": {
+        // Ours (guide 3.13.5): an investment in one of our ventures (players' or the Merchant Adventurers'), or its settlement. Read
+        // again at the ship's next turn (or the finance pass while she is at sea); the shapes aren't published beyond the venture.
+        const vid = str("venture_id", "id");
+        const rec = vid ? this.ventureMem.recs.find((r) => r.id === vid) : undefined;
+        if (!rec) break;
+        this.venturesSeen = null;
+        if (e.event_type === "venture_investment") {
+          const who = str("investor_company_id", "company_id");
+          const name = str("investor_name", "investor_company_name", "company_name") ?? "";
+          const amount = num("amount_pence") ?? num("capital_pence");
+          if (who === undefined || !this.ourCompany(who)) {
+            if (/merchant adventurers/i.test(name) && amount !== undefined && amount > 0) rec.ma += amount;
+            this.log(rec.ship, `venture to ${rec.dest}: ${name || "an investor"} put in${amount !== undefined ? ` ${cr(amount)}` : ""}`);
+            this.persist();
+          }
+        } else this.log(rec.ship, `venture to ${rec.dest}: settled (the game's notice)`);
+        this.agents.get(rec.shipId)?.nudge();
+        this.financeDirty = true;
         break;
       }
       case "ship_arrived":
@@ -5533,6 +6385,11 @@ export class FleetManager implements FleetHost {
         const named = [...new Set([...regions, str("banking_region") ?? ""])].map((x) => asRegion(x)).filter((x): x is BankingRegion => x !== null);
         if (named.length) for (const r of named) this.linesSeen.delete(r);
         else this.linesSeen.clear();
+        // Our own bank's line (runBank): never weighed for our own refinancing (a line never matches its own bank's request).
+        if (str("bank_company_id") === this.world.companyId) {
+          this.bankDirty = true;
+          break;
+        }
         const share = num("rate_pct_of_goldsmiths_bps");
         const lid = str("line_id", "lending_line_id", "id") ?? e.id;
         this.logOnceFor(
@@ -5546,7 +6403,10 @@ export class FleetManager implements FleetHost {
       }
       case "lending_line_quoted":
       case "lending_line_exhausted": {
-        // Ours as a bank (the user's, run by hand: the autopilot posts no lines): logged only.
+        // Ours as a bank (a line the autopilot posted with runBank on, or one posted by hand): its room and quotes are read again at
+        // the next finance pass (the room not yet lent is fenced from other spending: bankLineFence).
+        this.bankDirty = true;
+        this.financeDirty = true;
         const principal = num("principal_pence");
         const rate = num("annual_rate_bps");
         this.log(
@@ -5573,8 +6433,108 @@ export class FleetManager implements FleetHost {
         this.log(
           "fleet",
           `${asBank ? "our bank carried a remittance as a draft" : `${str("bank_name") ?? "a bank"} carried a remittance of ours as a draft`}` +
-            `${from && to ? ` ${from} → ${to}` : ""}${gross ? ` (${cr(gross)}` : ""}${gross && fee !== undefined ? `, fee ${cr(fee)})` : gross ? ")" : ""}`,
+            `${from && to ? ` ${from} → ${to}` : ""}${gross ? ` (${cr(gross)}` : ""}${gross && fee !== undefined ? `, fee ${cr(fee)})` : gross ? ")" : ""}` +
+            `${asBank && fee !== undefined ? ": the fee is income; the draft was paid out of our vault there, so that region's offer is weighed again" : ""}`,
         );
+        if (asBank && bankId === this.world.companyId) {
+          // Fee income (guide 3.13.4: the payer pays us the whole sum at its end, we pay it less the fee at ours): the vaults move,
+          // and a destination drained below its surplus is dropped from the schedule at the next pass.
+          this.bankMem.drafts++;
+          this.bankMem.draftFees += Math.max(0, Math.round(fee ?? 0));
+          this.bankDirty = true;
+          this.financeDirty = true;
+          void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
+          this.persist();
+        }
+        break;
+      }
+      case "bank_chartered":
+      case "bank_winding_down":
+      case "bank_failed":
+      case "bank_closed": {
+        // Public (guide 3.13.4). Our own bank: read again at once (the autopilot never winds it down; a failure or a wind-down is the
+        // owner's to see to). A bank holding deposits of ours: the deposits pass looks at once (a bank in trouble has ours withdrawn).
+        // Every bank is listed afresh.
+        const bankId = str("bank_company_id", "bank_id", "company_id") ?? e.company_id ?? undefined;
+        const name = str("bank_name", "name") ?? "a bank";
+        // Listed afresh at the next read; the last list stands meanwhile (staleBanks), this bank's state as the notice tells it, so
+        // ours there counts as frozen (never as cash) at once.
+        this.staleBanks();
+        if (bankId && this.banksSeen && e.event_type !== "bank_chartered") {
+          const at = new Date().toISOString();
+          this.banksSeen = {
+            ...this.banksSeen,
+            banks: this.banksSeen.banks.flatMap((b) =>
+              b.company_id !== bankId ? [b] : e.event_type === "bank_closed" ? [] : [{ ...b, status: "winding_down", ...(e.event_type === "bank_failed" ? { failed_at: b.failed_at ?? at } : {}) }],
+            ),
+          };
+        }
+        if (bankId && bankId === this.world.companyId) {
+          this.bankDirty = true;
+          this.financeDirty = true;
+          this.log(
+            "fleet",
+            e.event_type === "bank_chartered"
+              ? `our bank ${name} is chartered`
+              : `WARNING: our bank ${e.event_type === "bank_failed" ? "FAILED (a withdrawal went unpaid for a game day)" : e.event_type === "bank_winding_down" ? "is winding down (stopping new business; depositors paid out as loans come in)" : "closed"}: the autopilot never winds a bank down or charters again on its own until the charter's case says so`,
+          );
+          this.advisor.trigger(`our bank: ${e.event_type.replace(/_/g, " ")}`);
+          break;
+        }
+        if (e.event_type === "bank_chartered") break;
+        const ours = [...this.depositRecs.values()].filter((r) => isOpen(r) && (!bankId || r.bank === bankId));
+        const hand = (this.depositsSeen?.list ?? []).some((d) => isOpen(d) && !this.depositRecs.has(d.id) && (!bankId || d.bank_company_id === bankId));
+        if (ours.length || hand) {
+          this.depositsDirty = true;
+          this.financeDirty = true;
+          const what = e.event_type === "bank_failed" ? "FAILED" : e.event_type === "bank_winding_down" ? "is winding down" : "closed";
+          this.log(
+            "fleet",
+            `deposits: WARNING ${name} ${what}${ours.length ? `: our ${cr(ours.reduce((n, r) => n + r.balance, 0))} there is asked back once, and is frozen meanwhile (a bank that isn't open pays its depositors pro rata as its loans come in): owed later, never counted as cash` : ""}` +
+              `${hand ? "; a deposit made by hand is there too: withdraw it on the bank page" : ""}`,
+          );
+        }
+        break;
+      }
+      case "bank_deposit_made":
+      case "bank_withdrawal":
+      case "bank_deposit_set_off":
+      case "bank_deposit_written_off":
+      case "bank_client_terms_set": {
+        // To the depositor and the bank (guide 3.13.4). Ours as depositor: our deposits are read again at the next pass (a withdrawal
+        // the bank pays later lands in the vault here). Ours as the bank: a depositor's money is kept in that region's floor.
+        const me = this.world.companyId;
+        const bankId = str("bank_company_id");
+        const depositor = str("depositor_company_id");
+        const asBank = !!me && bankId === me && depositor !== me;
+        const amount = num("amount_pence") ?? num("paid_pence") ?? num("set_off_pence") ?? num("written_off_pence");
+        const region = str("banking_region", "to_region");
+        const name = str("bank_name") ?? "a bank";
+        this.depositsDirty = true;
+        this.financeDirty = true;
+        if (asBank) {
+          this.bankDirty = true;
+          if (e.event_type === "bank_deposit_made") {
+            this.log("fleet", `our bank: a depositor put ${amount !== undefined ? cr(amount) : "money"} with us${region ? ` in ${region}` : ""}: kept in that region's floor, never spent (it is theirs to withdraw)`);
+          } else if (e.event_type === "bank_withdrawal") {
+            this.log("fleet", `our bank paid a depositor's withdrawal${amount !== undefined ? ` of ${cr(amount)}` : ""}${region ? ` in ${region}` : ""}`);
+            void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
+          }
+          break;
+        }
+        if (e.event_type === "bank_withdrawal") {
+          // Ours paid (at once, or later as the bank's cash came in): the cash is in the vault.
+          void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
+        } else if (e.event_type === "bank_deposit_set_off" || e.event_type === "bank_deposit_written_off") {
+          this.log(
+            "fleet",
+            `deposits: WARNING ${name} ${e.event_type === "bank_deposit_set_off" ? "set a deposit of ours off against a loan it secured" : "WROTE OFF part of a deposit of ours"}${amount !== undefined ? ` (${cr(amount)})` : ""}`,
+          );
+        } else if (e.event_type === "bank_client_terms_set") {
+          const bonus = num("rate_bonus_bps");
+          const disc = num("exchange_discount_bps");
+          this.logOnceFor(`client-terms|${bankId ?? name}|${bonus}|${disc}`, "fleet", `deposits: ${name} set client terms for us${bonus !== undefined ? `: +${bonus} bps a game day on our deposits` : ""}${disc !== undefined ? `, ${disc} bps off its exchange fees` : ""}`);
+        }
         break;
       }
       case "charter_fill_dispatched": {
@@ -5798,6 +6758,44 @@ export class FleetManager implements FleetHost {
       case "envelope_sold":
         // Ours: booked from envelope/mine at the next check (once).
         this.envelopesDirty = true;
+        break;
+      // R&D (guide 3.19): our project's stages, a grant, a patent lapsing or made public: our standing read again at the next pass; the
+      // designs we could make read again (a grant, a licence sold or closed, a component fitted). Payloads aren't published: read
+      // defensively, never acted on by themselves.
+      case "rnd_project_started":
+      case "rnd_stage_passed":
+      case "rnd_stage_failed":
+      case "rnd_upkeep_unpaid":
+      case "rnd_project_abandoned":
+      case "rnd_patent_upkeep_arrears":
+      case "rnd_patent_granted":
+      case "rnd_patent_made_public":
+      case "rnd_patent_lapsed":
+      case "licence_contract_closed":
+        this.designsSeen = null;
+        if (e.event_type !== "rnd_patent_granted" || this.isOurCompany(str("holder_company_id", "company_id") ?? "")) this.lastRndCheck = 0;
+        if (e.event_type === "rnd_upkeep_unpaid" || e.event_type === "rnd_patent_upkeep_arrears") {
+          this.log("fleet", `R&D: ${e.event_type.replace(/_/g, " ")} (the home vault couldn't pay it)`);
+        }
+        break;
+      case "licence_sold": {
+        // Sent to the holder and the licensee: ours to hold, it is licence income (its amount read defensively).
+        this.designsSeen = null;
+        const holder = str("holder_company_id", "seller_company_id");
+        const pence = num("total_pence") ?? num("price_pence") ?? num("amount_pence");
+        if (holder && this.isOurCompany(holder) && pence !== undefined && pence > 0) {
+          this.rndMem.rndStats.licenceIncomePence += pence;
+          this.log("fleet", `research: licence units of a design of ours sold for ${cr(pence)}`);
+          void this.world.refreshVaults().then(() => this.cashArrived(), () => undefined);
+        }
+        break;
+      }
+      case "component_fitted":
+        this.designsSeen = null;
+        break;
+      case "ship_shares_sold":
+        // Ours sold, or 64ths of a ship we hold changed hands: our holdings read again soon.
+        this.sharesDirty = true;
         break;
       case "crown_bailiff_warehouse_seizure":
       case "crown_bailiff_upkeep_seizure":
@@ -6321,7 +7319,8 @@ export class FleetManager implements FleetHost {
   private async assignLaneNow(agent: ShipAgent, from: string, r: ShipResult, pin: { onlySource?: string; onlyDest?: string } = {}): Promise<Lane | null> {
     // A smuggler does no lawful work (guide 3.18: her seizure must cost nothing but her); nor a ship being sold or broken up
     // (housekeeping: listed she must lie where she is, and bound for the breakers she must arrive empty), or gone that way.
-    if (this.smugglers.has(agent.shipId) || this.retiring.has(agent.shipId) || this.retiredIds.has(agent.shipId)) return null;
+    // Nor the news packet (news.ts): her passages are the courier's, between the hubs.
+    if (this.smugglers.has(agent.shipId) || this.retiring.has(agent.shipId) || this.retiredIds.has(agent.shipId) || this.courierOn(agent.shipId)) return null;
     const prev = agent.lane;
     const cash = this.loadCash(agent);
     const spec = this.specFor(agent, r);
@@ -6331,7 +7330,10 @@ export class FleetManager implements FleetHost {
     if (order?.order === "port" && order.ref === from) this.noteOrder(agent, order, "done");
     // A port order plans only loads from that port (none paying: the ship sails there empty, ShipAgent.atPort).
     const portOrder = order?.order === "port" && order.ref !== from ? order.ref : undefined;
-    const opts = { ...this.planOptions(cash, agent), ...pin, ...(portOrder ? { onlySource: portOrder } : {}) };
+    // Passengers waiting where she lies (passengerVoyages; voyages.ts): their fares counted in her lanes from here (her own port's
+    // groups only, cached), passages for fares alone too while she may wait a round for them. Never on an insured voyage's pin.
+    const pax = pin.onlySource || pin.onlyDest ? undefined : await this.paxLanes(agent, from, r, agent.paxLaneAllowed());
+    const opts = { ...this.planOptions(cash, agent), ...pin, ...(portOrder ? { onlySource: portOrder } : {}), ...(pax ? { pax } : {}) };
     const pick = (lanes: Lane[]) => lanes.find((l) => !agent.isAvoided(l.key) && (!portOrder || l.source === portOrder)) ?? null;
     let lanes = await rankLanes(w, spec, from, this.reservations(agent), opts);
     let best = pick(lanes);
@@ -6363,6 +7365,7 @@ export class FleetManager implements FleetHost {
     // Its tons before or after a stalled posting's lapse move the fleet's call on it.
     this.stakesAt = 0;
     if (best) agent.noteLane(best);
+    if (best?.pax && best.key !== prev?.key) this.notePaxChosen(agent, best);
     if (best && best.key !== prev?.key) {
       this.log(
         agent.name,
@@ -6404,7 +7407,9 @@ export class FleetManager implements FleetHost {
     // the others' loads alone.
     const floor = this.ownFloor(agent);
     const base = this.planOptions(Math.max(cash, floor), agent);
-    const opts = { ...base, onlySource: port, onlyDest, cashAt: (at: number, src: string) => Math.max(floor, base.cashAt ? base.cashAt(at, src) : cash) };
+    // The fares of passengers waiting here count as when it was planned (never a passage for fares alone: this is a load).
+    const pax = onlyDest ? undefined : await this.paxLanes(agent, port, r, false);
+    const opts = { ...base, onlySource: port, onlyDest, cashAt: (at: number, src: string) => Math.max(floor, base.cashAt ? base.cashAt(at, src) : cash), ...(pax ? { pax } : {}) };
     let lanes: Lane[];
     try {
       lanes = await rankLanes(this.world, this.specFor(agent, r), port, this.reservations(agent), opts);
@@ -6426,6 +7431,12 @@ export class FleetManager implements FleetHost {
     });
     if (agent.lane !== prev) return null;
     if (levered) pick = levered;
+    // Cash limits this load and no loan is planned for it: a venture may raise outside capital for it instead (guide 3.13.5;
+    // ventureStart weighs it once the stores are aboard, before anything of the load is bought).
+    const cap = this.specFor(agent, r).cap;
+    if (!levered && pick && this.settings.ventures && pick.tons < cap * 0.9 && pick.capital >= room * 0.9) {
+      this.ventureCands.set(agent.shipId, { key: pick.key, room, small: pick.cashProfit, at: Date.now() });
+    } else this.ventureCands.delete(agent.shipId);
     if (!pick) {
       this.log(
         agent.name,
@@ -6566,6 +7577,7 @@ export class FleetManager implements FleetHost {
 
   private noteConvoy(r: ConvoyResult): void {
     const c = r.convoy;
+    const outside = (r.members ?? []).filter((m) => !this.ourCompanyIds.has(m.company_id) && m.company_id !== this.world.companyId);
     this.convoyCache.set(c.id, {
       from: c.origin_port_id,
       dest: c.dest_port_id,
@@ -6576,6 +7588,12 @@ export class FleetManager implements FleetHost {
       // The pace is the slowest joined member's (pending requests don't sail).
       memberClasses: r.members.filter((m) => m.status === "joined").map((m) => m.ship_class),
       checkedAt: Date.now(),
+      fee: c.escort_fee_pence_per_ton || 0,
+      minSpeedCk: c.min_speed_centiknots ?? null,
+      pending: Array.isArray(r.pending_requests) ? r.pending_requests : [],
+      outsiders: outside.length,
+      escrow: outside.reduce((n, m) => n + (m.escort_fee_pence || 0), 0),
+      ours: r.members.length - outside.length,
     });
   }
 
@@ -6633,6 +7651,8 @@ export class FleetManager implements FleetHost {
       else this.convoyCache.delete(convoyId);
       c = this.convoyCache.get(convoyId);
     }
+    // Ours, still forming, with requests to join (escort fees, escort.ts): decided as they come (approved only if no slower than us).
+    if (c && c.status === "forming" && c.organizer === this.world.companyId && c.pending?.length) await this.escortRequests(convoyId, c);
     // Over (completed, cancelled): the ship is free. Not listed, or not forming here, while she is still in it: she
     // can't dock or sail alone, so she waits (a depart now would only be refused).
     if (c && (c.status === "completed" || c.status === "cancelled")) return null;
@@ -6727,7 +7747,8 @@ export class FleetManager implements FleetHost {
         let convoyId: string;
         let departsAt: number;
         if (decision.kind === "join") {
-          const res = await this.client.joinConvoy({ convoy_id: decision.convoyId, ship_id: agent.shipId });
+          // A convoy of ours that charges escort fees (escort.ts): an armed ship of ours joins it as an escort, so the fees come to us.
+          const res = await this.client.joinConvoy({ convoy_id: decision.convoyId, ship_id: agent.shipId, ...(decision.escort ? { as_escort: true } : {}) });
           if (res.status !== "joined") {
             await this.client.detachConvoy({ convoy_id: decision.convoyId, ship_id: agent.shipId }).catch(() => undefined);
             return { kind: "failed", why: `the request is ${res.status}` };
@@ -6735,20 +7756,73 @@ export class FleetManager implements FleetHost {
           convoyId = decision.convoyId;
           departsAt = Date.parse(res.departs_at);
           this.convoyCache.delete(convoyId);
-          this.log(agent.name, `joined our convoy to ${dest} (${decision.ships + 1} ships), sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s`);
+          this.log(agent.name, `joined our convoy to ${dest} (${decision.ships + 1} ships)${decision.escort ? " as an escort (it charges other companies' ships)" : ""}, sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s`);
         } else {
-          const res = await this.client.createConvoy({
-            name: `Fleet to ${dest}`,
-            flagship_id: agent.shipId,
-            dest_port_id: dest,
-            depart_in_game_minutes: decision.departInGameMin,
-            admission: "invite_only",
-            visibility: "private",
-          });
-          this.noteConvoy(res);
-          convoyId = res.convoy.id;
-          departsAt = Date.parse(res.convoy.departs_at);
-          this.log(agent.name, `formed a convoy to ${dest} for ${decision.partners} more of our ships, sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s`);
+          // Escort fees (escort.ts): announced public, by approval, with a fee; this ship joins it as an escort. No speed floor on it (the
+          // game may judge a joiner laden, up to a fifth slower, and refuse our own ships): approval vets every outsider's speed instead
+          // (joinVerdict, against our slowest's).
+          const esc = await this.escortTerms(agent, r, plan, decision.slowest, decision.partners);
+          let ann: ConvoyResult | null = null;
+          if (esc) {
+            try {
+              ann = await this.client.announceConvoy({
+                name: `Fleet to ${dest}`,
+                origin_port_id: from,
+                dest_port_id: dest,
+                depart_in_game_minutes: decision.departInGameMin,
+                admission: "approval",
+                visibility: "public",
+                escort_fee_pence_per_ton: esc.fee,
+              });
+            } catch (e) {
+              // No answer: as before (the next decision finds it among ours forming). Refused (a company's five forming announcements
+              // reached, or the like): a private convoy of ours, as before escort fees, never sailing alone for it.
+              if (this.isFatal(e) || isApiError(e, "world_paused") || !isApiError(e) || e.status >= 500) throw e;
+              this.log(agent.name, `offering a convoy to ${dest} to other companies was refused (${e.message}): forming a private one of ours`);
+              this.noteEscort("", dest, "failed", `announcing it was refused (${e.message}): a private convoy of ours instead`);
+            }
+          }
+          if (esc && ann) {
+            this.noteConvoy(ann);
+            this.escortConvoys.set(ann.convoy.id, { from, dest, fee: esc.fee, minSpeedCk: esc.minSpeedCk, departsAt: Date.parse(ann.convoy.departs_at) });
+            this.escortStats.offered++;
+            this.noteEscort(ann.convoy.id, dest, "offered", `${cr(esc.fee)}/t of a joiner's hold, none approved slower than ${(esc.minSpeedCk / 100).toFixed(1)} kn (${esc.why})`);
+            let res: ConvoyMembershipResult;
+            try {
+              res = await this.client.joinConvoy({ convoy_id: ann.convoy.id, ship_id: agent.shipId, as_escort: true });
+            } catch (e) {
+              if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+              // The announcement stands with none of ours in it (cancelled when due unless others muster): she sails alone.
+              this.log(agent.name, `announced a convoy to ${dest} but couldn't join it (${(e as Error).message}): sailing alone; the announcement lapses when due`);
+              this.noteEscort(ann.convoy.id, dest, "failed", `our ship couldn't join: ${(e as Error).message}`);
+              return { kind: "failed", why: (e as Error).message };
+            }
+            if (res.status !== "joined") {
+              await this.client.detachConvoy({ convoy_id: ann.convoy.id, ship_id: agent.shipId }).catch(() => undefined);
+              return { kind: "failed", why: `the request is ${res.status}` };
+            }
+            convoyId = ann.convoy.id;
+            departsAt = Date.parse(res.departs_at);
+            this.convoyCache.delete(convoyId);
+            this.log(
+              agent.name,
+              `formed a convoy to ${dest} for ${decision.partners} more of our ships, sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s; ` +
+                `public, other companies' ships admitted by approval at ${cr(esc.fee)}/t of their hold (paid to our escorts on arrival), none approved slower than ${(esc.minSpeedCk / 100).toFixed(1)} kn`,
+            );
+          } else {
+            const res = await this.client.createConvoy({
+              name: `Fleet to ${dest}`,
+              flagship_id: agent.shipId,
+              dest_port_id: dest,
+              depart_in_game_minutes: decision.departInGameMin,
+              admission: "invite_only",
+              visibility: "private",
+            });
+            this.noteConvoy(res);
+            convoyId = res.convoy.id;
+            departsAt = Date.parse(res.convoy.departs_at);
+            this.log(agent.name, `formed a convoy to ${dest} for ${decision.partners} more of our ships, sailing in ${Math.round((departsAt - this.world.now()) / 1000)}s`);
+          }
         }
         // Seen at once by the next decision (this ship is now in a convoy, not a partner to count).
         if (agent.last) agent.last = { ...agent.last, ship: { ...agent.last.ship, convoy_id: convoyId, status: "anchored_roadstead" } };
@@ -6776,7 +7850,7 @@ export class FleetManager implements FleetHost {
     from: string,
     dest: string,
     plan: RoutePlan,
-  ): Promise<{ kind: "alone" } | { kind: "join"; convoyId: string; ships: number } | { kind: "form"; departInGameMin: number; partners: number }> {
+  ): Promise<{ kind: "alone" } | { kind: "join"; convoyId: string; ships: number; escort: boolean } | { kind: "form"; departInGameMin: number; partners: number; slowest: number }> {
     const alone = { kind: "alone" as const };
     const w = this.world;
     if (!this.settings.convoys || this.stopRequested) return alone;
@@ -6785,6 +7859,10 @@ export class FleetManager implements FleetHost {
     if (this.smugglers.has(agent.shipId) || agent.contrabandAboard(r).length > 0) return alone;
     // Bound for the breakers (housekeeping): a convoy would keep her from changing hands where she arrives (guide 3.4).
     if (this.retiring.has(agent.shipId)) return alone;
+    // A venture's ship sails alone (guide 3.10, 3.13.5: venture ships can't join a convoy).
+    if (this.ventureOn(agent.shipId)) return alone;
+    // The news packet sails alone (news.ts): the fastest hull afloat, first to the next coffee house.
+    if (this.courierOn(agent.shipId)) return alone;
     const now = w.now();
     const speed = (cls: string) => (w.shipClass(cls)?.base_speed_centiknots ?? 800) / 100;
     const ourSpeed = speed(agent.shipClass);
@@ -6841,8 +7919,23 @@ export class FleetManager implements FleetHost {
     for (const c of forming) this.noteConvoy(c);
     const live = forming.map((c) => ({ c, departsAt: Date.parse(c.convoy.departs_at) })).filter(({ departsAt }) => departsAt - now > 10_000);
     if (live.length) {
+      // One open to other companies (public, not invite-only, charging escort fees, or with an outsider in): never for a ship of ours
+      // with a policy on her, or one that can't be read (as for the ship that forms it, escortTerms): Lloyd's may price the consorts in,
+      // and an outsider free to leave or be left behind voids it (guide 3.6).
+      const outsidersMay = (c: ConvoyResult) =>
+        c.convoy.visibility === "public" || c.convoy.admission !== "invite_only" || (c.convoy.escort_fee_pence_per_ton ?? 0) > 0 || c.members.some((m) => !this.ourCompany(m.company_id));
+      const insured = live.some(({ c }) => outsidersMay(c)) && (await agent.insuredPolicy()) !== null;
+      // Other companies' ships in one of ours that charges escort fees (escort.ts) were approved no slower than our slowest: only their
+      // speed matters (a faster one can't slow us); and ours must not be under a floor one carries (the game would refuse her).
       const pick = live
-        .filter(({ c }) => c.members.every((m) => alike(m.ship_class) && !this.smugglers.has(m.ship_id) && !this.carriesContraband(this.agents.get(m.ship_id))))
+        .filter(
+          ({ c }) =>
+            !(insured && outsidersMay(c)) &&
+            (c.convoy.min_speed_centiknots == null || ourSpeed * 100 >= c.convoy.min_speed_centiknots) &&
+            c.members.every(
+              (m) => (this.agents.has(m.ship_id) ? alike(m.ship_class) : alike(m.ship_class) || speed(m.ship_class) >= ourSpeed) && !this.smugglers.has(m.ship_id) && !this.carriesContraband(this.agents.get(m.ship_id)),
+            ),
+        )
         .sort((a, b) => a.departsAt - b.departsAt)[0];
       if (!pick) return alone;
       const n = Math.max(1, pick.c.members.length);
@@ -6874,7 +7967,8 @@ export class FleetManager implements FleetHost {
           if (!mp || a.last.stores.provisions_tons < this.convoyStores(a, mp, pick.departsAt, slowest).need) return alone;
         }
       }
-      return { kind: "join", convoyId: pick.c.convoy.id, ships: n };
+      // It charges escort fees: an armed ship of ours joins as an escort (the fees are shared by the escorts that arrive, guide 3.10).
+      return { kind: "join", convoyId: pick.c.convoy.id, ships: n, escort: (pick.c.convoy.escort_fee_pence_per_ton ?? 0) > 0 && r.ship.cannons_count > 0 };
     }
 
     // Our other ships that will leave the same way soon: at this port with the same lane, or on their way here for it.
@@ -6914,7 +8008,7 @@ export class FleetManager implements FleetHost {
       partners.reduce((n, p) => n + slower(p.cls, p.guns, p.value, convoy, { knots: p.speed, at: p.ready }, 0, p.stake), 0);
     const gain = ((ours + partners.reduce((n, p) => n + p.exposure, 0)) * k) / (k + 1) - stormCost - paxLate(now + waitMs, slowest);
     if (gain <= waitCost(waitMs) || !fits(now + waitMs, slowest)) return alone;
-    return { kind: "form", departInGameMin: Math.min(3 * 24 * 60, Math.ceil(waitMs / w.gameMinuteMs)), partners: k };
+    return { kind: "form", departInGameMin: Math.min(3 * 24 * 60, Math.ceil(waitMs / w.gameMinuteMs)), partners: k, slowest };
   }
 
   /** Another of our ships' hold at this port on this good for a re-post, if any. */
@@ -6933,6 +8027,13 @@ export class FleetManager implements FleetHost {
   }
 
   // ── Cash ────────────────────────────────────────────────────────────────────
+
+  /** Ships of ours still in the fleet: one sunk, seized or sold stays in the map (gone) until the next scan retires it. */
+  private shipsAfloat(): number {
+    let n = 0;
+    for (const a of this.agents.values()) if (!a.gone) n++;
+    return n;
+  }
 
   private fleetTons(oceanic: boolean): number {
     let t = 0;
@@ -6968,9 +8069,10 @@ export class FleetManager implements FleetHost {
   }
 
   private floorIn(region: BankingRegion): number {
-    // Each region also keeps its own warehouses' rent (billed from the port's region).
+    // Each region also keeps its own warehouses' rent (billed from the port's region), and what depositors hold with our bank
+    // there (guide 3.13.4: their money lands in our vault and is paid back from it; never spent: bankOwed).
     const rent = Math.ceil(UPKEEP_DAYS_RESERVED * (this.bills.rent.get(region) ?? 0));
-    return (region === this.homeRegion ? this.homeFloor() : REGION_FLOOR_PENCE) + rent;
+    return (region === this.homeRegion ? this.homeFloor() : REGION_FLOOR_PENCE) + rent + (this.bankOwed.get(region) ?? 0);
   }
 
   /**
@@ -7154,6 +8256,15 @@ export class FleetManager implements FleetHost {
     const w = this.world;
     if (!opts.fresh) await w.refreshVaults();
     let have = w.vault(region) - this.floorIn(region);
+    // Our bank deposits come back first (guide 3.13.4; pullForRegion): those in this region free, those elsewhere when the bank's exchange
+    // fee into it, less our client discount, is strictly under the Crown's fee for the route, else into their own region for the remittance
+    // below to carry (only what the other regions' spare can't bring). What a bank can't pay at once is owed later and isn't counted;
+    // ours frozen at a bank that isn't open is never asked here. Spends count our deposits as cash (spendable), so this is where they
+    // come back, before anything is borrowed.
+    if (have < amount && this.canRemit && this.depositsOut() > 0) {
+      await this.pullForRegion(region, amount - have);
+      have = w.vault(region) - this.floorIn(region);
+    }
     if (have < amount && this.canRemit) {
       // Pull the shortfall from the cheapest corridor first, paying the ACH fee. Each donor's spare is worked
       // out from the vaults as read after the remit before it.
@@ -7202,8 +8313,9 @@ export class FleetManager implements FleetHost {
     }
     if (have < amount && opts.essential) {
       // Stores to sail safely are what the floor is kept for: they may use it, down to a day's upkeep at
-      // home and a day's warehouse rent anywhere.
-      const keep = (region === this.homeRegion ? Math.min(this.homeFloor(), Math.ceil(this.upkeepPerDay())) : 0) + Math.ceil(this.bills.rent.get(region) ?? 0);
+      // home and a day's warehouse rent anywhere; never what depositors hold with our bank there.
+      const keep =
+        (region === this.homeRegion ? Math.min(this.homeFloor(), Math.ceil(this.upkeepPerDay())) : 0) + Math.ceil(this.bills.rent.get(region) ?? 0) + (this.bankOwed.get(region) ?? 0);
       return Math.max(0, w.vault(region) - keep);
     }
     return Math.max(0, have);
@@ -7325,7 +8437,8 @@ export class FleetManager implements FleetHost {
       if (!r || !cls) continue;
       const courier = cls.can_seal_dispatches || cls.id === "packet";
       const never = neverRetire({ ships: ships.length, courier, smuggler: this.smugglers.has(a.shipId), arrested: a.arrested, aiOrder: !!this.advisor.shipOrder(a.shipId), components: r.components?.length ?? 0 });
-      if (never || this.retiring.has(a.shipId) || this.retireSkip.has(a.shipId) || this.retiredIds.has(a.shipId)) {
+      // A venture's ship (guide 3.13.5: bound to its voyage until it settles) is never judged meanwhile.
+      if (never || this.retiring.has(a.shipId) || this.retireSkip.has(a.shipId) || this.retiredIds.has(a.shipId) || this.ventureOn(a.shipId)) {
         this.deadStreaks.delete(a.shipId);
         continue;
       }
@@ -7581,7 +8694,8 @@ export class FleetManager implements FleetHost {
     const cls = w.shipClass(a.shipClass);
     const never = neverRetire({
       ships: [...this.agents.values()].filter((x) => !x.gone).length,
-      courier: !!cls && (cls.can_seal_dispatches || cls.id === "packet"),
+      // A news packet given up (news.ts) is sold the same way; any other courier is left alone.
+      courier: !!cls && (cls.can_seal_dispatches || cls.id === "packet") && this.retiring.get(a.shipId)?.reason !== "news",
       smuggler: this.smugglers.has(a.shipId),
       arrested: a.arrested,
       aiOrder: !!this.advisor.shipOrder(a.shipId),
@@ -7918,6 +9032,17 @@ export class FleetManager implements FleetHost {
   private async retireStillPays(a: ShipAgent, r: ShipResult, m: RetireMark): Promise<string | null> {
     const cls = this.world.shipClass(a.shipClass);
     if (!cls) return null;
+    // A news packet given up (news.ts): no lane is weighed for her (never a trader); the break-up must still pay over her upkeep against
+    // what her news sold for lately.
+    if (m.reason === "news") {
+      const trialMs = NEWS_TRIAL_GAME_DAYS * this.gameDayMs;
+      const earn = this.newsMem.sales.filter(([t]) => Date.now() - t <= trialMs).reduce((n, [, p]) => n + p, 0) / (trialMs / 3_600_000);
+      const rebuild = this.knownQuotes(a.shipClass).has(a.shipClass) ? this.rebuildOf(a, r) : m.rebuild;
+      const c = breakUpCase({ rebuild, upkeepPerHour: this.upkeepShare(a), earnPerHour: earn, horizonHours: this.retireHorizonHours() });
+      if (!c.ok) return c.why;
+      m.payout = c.payout;
+      return "";
+    }
     const s = this.settings;
     const mz = await this.retireMeasure(a, r, cls, [...this.agents.values()].filter((x) => !x.gone).length >= s.maxShips && s.autoBuy && this.canBuild);
     if (!mz) return null;
@@ -8713,12 +9838,14 @@ export class FleetManager implements FleetHost {
   }
 
   /**
-   * What our loans will take to repay (a ship mortgage's next installments only: debtFlows), and the builds of commissions
-   * we took and haven't delivered (their collateral rides on them) (pence): never spent on hulls, marques, patrols,
-   * underwriting, lending or another commission.
+   * What our loans will take to repay (a ship mortgage's next installments only: debtFlows), the builds of commissions
+   * we took and haven't delivered (their collateral rides on them), and our bank's lending lines' room not yet lent (a matching
+   * request escrows it from our vault at any moment: bankLineFence) (pence): never spent on hulls, marques, patrols,
+   * underwriting, lending, deposits or another commission. Our own line's room is the exception for a spend: it counts back
+   * (spendable) and the line is withdrawn first (freeLineFor).
    */
   private debtFence(): number {
-    return this.debtFlows(this.world.now()).reduce((n, d) => n + d.pence, 0) + this.pendingBorrowPence(true) + this.commissionFence();
+    return this.debtFlows(this.world.now()).reduce((n, d) => n + d.pence, 0) + this.pendingBorrowPence(true) + this.commissionFence() + this.bankLineFence();
   }
 
   /** The build cost of commissions we took (or may have: an acceptance with no answer) and haven't delivered (pence). */
@@ -8781,6 +9908,8 @@ export class FleetManager implements FleetHost {
       this.financeDirty = true;
       return no("our idle cash is quoted on loan requests: taking it back before borrowing");
     }
+    // Our deposits and our bank's lending line never stop a loan (guide 3.13.4, 3.13.8): a spend counts our deposits at healthy banks and
+    // the line's unlent room as cash (spendable), brings them back first (ensureCash, freeLineFor) and borrows only what they can't cover.
     if (!this.worth || this.worth.pence <= 0) return no("net worth isn't known yet");
     if (Date.now() - this.worth.at > 3 * WORTH_TTL_MS) return no("net worth hasn't been read lately");
     const room = (this.worth.pence * s.maxDebtPct) / 100 - this.debtOwed();
@@ -8835,7 +9964,9 @@ export class FleetManager implements FleetHost {
     for (const a of this.agents.values()) {
       const r = a.last;
       // Nor one being retired (housekeeping): a lien would withdraw her at the yard, often after an empty passage there.
-      if (a.gone || a.arrested || !r || r.ship.status === "sunk" || r.ship.convoy_id || pledges.liened.has(a.shipId) || forSale.has(a.shipId) || this.retiring.has(a.shipId)) continue;
+      // Never a venture's ship (guide 3.13.1: a ship carrying a venture can't be pledged), nor the news packet (news.ts: given up, she is
+      // sold, which a lien would stop).
+      if (a.gone || a.arrested || !r || r.ship.status === "sunk" || r.ship.convoy_id || pledges.liened.has(a.shipId) || forSale.has(a.shipId) || this.retiring.has(a.shipId) || this.ventureOn(a.shipId) || this.courierOn(a.shipId)) continue;
       // Never a smuggler or a ship with contraband aboard: her seizure would take the lender's lien with her (guide 3.18).
       if (this.smugglers.has(a.shipId) || a.contrabandAboard(r).length > 0) continue;
       if ((await a.insuredPolicy(60_000, true)) !== null) continue;
@@ -8966,10 +10097,13 @@ export class FleetManager implements FleetHost {
     }
   }
 
-  /** A load short of cash at its source: for CASH_SHORT_MS the fleet needs cash, and idle cash quoted comes back soon (runIdleCash). */
+  /**
+   * A load short of cash at its source: for CASH_SHORT_MS the fleet needs cash, and idle cash quoted, on deposit or in our bank's
+   * lending lines comes back soon (runIdleCash, runDeposits, runBank).
+   */
   private noteCashShort(): void {
     this.cashShortAt = Date.now();
-    if (this.ourQuotes.size > 0 || this.pendingCredit.some((p) => p.kind === "quote")) this.financeDirty = true;
+    if (this.ourQuotes.size > 0 || this.pendingCredit.some((p) => p.kind === "quote") || this.depositsOut() > 0 || this.ourLinesOpen()) this.financeDirty = true;
   }
 
   /**
@@ -9092,11 +10226,31 @@ export class FleetManager implements FleetHost {
         this.debtShort = null;
         this.financeAction = loans.loans.length ? "we owe on loans, but the key lacks treasury_remit: they must be repaid by hand" : "the key lacks treasury_remit: no loans, repayments or lending";
         this.idleAction = "off: the key lacks treasury_remit";
+        this.depositBlocked = "the key lacks treasury_remit";
+        this.depositAction = "off: the key lacks treasury_remit (deposits and withdrawals need it)";
+        this.bankAction = "off: the key lacks treasury_remit (a bank's every call needs it)";
         return;
       }
       await this.repayLoans();
       await this.runRequests();
       await this.runIdleCash();
+      // Our own bank, then deposits with other banks (guide 3.13.4): after the idle-cash quotes (they earn more), each on its own so a
+      // failure in one never stops the other.
+      await this.runBank().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.bankAction = `the check failed: ${(e as Error).message}`;
+        this.log("fleet", `our bank check failed: ${(e as Error).message}`);
+      });
+      await this.runDeposits().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.depositAction = `the check failed: ${(e as Error).message}`;
+        this.log("fleet", `deposit check failed: ${(e as Error).message}`);
+      });
+      // Ventures whose ship is at sea or gone (guide 3.13.5): one settled, cancelled or lost meanwhile is closed.
+      await this.reviewVentures().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.log("fleet", `venture check failed: ${(e as Error).message}`);
+      });
     } finally {
       this.financeBusy = false;
       this.persist();
@@ -9199,7 +10353,8 @@ export class FleetManager implements FleetHost {
 
   /**
    * Our own net-worth estimate (guide 3.17), on the low side: vaults and escrow, our hulls at their rebuild value (hullValue),
-   * our own goods aboard (not freight) and in warehouses at base, less what we owe, plus what we are owed.
+   * our own goods aboard (not freight) and in warehouses at base, less what we owe, plus what we are owed, plus our bank deposits
+   * (at banks still listed and not failed only), less what our own bank owes its depositors (a bank's net, as the board counts it).
    */
   private async estimateWorth(): Promise<number> {
     const w = this.world;
@@ -9216,6 +10371,8 @@ export class FleetManager implements FleetHost {
     for (const wh of warehouses ?? []) for (const i of wh.inventory ?? []) n += i.quantity * w.basePrice(i.commodity_id);
     for (const l of this.loansCache?.loans ?? []) n -= Math.max(0, l.owed_pence);
     for (const l of this.loansCache?.lent ?? []) n += Math.max(0, l.owed_pence);
+    n += this.depositsWorth();
+    n -= Math.max(0, this.ownBank?.bank?.deposits_pence ?? 0);
     return Math.round(n);
   }
 
@@ -9807,7 +10964,8 @@ export class FleetManager implements FleetHost {
    * fund for IDLE_SETTLE_GAME_H is quoted on players' open requests (quoteIdle): secured, with recourse, from borrowers with
    * a clean credit record, never our own companies. It is taken back when the fleet needs the cash (a ship waits for it, or
    * a load at its source was short of it lately: no loan is taken while it is out), while we owe on a loan, near the
-   * season's end, or when the spare falls under half what is quoted. Only quotes we made are touched; bank deposits aren't made.
+   * season's end, or when the spare falls under half what is quoted. Only quotes we made are touched. Bank deposits (runDeposits)
+   * come after, on what this leaves (quotes earn more).
    */
   private async runIdleCash(): Promise<void> {
     const w = this.world;
@@ -10060,8 +11218,8 @@ export class FleetManager implements FleetHost {
       worthSource: this.worth?.source ?? null,
       debtPence: this.debtOwed(),
       capPence: this.worth ? Math.round((this.worth.pence * s.maxDebtPct) / 100) : null,
-      // What our loans alone keep back (debtFence also holds commission builds).
-      fencePence: Math.round(this.debtFence() - this.commissionFence()),
+      // What our loans alone keep back (debtFence also holds commission builds and our bank's lines' room).
+      fencePence: Math.round(this.debtFence() - this.commissionFence() - this.bankLineFence()),
       borrowed,
       nextRepayBy: by.length ? new Date(Math.min(...by)).toISOString() : null,
       interestPaidPence: this.interestPaidBefore + interest("borrower"),
@@ -10153,9 +11311,10 @@ export class FleetManager implements FleetHost {
   /**
    * Cash a load bought at `at` in `region` may use: the least the fleet's spare cash falls to from then
    * on, after our other ships' loads and with cash due (less the fee to bring it to `region`). A ship
-   * never counts on cash another's load needs first. With nothing due this equals loadCash().
+   * never counts on cash another's load needs first. With nothing due this equals loadCash() (our deposits at
+   * healthy banks counted as cash in hand: spareWithDeposits).
    */
-  private cashAt(flows: CashFlow[], at: number, region: BankingRegion | null, spare = this.spareCash()): number {
+  private cashAt(flows: CashFlow[], at: number, region: BankingRegion | null, spare = this.spareWithDeposits()): number {
     let bal = spare;
     let low: number | null = null;
     for (const f of flows) {
@@ -10171,7 +11330,9 @@ export class FleetManager implements FleetHost {
    * Cash this ship may put into its load now in `region` (topped up from other regions): at most
    * `amount`, and never what our other ships' loads count on unless cash due lands before they buy;
    * but always its own plan's share planned on cash in hand, while that cash is there (ownCall: that
-   * share respected the others when it was planned). Call holding the cash lock. Re-sizing off: as before.
+   * share respected the others when it was planned). Our deposits at healthy banks count as cash in hand and come back
+   * here (ensureCash) before any load loan is taken for what they can't cover. Call holding the cash lock. Re-sizing off:
+   * as before.
    */
   async loadBudget(agent: ShipAgent, region: BankingRegion, amount: number): Promise<number> {
     // A repayment due that cash can't cover: no new spending until it is paid (runFinance remits to it).
@@ -10180,11 +11341,11 @@ export class FleetManager implements FleetHost {
       // As before, but never what our loans will take to repay.
       const fence = this.debtFence();
       if (fence <= 0) return this.ensureCash(region, amount);
-      const cap = Math.max(0, this.spareCash() - fence);
+      const cap = Math.max(0, this.spareWithDeposits() - fence);
       return Math.min(cap, await this.ensureCash(region, Math.min(amount, cap)));
     }
     await this.world.refreshVaults();
-    const spare = this.spareCash();
+    const spare = this.spareWithDeposits();
     // First call on its own plan's cash in hand (ownFloor: never what our loans' repayments need); beyond that never
     // what our other ships' loads count on.
     let budget = Math.max(this.cashAt(this.cashFlows(agent), this.world.now(), region, spare), this.ownFloor(agent, spare));
@@ -10226,6 +11387,4877 @@ export class FleetManager implements FleetHost {
   private charterTaperReport(): NonNullable<CashReport["charterTaper"]> {
     const earned = this.world.charterEarnings();
     return { earnedPence: Math.round(earned), thresholdPence: TAPER_FREE_PENCE, windowGameDays: TAPER_WINDOW_GAME_DAYS, factor: this.world.charterTaper(0, earned) };
+  }
+
+  // ── Bank deposits and our own bank (deposits.ts, bank.ts; guide 3.13.4) ────
+
+  /**
+   * What the autopilot has on deposit and may still withdraw (pence): its open deposits' free balances, bar those frozen at a bank that
+   * isn't open (depositsFrozen).
+   */
+  private depositsOut(): number {
+    let n = 0;
+    for (const r of this.depositRecs.values()) if (isOpen(r) && !this.depositFrozen(r.bank)) n += freeBalance(r);
+    return n;
+  }
+
+  /** Why ours at this bank is frozen (bankFrozen: not open, failed or gone from the list), or null: open, or the banks not read yet. */
+  private depositFrozen(bank: string): string | null {
+    if (!this.banksSeen) return null;
+    return bankFrozen(this.banksSeen.banks.find((b) => b.company_id === bank));
+  }
+
+  /**
+   * Ours frozen at a bank that isn't open (pence; free balances): it pays nothing on demand (guide 3.13.4: depositors are paid pro rata as
+   * its loans come in), so it is owed later, never counted as cash nor toward what is on deposit.
+   */
+  private depositsFrozen(): number {
+    let n = 0;
+    for (const r of this.depositRecs.values()) if (isOpen(r) && this.depositFrozen(r.bank)) n += freeBalance(r);
+    return n;
+  }
+
+  /**
+   * Ours the fleet may count as cash (pence): free balances at banks listed open and healthy (bankTrouble: nothing overdue, reserves at
+   * the Crown's 20%), none held after a withdrawal with no answer. They come back on demand: ensureCash pulls them (pullForRegion)
+   * before it remits, and so before anything is borrowed. Nothing while the banks are unread or the key can't withdraw.
+   */
+  private depositsLiquid(): number {
+    if (!this.banksSeen || !this.canRemit) return 0;
+    const byBank = new Map(this.banksSeen.banks.map((b) => [b.company_id, b]));
+    const now = Date.now();
+    let n = 0;
+    for (const [id, r] of this.depositRecs) if (isOpen(r) && (this.depositHold.get(id) ?? 0) <= now && bankTrouble(byBank.get(r.bank)) === null) n += freeBalance(r);
+    return n;
+  }
+
+  /**
+   * What a spend may count on (pence) after the loads the fleet is bound to buy (`committed`) and the debt fence: spare above the
+   * floors, our deposits at healthy open banks (depositsLiquid: ensureCash brings them back before it remits or anything is borrowed)
+   * and our own lending line's room not yet lent (withdrawn first when the spend needs it: freeLineFor). Parked idle cash never holds
+   * the fleet back.
+   */
+  private spendable(committed: number): number {
+    return this.spareCash() + this.depositsLiquid() + this.ourLineRoom() - committed - this.debtFence();
+  }
+
+  /**
+   * Spare cash above the floors with our deposits at healthy open banks (depositsLiquid): what loads are planned and bought on (loadCash,
+   * cashAt, loadBudget). Buying one brings the deposits back (ensureCash), and a load loan covers only what they can't.
+   */
+  private spareWithDeposits(): number {
+    return this.spareCash() + this.depositsLiquid();
+  }
+
+  /**
+   * Spare above a region's floor (pence; the vaults as last read) for a spend that never remits (marques, patrols, underwriting),
+   * holding the cash lock: our deposits in that region brought back first when it is short (free; never by exchange or remittance).
+   */
+  private async regionSpare(region: BankingRegion, amount: number): Promise<number> {
+    const w = this.world;
+    if (w.vault(region) - this.floorIn(region) < amount && this.depositsOut() > 0) await this.pullForRegion(region, amount - (w.vault(region) - this.floorIn(region)), false);
+    return w.vault(region) - this.floorIn(region);
+  }
+
+  /**
+   * A spend refused for want of cash (pence: what it needed; the buyer, a listing, a commission): kept out of new deposits for
+   * DEPOSIT_SETTLE_GAME_H game hours (depositRoom), so ours beyond what is left come back; the finance pass looks soon.
+   */
+  private noteSpendShort(pence: number): void {
+    const live = this.spendKeep() - this.buyerKeep();
+    this.spendShort = { pence: Math.max(live, Math.ceil(Math.max(0, pence))), at: Date.now() };
+    if (this.depositsOut() > 0 || this.ourLinesOpen()) this.financeDirty = true;
+  }
+
+  /**
+   * Kept out of new deposits, our bank's charter and its lending line (pence): the buyer's next hull (buyerKeep) and what a spend was
+   * refused for within the last DEPOSIT_SETTLE_GAME_H game hours (noteSpendShort).
+   */
+  private spendKeep(): number {
+    const s = this.spendShort;
+    const short = s && Date.now() - s.at < DEPOSIT_SETTLE_GAME_H * 60 * this.world.gameMinuteMs ? s.pence : 0;
+    return this.buyerKeep() + short;
+  }
+
+  /**
+   * Our deposits for net worth (guide 3.17 counts them; on the low side): every open one of ours as last read (the user's too; ours as our
+   * record has it when that is newer, so a withdrawal since, already in the vault, isn't counted twice), and ours made since, at banks
+   * still listed and never failed.
+   */
+  private depositsWorth(): number {
+    const listed = new Map((this.banksSeen?.banks ?? []).map((b) => [b.company_id, b]));
+    const counts = (bank: string) => {
+      const b = listed.get(bank);
+      return !!b && !b.failed_at;
+    };
+    let n = 0;
+    const seen = new Set<string>();
+    const listAt = this.depositsSeen?.at ?? 0;
+    for (const d of this.depositsSeen?.list ?? []) {
+      seen.add(d.id);
+      const r = this.depositRecs.get(d.id);
+      if (r && r.seen > listAt) {
+        if (isOpen(r) && counts(r.bank)) n += r.balance;
+      } else if (isOpen(d) && counts(d.bank_company_id)) n += Math.max(0, d.balance_pence);
+    }
+    for (const [id, r] of this.depositRecs) if (!seen.has(id) && isOpen(r) && counts(r.bank)) n += r.balance;
+    return n;
+  }
+
+  /** The daily bills (pence a game day): fleet upkeep, the wealth levy and every region's warehouse rent. */
+  private billsPerDay(): number {
+    let rent = 0;
+    for (const p of this.bills.rent.values()) rent += p;
+    return this.upkeepPerDay() + this.levyPerDay() + rent;
+  }
+
+  /**
+   * While the buyer may build (on, the key able to, the fleet under its cap, the season normal, no AI hold): its next hull (the best it
+   * weighed last that pays back in time, else the cheapest hull quoted for a class it may build; the factor's guess before any quote), with
+   * DEPOSIT_BUYER_HEADROOM more for her first cargo, stays out of deposits, our bank's charter and its lending: a hull is the better use
+   * of the cash. 0 otherwise.
+   */
+  private buyerKeep(): number {
+    const s = this.settings;
+    if (!s.autoBuy || !this.canBuild || this.world.seasonMode() !== "normal" || this.advisor.buyHold()) return 0;
+    let afloat = 0;
+    for (const a of this.agents.values()) if (!a.gone) afloat++;
+    if (afloat >= s.maxShips) return 0;
+    const quotes = [...this.hullQuotes].filter(([k, v]) => v > 0 && s.buyClasses.includes(k.slice(k.indexOf("|") + 1))).map(([, v]) => v);
+    const next = this.buyerOptions.find((o) => o.costPence > 0 && o.paybackHours <= s.maxPaybackHours)?.costPence ?? 0;
+    return Math.ceil(Math.max(next, quotes.length ? Math.min(...quotes) : FACTOR_HULL_GUESS_PENCE) * DEPOSIT_BUYER_HEADROOM);
+  }
+
+  /**
+   * Why idle cash put to work at banks (our deposits, our bank's lines and exchange offers) must come back now, or null: a ship waits
+   * for cash, the loads to be bought need more than is spare, a load was cut to the cash at its source lately, a loan repayment is
+   * short, or the season's final hours.
+   */
+  private cashWanted(): string | null {
+    if ([...this.agents.values()].some((a) => a.waitingForCash)) return "a ship waits for cash";
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    if (this.spareCash() - committed < 0) return "the loads to be bought need more than is spare";
+    if (Date.now() - this.cashShortAt < CASH_SHORT_MS) return "a load was cut to the cash at its source lately";
+    if (this.debtShort) return "a loan repayment is short";
+    if (this.world.seasonMode() === "final") return "the season's final hours";
+    return null;
+  }
+
+  /**
+   * What may sit on deposit in all now (depositTarget): spare above the floors less the loads bound to be bought and the fence (our
+   * loans, commissions, our bank's lines' room), with what is on deposit (`held`) counted back in, less the liquid buffer, the buyer's
+   * next hull (buyerKeep) and what a spend was refused for lately (noteSpendShort), within the budget.
+   */
+  private depositRoom(held: number): { target: number; loose: number; buffer: number; keep: number } {
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    const loose = this.spareCash() - committed - this.debtFence();
+    const buffer = depositBuffer(this.billsPerDay());
+    const keep = this.spendKeep();
+    return { target: depositTarget({ loose, held, buffer, keep, budget: this.settings.depositBudgetPence }), loose, buffer, keep };
+  }
+
+  /**
+   * Why everything of ours on deposit comes back now (null: it may stay): the setting off, cashWanted, a loan call unanswered, or a
+   * loan we owe (a ship mortgage aside: never repaid early) dearer than the best deposit pays (`bestRateBps`, ours included): repaying it
+   * comes first (guide 3.13.1: early repayment costs nothing).
+   */
+  private depositStop(bestRateBps: number): string | null {
+    if (!this.settings.deposits) return "deposits are off";
+    const want = this.cashWanted();
+    if (want) return want;
+    if (this.pendingBorrowPence() > 0) return "a loan call had no answer";
+    let best = bestRateBps;
+    for (const r of this.depositRecs.values()) if (isOpen(r)) best = Math.max(best, r.rateBps);
+    const dear = (this.loansCache?.loans ?? [])
+      .filter((l) => (l.status === "active" || l.status === "defaulted") && l.owed_pence > 0 && !this.isMortgage(l))
+      .map((l) => annualBpsOf(l));
+    const worst = dear.length ? Math.max(...dear) : 0;
+    if (worst > annualOf(best)) return `we owe on a loan at ${pctYear(worst)}, dearer than any deposit pays (${pctYear(annualOf(best))}): repaying it comes first`;
+    return null;
+  }
+
+  /**
+   * The banks are listed afresh at the next read (a bank's notice, a refusal, our charter); the last list stands meanwhile, so a deposit
+   * of ours at a bank that isn't open stays frozen and none of ours is counted as cash on a guess.
+   */
+  private staleBanks(): void {
+    if (this.banksSeen) this.banksSeen = { ...this.banksSeen, at: 0 };
+  }
+
+  /** The banks (`bank/list`: every bank open or winding down), read at most every `maxAgeMs`; null: unreadable (the last list is kept). */
+  private async readBanks(maxAgeMs: number): Promise<BankResult[] | null> {
+    if (this.banksSeen && Date.now() - this.banksSeen.at < maxAgeMs) return this.banksSeen.banks;
+    const banks = await this.client.banks().catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (banks) this.banksSeen = { at: Date.now(), banks };
+    return banks;
+  }
+
+  /**
+   * Our deposits (`bank/deposits`): those we hold as depositor (records updated, a deposit call with no answer adopted or given up)
+   * and, when we are a bank, those depositors hold with us (kept in each region's floor: noteBankOwed). Null: unreadable.
+   */
+  private async readDeposits(): Promise<DepositResult[] | null> {
+    const me = this.world.companyId;
+    const all = await this.client.deposits().catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!all || !me) return null;
+    this.noteBankOwed(all.filter((d) => d.bank_company_id === me && d.depositor_company_id !== me));
+    const mine = all.filter((d) => d.depositor_company_id === me);
+    this.depositsSeen = { at: Date.now(), list: mine };
+    this.noteDeposits(mine);
+    return mine;
+  }
+
+  /**
+   * Depositors' money our bank holds (guide 3.13.4: it lands in our vault there and is paid back from it), per region from our bank's
+   * deposit list: kept in that region's floor (floorIn), never spent. What our bank's own figure owes beyond the list (or all of it,
+   * the list unread) is kept at home. Said when it changes.
+   */
+  private noteBankOwed(held: DepositResult[] | null): void {
+    const owed = new Map<BankingRegion, number>();
+    for (const d of held ?? []) {
+      const r = asRegion(d.banking_region);
+      if (r && isOpen(d) && d.balance_pence > 0) owed.set(r, (owed.get(r) ?? 0) + d.balance_pence);
+    }
+    const sum = (m: Map<BankingRegion, number>) => [...m.values()].reduce((n, p) => n + p, 0);
+    const total = Math.max(0, this.ownBank?.bank?.deposits_pence ?? 0);
+    // The list unread: what was placed before stands.
+    if (held === null && total > 0) for (const [r, p] of this.bankOwed) owed.set(r, p);
+    const home = this.homeRegion ?? asRegion(this.ownBank?.bank?.home_region);
+    const placed = sum(owed);
+    if (home && total > placed) owed.set(home, (owed.get(home) ?? 0) + total - placed);
+    const before = sum(this.bankOwed);
+    this.bankOwed = owed;
+    const after = sum(owed);
+    if (before !== after) {
+      this.log(
+        "fleet",
+        after > 0
+          ? `our bank: depositors hold ${cr(after)} with us (${[...owed].map(([r, p]) => `${r} ${cr(p)}`).join(", ")}): kept in those regions' floors, never spent`
+          : "our bank: no depositors' money held any more",
+      );
+    }
+  }
+
+  /**
+   * Our deposits as `bank/deposits` lists them (ours as depositor, any status): records updated; a deposit call with no answer is ours
+   * if a deposit at that bank, region and sum opened since is listed, else given up after DEPOSIT_PENDING_MS (never sent again
+   * meanwhile); closed records past keeping dropped (their interest kept in the total); holds after a call with no answer lapse.
+   */
+  private noteDeposits(mine: DepositResult[]): void {
+    const w = this.world;
+    const now = Date.now();
+    const byId = new Map(mine.map((d) => [d.id, d]));
+    for (const p of [...this.pendingDeposits]) {
+      const hit = mine.find((d) => !this.depositRecs.has(d.id) && d.bank_company_id === p.bank && d.banking_region === p.region && d.deposited_pence === p.amount && Date.parse(d.created_at) >= p.at - 120_000);
+      if (hit) {
+        this.pendingDeposits = this.pendingDeposits.filter((x) => x !== p);
+        this.depositRecs.set(hit.id, depositRec(hit, now));
+        this.depositStats.deposited += p.amount;
+        this.depositStats.deposits++;
+        this.log("fleet", `deposits: the deposit of ${cr(p.amount)} with ${p.bankName} in ${p.region} whose call had no answer was made after all`);
+      } else if (w.now() - p.at > DEPOSIT_PENDING_MS) {
+        this.pendingDeposits = this.pendingDeposits.filter((x) => x !== p);
+        this.log("fleet", `deposits: the deposit of ${cr(p.amount)} with ${p.bankName} whose call had no answer isn't among ours ${Math.round(DEPOSIT_PENDING_MS / 60_000)} min on: it wasn't made`);
+      }
+    }
+    for (const [id, r] of [...this.depositRecs]) {
+      const d = byId.get(id);
+      // Not listed: left as last seen (a withdrawal of it says if it is gone).
+      if (!d) continue;
+      const next = depositRec(d, now, r);
+      if (next.writtenOff > r.writtenOff) this.log("fleet", `deposits: WARNING ${r.bankName} wrote off ${cr(next.writtenOff - r.writtenOff)} of our deposit in ${r.region}`);
+      this.depositRecs.set(id, next);
+    }
+    for (const [id, r] of [...this.depositRecs]) {
+      if (isOpen(r) || now - r.seen < DEPOSIT_REC_KEEP_MS) continue;
+      this.depositInterestBefore += r.interest;
+      this.depositRecs.delete(id);
+    }
+    for (const [id, until] of [...this.depositHold]) if (until <= now) this.depositHold.delete(id);
+  }
+
+  /**
+   * Withdraws `amount` (pence, gross) of one of our deposits (guide 3.13.4: `bank/withdraw`), into its own region, or into `to` by the
+   * bank's exchange at `feeBps`; the caller holds the cash lock. A demand deposit is paid at once only as far as the bank's cash
+   * reaches: the rest is asked for and owed later (the deposit's pending withdrawal, never counted as cash). A call with no answer, or
+   * a refusal, leaves the deposit alone until our deposits are read again (a refusal at a bank that isn't open is logged once: frozen).
+   * What reached the vault at once (net of the fee; null: no answer; "refused": nothing came).
+   */
+  private async pullDeposit(id: string, amount: number, to: BankingRegion | null, feeBps: number, why: string): Promise<number | null | "refused"> {
+    const w = this.world;
+    const r = this.depositRecs.get(id);
+    if (!r || !isOpen(r)) return 0;
+    const gross = Math.floor(Math.min(amount, freeBalance(r)));
+    if (gross <= 0) return 0;
+    const dest = to ?? r.region;
+    try {
+      const after = await this.client.withdrawDeposit(id, gross, to ?? undefined);
+      const rec = depositRec(after, Date.now(), r);
+      this.depositRecs.set(id, rec);
+      const owed = Math.min(gross, Math.max(0, rec.pending - r.pending));
+      const paidGross = gross - owed;
+      const fee = Math.ceil((paidGross * feeBps) / 10_000);
+      const paid = Math.max(0, paidGross - fee);
+      // Booked at once, in case the read below fails.
+      w.vaults.set(dest, w.vault(dest) + paid);
+      await w.refreshVaults().catch((e) => {
+        if (this.isFatal(e)) throw e;
+      });
+      this.depositPulls.push({ at: w.now(), id, bank: r.bankName, region: r.region, to, amount: gross, paid, owed, fee, why });
+      if (this.depositPulls.length > DEPOSIT_PULLS_KEPT) this.depositPulls.splice(0, this.depositPulls.length - DEPOSIT_PULLS_KEPT);
+      this.depositStats.pulled += gross;
+      this.depositStats.pulls++;
+      this.depositIdleSince = 0;
+      this.log(
+        "fleet",
+        `deposits: withdrew ${cr(gross)} from ${r.bankName} in ${r.region}${to ? ` into ${to} by its exchange (fee ${cr(fee)}, under the Crown's)` : ""} (${why})` +
+          `${owed > 0 ? `: ${cr(paidGross)} paid at once, ${cr(owed)} owed by the bank (its cash ran short there; not ours to spend until it is paid)` : ""}`,
+      );
+      this.persist();
+      return paid;
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      const msg = (e as Error).message;
+      this.depositHold.set(id, Date.now() + DEPOSIT_HOLD_MS);
+      this.depositsDirty = true;
+      this.financeDirty = true;
+      if (outcomeUnknown(e)) {
+        this.log("fleet", `deposits: withdrawing ${cr(gross)} from ${r.bankName}: no answer (${msg}); our deposits are read again before anything more is asked of it`);
+        return null;
+      }
+      // Gone (closed meanwhile); else nothing free (asked for already, a loan's lock), a region it no longer offers, or a bank that
+      // isn't open (409 while it winds down: ours there is frozen, said once a state of the bank).
+      if (isApiError(e) && e.status === 404) this.depositRecs.set(id, { ...r, status: "closed", seen: Date.now() });
+      const frozen = this.depositFrozen(r.bank);
+      if (frozen) {
+        const key = frozenKey(this.banksSeen?.banks.find((b) => b.company_id === r.bank));
+        this.logOnceFor(`deposit-frozen|${id}|${key}`, "fleet", `deposits: withdrawing our ${cr(gross)} from ${r.bankName} was refused (${frozen}: ${msg}): frozen there, owed later (paid pro rata as its loans come in), never counted as cash`);
+      } else this.log("fleet", `deposits: withdrawing ${cr(gross)} from ${r.bankName} was refused: ${msg}`);
+      return "refused";
+    }
+  }
+
+  /**
+   * A region short of cash (ensureCash, which holds the cash lock): our deposits brought back before anything is remitted, and so before
+   * anything is borrowed (guide 3.13.4). Those in the region itself first (free). With `remit` (ensureCash's remittances follow), then
+   * those elsewhere whose bank's exchange fee into it, less our client discount, is strictly under the Crown's known fee for the route,
+   * cheapest first: the bank and our client terms are read again just before (the fee is fixed when asked), and one that no longer
+   * beats the Crown is passed over. Then, for what the other regions' spare can't bring, those elsewhere into their own region (free),
+   * the Crown's remittance carrying the cash on. The lowest rate first among equals. Never one frozen at a bank that isn't open, nor held
+   * after a call with no answer, nor beyond its free balance; a call with no answer stops it (nothing stacked on it).
+   */
+  private async pullForRegion(region: BankingRegion, need: number, remit = true): Promise<void> {
+    if (!this.canRemit || need <= 0 || this.paused || this.stopRequested) return;
+    const w = this.world;
+    const usable = () =>
+      [...this.depositRecs]
+        .filter(([id, r]) => isOpen(r) && freeBalance(r) > 0 && (this.depositHold.get(id) ?? 0) <= Date.now() && !this.depositFrozen(r.bank))
+        .sort(([, a], [, b]) => a.rateBps - b.rateBps || freeBalance(a) - freeBalance(b));
+    const why = `${region} was short of cash`;
+    let left = need;
+    // In the region itself: free.
+    for (const [id, r] of usable().filter(([, r]) => r.region === region)) {
+      if (left <= 0) return;
+      const free = freeBalance(r);
+      const got = await this.pullDeposit(id, Math.min(free, pullAmount(free, left)), null, 0, why);
+      if (got === null) return;
+      if (got !== "refused") left -= got;
+    }
+    if (left <= 0 || !remit || this.paused || this.stopRequested) return;
+    // Elsewhere, by the bank's exchange: only against the Crown's fee as published (never the 200 bps guess for a route unread).
+    const elsewhere = usable().filter(([, r]) => r.region !== region);
+    if (!elsewhere.length) return;
+    const rates = await this.readCrownRates();
+    const crownBps = (from: BankingRegion) => rates?.find((x) => x.from_region === from && x.to_region === region)?.fee_bps ?? null;
+    const listed = new Map((this.banksSeen?.banks ?? []).map((b) => [b.company_id, b]));
+    const byExchange = elsewhere
+      .map(([id, r]) => {
+        const crown = crownBps(r.region);
+        return { id, r, crown, fee: crown === null ? null : exchangeFee(listed.get(r.bank), region, r.discountBps, crown) };
+      })
+      .filter((c): c is { id: string; r: DepositRec; crown: number; fee: number } => c.fee !== null && c.crown !== null)
+      .sort((a, b) => a.fee - b.fee);
+    let terms: ClientTermsResult[] | null | undefined;
+    for (const c of byExchange) {
+      if (left <= 0 || this.paused || this.stopRequested) return;
+      // The bank's schedule and our discount as they stand now: a fee posted since our list read would be charged.
+      const fresh = await this.client.bankStatus(c.r.bank).catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (terms === undefined) {
+        terms = await this.client.clientTerms().catch((e) => {
+          if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+          return null;
+        });
+      }
+      if (fresh && this.banksSeen) this.banksSeen = { ...this.banksSeen, banks: this.banksSeen.banks.map((b) => (b.company_id === fresh.company_id ? fresh : b)) };
+      // Our discount from the bank's client terms (none counted when they can't be read: the dearer side).
+      const discount = terms?.find((t) => t.bank_company_id === c.r.bank && t.depositor_company_id === w.companyId)?.exchange_discount_bps ?? 0;
+      const fee = fresh && bankTrouble(fresh) === null ? exchangeFee(fresh, region, discount, c.crown) : null;
+      if (fee === null) continue;
+      const r = this.depositRecs.get(c.id);
+      const free = r && isOpen(r) ? freeBalance(r) : 0;
+      if (free <= 0) continue;
+      const got = await this.pullDeposit(c.id, Math.min(free, pullAmount(free, grossFor(left, fee))), region, fee, why);
+      if (got === null) return;
+      if (got !== "refused") left -= got;
+    }
+    if (left <= 0 || this.paused || this.stopRequested) return;
+    // Into their own regions for the remittances to carry on, only for what the other regions' spare (after the Crown's fee) can't bring.
+    let carry = 0;
+    for (const [r, v] of w.vaults) if (r !== region) carry += Math.max(0, v - this.floorIn(r)) * (1 - w.remitBps(r, region) / 10_000);
+    let rest = left - carry;
+    const own = usable()
+      .filter(([, r]) => r.region !== region)
+      .sort(([, a], [, b]) => w.remitBps(a.region, region) - w.remitBps(b.region, region));
+    for (const [id, r] of own) {
+      if (rest <= 0 || this.paused || this.stopRequested) return;
+      const bps = w.remitBps(r.region, region);
+      const free = freeBalance(r);
+      const got = await this.pullDeposit(id, Math.min(free, pullAmount(free, grossFor(rest, bps))), null, 0, `${why} (remitted on from ${r.region})`);
+      if (got === null) return;
+      if (got !== "refused") rest -= got * (1 - bps / 10_000);
+    }
+  }
+
+  /**
+   * Bank deposits (guide 3.13.4; deposits.ts), every finance pass while the setting is on or the autopilot has deposits out: ours and
+   * the banks read; ours at a bank in trouble withdrawn at once (into its own region, free), or at one that isn't open asked for once a
+   * state of the bank (frozen meanwhile: owed later, never counted as cash, said in the action); all of ours brought back when depositStop
+   * says so, or what is beyond the target (depositRoom) past DEPOSIT_HYSTERESIS_PENCE, the lowest rate first; otherwise, once spare cash
+   * has had nothing to fund for DEPOSIT_SETTLE_GAME_H, one new demand deposit a pass (placeDeposit). Nothing new in the season's
+   * endgame. Deposits made by hand are never touched (one at a bank in trouble is warned of once). Under the cash lock for every call.
+   */
+  private async runDeposits(): Promise<void> {
+    const w = this.world;
+    const s = this.settings;
+    const open = () => [...this.depositRecs].filter(([, r]) => isOpen(r));
+    if (!s.deposits && open().length === 0 && this.pendingDeposits.length === 0) {
+      this.depositBlocked = "deposits are off";
+      this.depositAction = "off";
+      this.depositIdleSince = 0;
+      this.depositTargetNow = 0;
+      return;
+    }
+    // The banks as read moments ago serve (our bank's pass reads them first), unless a bank's notice came since.
+    const [list, banks] = await Promise.all([this.readDeposits(), this.readBanks(this.depositsDirty ? 0 : 15_000)]);
+    this.depositsDirty = false;
+    this.depositAt = new Date().toISOString();
+    if (!list || !banks) {
+      this.depositBlocked = `${!list ? "our deposits" : "the banks"} couldn't be read`;
+      this.depositAction = `${this.depositBlocked}: nothing deposited or withdrawn this pass`;
+      return;
+    }
+    const byBank = new Map(banks.map((b) => [b.company_id, b]));
+    for (const d of list) {
+      if (!isOpen(d) || this.depositRecs.has(d.id)) continue;
+      const t = bankTrouble(byBank.get(d.bank_company_id));
+      if (t) this.logOnceFor(`hand-deposit|${d.id}|${t}`, "fleet", `deposits: WARNING a deposit made by hand (${cr(d.balance_pence)} with ${d.bank_name} in ${d.banking_region}): ${t}. The autopilot never touches it: withdraw it on the bank page`);
+    }
+    const did: string[] = [];
+    let arrived = false;
+    // Ours at a bank in trouble but open: withdrawn at once. At one that isn't open (frozen: it refuses withdrawals while it winds down
+    // and pays depositors pro rata as its loans come in): asked once a state of the bank (frozenKey), else every DEPOSIT_FROZEN_RETRY_MS.
+    for (const id of [...this.frozenAsked.keys()]) if (!isOpen(this.depositRecs.get(id) ?? { status: "closed" })) this.frozenAsked.delete(id);
+    const troubled = open().filter(([id, r]) => {
+      const b = byBank.get(r.bank);
+      if (freeBalance(r) <= 0 || (this.depositHold.get(id) ?? 0) > Date.now() || bankTrouble(b) === null) return false;
+      const asked = bankFrozen(b) ? this.frozenAsked.get(id) : undefined;
+      return !asked || asked.key !== frozenKey(b) || Date.now() - asked.at >= DEPOSIT_FROZEN_RETRY_MS;
+    });
+    if (troubled.length) {
+      await this.withCash(async () => {
+        for (const [id] of troubled) {
+          if (this.stopRequested || this.paused) return;
+          const r = this.depositRecs.get(id);
+          if (!r || !isOpen(r) || freeBalance(r) <= 0) continue;
+          const b = byBank.get(r.bank);
+          const why = bankTrouble(b) ?? "it is in trouble";
+          const frozen = bankFrozen(b) !== null;
+          if (frozen) this.frozenAsked.set(id, { key: frozenKey(b), at: Date.now() });
+          this.logOnceFor(
+            `bank-trouble|${id}|${why}`,
+            "fleet",
+            `deposits: WARNING ${r.bankName}: ${why}: ${frozen ? `asking for our ${cr(freeBalance(r))} there (a bank that isn't open pays its depositors pro rata as its loans come in: owed later meanwhile, never counted as cash)` : `withdrawing our ${cr(freeBalance(r))} there at once`}`,
+          );
+          const got = await this.pullDeposit(id, freeBalance(r), null, 0, `${r.bankName}: ${why}`);
+          if (got === "refused") did.push(`${r.bankName} refused our withdrawal (${why})${frozen ? ": frozen there, owed later" : ""}`);
+          else if (got !== null) {
+            did.push(got > 0 ? `withdrew ${cr(got)} from ${r.bankName} (${why})` : `asked ours back from ${r.bankName} (${why}): owed later`);
+            arrived ||= got > 0;
+          }
+        }
+      });
+    }
+    const frozenOut = this.depositsFrozen();
+    if (frozenOut > 0 && !did.some((x) => x.includes("frozen"))) did.push(`${cr(frozenOut)} frozen at banks that aren't open (owed later)`);
+    const takers = rankBanks(banks.filter((b) => bankRefusal(b, (id) => this.isOurCompany(id)) === null));
+    const held = this.depositsOut();
+    const stop = this.depositStop(takers[0]?.demand_rate_bps ?? 0);
+    const room = this.depositRoom(held);
+    const target = stop ? 0 : room.target;
+    this.depositTargetNow = target;
+    const now = Date.now();
+    if (stop || target - held < DEPOSIT_MIN_PENCE) this.depositIdleSince = 0;
+    else if (!this.depositIdleSince) this.depositIdleSince = now;
+    // Beyond the target (all of it on a stop): back into their own regions, the lowest rate first (none frozen: that bank refuses).
+    if (held > 0 && held > target && (stop !== null || held - target > DEPOSIT_HYSTERESIS_PENCE)) {
+      const why = stop ?? "more on deposit than the fleet can spare now";
+      let back = 0;
+      await this.withCash(async () => {
+        let left = held - target;
+        const order = pullOrder(
+          open()
+            .filter(([, r]) => !this.depositFrozen(r.bank))
+            .map(([id, r]) => ({ id, free: freeBalance(r), rateBps: r.rateBps, trouble: null as string | null }))
+            .filter((x) => x.free > 0 && (this.depositHold.get(x.id) ?? 0) <= Date.now()),
+        );
+        for (const x of order) {
+          if (left <= 0 || this.stopRequested || this.paused) break;
+          const amount = stop ? x.free : Math.min(x.free, pullAmount(x.free, left));
+          const got = await this.pullDeposit(x.id, amount, null, 0, why);
+          if (got === null) break;
+          if (got === "refused") continue;
+          left -= amount;
+          back += got;
+        }
+      });
+      if (back > 0 || arrived) this.cashArrived();
+      this.depositBlocked = why;
+      this.depositAction = `${did.length ? `${did.join("; ")}; ` : ""}${back > 0 ? `brought ${cr(back)} back from deposit` : "bringing our deposits back"} (${why})`;
+      return;
+    }
+    if (arrived) this.cashArrived();
+    const add = target - held;
+    const settleMs = DEPOSIT_SETTLE_GAME_H * 60 * w.gameMinuteMs;
+    const waited = this.depositIdleSince ? now - this.depositIdleSince : 0;
+    const heldText = held > 0 ? `${cr(held)} on deposit` : "nothing on deposit";
+    let blocked: string | null = stop;
+    if (!blocked && w.seasonMode() !== "normal") blocked = "the season's endgame: no new deposits";
+    if (!blocked && this.pendingDeposits.length) blocked = "a deposit call had no answer: looking for it among ours";
+    if (!blocked && now < this.depositRetryAt) blocked = "a deposit was refused lately";
+    if (!blocked && takers.length === 0) blocked = "no bank takes deposits on our terms (open, nothing overdue, reserves at the Crown's 20%, a demand rate above nothing and not mispriced, not our own)";
+    if (!blocked && add < DEPOSIT_MIN_PENCE) {
+      blocked =
+        held >= s.depositBudgetPence
+          ? `the ${cr(s.depositBudgetPence)} deposit budget is used`
+          : `no more idle cash: ${cr(Math.max(0, room.loose))} spare after the loads and fences, ${cr(room.buffer)} kept liquid${room.keep > 0 ? `, ${cr(room.keep)} kept for the buyer's next hull and spends short of cash lately` : ""}`;
+    }
+    if (!blocked && waited < settleMs) blocked = `${cr(add)} idle: deposited once it has had nothing to fund for ${DEPOSIT_SETTLE_GAME_H} game hours (~${Math.ceil((settleMs - waited) / 60_000)} min more)`;
+    this.depositBlocked = blocked;
+    if (blocked) {
+      this.depositAction = `${did.length ? `${did.join("; ")}; ` : ""}${heldText}: ${blocked}`;
+      return;
+    }
+    await this.placeDeposit(takers);
+    if (did.length) this.depositAction = `${did.join("; ")}; ${this.depositAction}`;
+  }
+
+  /**
+   * One new demand deposit (guide 3.13.4: `bank/deposit`, `notice: false`) under the cash lock, sized again on the vaults just read:
+   * with the best bank that takes ours and has room for it (bankCap, deposits made by hand there counted), in the region with the most
+   * spare above its floor (the cash already lies there: no remittance), at least DEPOSIT_MIN_PENCE. Saved before it is sent; one with
+   * no answer is looked for among our deposits (noteDeposits) and never sent again. A refusal passes that bank over a while.
+   */
+  private async placeDeposit(takers: BankResult[]): Promise<void> {
+    const w = this.world;
+    const s = this.settings;
+    await this.withCash(async () => {
+      if (this.stopRequested || this.paused || !this.settings.deposits || this.pendingDeposits.length) return;
+      await w.refreshVaults();
+      const held = this.depositsOut();
+      const stop = this.depositStop(takers[0]?.demand_rate_bps ?? 0);
+      if (stop) {
+        this.depositAction = `nothing deposited: ${stop}`;
+        return;
+      }
+      const add = this.depositRoom(held).target - held;
+      if (add < DEPOSIT_MIN_PENCE) {
+        this.depositAction = "nothing deposited: the idle cash went to other uses meanwhile";
+        return;
+      }
+      const atBank = new Map<string, number>();
+      for (const r of this.depositRecs.values()) if (isOpen(r)) atBank.set(r.bank, (atBank.get(r.bank) ?? 0) + r.balance);
+      for (const d of this.depositsSeen?.list ?? []) if (isOpen(d) && !this.depositRecs.has(d.id)) atBank.set(d.bank_company_id, (atBank.get(d.bank_company_id) ?? 0) + d.balance_pence);
+      const now = Date.now();
+      const pick = takers
+        .filter((b) => (this.bankSkip.get(b.company_id) ?? 0) <= now)
+        .map((b) => ({ b, room: bankCap(b, s.depositBudgetPence) - (atBank.get(b.company_id) ?? 0) }))
+        .find((x) => x.room >= DEPOSIT_MIN_PENCE);
+      if (!pick) {
+        this.depositAction = "nothing deposited: no bank that takes deposits has room for more of ours (2,500 Cr a bank unless insured with strong reserves; never over a tenth of its deposits and reserves)";
+        return;
+      }
+      const richest = [...w.vaults].map(([r, v]) => ({ region: r, spare: v - this.floorIn(r) })).sort((a, b) => b.spare - a.spare)[0];
+      const amount = richest ? Math.floor(Math.min(add, pick.room, richest.spare)) : 0;
+      if (!richest || amount < DEPOSIT_MIN_PENCE) {
+        this.depositAction = `nothing deposited: no region holds ${cr(DEPOSIT_MIN_PENCE)} spare above its floor`;
+        return;
+      }
+      const region = richest.region;
+      const b = pick.b;
+      const pend: PendingDeposit = { bank: b.company_id, bankName: b.name, region, amount, at: w.now() };
+      this.pendingDeposits.push(pend);
+      this.persist(true);
+      await this.journal?.flush();
+      try {
+        const d = await this.client.deposit({ bank_company_id: b.company_id, banking_region: region, amount_pence: amount, notice: false });
+        this.pendingDeposits = this.pendingDeposits.filter((x) => x !== pend);
+        this.depositRecs.set(d.id, depositRec(d, Date.now()));
+        this.depositStats.deposited += amount;
+        this.depositStats.deposits++;
+        w.vaults.set(region, w.vault(region) - amount);
+        this.depositAction = `deposited ${cr(amount)} with ${b.name} in ${region}`;
+        this.log(
+          "fleet",
+          `deposits: put ${cr(amount)} of idle cash on demand deposit with ${b.name} in ${region} at ${b.demand_rate_bps} bps a game day (~${pctYear(annualOf(b.demand_rate_bps))}), ` +
+            `${b.insured ? `insured (the Crown covers 2,500 Cr of ours once ${DEPOSIT_INSURED_AGE_GAME_DAYS} game days old)` : "uninsured (at most 2,500 Cr of ours there)"}; ` +
+            `its reserves ${cr(b.reserves_pence)} against the Crown's ${cr(b.required_reserve_pence)}, nothing overdue: withdrawn on demand when the fleet needs it`,
+        );
+        this.persist(true);
+      } catch (e) {
+        const unknown = outcomeUnknown(e);
+        if (!unknown) {
+          this.pendingDeposits = this.pendingDeposits.filter((x) => x !== pend);
+          this.persist();
+        }
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        const msg = (e as Error).message;
+        if (unknown) {
+          this.depositsDirty = true;
+          this.depositAction = "the deposit call had no answer: looking for it among ours";
+          this.log("fleet", `deposits: the deposit of ${cr(amount)} with ${b.name} had no answer (${msg}); looked for among our deposits, never sent again`);
+          return;
+        }
+        this.depositRetryAt = Date.now() + IDLE_RETRY_MS;
+        this.bankSkip.set(b.company_id, Date.now() + DEAL_SKIP_MS);
+        this.staleBanks();
+        this.depositAction = `the deposit with ${b.name} was refused: ${msg}`;
+        this.log("fleet", `deposits: the deposit of ${cr(amount)} with ${b.name} was refused: ${msg}`);
+      }
+    });
+  }
+
+  /** Bank deposits for the panel and the digest. */
+  private depositsReport(): DepositsReport {
+    const s = this.settings;
+    const iso = (ms: number | null | undefined) => (ms ? new Date(ms).toISOString() : null);
+    const banks = this.banksSeen?.banks ?? [];
+    const byBank = new Map(banks.map((b) => [b.company_id, b]));
+    const listed = !!this.banksSeen;
+    const rows: DepositsReport["deposits"] = [];
+    let interest = this.depositInterestBefore;
+    let owedLater = 0;
+    for (const [id, r] of this.depositRecs) {
+      interest += r.interest;
+      if (!isOpen(r)) continue;
+      // Asked for and not yet paid, and all that is free at a bank that isn't open (frozen: paid pro rata as its loans come in).
+      owedLater += r.pending + (this.depositFrozen(r.bank) ? freeBalance(r) : 0);
+      rows.push({
+        id,
+        bankId: r.bank,
+        bank: r.bankName,
+        region: r.region,
+        balancePence: r.balance,
+        pendingWithdrawalPence: r.pending,
+        rateBps: r.rateBps,
+        insured: byBank.get(r.bank)?.insured ?? null,
+        interestPence: r.interest,
+        openedAt: iso(r.at),
+        ours: true,
+        trouble: listed ? bankTrouble(byBank.get(r.bank)) : null,
+      });
+    }
+    for (const d of this.depositsSeen?.list ?? []) {
+      const region = asRegion(d.banking_region);
+      if (!isOpen(d) || this.depositRecs.has(d.id) || !region) continue;
+      rows.push({
+        id: d.id,
+        bankId: d.bank_company_id,
+        bank: d.bank_name,
+        region,
+        balancePence: d.balance_pence,
+        pendingWithdrawalPence: d.pending_withdrawal_pence ?? 0,
+        rateBps: d.effective_rate_bps,
+        insured: byBank.get(d.bank_company_id)?.insured ?? null,
+        interestPence: d.interest_credited_pence ?? 0,
+        openedAt: d.created_at ?? null,
+        ours: false,
+        trouble: listed ? bankTrouble(byBank.get(d.bank_company_id)) : null,
+      });
+    }
+    const atBank = new Map<string, number>();
+    for (const x of rows) atBank.set(x.bankId, (atBank.get(x.bankId) ?? 0) + x.balancePence);
+    const judged = rankBanks(banks).map((b) => {
+      const refusal = bankRefusal(b, (id) => this.isOurCompany(id));
+      const room = refusal ? 0 : Math.max(0, bankCap(b, s.depositBudgetPence) - (atBank.get(b.company_id) ?? 0));
+      return {
+        id: b.company_id,
+        name: b.name,
+        rateBps: b.demand_rate_bps,
+        insured: b.insured,
+        depositsPence: b.deposits_pence,
+        reservesPence: b.reserves_pence,
+        requiredPence: b.required_reserve_pence,
+        roomPence: room,
+        verdict: refusal ?? (room >= DEPOSIT_MIN_PENCE ? "takes ours" : "full for ours (its cap reached)"),
+        ok: !refusal,
+      };
+    });
+    judged.sort((a, b) => Number(b.ok) - Number(a.ok));
+    return {
+      enabled: s.deposits,
+      budgetPence: s.depositBudgetPence,
+      blocked: this.depositBlocked,
+      action: this.depositAction,
+      checkedAt: this.depositAt,
+      targetPence: this.depositTargetNow,
+      heldPence: this.depositsOut(),
+      owedLaterPence: owedLater,
+      interestPence: interest,
+      deposits: rows,
+      banks: judged.slice(0, 12).map(({ ok: _ok, ...x }) => x),
+      pulls: this.depositPulls.map((p) => ({ at: new Date(p.at).toISOString(), bank: p.bank, region: p.region, to: p.to, amountPence: p.amount, paidPence: p.paid, owedPence: p.owed, feePence: p.fee, why: p.why })),
+      depositedPence: this.depositStats.deposited,
+      depositsMade: this.depositStats.deposits,
+      pulledPence: this.depositStats.pulled,
+    };
+  }
+
+  /** The autopilot's lending lines open (as last read; not yet read since a restart: taken as open), or a post with no answer. */
+  private ourLinesOpen(): boolean {
+    const m = this.bankMem;
+    if (m.pendingLine) return true;
+    if (!m.lineIds.length) return false;
+    return !this.ownLines || this.ownLines.lines.some((l) => l.status === "open" && m.lineIds.includes(l.id));
+  }
+
+  /**
+   * Our bank's lending lines' room not yet lent or quoted (pence; guide 3.13.8: a matching request escrows a quote's principal from our
+   * vault at once): every open line of our bank as last read (one posted by hand too), and a post with no answer at its size.
+   */
+  private bankLineFence(): number {
+    const me = this.world.companyId;
+    let n = 0;
+    for (const l of this.ownLines?.lines ?? []) if (l.status === "open" && l.bank_company_id === me) n += Math.max(0, l.remaining_capacity_pence);
+    if (this.bankMem.pendingLine) n += this.bankMem.pendingLine.maxLine;
+    return n;
+  }
+
+  /**
+   * The unlent room of the autopilot's own lending lines as last read (pence; never a line posted by hand, nor a post with no answer):
+   * cash a spend may count on (spendable), the line withdrawn first when the spend needs it (freeLineFor).
+   */
+  private ourLineRoom(): number {
+    const ids = this.bankMem.lineIds;
+    let n = 0;
+    for (const l of this.ownLines?.lines ?? []) if (l.status === "open" && ids.includes(l.id)) n += Math.max(0, l.remaining_capacity_pence);
+    return n;
+  }
+
+  /**
+   * Before a spend judged on spendable, holding the cash lock (`need`: what it takes out of spendable(`committed`)): when spare cash and
+   * our deposits after the loads and the fence fall short of it, the spend is eating into our lending line's unlent room, so our line is
+   * withdrawn first (its open quotes released) and no borrower's request escrows that cash meanwhile. bankLine posts one again on what
+   * the fleet can spare then.
+   */
+  private async freeLineFor(need: number, committed: number, what: string): Promise<void> {
+    if (this.ourLineRoom() <= 0 || this.spareCash() + this.depositsLiquid() - committed - this.debtFence() >= need) return;
+    await this.withdrawOurLinesHeld(`the fleet needs its room for ${what}`);
+  }
+
+  /**
+   * Each region's spare beyond its floor and the loads our ships are bound to buy there (pence): what our bank may pay drafts out of
+   * and lend from.
+   */
+  private regionSurplus(): Map<BankingRegion, number> {
+    const w = this.world;
+    const out = new Map<BankingRegion, number>();
+    for (const [r, v] of w.vaults) out.set(r, v - this.floorIn(r));
+    for (const a of this.agents.values()) {
+      const src = a.lane?.source;
+      const c = src ? this.committedBy(a) : 0;
+      if (!src || c <= 0) continue;
+      const r = w.region(src);
+      if (out.has(r)) out.set(r, out.get(r)! - c);
+    }
+    return out;
+  }
+
+  /** The Crown's remittance fees (`treasury/rates`), read at most every BANK_RATES_TTL_MS; the last read when one fails. */
+  private async readCrownRates(): Promise<AchRate[] | null> {
+    if (this.crownRates && Date.now() - this.crownRates.at < BANK_RATES_TTL_MS) return this.crownRates.rates;
+    const rates = await this.client.rates().catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (rates) this.crownRates = { at: Date.now(), rates };
+    return this.crownRates?.rates ?? null;
+  }
+
+  /**
+   * Our own bank as listed (`bank/list`: every bank open or winding down), else (once we have had one) `bank/status` for one closed or
+   * failed. Null: we are no bank; undefined: it couldn't be told.
+   */
+  private async readOwnBank(): Promise<BankResult | null | undefined> {
+    const me = this.world.companyId;
+    if (!me) return undefined;
+    const banks = await this.readBanks(30_000);
+    const listed = banks?.find((b) => b.company_id === me);
+    if (listed) {
+      this.ownBank = { at: Date.now(), bank: listed };
+      return listed;
+    }
+    const m = this.bankMem;
+    if (banks && m.charteredAt === null && m.pendingCharter === null && !this.ownBank?.bank) {
+      this.ownBank = { at: Date.now(), bank: null };
+      return null;
+    }
+    try {
+      const b = await this.client.bankStatus(me);
+      this.ownBank = { at: Date.now(), bank: b };
+      return b;
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      // Refused (404: no bank of ours), with the list read: no bank. Anything else can't tell.
+      if (isApiError(e) && e.status >= 400 && e.status < 500 && banks) {
+        this.ownBank = { at: Date.now(), bank: null };
+        return null;
+      }
+      return undefined;
+    }
+  }
+
+  /** Our bank's open lending lines (`bank/lending-lines?company_id=`), ours by hand included; null: unreadable. */
+  private async readOwnLines(): Promise<LendingLine[] | null> {
+    const me = this.world.companyId;
+    if (!me) return null;
+    const lines = await this.client.lendingLines({ company_id: me }).catch((e) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!lines) return null;
+    const ours = lines.filter((l) => l.bank_company_id === me);
+    this.ownLines = { at: Date.now(), lines: ours };
+    return ours;
+  }
+
+  /**
+   * Our own bank (guide 3.13.4, 3.13.8, 3.12; bank.ts), every finance pass while the setting is on or a bank of ours (or a call about
+   * one) is to be looked after. With none: the charter's case (charterBlock) and the charter. With one open: what depositors hold kept
+   * in the floors, the exchange schedule (bankDrafts) and the lending line (bankLine); with the setting off, both withdrawn and a
+   * warning that the bank stays chartered. Never wound down: a bank failing, winding down or owing withdrawals is warned of.
+   */
+  private async runBank(): Promise<void> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.bankMem;
+    if (!w.companyId) return;
+    const mayHave = m.charteredAt !== null || m.pendingCharter !== null || m.lineIds.length > 0 || m.pendingLine !== null || !!this.ownBank?.bank;
+    if (!s.runBank && !mayHave) {
+      this.bankVerdict = "running a bank is off";
+      this.bankAction = "off";
+      this.bankWarnings = [];
+      return;
+    }
+    // Switched off with a bank of ours about: looked at every BANK_CHECK_MS (sooner after one of its notices) to stand it down and warn.
+    if (!s.runBank && !this.bankDirty && Date.now() - this.lastBankCheck < BANK_CHECK_MS) return;
+    this.lastBankCheck = Date.now();
+    this.bankDirty = false;
+    this.bankAt = new Date().toISOString();
+    const bank = await this.readOwnBank();
+    if (bank === undefined) {
+      this.bankAction = "our bank couldn't be read: nothing done this pass";
+      return;
+    }
+    // A charter call with no answer: ours if a bank of ours is listed now; given up after BANK_PENDING_MS (never sent again meanwhile).
+    if (m.pendingCharter !== null) {
+      if (bank) {
+        m.pendingCharter = null;
+        m.charteredAt = Date.parse(bank.chartered_at) || w.now();
+        this.log("fleet", `our bank: the charter whose call had no answer went through (${bank.name})`);
+        this.persist(true);
+      } else if (w.now() - m.pendingCharter > BANK_PENDING_MS) {
+        m.pendingCharter = null;
+        m.retryAt = Date.now() + BANK_RETRY_MS;
+        this.log("fleet", `our bank: the charter whose call had no answer isn't among the banks ${Math.round(BANK_PENDING_MS / 60_000)} min on: it wasn't made (not tried again for an hour)`);
+        this.persist(true);
+      }
+    }
+    if (bank && m.charteredAt === null) {
+      m.charteredAt = Date.parse(bank.chartered_at) || w.now();
+      this.persist();
+    }
+    // A bank of ours gone from every list since we had one counts as closed (never chartered again on its own).
+    const status: OurBankStatus = !bank && m.charteredAt !== null && m.pendingCharter === null ? "closed" : statusOf(bank, m.pendingCharter !== null);
+    // What depositors hold with us: in the floors (their deposits read only when there are any).
+    if (bank && bank.deposits_pence > 0) {
+      const all = await this.client.deposits().catch((e) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      this.noteBankOwed(all ? all.filter((d) => d.bank_company_id === w.companyId && d.depositor_company_id !== w.companyId) : null);
+    } else if (this.bankOwed.size) this.noteBankOwed([]);
+    this.noteBankWarnings(bank, status);
+    if (status === "open" && bank) {
+      if (!s.runBank) {
+        await this.bankStandDown(bank);
+        return;
+      }
+      m.offWarned = false;
+      this.bankVerdict = `${bank.name} open since ${bank.chartered_at.slice(0, 16).replace("T", " ")}: deposits ${bank.demand_rate_bps} / ${bank.notice_rate_bps} bps a game day, ${bank.insured ? "insured" : "uninsured"}`;
+      const drafts = await this.bankDrafts(bank);
+      const line = await this.bankLine();
+      this.bankAction = [drafts, line].filter(Boolean).join("; ");
+      return;
+    }
+    if (status === "chartering") {
+      this.bankVerdict = "a charter call had no answer: looking for our bank among the banks";
+      this.bankAction = this.bankVerdict;
+      return;
+    }
+    if (status === "winding_down" || status === "failed") {
+      // A wind-down withdraws every line (guide 3.13.4): none of ours is left to look after.
+      if (m.lineIds.length || m.pendingLine) {
+        m.lineIds = [];
+        m.pendingLine = null;
+        this.persist();
+      }
+      this.bankVerdict = `our bank ${status === "failed" ? "failed" : "is winding down"}: nothing more is done with it (the owner's to see to on the bank page)`;
+      this.bankAction = this.bankVerdict;
+      return;
+    }
+    if (!s.runBank) {
+      // Off with no bank of ours open: nothing left to look after. Switching it on again is a deliberate new charter only when the owner's
+      // own setting was off: an AI directive's off (it lapses at its horizon) never re-arms a charter for a bank of ours that closed.
+      const ownerOff = !this.ownSettings.runBank;
+      if ((ownerOff && m.charteredAt !== null) || m.lineIds.length || m.pendingLine || m.feesAt !== null) {
+        if (ownerOff) m.charteredAt = null;
+        m.lineIds = [];
+        m.pendingLine = null;
+        m.feesAt = null;
+        this.persist();
+      }
+      // A closed bank needs no more looking at while the setting is off.
+      if (status === "closed") this.ownBank = { at: Date.now(), bank: null };
+      this.bankVerdict = status === "closed" ? "running a bank is off (our bank closed)" : "running a bank is off";
+      this.bankAction = "off";
+      return;
+    }
+    // One of ours closed (wound down by hand): never chartered again on the autopilot's own (another fee, never refunded).
+    if (status === "closed") {
+      this.bankVerdict = "our bank closed (wound down by hand): not chartered again automatically (switch running a bank off and on again in the settings to allow a new charter; the AI switching it off doesn't)";
+      this.bankAction = this.bankVerdict;
+      return;
+    }
+    // No bank yet: the charter's case.
+    await this.charterOurBank();
+  }
+
+  /** Our bank's warnings for the panel, each logged once when it first appears (again only after it cleared). */
+  private noteBankWarnings(bank: BankResult | null, status: OurBankStatus): void {
+    const out: Array<[string, string]> = [];
+    if (status === "failed") out.push(["failed", "our bank FAILED: depositors are paid pro rata as its loans come in, and the company can't charter again while it owes them"]);
+    if (status === "winding_down") out.push(["winding", "our bank is winding down: it closes once nothing is lent out (the autopilot never winds a bank down)"]);
+    if (bank && bank.overdue_withdrawals_pence > 0) {
+      out.push(["overdue", `${cr(bank.overdue_withdrawals_pence)} of depositors' withdrawals are overdue: a bank that leaves one unpaid for a game day FAILS (cash is needed where they are owed)`]);
+    }
+    if (bank && status === "open" && bank.reserves_pence < bank.required_reserve_pence) out.push(["reserve", "vault cash under the Crown's 20% of what we owe depositors: new loan quotes are refused"]);
+    if (bank && bank.deposits_pence > 0) out.push(["depositors", `depositors hold ${cr(bank.deposits_pence)} with us: kept in the floors where it lies, never spent`]);
+    if (bank && status === "open" && (bank.demand_rate_bps > 0 || bank.notice_rate_bps > 0 || bank.insured)) {
+      out.push(["terms", `its deposit terms are ${bank.demand_rate_bps} / ${bank.notice_rate_bps} bps${bank.insured ? ", insured" : ""} (set by hand, not the autopilot's 0 / 0 uninsured): left as they are; depositors' money is kept in the floors`]);
+    }
+    if (bank && status === "open" && !this.settings.runBank) out.push(["off", "running a bank is off: the bank stays chartered (never wound down by the autopilot); its exchange offers and our lending line are withdrawn"]);
+    const kinds = new Set(out.map(([k]) => k));
+    for (const k of [...this.bankWarned]) if (!kinds.has(k)) this.bankWarned.delete(k);
+    for (const [k, text] of out) {
+      if (this.bankWarned.has(k)) continue;
+      this.bankWarned.add(k);
+      if (k !== "depositors" && k !== "terms") this.log("fleet", `our bank: WARNING ${text}`);
+      if (k === "overdue" || k === "failed") this.advisor.trigger(`our bank: ${k}`);
+    }
+    this.bankWarnings = out.map(([, t]) => t);
+  }
+
+  /**
+   * The charter (guide 3.13.4: `bank/charter`, 10,000 Cr to the Crown, never refunded, and 50,000 Cr of our own funds after it): when
+   * charterBlock passes and the fleet doesn't want the cash, under the cash lock, the fee and the funds gathered in the home vault first
+   * (remitted there if need be: the bank's region), deposit rates 0 / 0, uninsured, the longest notice. Saved before it is sent; a call
+   * with no answer is looked for among the banks (runBank), never sent again. A refusal waits BANK_RETRY_MS (a 403/409, e.g. a failed
+   * bank of ours still owing depositors, BANK_REFUSED_RETRY_MS).
+   */
+  private async charterOurBank(): Promise<void> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.bankMem;
+    const block = () => {
+      let committed = 0;
+      for (const a of this.agents.values()) committed += this.committedBy(a);
+      const worth = this.worth && Date.now() - this.worth.at <= 3 * WORTH_TTL_MS ? this.worth.pence : null;
+      return (
+        this.cashWanted() ??
+        charterBlock({
+          on: s.runBank,
+          pending: m.pendingCharter !== null,
+          retryAt: m.retryAt,
+          nowLocal: Date.now(),
+          seasonNormal: w.seasonMode() === "normal",
+          debtShort: !!this.debtShort,
+          worth,
+          minWorth: s.bankMinNetWorthPence,
+          // Our deposits at healthy banks count (ensureCash brings them home for it); the buyer's next hull and spends short lately don't.
+          loose: this.spareCash() + this.depositsLiquid() - committed - this.debtFence() - this.spendKeep(),
+          buffer: depositBuffer(this.billsPerDay()),
+        })
+      );
+    };
+    const why = block();
+    if (why) {
+      this.bankVerdict = `no bank: ${why}`;
+      this.bankAction = this.bankVerdict;
+      return;
+    }
+    await this.withCash(async () => {
+      if (this.stopRequested || this.paused || !this.settings.runBank || m.pendingCharter !== null) return;
+      await w.refreshVaults();
+      const again = block();
+      if (again) {
+        this.bankAction = `no bank: ${again}`;
+        return;
+      }
+      const home = this.homeRegion;
+      if (!home) {
+        this.bankAction = "no bank: the home region isn't known yet";
+        return;
+      }
+      const need = BANK_CHARTER_FEE_PENCE + BANK_OWN_FUNDS_PENCE;
+      const have = await this.ensureCash(home, need, { fresh: true });
+      if (have < need) {
+        this.bankAction = `no bank: only ${cr(have)} could be gathered above home's floor for the ${cr(need)} the charter needs there`;
+        return;
+      }
+      m.pendingCharter = w.now();
+      this.persist(true);
+      await this.journal?.flush();
+      try {
+        const b = await this.client.charterBank({ demand_rate_bps: BANK_DEPOSIT_RATE_BPS, notice_rate_bps: BANK_DEPOSIT_RATE_BPS, notice_game_hours: BANK_NOTICE_GAME_H, insured: false });
+        m.pendingCharter = null;
+        m.charteredAt = Date.parse(b.chartered_at) || w.now();
+        this.ownBank = { at: Date.now(), bank: b };
+        this.staleBanks();
+        await w.refreshVaults().catch((e) => {
+          if (this.isFatal(e)) throw e;
+        });
+        this.bankVerdict = `${b.name} chartered`;
+        this.bankAction = `chartered ${b.name}`;
+        this.log(
+          "fleet",
+          `OUR BANK: chartered ${b.name} (the Crown's ${cr(BANK_CHARTER_FEE_PENCE)} fee, never refunded; net worth ~${cr(this.worth?.pence ?? 0)}): deposit rates 0 / 0, uninsured, so no depositors' money is taken; ` +
+            "exchange fees for drafts and a lending line follow as the cash allows. The autopilot never winds it down (by hand on the bank page)",
+        );
+        this.advisor.trigger("we chartered a bank");
+        this.persist(true);
+      } catch (e) {
+        const unknown = outcomeUnknown(e);
+        if (!unknown) {
+          m.pendingCharter = null;
+          this.persist(true);
+        }
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        const msg = (e as Error).message;
+        if (unknown) {
+          this.bankAction = "the charter call had no answer: looking for our bank among the banks";
+          this.log("fleet", `our bank: the charter call had no answer (${msg}); looked for among the banks, never sent again`);
+          return;
+        }
+        m.retryAt = Date.now() + (isApiError(e) && (e.status === 403 || e.status === 409) ? BANK_REFUSED_RETRY_MS : BANK_RETRY_MS);
+        this.persist(true);
+        this.bankAction = `the charter was refused: ${msg}`;
+        this.log("fleet", `our bank: the charter was refused: ${msg} (not tried again until ${new Date(m.retryAt).toISOString()})`);
+      }
+    });
+  }
+
+  /**
+   * runBank switched off with our bank open: our lending lines withdrawn (their loans run on), the exchange offers we posted withdrawn,
+   * the bank left chartered and its deposit terms as they are; warned once (wind-down is the owner's, by hand).
+   */
+  private async bankStandDown(bank: BankResult): Promise<void> {
+    const m = this.bankMem;
+    const did: string[] = [];
+    await this.readOwnLines();
+    if (this.ourLinesOpen()) did.push(await this.withdrawOurLines("running a bank is off"));
+    if (m.feesAt !== null && Object.keys(postedSchedule(bank)).length) {
+      did.push(await this.postSchedule(bank, {}, "running a bank is off"));
+      m.feesAt = null;
+      this.persist();
+    }
+    if (!m.offWarned) {
+      m.offWarned = true;
+      this.log("fleet", `our bank: WARNING running a bank is off: ${bank.name} stays chartered (the autopilot never winds a bank down: that is by hand on the bank page); our lines and exchange offers are withdrawn`);
+      this.persist();
+    }
+    this.bankVerdict = "running a bank is off: the bank stays chartered (wind it down by hand)";
+    this.bankAction = did.filter(Boolean).join("; ") || "nothing of ours left out (lines and exchange offers withdrawn)";
+  }
+
+  /**
+   * Our exchange schedule (drafts, guide 3.12 / 3.13.4; bank.ts): into each region (never home; never one paying warehouse rent while
+   * auto-remit for bills isn't known on) whose vault keeps a clear surplus beyond its floor and the loads to be bought there, 85% of the
+   * median Crown fee into it (never under 20 bps). A region whose surplus fell, or every region when the fleet wants the cash, is dropped
+   * at once; additions and fees that moved materially wait BANK_TERMS_GAP_GAME_H after our last change; nothing is added in the season's
+   * endgame. Under the cash lock (a draft pays out of our vaults).
+   */
+  private async bankDrafts(bank: BankResult): Promise<string> {
+    const w = this.world;
+    const m = this.bankMem;
+    const posted = postedSchedule(bank);
+    const stop = this.cashWanted();
+    let want: Record<string, number> = {};
+    if (!stop) {
+      const surplus = this.regionSurplus();
+      // A draft may empty the vault it pays from: never where rent falls due unless auto-remit tops a short bill up.
+      for (const r of [...surplus.keys()]) if ((this.bills.rent.get(r) ?? 0) > 0 && !this.autoRemit?.on) surplus.delete(r);
+      const regions = draftRegions(surplus, this.homeRegion, new Set(Object.keys(posted)));
+      const rates = await this.readCrownRates();
+      want = rates ? draftSchedule(rates, regions) : Object.fromEntries(Object.entries(posted).filter(([r]) => (regions as string[]).includes(r)));
+      if (w.seasonMode() !== "normal") want = Object.fromEntries(Object.entries(posted).filter(([r]) => r in want));
+    }
+    const diff = scheduleDiff(posted, want);
+    const gapOk = m.feesAt === null || w.now() - m.feesAt >= BANK_TERMS_GAP_GAME_H * 60 * w.gameMinuteMs;
+    const text = (x: Record<string, number>) => Object.entries(x).map(([r, f]) => `${r} ${f} bps`).join(", ");
+    if (!diff.dropped.length && !(gapOk && (diff.added.length || diff.moved.length))) {
+      return Object.keys(posted).length ? `exchange fees posted: ${text(posted)}` : stop ? `no exchange offered (${stop})` : "no exchange offered: no region (but home) has a clear surplus to pay drafts out of";
+    }
+    // Drops at once; additions and moved fees only once the gap is up (until then, what stands less the drops).
+    const next = gapOk ? want : Object.fromEntries(Object.entries(posted).filter(([r]) => r in want));
+    const why = stop ?? (diff.dropped.length ? `${diff.dropped.join(", ")} no longer has a clear surplus` : diff.added.length ? `${diff.added.join(", ")} has a clear surplus` : "the Crown's fees moved");
+    return this.postSchedule(bank, next, why);
+  }
+
+  /** Posts our exchange schedule (`bank/terms`, the deposit terms sent back as listed) under the cash lock; what it did, for the action. */
+  private async postSchedule(bank: BankResult, next: Record<string, number>, why: string): Promise<string> {
+    const w = this.world;
+    let out = "";
+    await this.withCash(async () => {
+      if (this.stopRequested || this.paused) return;
+      try {
+        const after = await this.client.setBankTerms({
+          demand_rate_bps: bank.demand_rate_bps,
+          notice_rate_bps: bank.notice_rate_bps,
+          notice_game_hours: Math.min(720, Math.max(1, bank.notice_game_hours || BANK_NOTICE_GAME_H)),
+          insured: bank.insured,
+          exchange_fee_bps: next,
+        });
+        this.ownBank = { at: Date.now(), bank: after };
+        this.bankMem.feesAt = w.now();
+        const fees = Object.entries(next).map(([r, f]) => `${r} ${f} bps`).join(", ");
+        out = fees ? `exchange fees posted: ${fees}` : "exchange offers withdrawn";
+        this.log("fleet", `our bank: ${fees ? `exchange fees for drafts now ${fees} (a margin under the Crown's; a draft pays out of our vault there)` : "every exchange offer withdrawn"} (${why})`);
+        this.persist();
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.bankDirty = true;
+        const msg = (e as Error).message;
+        out = outcomeUnknown(e) ? "the exchange fee change had no answer: our bank is read again" : `changing the exchange fees was refused: ${msg}`;
+        this.log("fleet", `our bank: ${out}`);
+      }
+    });
+    return out;
+  }
+
+  /**
+   * Our lending line (guide 3.13.8; bank.ts): one line of the autopilot's (lines posted by hand are never touched), ship liens and
+   * balloon only, in the regions whose vault has spare beyond its floor and loads, sized to the cash the fleet doesn't need (on deposit
+   * included: it comes back for the line) within the lending budget less what our other lines' loans still have out, terms maturing
+   * before the season's endgame. Withdrawn (its open quotes released, its loans running on) when the fleet wants the cash, we owe on a
+   * loan, the season is ending, no region has spare, or there is no room; cut at once, grown at most every BANK_TERMS_GAP_GAME_H. A
+   * post with no answer is looked for among our lines, never sent again. Under the cash lock.
+   */
+  private async bankLine(): Promise<string> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.bankMem;
+    const lines = await this.readOwnLines();
+    if (!lines) return "our lending lines couldn't be read";
+    const open = lines.filter((l) => l.status === "open");
+    if (m.pendingLine) {
+      const p = m.pendingLine;
+      const hit = open.find((l) => !m.lineIds.includes(l.id) && Date.parse(l.created_at) >= p.at - 120_000);
+      if (hit) {
+        m.lineIds.push(hit.id);
+        m.pendingLine = null;
+        m.lineAt = w.now();
+        this.log("fleet", "our bank: the lending line whose post had no answer was posted after all");
+        this.persist(true);
+      } else if (w.now() - p.at > BANK_PENDING_MS) {
+        m.pendingLine = null;
+        this.log("fleet", `our bank: the lending line whose post had no answer isn't among ours ${Math.round(BANK_PENDING_MS / 60_000)} min on: it wasn't posted`);
+        this.persist(true);
+      } else return "a lending line post had no answer: looking for it among our lines";
+    }
+    const known = m.lineIds.length;
+    m.lineIds = m.lineIds.filter((id) => open.some((l) => l.id === id));
+    if (m.lineIds.length !== known) this.persist();
+    // Loans our lines made, for the record.
+    for (const l of this.loansCache?.lent ?? []) {
+      if (!l.lending_line_id || m.lineLoans.includes(l.id)) continue;
+      m.lineLoans.push(l.id);
+      if (m.lineLoans.length > BANK_LINE_LOANS_KEPT) m.lineLoans.splice(0, m.lineLoans.length - BANK_LINE_LOANS_KEPT);
+      this.persist();
+    }
+    const ours = open.filter((l) => m.lineIds.includes(l.id));
+    const line = ours[0];
+    const extra = ours.slice(1);
+    const term = lineTermDays(w.seasonLeftMs(), SEASON_ENDGAME_MS, 24 * 60 * w.gameMinuteMs);
+    const linesLent = (this.loansCache?.lent ?? [])
+      .filter((l) => !!l.lending_line_id && (l.status === "active" || l.status === "defaulted"))
+      .reduce((n, l) => n + Math.max(0, l.outstanding_principal_pence), 0);
+    const budget = s.bankLendingBudgetPence - Math.max(0, linesLent - (line?.outstanding_pence ?? 0));
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    const free = this.spareCash() - committed - (this.debtFence() - this.bankLineFence()) - depositBuffer(this.billsPerDay()) - this.spendKeep() + this.depositsLiquid();
+    const out = (line?.outstanding_pence ?? 0) + (line?.quoted_pence ?? 0);
+    // A line standing is never cut below what it has out (its loans and quotes stand); one with nothing out and no room for a loan
+    // comes down. A new one is posted only with room for a loan and at least one borrower's cap.
+    const kept = Math.max(out, Math.floor(Math.min(budget, out + Math.max(0, free))));
+    const size = line ? (out > 0 || lineSize({ budget, free, outstanding: 0, quoted: 0 }) > 0 ? kept : 0) : lineSize({ budget, free, outstanding: 0, quoted: 0 });
+    const regions = lineRegions(this.regionSurplus(), new Set(line?.regions ?? []));
+    const why =
+      this.cashWanted() ??
+      (this.debtOwed() > 0 ? "we owe on a loan: lending at less than we borrow at"
+      : w.seasonMode() !== "normal" ? "the season is ending"
+      : term === null ? "too little season left for a loan to mature before the endgame"
+      : !regions.length ? "no region has spare cash to lend from"
+      : size <= 0 ? `no room for another loan within the ${cr(s.bankLendingBudgetPence)} lending budget and the cash the fleet doesn't need`
+      : null);
+    if (why || term === null) {
+      if (ours.length) return this.withdrawOurLines(why ?? "no term");
+      return `no lending line (${why})`;
+    }
+    const want = lineTerms({ regions, maxLine: size, termDays: term });
+    if (!line) {
+      if (Date.now() < this.bankLineRetryAt) return "no lending line: a post was refused lately";
+      return this.postOurLine(want);
+    }
+    const did: string[] = [];
+    if (extra.length) did.push(await this.withdrawOurLines("one line of ours is enough", extra.map((l) => l.id)));
+    const change = lineChange(line, want);
+    const standing = `lending line open in ${line.regions.join(", ")}: ${cr(line.outstanding_pence)} lent, ${cr(line.quoted_pence)} quoted, ${cr(line.remaining_capacity_pence)} room`;
+    if (change === "none") did.push(standing);
+    else if (change === "change" && m.lineAt !== null && w.now() - m.lineAt < BANK_TERMS_GAP_GAME_H * 60 * w.gameMinuteMs) did.push(`${standing} (its terms change at most every ${BANK_TERMS_GAP_GAME_H} game hours)`);
+    else did.push(await this.updateOurLine(line, want, change));
+    return did.filter(Boolean).join("; ");
+  }
+
+  /** Posts our lending line (`bank/lending-line`) under the cash lock: saved before it is sent, one with no answer looked for (bankLine). */
+  private async postOurLine(want: LendingLineTerms): Promise<string> {
+    const w = this.world;
+    const m = this.bankMem;
+    let out = "";
+    await this.withCash(async () => {
+      if (this.stopRequested || this.paused || !this.settings.runBank || m.pendingLine) return;
+      m.pendingLine = { at: w.now(), maxLine: want.max_line_pence };
+      this.persist(true);
+      await this.journal?.flush();
+      try {
+        const line = await this.client.postLendingLine(want);
+        m.pendingLine = null;
+        m.lineIds.push(line.id);
+        m.lineAt = w.now();
+        this.ownLines = { at: Date.now(), lines: [...(this.ownLines?.lines ?? []).filter((l) => l.id !== line.id), line] };
+        out = `posted a lending line of ${cr(want.max_line_pence)} in ${want.regions.join(", ")}`;
+        this.log(
+          "fleet",
+          `our bank: posted a lending line in ${want.regions.join(", ")}: ship liens, balloon, with recourse, at ${want.rate_pct_of_goldsmiths_bps / 100}% of the Goldsmiths' rate for the term, ` +
+            `at most ${want.max_ltv_bps / 100}% of the pledged ship's rebuild value (a foreclosed ship is credited at 80%), up to ${want.max_term_game_days} game days, ${cr(want.max_per_borrower_pence)} a borrower, ${cr(want.max_line_pence)} in all; ` +
+            `borrowers with no default ever, no walk-away and at most ${cr(want.max_owed_pence ?? 0)} owed. It quotes on matching requests at once (escrowed from our vault there); its room is kept out of other spending`,
+        );
+        this.persist(true);
+      } catch (e) {
+        const unknown = outcomeUnknown(e);
+        if (!unknown) {
+          m.pendingLine = null;
+          this.persist();
+        }
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        const msg = (e as Error).message;
+        if (unknown) {
+          out = "the lending line post had no answer: looking for it among our lines";
+          this.log("fleet", `our bank: ${out} (${msg}); never posted again meanwhile`);
+          return;
+        }
+        this.bankLineRetryAt = Date.now() + IDLE_RETRY_MS;
+        out = `posting a lending line was refused: ${msg}`;
+        this.log("fleet", `our bank: ${out}`);
+      }
+    });
+    return out;
+  }
+
+  /** Replaces our line's terms (`bank/lending-line/update`; quotes already made stand) under the cash lock. A cut refused takes the line down instead. */
+  private async updateOurLine(line: LendingLine, want: LendingLineTerms, change: "shrink" | "change"): Promise<string> {
+    let out = "";
+    let down = false;
+    await this.withCash(async () => {
+      if (this.stopRequested || this.paused) return;
+      try {
+        const after = await this.client.updateLendingLine({ ...want, line_id: line.id });
+        this.bankMem.lineAt = this.world.now();
+        this.ownLines = { at: Date.now(), lines: (this.ownLines?.lines ?? []).map((l) => (l.id === line.id ? after : l)) };
+        out = `lending line ${change === "shrink" ? "cut" : "changed"} to ${cr(want.max_line_pence)} in ${want.regions.join(", ")}, up to ${want.max_term_game_days} game days`;
+        this.log("fleet", `our bank: ${out} (quotes already made stand)`);
+        this.persist();
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.bankDirty = true;
+        const msg = (e as Error).message;
+        out = outcomeUnknown(e) ? "the lending line change had no answer: our lines are read again" : `changing the lending line was refused: ${msg}`;
+        this.log("fleet", `our bank: ${out}`);
+        // Its room must never outgrow what we can spare: a cut that was refused takes the line down.
+        down = change === "shrink" && !outcomeUnknown(e);
+      }
+    });
+    if (down) out = `${out}; ${await this.withdrawOurLines("a cut to its room was refused")}`;
+    return out;
+  }
+
+  /** Withdraws our lending lines (`bank/lending-line/withdraw`: open quotes released, loans run on) under the cash lock (`ids`: those only). */
+  private async withdrawOurLines(why: string, ids = [...this.bankMem.lineIds]): Promise<string> {
+    if (!ids.length) return "";
+    let out = "";
+    await this.withCash(async () => {
+      out = await this.withdrawOurLinesHeld(why, ids);
+    });
+    return out;
+  }
+
+  /** withdrawOurLines for a caller already holding the cash lock (a spend that needs the line's room: freeLineFor). */
+  private async withdrawOurLinesHeld(why: string, ids = [...this.bankMem.lineIds]): Promise<string> {
+    const m = this.bankMem;
+    if (!ids.length) return "";
+    let n = 0;
+    let released = 0;
+    for (const id of ids) {
+      try {
+        const res = await this.client.withdrawLendingLine(id);
+        m.lineIds = m.lineIds.filter((x) => x !== id);
+        n++;
+        released += res.quotes_released ?? 0;
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        // Not open any more (404/409): gone. No answer: read again at the next pass.
+        if (isApiError(e) && (e.status === 404 || e.status === 409)) m.lineIds = m.lineIds.filter((x) => x !== id);
+        else {
+          this.bankDirty = true;
+          this.log("fleet", `our bank: withdrawing our lending line (${id.slice(0, 8)}) failed: ${(e as Error).message}`);
+        }
+      }
+    }
+    if (released > 0) {
+      await this.world.refreshVaults().catch((e) => {
+        if (this.isFatal(e)) throw e;
+      });
+    }
+    this.ownLines = this.ownLines ? { ...this.ownLines, lines: this.ownLines.lines.filter((l) => !ids.includes(l.id) || m.lineIds.includes(l.id)) } : null;
+    this.persist(true);
+    if (!n) return "";
+    if (released > 0) this.cashArrived();
+    this.log("fleet", `our bank: withdrew our lending line${n === 1 ? "" : "s"} (${why})${released ? `: ${released} open quote${released === 1 ? "" : "s"} released, escrow back` : ""}; loans already made run on`);
+    return `lending line withdrawn (${why})`;
+  }
+
+  /** Our bank for the panel and the digest. */
+  private bankReport(): BankReport {
+    const s = this.settings;
+    const m = this.bankMem;
+    const b = this.ownBank?.bank ?? null;
+    const me = this.world.companyId;
+    const iso = (ms: number | null) => (ms !== null ? new Date(ms).toISOString() : null);
+    const rates = this.crownRates?.rates ?? null;
+    const lineLoans = new Set([...m.lineLoans, ...(this.loansCache?.lent ?? []).filter((l) => !!l.lending_line_id).map((l) => l.id)]);
+    let defaults = 0;
+    let interest = 0;
+    for (const id of lineLoans) {
+      const r = this.loanRecs.get(id);
+      if (!r) continue;
+      if (r.status === "defaulted" || r.status === "recovered" || r.status === "written_off") defaults++;
+      interest += Math.max(0, r.interestPaid);
+    }
+    const running = (this.loansCache?.lent ?? []).filter((l) => !!l.lending_line_id && (l.status === "active" || l.status === "defaulted"));
+    return {
+      enabled: s.runBank,
+      status: this.ownBank !== null && !b && m.charteredAt !== null && m.pendingCharter === null ? "closed" : statusOf(b, m.pendingCharter !== null),
+      verdict: this.bankVerdict,
+      action: this.bankAction,
+      checkedAt: this.bankAt,
+      charteredAt: iso(m.charteredAt),
+      minNetWorthPence: s.bankMinNetWorthPence,
+      lendingBudgetPence: s.bankLendingBudgetPence,
+      netWorthPence: this.worth?.pence ?? null,
+      terms: b ? { demandRateBps: b.demand_rate_bps, noticeRateBps: b.notice_rate_bps, noticeGameHours: b.notice_game_hours, insured: b.insured } : null,
+      depositsOwedPence: Math.max(0, b?.deposits_pence ?? 0),
+      owedByRegion: [...this.bankOwed].map(([region, pence]) => ({ region, pence })),
+      reservesPence: b?.reserves_pence ?? 0,
+      requiredReservePence: b?.required_reserve_pence ?? 0,
+      overdueWithdrawalsPence: b?.overdue_withdrawals_pence ?? 0,
+      fees: Object.entries(postedSchedule(b)).flatMap(([r, feeBps]) => {
+        const region = asRegion(r);
+        return region ? [{ region, feeBps, crownMedianBps: rates ? medianFeeInto(rates, region) : null }] : [];
+      }),
+      feesChangedAt: iso(m.feesAt),
+      drafts: b ? Math.max(b.drafts_carried, m.drafts) : m.drafts,
+      draftFeesPence: b ? Math.max(b.draft_fees_pence, m.draftFees) : m.draftFees,
+      lines: (this.ownLines?.lines ?? [])
+        .filter((l) => l.status === "open" && l.bank_company_id === me)
+        .map((l) => ({
+          id: l.id,
+          ours: m.lineIds.includes(l.id),
+          regions: l.regions,
+          ratePctBps: l.rate_pct_of_goldsmiths_bps,
+          maxLtvBps: l.max_ltv_bps,
+          maxTermDays: l.max_term_game_days,
+          maxPerBorrowerPence: l.max_per_borrower_pence,
+          maxLinePence: l.max_line_pence,
+          outstandingPence: l.outstanding_pence,
+          quotedPence: l.quoted_pence,
+          remainingPence: l.remaining_capacity_pence,
+        })),
+      loans: {
+        made: lineLoans.size,
+        active: running.length,
+        outstandingPence: running.reduce((n, l) => n + Math.max(0, l.owed_pence), 0),
+        defaults,
+        interestPence: interest,
+      },
+      warnings: [...this.bankWarnings],
+    };
+  }
+
+  /** Deposits and our bank for the AI digest (no bank or company named). */
+  private digestBanking(): DigestInput["banking"] {
+    const d = this.depositsReport();
+    const b = this.bankReport();
+    return {
+      deposits: {
+        on: this.settings.deposits,
+        user: this.ownSettings.deposits,
+        budget: this.ownSettings.depositBudgetPence,
+        held: d.heldPence,
+        target: d.targetPence,
+        interest: d.interestPence,
+        banks: new Set(d.deposits.filter((x) => x.ours).map((x) => x.bankId)).size,
+        blocked: d.blocked,
+      },
+      bank: {
+        on: this.settings.runBank,
+        user: this.ownSettings.runBank,
+        status: b.status,
+        verdict: b.verdict,
+        fees: b.fees.map((f) => ({ region: f.region, bps: f.feeBps })),
+        drafts: b.drafts,
+        draftFees: b.draftFeesPence,
+        lineOut: b.lines.filter((l) => l.ours).reduce((n, l) => n + l.outstandingPence + l.quotedPence, 0),
+        lineRoom: b.lines.filter((l) => l.ours).reduce((n, l) => n + l.remainingPence, 0),
+        loans: b.loans.made,
+        defaults: b.loans.defaults,
+        interest: b.loans.interestPence,
+        warnings: b.warnings.length,
+      },
+    };
+  }
+
+  // ── Passenger voyages, commenda ventures, escort fees (voyages.ts, ventures.ts, escort.ts; guide 3.20, 3.13.5, 3.10) ──
+
+  /** Why the planner counts no passengers' fares now (null: it does, where a ship lies with groups waiting). */
+  private paxVoyageBlocked(): string | null {
+    if (!this.settings.usePassengers) return "passengers are off";
+    if (!this.settings.passengerVoyages) return "passenger voyages are off (the spare hold of voyages sailed anyway only)";
+    const why = this.world.paxBlockedNow();
+    return why ? `passenger offers were refused for the key (${why})` : null;
+  }
+
+  /**
+   * What the planner needs to count the fares of passengers waiting where she lies (voyages.ts), or undefined: passengerVoyages or
+   * usePassengers off, offers refused for the key, she isn't lying at `from`, or she takes none (a smuggler, being retired, arrested,
+   * contraband aboard, in a convoy, a venture's, insured or that unknown: offerBerths would post none). Reads only her own port's
+   * groups (World.waitingAt, cached a few game minutes) and the pricer's cached fares: never another port's, never a fare page.
+   * `only`: passages for fares alone may be planned too.
+   */
+  private async paxLanes(agent: ShipAgent, from: string, r: ShipResult, only: boolean): Promise<PaxLanes | undefined> {
+    const w = this.world;
+    if (this.paxVoyageBlocked() !== null) return undefined;
+    if (r.ship.status === "sailing" || r.ship.current_port_id !== from || r.ship.convoy_id) return undefined;
+    if (this.smugglers.has(agent.shipId) || this.retiring.has(agent.shipId) || agent.arrested || agent.contrabandAboard(r).length > 0 || this.ventureOn(agent.shipId)) return undefined;
+    // A policy on her (or one that can't be read): passengers make a richer prize than the cargo declared (offerBerths posts none).
+    if ((await agent.insuredPolicy()) !== null) return undefined;
+    const groups = await w.waitingAt(from);
+    if (groups.length === 0) return undefined;
+    const cls = w.shipClass(agent.shipClass);
+    const knots = (cls?.base_speed_centiknots ?? 800) / 100;
+    const refKnots = median(w.catalog.ship_classes.map((c) => c.base_speed_centiknots / 100)) ?? knots;
+    const dayMs = 24 * 60 * w.gameMinuteMs;
+    const since = w.now() - PAX_RECENT_GAME_DAYS * dayMs;
+    const bands = w.fareSummary.bands;
+    return {
+      from,
+      groups,
+      perTon: cls?.passengers_per_ton || 1,
+      reserve: agent.paxPlanReserve(r),
+      ratePerHour: agent.rate,
+      speed: speedFactor(knots, refKnots),
+      dayMs,
+      nextRound: (t) => w.nextGameHour(t),
+      only,
+      pricing: (dest, nm) =>
+        paxPricing({
+          from,
+          dest,
+          nm,
+          groups,
+          records: w.routeFaresCached(from, dest) ?? w.fares.records,
+          bands,
+          since,
+          unmet: (kind) => !!w.paxUnmet(from, dest, kind),
+          route: w.paxRoute(routeKey(from, dest)),
+        }),
+    };
+  }
+
+  /** A lane chosen with passengers' fares counted: on the record (the offer itself goes up at sail time). */
+  private notePaxChosen(agent: ShipAgent, lane: Lane): void {
+    const p = lane.pax;
+    if (!p) return;
+    const only = lane.kind === "passengers";
+    this.paxVoyageStats.chosen++;
+    if (only) this.paxVoyageStats.only++;
+    this.paxVoyageStats.expected += p.value;
+    this.paxVoyageRecent.push({ at: new Date().toISOString(), shipId: agent.shipId, ship: agent.name, lane: lane.key, only, dest: p.dest, heads: p.heads, perHead: p.perHead, valuePence: p.value, outcome: "planned" });
+    if (this.paxVoyageRecent.length > PAX_VOYAGES_KEPT) this.paxVoyageRecent.splice(0, this.paxVoyageRecent.length - PAX_VOYAGES_KEPT);
+    if (only) this.log(agent.name, `sailing for passengers alone: ~${p.heads} waiting here for ${p.dest} at ~${cr(p.perHead)}/head, ~${cr(p.value)} expected (offered at sail time; not sailed if nobody boards)`);
+    this.persist();
+  }
+
+  /** What became of a lane chosen with passengers' fares counted (ShipAgent.sailTo): sailed with them, without, or given up. */
+  notePaxVoyage(agent: ShipAgent, lane: Lane, outcome: "sailed" | "unboarded" | "given_up"): void {
+    for (let i = this.paxVoyageRecent.length - 1; i >= 0; i--) {
+      const r = this.paxVoyageRecent[i];
+      if (r.shipId !== agent.shipId || r.lane !== lane.key) continue;
+      if (r.outcome === "planned") {
+        r.outcome = outcome;
+        if (outcome === "sailed") this.paxVoyageStats.sailed++;
+        if (outcome === "given_up") this.paxVoyageStats.givenUp++;
+        this.persist();
+      }
+      return;
+    }
+  }
+
+  private paxVoyagesReport(): PaxVoyagesReport {
+    const c = this.world.waitingCached();
+    return {
+      enabled: this.settings.usePassengers && this.settings.passengerVoyages,
+      blocked: this.paxVoyageBlocked(),
+      chosen: this.paxVoyageStats.chosen,
+      only: this.paxVoyageStats.only,
+      sailed: this.paxVoyageStats.sailed,
+      givenUp: this.paxVoyageStats.givenUp,
+      expectedPence: Math.round(this.paxVoyageStats.expected),
+      portsCached: c.ports,
+      groupsCached: c.groups,
+      recent: this.paxVoyageRecent.map((r) => ({ ...r })),
+    };
+  }
+
+  // Ventures (guide 3.13.5; ventures.ts).
+
+  /** The venture under way on this ship, if any. */
+  private ventureOn(shipId: string): VentureRec | undefined {
+    return this.ventureMem.recs.find((r) => r.shipId === shipId && ventureActive(r));
+  }
+
+  /** Whether a venture of ours is under way on her (FleetHost). */
+  ventureShip(agent: ShipAgent): boolean {
+    return !!this.ventureOn(agent.shipId);
+  }
+
+  /** Whether a venture under way on her holds this good aboard (from its buy on): never ours to sell, deliver, unload or stow. */
+  ventureGood(agent: ShipAgent, good: string): boolean {
+    const r = this.ventureOn(agent.shipId);
+    if (!r || r.stage === "opening" || r.stage === "raising") return false;
+    return r.parts.some((p) => p.good === good) || (r.bought[good] ?? 0) > 0;
+  }
+
+  /** Why no new venture is opened now (null: one may be, where a load is cash-limited). */
+  private ventureBlockedNow(): string | null {
+    const s = this.settings;
+    if (!s.ventures) return "ventures are off";
+    if (!s.resizeLoads) return "resizeLoads is off (a load is found cash-limited only when it is planned again at its source)";
+    if (this.debtShort) return "a loan repayment is short";
+    if (this.world.seasonMode() !== "normal") return "the season's endgame: no new ventures";
+    const on = this.ventureMem.recs.find(ventureActive);
+    if (on) return `one is under way on ${on.ship} (one at a time)`;
+    if (this.ventureStarting) return `one is being weighed for ${this.agents.get(this.ventureStarting)?.name ?? "a ship"} (one at a time)`;
+    return null;
+  }
+
+  /** Our companies (a stake or an investor of ours is never outside capital). */
+  private ourCompany(id: string): boolean {
+    return this.ourCompanyIds.has(id) || id === this.world.companyId;
+  }
+
+  /**
+   * The load a venture would carry from `port` to `dest` with `cash` (planner.ts, market goods only: sold through the venture),
+   * as VentureParts with the buy limit buyPart would set; `maxTons`: no more than this (the tons whose lock clears before the
+   * deadline), planned as her hold. Null: none pays.
+   */
+  private async venturePlan(agent: ShipAgent, r: ShipResult, port: string, dest: string, cash: number, maxTons?: number): Promise<{ lane: Lane; parts: VenturePart[] } | null> {
+    const w = this.world;
+    const opts: PlanOptions = { ...this.planOptions(cash, agent), cash, cashAt: undefined, onlySource: port, onlyDest: dest, marketOnly: true, bias: undefined };
+    const spec = this.specFor(agent, r);
+    if (maxTons !== undefined) spec.cap = Math.max(0, Math.min(spec.cap, Math.floor(maxTons)));
+    if (spec.cap < 1) return null;
+    const lanes = await rankLanes(w, spec, port, this.reservations(agent), opts);
+    const lane = lanes.find((l) => l.source === port && l.dest === dest && l.kind === "market" && l.freight.length === 0 && l.parts.length > 0 && l.parts.every((p) => p.kind === "market"));
+    if (!lane) return null;
+    const customs = 1 + w.customsBps(port) / 10_000;
+    const fee = 1 + w.remitBps(w.region(dest), w.region(port)) / 10_000;
+    const kept = (1 - (lane.piracyBps ?? 0) / 10_000) * (1 - (lane.stormBps ?? 0) / 10_000);
+    const parts = lane.parts.map((p) => ({
+      good: p.good,
+      tons: p.tons,
+      // As buyPart: every ton must clear the margin after the share pirates and storms are expected to take.
+      limit: Math.max(1, Math.floor(Math.min((p.minPay - this.settings.minMarginPence) * kept, p.cashPay * kept) / (customs * fee))),
+      pay: p.pay,
+    }));
+    return { lane, parts };
+  }
+
+  /**
+   * At a lane's source (ShipAgent.loadAt; guide 3.13.5): a venture opened for a load cash limits, instead of buying it as it stands.
+   * Only when resizeLaneNow found it cash-limited with no load loan planned (the loan, cheaper when it pays, is weighed first), fresh
+   * and for this lane; ventures on and nothing blocking (ventureBlockedNow: one at a time, the Merchant Adventurers never back two of
+   * a merchant's at once); the lane all market goods (never provisions), no freight; nothing aboard her (cargo, sealed freight,
+   * passengers or an offer open: the venture's tons must be all its own); she berthed at the source, out of any convoy, not liened,
+   * insured (or unknown), retiring, arrested or smuggling; and the value test passed (ventureCase) on the outside capital expected,
+   * landing before the season ends. The open is saved before it is sent; our stake (the load's own cash, loadBudget) goes in at once.
+   * True: opened (or its answer awaited): the lane is given up and ventureTurn takes her.
+   */
+  async ventureStart(agent: ShipAgent, r: ShipResult, lane: Lane): Promise<boolean> {
+    const cand = this.ventureCands.get(agent.shipId);
+    this.ventureCands.delete(agent.shipId);
+    if (!cand || cand.key !== lane.key || Date.now() - cand.at > 5 * 60_000) return false;
+    if (this.ventureBlockedNow()) return false;
+    // One at a time, fleet-wide: the slot is taken here, before the first await (two ships at their sources never both weigh and open
+    // one), and given back however this ends; an open's record holds it from then on (ventureBlockedNow).
+    this.ventureStarting = agent.shipId;
+    try {
+      return await this.ventureOpen(agent, r, lane, cand);
+    } finally {
+      this.ventureStarting = null;
+    }
+  }
+
+  /** ventureStart's checks, value test and open, the one-at-a-time slot held. */
+  private async ventureOpen(agent: ShipAgent, r: ShipResult, lane: Lane, cand: { key: string; room: number; small: number; at: number }): Promise<boolean> {
+    const w = this.world;
+    const port = lane.source;
+    if (r.ship.status !== "berthed" || r.ship.current_port_id !== port || r.ship.convoy_id) return false;
+    if ((this.ventureSkip.get(agent.shipId) ?? 0) > Date.now()) return false;
+    if (this.smugglers.has(agent.shipId) || this.retiring.has(agent.shipId) || agent.arrested) return false;
+    if (lane.kind !== "market" || lane.freight.length > 0 || lane.parts.length === 0 || lane.parts.some((p) => p.kind !== "market" || p.good === "provisions")) return false;
+    if (Object.values(r.cargo_manifest).some((t) => t > 0) || agent.sealedTons() > 0 || agent.paxHeads() > 0 || agent.offering) return false;
+    if ((await agent.insuredPolicy(0, true)) !== null) return false;
+    if ((await this.isLiened(agent.shipId)) !== false) return false;
+    const spec = this.specFor(agent, r);
+    // What filling her hold costs at catalog prices (the Merchant Adventurers' stake is a part of it): outside capital is learned against it.
+    const planned = lane.parts.reduce((n, p) => n + p.tons, 0);
+    const perTon = lane.parts.reduce((n, p) => n + p.tons * w.basePrice(p.good), 0) / Math.max(planned, 1);
+    const fillCost = Math.round(spec.cap * perTon);
+    const expected = Math.round(this.ventureMem.outsideRatio * fillCost);
+    const stake = Math.floor(Math.max(0, Math.min(cand.room, lane.capital)));
+    if (stake < VENTURE_MIN_STAKE_PENCE || expected <= 0) return false;
+    const big = await this.venturePlan(agent, r, port, lane.dest, stake + expected).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!big || agent.lane?.key !== lane.key) return false;
+    // The window: the Merchant Adventurers' look, then the bigger load's turnaround lock (a game minute or two a ton, and the pad for
+    // the buy's calls) and slack.
+    const lockMin = lockGameMin(big.lane.tons, w.handlingMsPerTon(port), w.gameMinuteMs);
+    const hours = raiseHours(lockMin);
+    if (hours === null) {
+      this.logOnceFor(`${agent.shipId}|venture-lock|${lane.key}`, agent.name, `cash limits the load at ${port}; no venture: the bigger load's lock (${lockMin} game minutes) leaves too little raising time`);
+      return false;
+    }
+    // The ship's time beyond the lock she'd sit through loading anyway, at what it is worth, and the berth's dues meanwhile.
+    const extraMs = Math.max(0, (hours * 60 - lockMin) * w.gameMinuteMs);
+    const idle = (extraMs / 3_600_000) * agent.rate + w.berthDuesFor(port, extraMs, false);
+    const shareBps = this.ventureMem.shareBps;
+    // The venture shares its cargo's P&L only: the hull's risk and the berth dues (in the planner's cash profit) are ours in full.
+    const shipCost = big.lane.shipCost ?? 0;
+    const c = ventureCase({
+      stake,
+      raised: stake + expected,
+      smallProfit: cand.small,
+      bigCapital: big.lane.capital,
+      bigProfit: big.lane.cashProfit + shipCost,
+      shipCost,
+      shareBps,
+      idleCost: idle,
+      minGain: VENTURE_MIN_GAIN_PENCE,
+    });
+    if (!c.ok) {
+      this.logOnceFor(`${agent.shipId}|venture|${lane.key}`, agent.name, `cash limits the load at ${port}; a venture for more wouldn't pay: ${c.why}`);
+      return false;
+    }
+    if (!w.beforeSeasonEnd(w.now() + hours * 60 * w.gameMinuteMs + big.lane.deliverMs)) return false;
+    const rec: VentureRec = {
+      id: null,
+      shipId: agent.shipId,
+      ship: agent.name,
+      origin: port,
+      dest: lane.dest,
+      shareBps,
+      raiseHours: hours,
+      raiseBy: null,
+      openedAt: w.now(),
+      buyAt: null,
+      lockMin,
+      perTon: big.lane.tons > 0 ? big.lane.capital / big.lane.tons : undefined,
+      stage: "opening",
+      pending: { call: "open", at: Date.now() },
+      stakePlanned: stake,
+      stake: 0,
+      stakeTried: false,
+      capital: 0,
+      outside: 0,
+      ma: 0,
+      expectedOutside: expected,
+      smallProfit: Math.round(cand.small),
+      planProfit: Math.round(big.lane.cashProfit),
+      fillCost,
+      parts: big.parts,
+      bought: {},
+      spent: 0,
+      proceeds: 0,
+      arrivedAt: null,
+      lastSellAt: 0,
+      merchantShare: null,
+      stakePayout: null,
+      outcome: null,
+      learned: false,
+      why: c.why,
+      closedAt: null,
+      status: null,
+    };
+    this.ventureMem.recs.push(rec);
+    this.trimVentures();
+    // Saved before it is sent: a call with no answer is looked for among our ventures, never sent again.
+    this.persist(true);
+    let v: Venture;
+    try {
+      v = await this.client.openVenture({ ship_id: agent.shipId, dest_port_id: lane.dest, investor_share_bps: shareBps, raise_game_hours: hours });
+    } catch (e) {
+      if (this.isFatal(e)) throw e;
+      const msg = (e as Error).message;
+      if (outcomeUnknown(e)) {
+        this.log(agent.name, `opening a venture for ${lane.dest}: no answer (${msg}); our ventures are read before anything more is done`);
+        this.releaseLane(agent);
+        return true;
+      }
+      this.closeVenture(rec, "not_opened", `the open was refused: ${msg}`);
+      this.ventureSkip.set(agent.shipId, Date.now() + VENTURE_SKIP_MS);
+      this.log(agent.name, `a venture for ${lane.dest} was refused (${msg}): loading as planned`);
+      if (isApiError(e, "world_paused")) throw e;
+      return false;
+    }
+    this.adoptOpened(rec, v);
+    this.log(
+      agent.name,
+      `cash limits the load at ${port}: opened a venture to ${lane.dest} (investors ${(shareBps / 100).toFixed(0)}% of the profit, raising ${hours} game hours; ` +
+        `~${cr(expected)} hoped for from outside, ${cr(stake)} of our own in): ${loadText(big.lane)} planned (${c.why})`,
+    );
+    await this.ventureInvest(agent, rec);
+    this.releaseLane(agent);
+    return true;
+  }
+
+  /** The open's answer (or our list's record of it): raising until the deadline, the buy timed so its lock clears well before it. */
+  private adoptOpened(rec: VentureRec, v: Venture): void {
+    rec.id = v.id;
+    rec.pending = null;
+    rec.stage = "raising";
+    const by = Date.parse(v.raise_by);
+    rec.raiseBy = Number.isFinite(by) ? by : rec.openedAt + rec.raiseHours * 60 * this.world.gameMinuteMs;
+    rec.buyAt = buyTime(rec.raiseBy, rec.lockMin ?? 60, this.world.gameMinuteMs);
+    this.ventureMem.stats.opened++;
+    this.noteVentureRead(rec, v);
+    this.venturesSeen = null;
+    this.persist(true);
+  }
+
+  /** Keeps the record list short: closed ones beyond VENTURES_KEPT go, oldest first (one under way never). */
+  private trimVentures(): void {
+    const recs = this.ventureMem.recs;
+    while (recs.length > VENTURES_KEPT) {
+      const i = recs.findIndex((r) => !ventureActive(r));
+      if (i < 0) break;
+      recs.splice(i, 1);
+    }
+  }
+
+  /** What the game shows of a venture of ours, into its record. */
+  private noteVentureRead(rec: VentureRec, v: Venture): void {
+    rec.status = v.status;
+    rec.capital = v.capital_pence ?? rec.capital;
+    const ours = stakeOf(v, (id) => this.ourCompany(id));
+    if (ours > 0) rec.stake = Math.max(rec.stake, ours);
+    rec.outside = Math.max(rec.outside, Math.max(0, (v.capital_pence ?? 0) - ours));
+    rec.spent = v.spent_pence ?? rec.spent;
+    rec.proceeds = v.proceeds_pence ?? rec.proceeds;
+    const goods = new Set([...rec.parts.map((p) => p.good), ...(v.cargo ?? []).map((c) => c.commodity_id)]);
+    for (const g of goods) {
+      const t = cargoTons(v, g);
+      if (t > 0 || rec.bought[g] !== undefined) rec.bought[g] = t;
+    }
+    const by = v.raise_by ? Date.parse(v.raise_by) : NaN;
+    if (Number.isFinite(by)) rec.raiseBy = by;
+    const arrived = v.arrived_at ? Date.parse(v.arrived_at) : NaN;
+    if (Number.isFinite(arrived) && rec.arrivedAt === null) rec.arrivedAt = arrived;
+    // The raising window closed (she sailed, or it was cancelled or settled): what it raised is final, and learned now (once), never
+    // from a read taken while money could still come in.
+    if (v.status !== "raising") this.learnVenture(rec);
+  }
+
+  /** Our ventures (`venture/list` without a port: those we run or hold), read at most every `maxAgeMs`; null: unread. */
+  private async readVentures(maxAgeMs = VENTURE_READ_MS): Promise<Venture[] | null> {
+    const seen = this.venturesSeen;
+    if (seen && Date.now() - seen.at < maxAgeMs) return seen.list;
+    try {
+      const list = await this.client.ventures();
+      this.venturesSeen = { at: Date.now(), list: Array.isArray(list) ? list : [] };
+      return this.venturesSeen.list;
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    }
+  }
+
+  /** Our venture as last listed (`fresh`: read now); `read` false when the list couldn't be read. */
+  private async ventureRead(rec: VentureRec, maxAgeMs = VENTURE_READ_MS): Promise<{ v: Venture | null; read: boolean }> {
+    const list = await this.readVentures(maxAgeMs);
+    if (!list) return { v: null, read: false };
+    const v = rec.id ? (list.find((x) => x.id === rec.id) ?? null) : null;
+    if (v) this.noteVentureRead(rec, v);
+    return { v, read: true };
+  }
+
+  /**
+   * A venture call with no answer (VenturePending), against our ventures as listed now: what it did is adopted, never sent again.
+   * An open: our venture on that ship and route, raising, not one we know (else it wasn't made). An invest: our stake as listed. A
+   * buy or a sell: the venture's cargo and money as listed (an IOC either filled or didn't). A settle: its status. The list shows
+   * our own calls at once, so a read started VENTURE_PENDING_GAME_MIN (game time) after the call that doesn't show it means it didn't
+   * land: the ship is never left idle past the raising window on it. A list that can't be read is waited on. True when settled one
+   * way or the other (the record says how).
+   */
+  private async reconcileVenture(rec: VentureRec): Promise<boolean> {
+    const p = rec.pending;
+    if (!p) return true;
+    const readAt = Date.now();
+    const list = await this.readVentures(0);
+    if (!list) return false;
+    const old = readAt - p.at > VENTURE_PENDING_GAME_MIN * this.world.gameMinuteMs;
+    if (p.call === "open") {
+      const known = new Set(this.ventureMem.recs.map((x) => x.id).filter((x): x is string => !!x));
+      const v = list.find((x) => x.ship_id === rec.shipId && x.origin_port_id === rec.origin && x.dest_port_id === rec.dest && x.status === "raising" && this.ourCompany(x.merchant_company_id) && !known.has(x.id));
+      if (v) {
+        this.adoptOpened(rec, v);
+        this.log(rec.ship, `the venture to ${rec.dest} whose open had no answer was made after all`);
+        return true;
+      }
+      if (!old) return false;
+      this.closeVenture(rec, "not_opened", "the open had no answer and no venture of ours appeared");
+      this.log(rec.ship, `the venture to ${rec.dest} whose open had no answer isn't among ours ${VENTURE_PENDING_GAME_MIN} game minutes on: it wasn't made`);
+      return true;
+    }
+    const v = rec.id ? list.find((x) => x.id === rec.id) : undefined;
+    if (v) this.noteVentureRead(rec, v);
+    if (p.call === "invest") {
+      if (rec.stake > 0 || old || !v) {
+        rec.pending = null;
+        if (rec.stake > 0) this.ventureMem.stats.stakedPence += rec.stake;
+        this.persist(true);
+        return true;
+      }
+      return false;
+    }
+    if (p.call === "settle") {
+      if (v && (v.status === "settled" || v.status === "cancelled" || v.status === "lost")) {
+        rec.pending = null;
+        this.closeFromStatus(rec, v);
+        return true;
+      }
+      if (old || !v) {
+        rec.pending = null;
+        this.persist(true);
+        return true;
+      }
+      return false;
+    }
+    // A buy or a sell: the listing after it shows what it did (filled or not).
+    if (v || old) {
+      rec.pending = null;
+      this.persist(true);
+      return true;
+    }
+    return false;
+  }
+
+  /** Closes a record on the game's own status (settled, cancelled, lost), with what it paid us. */
+  private closeFromStatus(rec: VentureRec, v: Venture): void {
+    if (v.status === "settled") {
+      rec.merchantShare = v.merchant_share_pence ?? 0;
+      rec.stakePayout = payoutOf(v, (id) => this.ourCompany(id));
+      this.ventureMem.stats.settled++;
+      this.ventureMem.stats.merchantPence += rec.merchantShare;
+      this.ventureMem.stats.payoutPence += rec.stakePayout;
+      this.closeVenture(rec, "settled", `settled: the merchant's share ${cr(rec.merchantShare)}, our stake paid ${cr(rec.stakePayout)} (${cr(rec.stake)} in)`);
+    } else if (v.status === "cancelled") {
+      this.ventureMem.stats.cancelled++;
+      this.closeVenture(rec, "cancelled", rec.why.startsWith("cancelled") ? rec.why : "cancelled (unspent cash returned)");
+    } else if (v.status === "lost") {
+      this.ventureMem.stats.lost++;
+      this.closeVenture(rec, "lost", "the ship was lost: only unspent cash came back");
+    }
+    void this.world.refreshVaults().catch(() => undefined);
+    this.cashArrived();
+  }
+
+  /** A venture done with: closed on the record (and what it raised learned, once). */
+  private closeVenture(rec: VentureRec, outcome: NonNullable<VentureRec["outcome"]>, why: string): void {
+    this.learnVenture(rec);
+    rec.stage = "closed";
+    rec.pending = null;
+    rec.outcome = outcome;
+    rec.why = why;
+    rec.closedAt = this.world.now();
+    if (outcome !== "not_opened") this.log(rec.ship, `venture to ${rec.dest} ${outcome.replace(/_/g, " ")}: ${why}`);
+    this.trimVentures();
+    this.persist(true);
+  }
+
+  /**
+   * What a venture raised from outside, learned once (the investors' share and the outside capital expected next time): at the
+   * window's close (noteVentureRead: the first read no longer raising), else when the record closes, on what it last showed.
+   */
+  private learnVenture(rec: VentureRec): void {
+    if (rec.learned || !rec.id || rec.stage === "opening") return;
+    rec.learned = true;
+    const m = this.ventureMem;
+    const before = m.shareBps;
+    m.shareBps = learnShare(m.shareBps, rec.outside, rec.expectedOutside);
+    m.outsideRatio = learnOutside(m.outsideRatio, rec.outside, rec.fillCost);
+    m.stats.outsidePence += rec.outside;
+    m.stats.maPence += rec.ma;
+    if (m.shareBps !== before) this.log("fleet", `ventures: offering investors ${(m.shareBps / 100).toFixed(1)}% of the profit next time (was ${(before / 100).toFixed(1)}%; ${cr(rec.outside)} came from outside against ~${cr(rec.expectedOutside)} hoped for)`);
+    this.persist();
+  }
+
+  /**
+   * Our stake in a venture of ours (`venture/invest`): the load's own cash in the origin's region (loadBudget, holding the cash lock:
+   * never what our other ships' loads count on), once. Saved before it is sent; no answer: reconciled from the venture's stakes.
+   */
+  private async ventureInvest(agent: ShipAgent, rec: VentureRec): Promise<void> {
+    if (!rec.id || rec.stake > 0 || rec.pending || rec.stakeTried || rec.stakePlanned <= 0) return;
+    rec.stakeTried = true;
+    const region = this.world.region(rec.origin);
+    await this.withCash(async () => {
+      const cash = await this.loadBudget(agent, region, rec.stakePlanned);
+      const amount = Math.floor(Math.min(cash, rec.stakePlanned));
+      if (amount < VENTURE_MIN_STAKE_PENCE) {
+        this.log(agent.name, `venture to ${rec.dest}: no cash for our stake now (${cr(cash)} spare for it); raising from others only`);
+        this.persist(true);
+        return;
+      }
+      rec.pending = { call: "invest", at: Date.now(), pence: amount };
+      this.persist(true);
+      try {
+        const v = await this.client.investInVenture(rec.id!, amount);
+        rec.pending = null;
+        this.world.vaults.set(region, this.world.vault(region) - amount);
+        this.noteVentureRead(rec, v);
+        if (rec.stake <= 0) rec.stake = amount;
+        this.ventureMem.stats.stakedPence += rec.stake;
+        this.log(agent.name, `put ${cr(amount)} of our own into the venture to ${rec.dest} (the load's own cash)`);
+      } catch (e) {
+        if (this.isFatal(e)) throw e;
+        const msg = (e as Error).message;
+        if (outcomeUnknown(e)) {
+          this.log(agent.name, `our stake in the venture to ${rec.dest}: no answer (${msg}); its stakes are read before anything more is done`);
+          return;
+        }
+        rec.pending = null;
+        this.log(agent.name, `our stake in the venture to ${rec.dest} was refused (${msg}): raising from others only`);
+        if (isApiError(e, "world_paused")) throw e;
+      } finally {
+        this.persist(true);
+      }
+    });
+  }
+
+  /**
+   * A venture cancelled before sailing (`venture/settle` before she sails: its unspent cash returned, our stake among it): nothing
+   * was bought. Saved before it is sent. Null when done (she carries on as any ship, no venture tried on her for a while), else a wait.
+   */
+  private async ventureCancel(agent: ShipAgent, rec: VentureRec, why: string): Promise<number | null> {
+    if (!rec.id) {
+      this.closeVenture(rec, "failed", why);
+      return null;
+    }
+    rec.why = `cancelled: ${why}`;
+    rec.pending = { call: "settle", at: Date.now() };
+    rec.stage = "settling";
+    this.persist(true);
+    try {
+      const v = await this.client.settleVenture(rec.id);
+      rec.pending = null;
+      this.noteVentureRead(rec, v);
+      this.ventureSkip.set(agent.shipId, Date.now() + VENTURE_SKIP_MS);
+      if (v.status === "settled" || v.status === "cancelled" || v.status === "lost") this.closeFromStatus(rec, { ...v, status: v.status === "settled" ? "cancelled" : v.status });
+      else this.closeVenture(rec, "cancelled", rec.why);
+      return null;
+    } catch (e) {
+      if (this.isFatal(e)) throw e;
+      if (outcomeUnknown(e)) return 15_000;
+      rec.pending = null;
+      this.persist(true);
+      if (isApiError(e, "world_paused")) throw e;
+      this.log(agent.name, `cancelling the venture to ${rec.dest} was refused (${(e as Error).message}); reading it again`);
+      this.venturesSeen = null;
+      return 30_000;
+    }
+  }
+
+  /**
+   * Her turn in port while a venture of ours is under way on her (FleetHost; guide 3.13.5): a call with no answer reconciled first;
+   * then raising (our stake in, waiting for the buy's time), the buy (judged again on what was raised: too little, cancelled),
+   * buying through the venture, sailing alone to its port, selling through it there, settling. Null: no venture (or it closed).
+   */
+  async ventureTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null> {
+    const rec = this.ventureOn(agent.shipId);
+    if (!rec) return null;
+    if (rec.pending) {
+      const done = await this.reconcileVenture(rec);
+      if (!done) {
+        agent.setActivity(`venture to ${rec.dest}: waiting to learn whether our ${rec.pending.call} went through`);
+        return 15_000;
+      }
+      if (!ventureActive(rec)) return null;
+    }
+    switch (rec.stage) {
+      case "opening":
+        this.closeVenture(rec, "not_opened", "no open was sent");
+        return null;
+      case "raising":
+        return this.ventureRaising(agent, r, rec, port);
+      case "buying":
+        return this.ventureBuying(agent, r, rec, port);
+      case "loaded":
+        return this.ventureSail(agent, r, rec, port);
+      case "selling":
+        return this.ventureSelling(agent, r, rec, port);
+      case "settling":
+        return this.ventureSettle(agent, rec);
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Raising: our stake in, the game's status watched, the buy at its time: as late as the deadline and the lock allow, timed again at
+   * each read for the tons the capital raised so far would buy (money the Merchant Adventurers put in late in the window is then
+   * spent, not left to dilute our stake; more raised brings the buy forward, as its lock grows).
+   */
+  private async ventureRaising(agent: ShipAgent, r: ShipResult, rec: VentureRec, port: string): Promise<number | null> {
+    const w = this.world;
+    const { v, read } = await this.ventureRead(rec);
+    if (read && !v) {
+      this.closeVenture(rec, "failed", "it is no longer among our ventures");
+      return null;
+    }
+    if (v && v.status !== "raising") {
+      this.closeFromStatus(rec, v);
+      return ventureActive(rec) ? 15_000 : null;
+    }
+    if (port !== rec.origin) {
+      // Not where it was opened (she can't have sailed with it): the game's own deadline cancels it; nothing of ours rides on it.
+      return this.ventureCancel(agent, rec, `she lies at ${port}, not ${rec.origin}`);
+    }
+    await this.ventureInvest(agent, rec);
+    const now = w.now();
+    if (rec.raiseBy !== null) {
+      // The lock a buy of what is raised so far would set (a berth's own first, off one) and the slack (buyTime): the buy as late as
+      // they allow; due at once when her berth lock as it stands clears after that (ventureDecide then judges what still fits).
+      const dock = r.ship.status === "berthed" ? 0 : VENTURE_DOCK_LOCK_GAME_MIN;
+      const lock = lockGameMin(this.ventureTonsFor(r, rec, rec.capital), w.handlingMsPerTon(port), w.gameMinuteMs) + dock;
+      let at = buyTime(rec.raiseBy, lock, w.gameMinuteMs);
+      if (dock === 0 && this.ventureLockFrom(r) > at) at = Math.min(at, now);
+      if (at !== rec.buyAt || lock !== rec.lockMin) {
+        rec.buyAt = at;
+        rec.lockMin = lock;
+        this.persist();
+      }
+    }
+    if (rec.buyAt !== null && now >= rec.buyAt) return this.ventureDecide(agent, r, rec, port);
+    const left = (rec.buyAt ?? now) - now;
+    agent.setActivity(`venture to ${rec.dest}: raising capital, ${cr(rec.capital)} in (${cr(rec.outside)} from others); buying in ${Math.max(0, Math.round(left / 1000))}s`);
+    return Math.min(Math.max(1_000, left + 500), VENTURE_READ_MS);
+  }
+
+  /** Server ms a buy at her berth would start its lock from: now, or her berth lock's clearing if later; off a berth, a berth's own lock. */
+  private ventureLockFrom(r: ShipResult): number {
+    const w = this.world;
+    const now = w.now();
+    if (r.ship.status !== "berthed") return now + VENTURE_DOCK_LOCK_GAME_MIN * w.gameMinuteMs;
+    const u = r.ship.turnaround_unlocks_at ? Date.parse(r.ship.turnaround_unlocks_at) : NaN;
+    return Number.isFinite(u) ? Math.max(now, u) : now;
+  }
+
+  /** Tons `cash` would buy for the venture (at the planned cash a ton, else the parts' limits), within her hold's room. */
+  private ventureTonsFor(r: ShipResult, rec: VentureRec, cash: number): number {
+    const tons = rec.parts.reduce((n, p) => n + p.tons, 0);
+    const perTon = rec.perTon ?? (tons > 0 ? rec.parts.reduce((n, p) => n + p.tons * p.limit, 0) / tons : 0);
+    const room = Math.max(0, Math.floor(r.effective_hold_capacity_tons - r.cargo_used_tons - 1));
+    return perTon > 0 ? Math.min(room, Math.floor(Math.max(0, cash) / perTon)) : room;
+  }
+
+  /**
+   * The buy's time: the load planned again on the capital actually raised (market goods to the venture's port), no bigger than the
+   * tons whose lock clears before the deadline from when a buy would start (tonsInTime: she never departs late), and our part of it
+   * against what the load would make alone; too little (or nothing pays, or no time for a buy and its lock): cancelled.
+   */
+  private async ventureDecide(agent: ShipAgent, r: ShipResult, rec: VentureRec, port: string): Promise<number | null> {
+    const w = this.world;
+    const h = w.handlingMsPerTon(port);
+    const inTime = tonsInTime(rec.raiseBy ?? 0, this.ventureLockFrom(r), h, w.gameMinuteMs);
+    if (inTime < 1) {
+      return this.ventureCancel(agent, rec, r.ship.status === "berthed" ? "her berth lock wouldn't clear before the deadline after a buy" : "no berth in time for the buy and its lock before the deadline");
+    }
+    if (r.ship.status !== "berthed") {
+      agent.setActivity(`venture to ${rec.dest}: to a berth for the buy`);
+      return agent.berth(r);
+    }
+    const { v } = await this.ventureRead(rec, 0);
+    if (!v) {
+      agent.setActivity(`venture to ${rec.dest}: reading it before the buy`);
+      return 10_000;
+    }
+    if (v.status !== "raising") {
+      this.closeFromStatus(rec, v);
+      return ventureActive(rec) ? 15_000 : null;
+    }
+    const capital = Math.max(0, v.cash_pence ?? v.capital_pence ?? 0);
+    const big = capital > 0 ? await this.venturePlan(agent, r, port, rec.dest, capital, inTime) : null;
+    if (!big) return this.ventureCancel(agent, rec, `no load to ${rec.dest} pays with the ${cr(capital)} raised in the ${inTime} t whose lock clears before the deadline`);
+    // The venture shares its cargo's P&L only: the hull's risk and the berth dues (in the planner's cash profit) are ours in full.
+    const shipCost = big.lane.shipCost ?? 0;
+    const take = ourTake(big.lane.cashProfit + shipCost, Math.max(capital, big.lane.capital), rec.stake, rec.shareBps, shipCost);
+    const gain = Math.round(take - Math.max(0, rec.smallProfit));
+    if (gain < VENTURE_MIN_GAIN_PENCE / 2) {
+      return this.ventureCancel(agent, rec, `raised ${cr(rec.outside)} from others: our part ~${cr(take)} against ~${cr(rec.smallProfit)} loading alone`);
+    }
+    rec.parts = big.parts;
+    rec.planProfit = Math.round(big.lane.cashProfit);
+    if (big.lane.tons > 0) rec.perTon = big.lane.capital / big.lane.tons;
+    // The lock of the load kept (the timing as it now stands); what was raised is learned once the window closes (noteVentureRead).
+    rec.lockMin = lockGameMin(big.lane.tons, h, w.gameMinuteMs);
+    rec.stage = "buying";
+    this.persist(true);
+    this.log(
+      agent.name,
+      `venture to ${rec.dest}: ${cr(capital)} raised (${cr(rec.outside)} from others); buying ${loadText(big.lane)} through it (our part ~${cr(take)}, ~${cr(gain)} over loading alone; ` +
+        `at most ${inTime} t still clear their lock before the deadline)`,
+    );
+    return this.ventureBuying(agent, await agent.refresh(), rec, port);
+  }
+
+  /**
+   * Buying through the venture (`venture/buy`: an IOC from our vault, reimbursed at once): each good in as many IOCs as it takes to
+   * reach its plan (VENTURE_BUYS_PER_GOOD at most a round), at its buy limit. Each is sized to the venture's cash, the hold's room, the
+   * tons whose lock still clears before the deadline from her lock as it now stands (tonsInTime: she never departs late), and what
+   * our vault there can front for the moment (when it can't, our deposits come back and cash is raised from our other regions first:
+   * ensureCash); each call is saved before it is sent. A good is done when its plan is aboard, no ask is left under its limit (or an
+   * IOC filled nothing), or the buy is refused. Nothing aboard at the end: cancelled. Then she sails.
+   */
+  private async ventureBuying(agent: ShipAgent, r: ShipResult, rec: VentureRec, port: string): Promise<number | null> {
+    const w = this.world;
+    const gm = w.gameMinuteMs;
+    const h = w.handlingMsPerTon(port);
+    let { v } = await this.ventureRead(rec, 0);
+    if (!v) {
+      agent.setActivity(`venture to ${rec.dest}: reading it before buying`);
+      return 10_000;
+    }
+    if (v.status !== "raising") {
+      this.closeFromStatus(rec, v);
+      return ventureActive(rec) ? 15_000 : null;
+    }
+    const raiseBy = rec.raiseBy ?? 0;
+    if (r.ship.status !== "berthed") {
+      // Off the berth (evicted, a restart): with some of its cargo aboard she sails from the roadstead as she is; with none, a berth if
+      // there is still time for it, the buy and its lock, else the venture is cancelled (nothing bought).
+      if (rec.parts.some((p) => cargoTons(v!, p.good) > 0)) {
+        rec.stage = "loaded";
+        this.persist(true);
+        return this.ventureSail(agent, r, rec, port);
+      }
+      if (tonsInTime(raiseBy, this.ventureLockFrom(r), h, gm) < 1) return this.ventureCancel(agent, rec, "no berth in time for the buy before the deadline");
+      return agent.berth(r);
+    }
+    const region = w.region(port);
+    let stop: string | null = null;
+    goods: for (const p of rec.parts) {
+      for (let n = 0; n < VENTURE_BUYS_PER_GOOD; n++) {
+        const have = cargoTons(v, p.good);
+        const want = Math.floor(p.tons - have);
+        if (want < 1) continue goods;
+        const room = Math.floor(r.effective_hold_capacity_tons - r.cargo_used_tons - 1);
+        if (room < 1) {
+          stop = "the hold is full";
+          break goods;
+        }
+        // The tons whose lock (on top of hers as it stands) still clears the slack before the deadline.
+        const time = tonsInTime(raiseBy, this.ventureLockFrom(r), h, gm);
+        if (time < 1) {
+          stop = "no time left for another buy's lock before the deadline";
+          break goods;
+        }
+        const book = await this.client.book(port, p.good).catch((e: unknown) => {
+          if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+          return null;
+        });
+        if (!book) continue goods;
+        w.observeBook(book);
+        const customs = 1 + book.customs_bps / 10_000;
+        const asks = (book.books.find((b) => b.commodity_id === p.good)?.depth?.asks ?? []).filter((l) => !w.isUnfillable(port, p.good, l.order_id) && l.price_pence <= p.limit);
+        if (asks.length === 0) {
+          if (n === 0) this.log(agent.name, `venture to ${rec.dest}: no ${p.good} at ${port} under ${cr(p.limit)}/t`);
+          continue goods;
+        }
+        const cur = v;
+        const result = await this.withCash(async (): Promise<{ stop: string } | { wait: true; msg: string } | { refused: string } | { v: Venture; got: number }> => {
+          await w.refreshVaults().catch(() => undefined);
+          const perTon = p.limit * customs;
+          const byCash = Math.floor((cur.cash_pence ?? 0) / perTon);
+          if (byCash < 1) return { stop: "the venture's cash is spent" };
+          let qty = Math.min(want, room, time, byCash);
+          // Fronted from our vault for the moment the IOC takes (reimbursed from the venture at once): when the vault there can't front
+          // it, our deposits come back and cash is raised from our other regions first (ensureCash), never while a repayment is short.
+          if (Math.floor(Math.max(0, w.vault(region)) / perTon) < qty && !this.debtShort) {
+            await this.ensureCash(region, Math.ceil(qty * perTon) - this.floorIn(region), { fresh: true }).catch((e: unknown) => {
+              if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+              return 0;
+            });
+          }
+          qty = Math.min(qty, Math.floor(Math.max(0, w.vault(region)) / perTon));
+          if (qty < 1) return { stop: `our vault in ${region} can't front the buy for its moment` };
+          rec.pending = { call: "buy", at: Date.now(), good: p.good, tons: qty, before: have };
+          this.persist(true);
+          try {
+            const nv = await this.client.buyVentureCargo({ venture_id: rec.id!, commodity_id: p.good, quantity: qty, limit_price_pence: p.limit });
+            rec.pending = null;
+            this.noteVentureRead(rec, nv);
+            // The list as cached shows the venture before this buy: read afresh next time.
+            this.venturesSeen = null;
+            const got = cargoTons(nv, p.good) - have;
+            this.log(agent.name, `venture to ${rec.dest}: bought ${got}/${qty} t ${p.good} at ${port} ≤ ${cr(p.limit)}/t through it (${cr(nv.cash_pence ?? 0)} of its cash left)`);
+            return { v: nv, got };
+          } catch (e) {
+            if (this.isFatal(e)) throw e;
+            const msg = (e as Error).message;
+            if (outcomeUnknown(e)) return { wait: true, msg };
+            rec.pending = null;
+            if (isApiError(e, "world_paused")) throw e;
+            // 409: an ask of ours rests at or under the limit there (the investors' money never buys our own goods), or the like.
+            this.log(agent.name, `venture to ${rec.dest}: buying ${qty} t ${p.good} was refused (${msg})`);
+            return { refused: msg };
+          } finally {
+            this.persist(true);
+          }
+        });
+        if ("wait" in result) {
+          this.log(agent.name, `venture to ${rec.dest}: a buy of ${p.good} had no answer (${result.msg}); its cargo is read before anything more is bought`);
+          return 15_000;
+        }
+        if ("stop" in result) {
+          stop = result.stop;
+          break goods;
+        }
+        if ("refused" in result) continue goods;
+        v = result.v;
+        r = await agent.refresh();
+        // Nothing filled: no ask left under the limit (the book moved), on to the next good.
+        if (result.got < 1) continue goods;
+      }
+      this.log(agent.name, `venture to ${rec.dest}: ${VENTURE_BUYS_PER_GOOD} buys of ${p.good} this round; on to the next good`);
+    }
+    if (stop) this.log(agent.name, `venture to ${rec.dest}: stopped buying (${stop})`);
+    const last = v;
+    const aboard = rec.parts.reduce((n, p) => n + cargoTons(last, p.good), 0);
+    if (aboard <= 0) return this.ventureCancel(agent, rec, "nothing could be bought under the limits");
+    // Raised after this (late in the window) is spent before she sails, while a buy's lock still clears in time (ventureTopUp).
+    rec.cashAfterBuy = Math.max(0, last.cash_pence ?? 0);
+    rec.stage = "loaded";
+    this.persist(true);
+    this.log(
+      agent.name,
+      `venture to ${rec.dest}: ${aboard} t aboard (${cr(rec.cashAfterBuy)} of its cash unspent); sailing alone for it before ${rec.raiseBy !== null ? new Date(rec.raiseBy).toISOString() : "the deadline"}`,
+    );
+    return this.ventureSail(agent, await agent.refresh(), rec, port);
+  }
+
+  /**
+   * Loaded: alone, only to the venture's port (ShipAgent.sailFor: stores, the hull and the policy guard as any passage). At the
+   * origin she never departs late: once her berth lock has cleared the venture is read afresh (never from a list cached seconds ago:
+   * it may be over, its cargo gone), capital raised since the last buy is spent first while a buy's lock still clears in time
+   * (ventureTopUp), and past the deadline she doesn't sail at all (the game cancels it): she waits for its status.
+   */
+  private async ventureSail(agent: ShipAgent, r: ShipResult, rec: VentureRec, port: string): Promise<number | null> {
+    const w = this.world;
+    if (port === rec.dest) {
+      rec.stage = "selling";
+      rec.arrivedAt ??= w.now();
+      this.persist(true);
+      return this.ventureSelling(agent, r, rec, port);
+    }
+    const atOrigin = port === rec.origin;
+    const unlocks = r.ship.status === "berthed" && r.ship.turnaround_unlocks_at ? Date.parse(r.ship.turnaround_unlocks_at) : NaN;
+    const ready = !(Number.isFinite(unlocks) && unlocks > w.now());
+    // Cancelled by the game meanwhile (its deadline passed unsailed), or otherwise over: closed, and she is free.
+    const { v, read } = await this.ventureRead(rec, atOrigin && ready ? 0 : VENTURE_READ_MS);
+    if (v && (v.status === "settled" || v.status === "cancelled" || v.status === "lost")) {
+      this.logOnceFor(`${rec.id}|over`, agent.name, `WARNING: the venture to ${rec.dest} is ${v.status} before she sailed${rec.parts.some((p) => (rec.bought[p.good] ?? 0) > 0) ? " with its cargo aboard: what is aboard is handled as ours from now on" : ""}`);
+      this.closeFromStatus(rec, v);
+      return null;
+    }
+    if (atOrigin) {
+      if (rec.raiseBy !== null && w.now() >= rec.raiseBy) {
+        // Never departs late: past the deadline the game cancels it (what it holds settled there); she waits to read that.
+        if (read && !v) {
+          this.closeVenture(rec, "failed", "past its deadline unsailed, and no longer among our ventures");
+          return null;
+        }
+        this.logOnceFor(`${rec.id}|late`, agent.name, `WARNING: the venture to ${rec.dest} is past its deadline and she hasn't sailed: not sailing now; waiting for the game to cancel it`);
+        agent.setActivity(`venture to ${rec.dest}: past its deadline unsailed; waiting for it to be cancelled`);
+        return 15_000;
+      }
+      if (v && v.status === "raising" && r.ship.status === "berthed") {
+        const wait = await this.ventureTopUp(agent, r, rec, v, port);
+        if (wait !== null) return wait;
+      }
+    } else this.logOnceFor(`${rec.id}|where`, agent.name, `WARNING: the venture to ${rec.dest} finds her at ${port}: sailing on for its port`);
+    agent.setActivity(`venture to ${rec.dest}: sailing alone for it`);
+    return agent.sailFor(r, rec.dest);
+  }
+
+  /**
+   * Capital raised since her last buying round (the Merchant Adventurers put in late in the window), while she still lies berthed at
+   * the origin and a buy's lock would clear before the deadline: the load planned again on the venture's whole capital (spent and
+   * left) for what is aboard and the tons still in time (the destination's demand judged on the whole), and each good's tons beyond
+   * what is aboard bought at its break-even limit (no value test or cancel: unspent, that money would only dilute our stake). Null:
+   * nothing more to buy (she sails); else the buying round's wait.
+   */
+  private async ventureTopUp(agent: ShipAgent, r: ShipResult, rec: VentureRec, v: Venture, port: string): Promise<number | null> {
+    const w = this.world;
+    const cash = Math.max(0, v.cash_pence ?? 0);
+    const before = rec.cashAfterBuy;
+    if (before === undefined) {
+      rec.cashAfterBuy = cash;
+      this.persist();
+      return null;
+    }
+    const cheapest = Math.min(...rec.parts.map((p) => p.limit));
+    if (cash - before < Math.max(VENTURE_TOPUP_MIN_PENCE, Number.isFinite(cheapest) ? cheapest : 0)) return null;
+    // Judged once per sum raised: a round that buys nothing more isn't tried again until more comes in.
+    rec.cashAfterBuy = cash;
+    this.persist();
+    const inTime = tonsInTime(rec.raiseBy ?? 0, this.ventureLockFrom(r), w.handlingMsPerTon(port), w.gameMinuteMs);
+    const room = Math.floor(r.effective_hold_capacity_tons - r.cargo_used_tons - 1);
+    const extra = Math.min(inTime, room);
+    if (extra < 1) {
+      this.log(agent.name, `venture to ${rec.dest}: ${cr(cash - before)} more raised since the buy, but ${room < 1 ? "the hold is full" : "no buy's lock would clear before the deadline"}: sailing`);
+      return null;
+    }
+    const aboard = new Map(rec.parts.map((p) => [p.good, cargoTons(v, p.good)]));
+    const total = [...aboard.values()].reduce((n, t) => n + t, 0);
+    const big = await this.venturePlan(agent, r, port, rec.dest, Math.max(0, v.spent_pence ?? rec.spent) + cash, total + extra).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    // Each good to the larger of what is aboard and the new plan; goods aboard it dropped keep what they have.
+    const parts: VenturePart[] = (big?.parts ?? []).map((p) => ({ ...p, tons: Math.max(p.tons, aboard.get(p.good) ?? 0) }));
+    for (const p of rec.parts) if (!parts.some((x) => x.good === p.good)) parts.push({ ...p, tons: aboard.get(p.good) ?? 0 });
+    const more = parts.reduce((n, p) => n + Math.max(0, Math.floor(p.tons - (aboard.get(p.good) ?? 0))), 0);
+    if (!big || more < 1) {
+      this.log(agent.name, `venture to ${rec.dest}: ${cr(cash - before)} more raised since the buy; nothing more pays to buy with it in the ${extra} t left: sailing`);
+      return null;
+    }
+    rec.parts = parts;
+    rec.stage = "buying";
+    this.persist(true);
+    this.log(agent.name, `venture to ${rec.dest}: ${cr(cash - before)} more raised since the buy; buying up to ${Math.min(more, extra)} t more through it before she sails (its lock still clears in time)`);
+    return this.ventureBuying(agent, r, rec, port);
+  }
+
+  /**
+   * At the venture's port: its cargo sold through it (`venture/sell`) down to VENTURE_SELL_FLOOR of the planned price (never under
+   * half the bid), tried again as the buyers re-quote; after VENTURE_SELL_PATIENCE_GAME_H, settled (the game sells what is left
+   * into the bids at no less than half the Crown's bid).
+   */
+  private async ventureSelling(agent: ShipAgent, r: ShipResult, rec: VentureRec, port: string): Promise<number | null> {
+    const w = this.world;
+    const gm = w.gameMinuteMs;
+    if (port !== rec.dest) return this.ventureSail(agent, r, rec, port);
+    const { v } = await this.ventureRead(rec, 0);
+    if (!v) {
+      agent.setActivity(`venture to ${rec.dest}: reading it before selling`);
+      return 10_000;
+    }
+    if (v.status === "settled" || v.status === "cancelled" || v.status === "lost") {
+      this.closeFromStatus(rec, v);
+      return null;
+    }
+    const patient = rec.arrivedAt !== null && w.now() - rec.arrivedAt >= VENTURE_SELL_PATIENCE_GAME_H * 60 * gm;
+    const cargo = (v.cargo ?? []).filter((c) => c.tons >= 1);
+    if (cargo.length === 0 || patient) return this.ventureSettle(agent, rec);
+    if (rec.lastSellAt && w.now() - rec.lastSellAt < VENTURE_SELL_RETRY_GAME_MIN * gm) {
+      const wait = rec.lastSellAt + VENTURE_SELL_RETRY_GAME_MIN * gm - w.now();
+      agent.setActivity(`venture to ${rec.dest}: waiting ${Math.round(wait / 1000)}s for the buyers to re-quote`);
+      return Math.max(5_000, Math.min(wait, 60_000));
+    }
+    if (r.ship.status !== "berthed") {
+      agent.setActivity(`venture to ${rec.dest}: to a berth to sell its cargo`);
+      return agent.berth(r);
+    }
+    let left = 0;
+    let cur: Venture = v;
+    for (const c of cargo) {
+      const book = await this.client.book(port, c.commodity_id).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (!book) {
+        left += c.tons;
+        continue;
+      }
+      w.observeBook(book);
+      const b = book.books.find((x) => x.commodity_id === c.commodity_id);
+      const bids = b?.depth?.bids ?? [];
+      const best = bids.length ? Math.max(...bids.map((l) => l.price_pence)) : (b?.best_bid?.price_pence ?? 0);
+      const planned = rec.parts.find((p) => p.good === c.commodity_id)?.pay ?? best;
+      const limit = sellLimit(planned, best, false);
+      const qty = Math.floor(c.tons);
+      if (limit === null || limit > best || qty < 1) {
+        left += c.tons;
+        continue;
+      }
+      rec.pending = { call: "sell", at: Date.now(), good: c.commodity_id, tons: qty, before: c.tons };
+      this.persist(true);
+      try {
+        const nv = await this.client.sellVentureCargo({ venture_id: rec.id!, commodity_id: c.commodity_id, quantity: qty, limit_price_pence: limit });
+        rec.pending = null;
+        this.noteVentureRead(rec, nv);
+        cur = nv;
+        const after = cargoTons(nv, c.commodity_id);
+        left += after;
+        this.log(agent.name, `venture to ${rec.dest}: sold ${Math.max(0, c.tons - after)}/${qty} t ${c.commodity_id} at ${port} ≥ ${cr(limit)}/t through it (${cr(nv.proceeds_pence ?? 0)} of proceeds so far)`);
+      } catch (e) {
+        if (this.isFatal(e)) throw e;
+        const msg = (e as Error).message;
+        if (outcomeUnknown(e)) {
+          this.persist(true);
+          this.log(agent.name, `venture to ${rec.dest}: a sale of ${c.commodity_id} had no answer (${msg}); its cargo is read before anything more is sold`);
+          return 15_000;
+        }
+        rec.pending = null;
+        this.persist(true);
+        if (isApiError(e, "world_paused")) throw e;
+        this.log(agent.name, `venture to ${rec.dest}: selling ${qty} t ${c.commodity_id} was refused (${msg})`);
+        left += c.tons;
+      }
+    }
+    rec.lastSellAt = w.now();
+    this.persist(true);
+    if (left < 1 || (cur.cargo ?? []).every((c) => c.tons < 1)) return this.ventureSettle(agent, rec);
+    // Some left under our floor: the buyers re-quote every 6 game hours; she waits in the roadstead (no dues) meanwhile.
+    await agent.standBy(r, `venture to ${rec.dest}: ${left} t unsold under our floor; trying again after the buyers re-quote`);
+    return Math.max(5_000, Math.min(VENTURE_SELL_RETRY_GAME_MIN * gm, 60_000));
+  }
+
+  /** Settles the venture (`venture/settle`): saved before it is sent; closed on the game's answer, with what it paid us. */
+  private async ventureSettle(agent: ShipAgent, rec: VentureRec): Promise<number | null> {
+    rec.stage = "settling";
+    rec.pending = { call: "settle", at: Date.now() };
+    this.persist(true);
+    try {
+      const v = await this.client.settleVenture(rec.id!);
+      rec.pending = null;
+      this.noteVentureRead(rec, v);
+      if (v.status === "settled" || v.status === "cancelled" || v.status === "lost") {
+        this.closeFromStatus(rec, v);
+        return null;
+      }
+      this.persist(true);
+      agent.setActivity(`venture to ${rec.dest}: settling (${v.status})`);
+      return 60_000;
+    } catch (e) {
+      if (this.isFatal(e)) throw e;
+      if (outcomeUnknown(e)) return 15_000;
+      rec.pending = null;
+      this.persist(true);
+      if (isApiError(e, "world_paused")) throw e;
+      // Settled on its own meanwhile, or not yet allowed: read again, and try again later.
+      this.log(agent.name, `settling the venture to ${rec.dest} was refused (${(e as Error).message}); reading it again`);
+      this.venturesSeen = null;
+      const { v } = await this.ventureRead(rec, 0);
+      if (v && (v.status === "settled" || v.status === "cancelled" || v.status === "lost")) {
+        this.closeFromStatus(rec, v);
+        return null;
+      }
+      agent.setActivity(`venture to ${rec.dest}: waiting to settle`);
+      return 60_000;
+    }
+  }
+
+  /**
+   * Ventures whose ship isn't in port to see to them (at sea, or gone): their status read every finance pass at most every
+   * VENTURE_READ_MS, so one that settled, was cancelled or was lost with her closes (and never holds the next back).
+   */
+  private async reviewVentures(): Promise<void> {
+    const recs = this.ventureMem.recs.filter((r) => ventureActive(r) && r.id && !r.pending);
+    if (recs.length === 0) return;
+    for (const rec of recs) {
+      const a = this.agents.get(rec.shipId);
+      const inPort = !!a && !a.gone && a.last?.ship.status !== "sailing";
+      if (inPort) continue;
+      const { v, read } = await this.ventureRead(rec);
+      if (!read) return;
+      if (v && (v.status === "settled" || v.status === "cancelled" || v.status === "lost")) this.closeFromStatus(rec, v);
+      else if (!v && (!a || a.gone)) this.closeVenture(rec, "lost", "her ship is no longer ours and the venture isn't listed");
+    }
+  }
+
+  private venturesReport(): VenturesReport {
+    const m = this.ventureMem;
+    const active = m.recs.find(ventureActive);
+    const settled = m.recs.filter((r) => r.outcome === "settled");
+    return {
+      enabled: this.settings.ventures,
+      blocked: this.ventureBlockedNow(),
+      shareBps: m.shareBps,
+      outsideRatio: Math.round(m.outsideRatio * 1000) / 1000,
+      active: active ? viewOf(active) : null,
+      recent: m.recs.filter((r) => !ventureActive(r)).map(viewOf),
+      stats: { ...m.stats },
+      profitPence: Math.round(m.stats.merchantPence + m.stats.payoutPence - settled.reduce((n, r) => n + r.stake, 0)),
+    };
+  }
+
+  // Escort fees (guide 3.10; escort.ts).
+
+  /**
+   * Whether a convoy we form now charges other companies' ships, and on what terms: escortFees and convoys on, her guns (she collects
+   * the fees only as an escort), no policy on her (or unknown: Lloyd's may price consorts in, and an outsider who then doesn't sail
+   * voids it, guide 3.6), the season not in its last hours. The fee: half what an unarmed hold like hers would save per ton sailing
+   * with our ships rather than alone (escortFee); the floor: our slowest member's base speed, ours for the approvals (joinVerdict) and
+   * never given to the game (it may compare a laden joiner and refuse our own ships). Null: a private convoy of ours as before.
+   */
+  private async escortTerms(agent: ShipAgent, r: ShipResult, plan: RoutePlan, slowest: number, partners: number): Promise<{ fee: number; minSpeedCk: number; why: string } | null> {
+    const w = this.world;
+    if (!this.settings.escortFees || !this.settings.convoys || !(r.ship.cannons_count > 0) || w.seasonMode() === "final") return null;
+    if ((await agent.insuredPolicy()) !== null) return null;
+    const cls = w.shipClass(agent.shipClass);
+    const cap = Math.max(1, cls?.hold_capacity_tons ?? r.hold_capacity_tons ?? 1);
+    // A joiner's hold at a middling good's base price (we never see its cargo), unarmed, at our convoy's pace.
+    const perTon = median(w.catalog.commodities.map((c) => c.base_price_pence).filter((p) => p > 0)) ?? 0;
+    const cargo = cap * perTon;
+    const risk = w.piracyRisk(plan, 0, slowest * 0.8, cargo);
+    const loss = risk.cargoShare * cargo + risk.capture * (this.hullValue(agent.shipClass) + cargo);
+    const fee = escortFee(loss / cap, 1 + partners);
+    return { fee, minSpeedCk: Math.round(slowest * 100), why: `an unarmed ${Math.round(cap)} t hold like hers would expect to lose ~${cr(loss / cap)}/t alone` };
+  }
+
+  /** One escort event on the record. */
+  private noteEscort(convoyId: string, dest: string | null, what: EscortEvent["what"], note: string, pence?: number): void {
+    this.escortRecent.push({ at: new Date().toISOString(), convoyId, dest, what, note, ...(pence !== undefined ? { pence } : {}) });
+    if (this.escortRecent.length > ESCORT_EVENTS_KEPT) this.escortRecent.splice(0, this.escortRecent.length - ESCORT_EVENTS_KEPT);
+    this.persist();
+  }
+
+  /**
+   * Requests to join a convoy of ours (convoyWait, once per read): approved when the ship is no slower than our floor (escorts only
+   * with guns, a few outsiders at most), else rejected (joinVerdict); no outsider while a ship of ours in it holds a policy Lloyd's
+   * may have priced on its consorts; each decided once, by one of our ships at a time.
+   */
+  private async escortRequests(
+    convoyId: string,
+    c: { dest: string; minSpeedCk?: number | null; pending?: ConvoyMemberInfo[]; outsiders?: number; members?: string[]; memberClasses?: string[] },
+  ): Promise<void> {
+    if (this.escortBusy.has(convoyId)) return;
+    this.escortBusy.add(convoyId);
+    try {
+      const now = Date.now();
+      for (const [k, at] of [...this.escortDecided]) if (now - at > ESCORT_DECIDED_MS) this.escortDecided.delete(k);
+      // Our floor (the game is given none: sailInConvoy): a floor the convoy carries (older ones), as offered, else (after a restart)
+      // its pace now, the slowest joined member's speed: a joiner no slower never holds it back.
+      const pace = Math.min(...(c.memberClasses ?? []).map((cls) => this.world.shipClass(cls)?.base_speed_centiknots ?? Infinity));
+      const minSpeedCk = c.minSpeedCk || this.escortConvoys.get(convoyId)?.minSpeedCk || (Number.isFinite(pace) ? pace : 0);
+      // A ship of ours in it with a policy for its port (or one that can't be read): no outsider, who could leave or be left behind and
+      // void it (guide 3.6).
+      const priced = (c.pending ?? []).some((m) => !this.ourCompany(m.company_id)) && (await this.consortPriced({ dest: c.dest, members: c.members ?? [] }));
+      let outsiders = c.outsiders ?? 0;
+      for (const m of c.pending ?? []) {
+        const key = `${convoyId}|${m.ship_id}`;
+        if (this.escortDecided.has(key)) continue;
+        this.escortDecided.set(key, now);
+        const ours = this.ourCompany(m.company_id);
+        const speedCk = this.world.shipClass(m.ship_class)?.base_speed_centiknots ?? 0;
+        // Switched off since it was offered: no more outsiders (those in stay: their fees are escrowed).
+        const v =
+          !this.settings.escortFees && !ours
+            ? { approve: false, why: "escort fees are off now" }
+            : priced && !ours
+              ? { approve: false, why: "a ship of ours in it holds a policy Lloyd's may have priced on its consorts" }
+              : joinVerdict({ escort: m.is_escort, cannons: m.cannons_count, speedCk, minSpeedCk, outsiders, ours });
+        try {
+          if (v.approve) await this.client.approveConvoyRequest({ convoy_id: convoyId, ship_id: m.ship_id });
+          else await this.client.rejectConvoyRequest({ convoy_id: convoyId, ship_id: m.ship_id });
+          if (!ours) {
+            if (v.approve) {
+              outsiders++;
+              this.escortStats.approved++;
+              if (m.is_escort) this.escortStats.escortsApproved++;
+            } else this.escortStats.rejected++;
+          }
+          this.noteEscort(convoyId, c.dest, v.approve ? "approved" : "rejected", `a ${m.ship_class}${m.is_escort ? ` as an escort (${m.cannons_count} guns)` : ""}${m.escort_fee_pence ? `, ${cr(m.escort_fee_pence)} fee` : ""}: ${v.why}`, m.escort_fee_pence || undefined);
+          this.log("fleet", `escort fees: ${v.approve ? "admitted" : "turned away"} a ${m.ship_class}${m.is_escort ? " escort" : ""} to our convoy to ${c.dest} (${v.why})`);
+        } catch (e) {
+          if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+          // No answer: decided again at the next read. Refused (withdrawn, gone, not ready, too slow): nothing more to do.
+          if (outcomeUnknown(e)) this.escortDecided.delete(key);
+          this.log("fleet", `escort fees: ${v.approve ? "approving" : "rejecting"} a request to join our convoy to ${c.dest} failed: ${(e as Error).message}`);
+        }
+      }
+      this.convoyCache.delete(convoyId);
+    } finally {
+      this.escortBusy.delete(convoyId);
+    }
+  }
+
+  private escortReport(): EscortReport {
+    const w = this.world;
+    const now = w.now();
+    for (const [id, x] of [...this.escortConvoys]) if (x.departsAt < now - 24 * 60 * w.gameMinuteMs) this.escortConvoys.delete(id);
+    const open: EscortReport["open"] = [];
+    for (const [id, x] of this.escortConvoys) {
+      const c = this.convoyCache.get(id);
+      if (c && c.status !== "forming") continue;
+      open.push({
+        convoyId: id,
+        from: x.from,
+        dest: x.dest,
+        departsAt: new Date(c?.departsAt ?? x.departsAt).toISOString(),
+        feePerTonPence: x.fee,
+        minSpeedCk: c?.minSpeedCk ?? x.minSpeedCk,
+        ours: c?.ours ?? 0,
+        outsiders: c?.outsiders ?? 0,
+        pending: c?.pending?.length ?? 0,
+        escrowPence: c?.escrow ?? 0,
+      });
+    }
+    return {
+      enabled: this.settings.escortFees && this.settings.convoys,
+      blocked: !this.settings.convoys ? "convoys are off" : !this.settings.escortFees ? "escort fees are off" : null,
+      floorPerTonPence: ESCORT_FEE_FLOOR_PENCE_PER_TON,
+      capPerTonPence: ESCORT_FEE_MAX_PENCE_PER_TON,
+      open,
+      stats: { ...this.escortStats },
+      recent: this.escortRecent.map((e) => ({ ...e })),
+    };
+  }
+
+  // ── Components and research (rnd.ts; guide 3.19) ───────────────────────────
+
+  /**
+   * Why an avenue of ours that spends (components, research, the news packet, ship shares) starts nothing new now (null: it may): the
+   * autopilot stopping or the world paused, a loan repayment short (debtShort), the season's endgame or final hours (nothing new), or a
+   * ship waiting for cash to load (loads come first).
+   */
+  private avenueSpendBlock(): string | null {
+    if (this.stopRequested || this.paused) return "stopping or paused";
+    if (this.debtShort) return `a loan repayment comes first (${this.debtShort})`;
+    if (this.world.seasonMode() !== "normal") return "the season's endgame: nothing new";
+    if ([...this.agents.values()].some((a) => a.waitingForCash)) return "a ship waits for cash to load";
+    return null;
+  }
+
+  /**
+   * Cash for an avenue's spend (holding the cash lock), gated as the buyer's: what spendable leaves after the loads the fleet is bound to
+   * buy and the debt fence (our deposits at healthy banks and our own line's unlent room counted as cash), our line withdrawn first when
+   * the spend needs its room, then `amount` raised in `region` (ensureCash: deposits there and elsewhere brought back before anything is
+   * remitted). True, or why not (noted as a spend refused for cash, so deposits beyond it come back).
+   */
+  private async avenueCash(region: BankingRegion, amount: number, what: string): Promise<true | string> {
+    if (amount <= 0) return true;
+    await this.world.refreshVaults();
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    if (this.spendable(committed) < amount) {
+      this.noteSpendShort(amount);
+      return `no ${cr(amount)} spare for ${what} after the fleet's loads and what our loans will take to repay`;
+    }
+    await this.freeLineFor(amount, committed, what);
+    const cash = await this.ensureCash(region, amount);
+    if (cash < amount) {
+      this.noteSpendShort(amount);
+      return `couldn't raise ${cr(amount)} in ${region} for ${what}`;
+    }
+    return true;
+  }
+
+  /** Why no component is fitted now (null: one may be): the switch, the key (making and licences need infra_manage), the spend gates. */
+  private componentsBlock(): string | null {
+    if (!this.settings.components) return "components are off";
+    if (!this.canBuild) return "the key lacks infra_manage (making components and buying licences need it)";
+    return this.avenueSpendBlock();
+  }
+
+  /** How a ship earns and spends her time (rnd.ts ShipUse): her net a real hour over her last trips, idle time since in; her time at sea and in port. */
+  private shipUse(a: ShipAgent): ShipUse {
+    const t = a.state.time;
+    const total = t.laden + t.ballast + t.port + t.idle;
+    return {
+      perHour: Math.max(0, recentPerHour(a.tripLog, Date.now())),
+      seaShare: total > 0 ? (t.laden + t.ballast) / total : 0.5,
+      portShare: total > 0 ? t.port / total : 0.2,
+    };
+  }
+
+  /** A component spend (pence): toward the day's budget and the totals. */
+  private noteComponentSpend(pence: number): void {
+    if (!(pence > 0)) return;
+    this.rndMem.spends.push([Date.now(), pence]);
+    this.rndMem.stats.spentPence += pence;
+  }
+
+  /**
+   * The designs we could make (rnd.ts DesignOption), read at most every DESIGNS_TTL_MS: our licences with units left (or public now),
+   * our own patents and public designs whose make materials we know (from our licences and the licence offers: nothing else publishes
+   * them), and other companies' licence offers (one unit's price: per unit, or a lot of one), the cheapest per design; never our own
+   * companies' offers. The last read stands when one fails (null before any).
+   */
+  private async readDesigns(): Promise<NonNullable<FleetManager["designsSeen"]> | null> {
+    if (this.designsSeen && Date.now() - this.designsSeen.at < DESIGNS_TTL_MS) return this.designsSeen;
+    const soft = (e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    };
+    const register = await this.client.patentRegister().catch(soft);
+    const licences = await this.client.licences().catch(soft);
+    const offers = await this.client.contractPages({ contract_type: "licence_offer" }, 3).catch(soft);
+    const patents = await this.client.ownPatents().catch(soft);
+    const items = await this.client.components().catch(soft);
+    if (!register || !licences || !offers || !patents || !items) return this.designsSeen;
+    const makeOf = new Map<string, { materials: MaterialLine[]; labour: number }>();
+    for (const l of licences) makeOf.set(l.component_id, { materials: l.make_materials, labour: l.make_labour_pence });
+    for (const c of offers.items) if (c.licence) makeOf.set(c.licence.component_id, { materials: c.licence.make_materials, labour: c.licence.make_labour_pence });
+    const options: DesignOption[] = [];
+    const have = new Set<string>();
+    const add = (o: DesignOption) => {
+      have.add(o.componentId);
+      options.push(o);
+    };
+    for (const l of licences) {
+      if (l.units_left > 0 || l.patent_status === "public") {
+        add({ componentId: l.component_id, name: l.name, slot: l.slot, grade: l.grade, effects: l.effects, source: l.units_left > 0 ? "licence" : "public", materials: l.make_materials, labour: l.make_labour_pence });
+      }
+    }
+    for (const p of [...patents.filter((x) => x.status === "held"), ...register.filter((x) => x.status === "public")]) {
+      const mk = makeOf.get(p.component_id);
+      if (!mk || have.has(p.component_id)) continue;
+      add({ componentId: p.component_id, name: p.name, slot: p.slot, grade: p.grade, effects: p.effects, source: p.status === "held" ? "own" : "public", materials: mk.materials, labour: mk.labour });
+    }
+    const best = new Map<string, DesignOption>();
+    for (const c of offers.items) {
+      const t = c.licence;
+      if (!t || c.status !== "open" || have.has(t.component_id) || this.isOurCompany(c.issuer_company_id ?? "")) continue;
+      const left = c.remaining_quantity > 0 ? c.remaining_quantity : c.quantity_required - c.quantity_delivered;
+      // A lot priced whole needs exactly one unit left (all-or-nothing); a unit's price needs none known.
+      const price = unitPrice(t, t.price_basis === "total" ? Math.round(left) : 1);
+      if (price === null || !(price > 0)) continue;
+      const prev = best.get(t.component_id);
+      if (prev && (prev.offer?.price ?? Infinity) <= price) continue;
+      best.set(t.component_id, {
+        componentId: t.component_id,
+        name: t.name,
+        slot: t.slot,
+        grade: t.grade,
+        effects: t.effects,
+        source: "offer",
+        materials: t.make_materials,
+        labour: t.make_labour_pence,
+        offer: { contractId: c.id, price, region: t.banking_region },
+      });
+    }
+    options.push(...best.values());
+    this.designsSeen = { at: Date.now(), options, items, patents };
+    return this.designsSeen;
+  }
+
+  /**
+   * What the make materials our warehouse here lacks would cost (pence): the yard's ask book walked cheapest first (players' asks and the
+   * NPC ladder) with the port's customs. Null: the book can't supply one of them (or wasn't read).
+   */
+  private materialsCost(materials: readonly MaterialLine[], book: PortOrderBook | null, held: (good: string) => number, port: string): number | null {
+    let n = 0;
+    for (const m of materials) {
+      let need = Math.max(0, Math.ceil(m.quantity - held(m.commodity_id)));
+      if (need <= 0) continue;
+      const asks = [...(book?.books.find((b) => b.commodity_id === m.commodity_id)?.depth?.asks ?? [])].sort((x, y) => x.price_pence - y.price_pence);
+      for (const l of asks) {
+        if (need <= 0) break;
+        const q = Math.min(need, l.remaining_quantity);
+        n += q * l.price_pence;
+        need -= q;
+      }
+      if (need > 0) return null;
+    }
+    const customs = book?.customs_bps ?? this.world.customsBps(port);
+    return Math.round(n * (1 + customs / 10_000));
+  }
+
+  /**
+   * Materials held in our warehouse at `port` for something not yet done there (commodity → tons), so nothing else counts them as its
+   * own: a fit job's make materials (bought or being bought) and our research prototype's (until it takes them). `skip` leaves the
+   * asker's own out. Leftovers waiting to be sold aren't held: a make or a build that uses them saves selling them off.
+   */
+  private reservedMaterials(port: string, skip: { job?: boolean; proto?: boolean } = {}): Map<string, number> {
+    const m = this.rndMem;
+    const out = new Map<string, number>();
+    const add = (good: string, tons: number) => out.set(good, (out.get(good) ?? 0) + Math.max(0, tons));
+    const j = m.job;
+    if (!skip.job && j && j.port === port && (j.stage === "materials" || j.stage === "make")) for (const x of j.materials ?? []) add(x.commodity_id, x.quantity);
+    const pr = m.project;
+    if (!skip.proto && pr && pr.protoYard === port && !pr.protoDone) for (const [g, q] of pr.protoNeed ?? pr.protoBought ?? []) add(g, q);
+    return out;
+  }
+
+  /** What our warehouse holds of a good free to use (unlocked, less what is held there for something else: reservedMaterials). */
+  private freeHeld(wh: { inventory: ReadonlyArray<{ commodity_id: string; quantity: number; locked_quantity: number }> } | null | undefined, reserved: ReadonlyMap<string, number>): (good: string) => number {
+    return (good: string) => {
+      const i = wh?.inventory.find((x) => x.commodity_id === good);
+      return Math.max(0, (i ? i.quantity - i.locked_quantity : 0) - (reserved.get(good) ?? 0));
+    };
+  }
+
+  /**
+   * Buys what our warehouse at `port` lacks of `materials` into it (guide 3.19: a make, or a prototype, takes them from a warehouse at a
+   * yard), leasing the room first: per material one IOC bid at the price that reaches the tons on the book, a little over, within `budget`
+   * in all. Materials held there for something else (reservedMaterials, `own`'s left out) don't count as ours to use. Booked to the vault
+   * as paid. The lease before it grew it (null: it didn't), to go back to once the materials are used, and what was bought (commodity,
+   * tons). Holds the cash lock (the caller's).
+   */
+  private async buyIntoWarehouse(
+    port: string,
+    materials: readonly MaterialLine[],
+    budget: number,
+    what: string,
+    own: "job" | "proto",
+  ): Promise<{ ok: boolean; spent: number; why: string; leaseBefore: number | null; bought: Array<[string, number]> }> {
+    const w = this.world;
+    const region = w.region(port);
+    let spent = 0;
+    let leaseBefore: number | null = null;
+    const bought: Array<[string, number]> = [];
+    try {
+      // Unreadable is not empty: a guess could buy twice or set the lease below what it is.
+      const wh = await this.client.warehouse(port);
+      const held = this.freeHeld(wh, this.reservedMaterials(port, own === "job" ? { job: true } : { proto: true }));
+      const want = materials.map((m) => ({ m, qty: Math.max(0, Math.ceil(m.quantity - held(m.commodity_id))) })).filter((x) => x.qty > 0);
+      if (want.length === 0) return { ok: true, spent, why: "", leaseBefore, bought };
+      const need = wh.used_tonnage + wh.reserved_tonnage + want.reduce((n, x) => n + x.qty, 0);
+      if (wh.leased_tonnage < need) {
+        await this.client.setLease(port, Math.ceil(need));
+        leaseBefore = wh.leased_tonnage;
+      }
+      const book = await this.client.book(port);
+      w.observeBook(book);
+      for (const { m, qty } of want) {
+        const asks = [...(book.books.find((b) => b.commodity_id === m.commodity_id)?.depth?.asks ?? [])].sort((x, y) => x.price_pence - y.price_pence);
+        let left = qty;
+        let top = 0;
+        for (const l of asks) {
+          if (left <= 0) break;
+          top = l.price_pence;
+          left -= l.remaining_quantity;
+        }
+        if (left > 0 || top <= 0) return { ok: false, spent, why: `the book at ${port} can't supply ${qty} t of ${m.commodity_id}`, leaseBefore, bought };
+        const limit = Math.ceil(top * MATERIALS_BID_MARKUP);
+        if (spent + limit * qty > budget) return { ok: false, spent, why: `${qty} t of ${m.commodity_id} would take it past the ${cr(budget)} allowed`, leaseBefore, bought };
+        const res = await this.client.placeOrder({ port_id: port, commodity_id: m.commodity_id, side: "bid", time_in_force: "ioc", price_pence: limit, quantity: qty });
+        const cost = res.total_gross_pence + res.customs_duty_pence;
+        spent += cost;
+        w.vaults.set(region, w.vault(region) - cost);
+        if (res.filled_quantity > 0) bought.push([m.commodity_id, res.filled_quantity]);
+        if (res.filled_quantity < qty) return { ok: false, spent, why: `${qty - res.filled_quantity} t of ${m.commodity_id} short`, leaseBefore, bought };
+      }
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return { ok: false, spent, why: (e as Error).message, leaseBefore, bought };
+    } finally {
+      if (spent > 0) this.persist(true);
+    }
+    this.log("fleet", `bought the materials for ${what} at ${port} into our warehouse there (${cr(spent)})`);
+    return { ok: true, spent, why: "", leaseBefore, bought };
+  }
+
+  /** Why she can't be fitted at all now (null: she may): she must lie berthed here, free of the fleet's other modes, nothing barring a berth trade. */
+  private fitUnfit(a: ShipAgent, r: ShipResult, port: string): string | null {
+    if (r.ship.status !== "berthed" || r.ship.current_port_id !== port) return "she isn't berthed here";
+    if (a.arrested) return "she is arrested";
+    if (this.smugglers.has(a.shipId) || a.contrabandAboard(r).length > 0) return "she smuggles, or contraband is aboard";
+    if (this.retiring.has(a.shipId) || this.retiredIds.has(a.shipId)) return "she is being sold or broken up";
+    if (this.ventureOn(a.shipId)) return "a venture of ours is under way on her";
+    if (this.advisor.shipOrder(a.shipId)) return "an AI order is in force for her";
+    return null;
+  }
+
+  /**
+   * Components (guide 3.19; rnd.ts), from her turn berthed at a yard before anything is loaded there (never a detour): the best component
+   * that pays her is fitted (made here first if need be, its licence and materials bought). A fit whose call had no answer is read back
+   * first; one left between steps elsewhere stops (what it bought stays for a later fit). True: she was fitted (read her again).
+   */
+  async fitComponents(agent: ShipAgent, r: ShipResult, port: string): Promise<boolean> {
+    if (this.fitBusy) return false;
+    this.fitBusy = true;
+    try {
+      return await this.fitComponentsNow(agent, r, port);
+    } catch (e) {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      this.componentsAction = `the fit check failed: ${(e as Error).message}`;
+      this.log(agent.name, `components: the check at ${port} failed (${(e as Error).message})`);
+      return false;
+    } finally {
+      this.fitBusy = false;
+      this.persist();
+    }
+  }
+
+  private async fitComponentsNow(agent: ShipAgent, r: ShipResult, port: string): Promise<boolean> {
+    const m = this.rndMem;
+    if ((await this.settleJob()) === "wait") {
+      this.componentsAction = "a fit's call had no answer: reading it back before anything more";
+      return false;
+    }
+    if (m.job && (m.job.shipId !== agent.shipId || m.job.port !== port)) this.stopJob(`${m.job.ship} left ${m.job.port} before it was done`);
+    const block = this.componentsBlock();
+    this.componentsBlocked = block;
+    if (block) {
+      if (m.job) this.stopJob(block);
+      return false;
+    }
+    // Fitting is permanent (guide 3.19): she must lie berthed here, free of the fleet's other modes, with no policy open on her.
+    const unfit = this.fitUnfit(agent, r, port);
+    if (unfit) {
+      if (m.job) this.stopJob(unfit);
+      return false;
+    }
+    // The best component first (most calls find none, and no policy need be read for that), then her policy, strictly.
+    const pick = m.job ? null : await this.pickComponent(agent, r, port);
+    if (!m.job && !pick) return false;
+    const policy = await agent.insuredPolicy(60_000, true);
+    if (policy !== null) {
+      const why = policy ? "she is insured (no component goes on a ship with an open policy)" : "her insurance couldn't be read";
+      if (m.job) this.stopJob(why);
+      else this.componentsAction = `${agent.name} at ${port}: "${pick!.name}" would pay, but ${why}`;
+      return false;
+    }
+    if (pick) {
+      m.job = pick;
+      this.persist(true);
+      this.log(
+        agent.name,
+        `components: fitting "${pick.name}" (${pick.slot}, grade ${pick.grade}) at ${port}: ~${cr(pick.gainPerHour)} a real hour more for her, ~${cr(pick.value)} over the horizon ` +
+          `for ${cr(pick.cost)} (${pick.offer ? `a licence unit ${cr(pick.offer.price)}, ` : ""}${pick.materialsPence ? `materials ~${cr(pick.materialsPence)}, ` : ""}${pick.labour ? `labour ${cr(pick.labour)}, ` : ""}the 4% fee ~${cr(pick.fee)})`,
+      );
+    }
+    const job = m.job;
+    if (!job) return false;
+    return this.runJob(agent, port, job);
+  }
+
+  /**
+   * The component that pays her best here (null: none): one we made lying here, else a design we may make (or buy a unit of) whose
+   * effect words read as strengths only, valued on her own recent net (componentGain) over the season left (two weeks at most), against
+   * the licence, the materials at this yard's asks, the labour and the 4% fee (fitCase), within the day's budget; the best net gain.
+   */
+  private async pickComponent(agent: ShipAgent, r: ShipResult, port: string): Promise<FitJob | null> {
+    const w = this.world;
+    const s = this.settings;
+    const m = this.rndMem;
+    const soft = (e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    };
+    const use = this.shipUse(agent);
+    if (!(use.perHour > 0)) {
+      this.componentsAction = `${agent.name} at ${port}: nothing earned lately to weigh a component on`;
+      return null;
+    }
+    const designs = await this.readDesigns();
+    if (!designs) {
+      this.componentsAction = "the patent register, our licences or the licence offers couldn't be read";
+      return null;
+    }
+    const items = (await this.client.components().catch(soft)) ?? designs.items;
+    const learned = new Map(m.learned);
+    const horizonHours = Math.max(0, Math.min(w.seasonLeftMs() - SEASON_ENDGAME_MS, COMPONENT_HORIZON_MS)) / 3_600_000;
+    const fee = fittingFee(this.rebuildOf(agent, r));
+    const options: DesignOption[] = [
+      ...items
+        .filter((i) => i.port_id === port)
+        .map((i) => ({ componentId: i.component_id, name: i.name, slot: i.slot, grade: i.grade, effects: i.effects, source: "made" as const, materials: null, labour: 0, itemId: i.item_id })),
+      ...designs.options,
+    ];
+    const scored = options
+      .filter((o) => slotFree(r.components, o.slot))
+      .map((o) => {
+        const e = effectsOf(o.effects);
+        return { o, gain: e ? componentGain(e, o.grade, use, learned.get(o.componentId)) : 0 };
+      })
+      .filter((x) => x.gain > 0)
+      .sort((a, b) => b.gain - a.gain)
+      .slice(0, 6);
+    if (scored.length === 0) {
+      this.componentsAction = `${agent.name} at ${port}: no design with readable strengths for a free slot of hers`;
+      return null;
+    }
+    let book: PortOrderBook | null | undefined;
+    let held: ((good: string) => number) | undefined;
+    const spent24 = spentLastDay(m, Date.now());
+    const notes: string[] = [];
+    let best: { job: FitJob; net: number } | null = null;
+    for (const { o, gain } of scored) {
+      let materials = 0;
+      if (o.source !== "made") {
+        if (!o.materials) continue;
+        if (book === undefined) {
+          book = await this.client.book(port).catch(soft);
+          if (book) w.observeBook(book);
+          const wh = await this.client.warehouse(port).catch(soft);
+          // Materials held here for our prototype aren't ours to make with.
+          held = this.freeHeld(wh, this.reservedMaterials(port));
+        }
+        const c = this.materialsCost(o.materials, book ?? null, held!, port);
+        if (c === null) {
+          notes.push(`"${o.name}": its materials can't be bought here`);
+          continue;
+        }
+        materials = c;
+      }
+      const labour = o.source === "made" ? 0 : o.labour;
+      const fc = fitCase({ gainPerHour: gain, horizonHours, cost: { licence: o.offer?.price ?? 0, materials, labour, fee } });
+      if (!fc.ok) {
+        notes.push(`"${o.name}": ${fc.why}`);
+        continue;
+      }
+      if (spent24 + fc.cost > s.componentBudgetPence) {
+        notes.push(`"${o.name}": ${cr(fc.cost)} would pass the day's ${cr(s.componentBudgetPence)} budget (${cr(spent24)} spent)`);
+        continue;
+      }
+      const net = fc.value - fc.cost;
+      if (best && best.net >= net) continue;
+      best = {
+        net,
+        job: {
+          shipId: agent.shipId,
+          ship: agent.name,
+          port,
+          componentId: o.componentId,
+          name: o.name,
+          slot: o.slot,
+          grade: o.grade,
+          stage: o.source === "made" ? "fit" : o.source === "offer" ? "licence" : "materials",
+          sentAt: null,
+          ...(o.itemId ? { itemId: o.itemId } : {}),
+          ...(o.offer ? { offer: { ...o.offer } } : {}),
+          ...(o.materials ? { materials: o.materials.map((x) => ({ ...x })), labour, materialsPence: materials } : {}),
+          fee,
+          spent: 0,
+          at: Date.now(),
+          gainPerHour: Math.round(gain),
+          value: fc.value,
+          cost: fc.cost,
+        },
+      };
+    }
+    if (!best) {
+      this.componentsAction = `${agent.name} at ${port}: none pays (${notes.slice(0, 3).join("; ") || "no design weighed"})`;
+      return null;
+    }
+    return best.job;
+  }
+
+  /**
+   * Carries a fit on through its stages (rnd.ts FitJob), each under the cash lock with its money raised as the buyer's is (avenueCash),
+   * each call saved as sent first: a licence unit bought from its offer, the materials bought into our warehouse here, one made here, then
+   * fitted while she lies berthed here (her slot still free). A call with no answer leaves the job for settleJob; a refusal stops it (what
+   * it bought stays for a later fit). True: fitted.
+   */
+  private async runJob(agent: ShipAgent, port: string, j: FitJob): Promise<boolean> {
+    const w = this.world;
+    const m = this.rndMem;
+    const region = w.region(port);
+    const soft = (e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    };
+    // A call sent and saved as such: on an error, cleared unless its outcome is unknown; a pause or a fatal error goes up.
+    const sent = async <T>(call: () => Promise<T>): Promise<T | "no answer" | Error> => {
+      j.sentAt = Date.now();
+      this.persist(true);
+      await this.journal?.flush();
+      try {
+        const res = await call();
+        j.sentAt = null;
+        return res;
+      } catch (e) {
+        const unknown = outcomeUnknown(e);
+        if (!unknown) j.sentAt = null;
+        this.persist(true);
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return unknown ? "no answer" : (e as Error);
+      }
+    };
+    if (j.stage === "licence") {
+      const o = j.offer;
+      if (!o) return this.stopJob("no licence offer to buy from"), false;
+      j.before = (await this.client.licences().catch(soft))?.find((l) => l.component_id === j.componentId)?.units_granted ?? 0;
+      const got = await this.withCash(async () => {
+        if (this.stopRequested) return "stopping";
+        const cash = await this.avenueCash(o.region, o.price, `a licence for "${j.name}"`);
+        if (cash !== true) return cash;
+        return sent(() => this.client.acceptLicenceOffer(o.contractId, 1));
+      });
+      if (got === "no answer") return this.log(agent.name, `components: buying a licence unit for "${j.name}" had no answer: read back from our licences (never sent again)`), false;
+      if (typeof got === "string" || got instanceof Error) return this.stopJob(`no licence unit for "${j.name}" (${typeof got === "string" ? got : got.message})`), false;
+      w.vaults.set(o.region, w.vault(o.region) - o.price);
+      j.spent += o.price;
+      this.noteComponentSpend(o.price);
+      m.stats.unitsBought++;
+      this.designsSeen = null;
+      j.stage = "materials";
+      this.persist(true);
+      this.log(agent.name, `components: bought a licence unit for "${j.name}" for ${cr(o.price)} (paid in ${o.region})`);
+    }
+    if (j.stage === "materials") {
+      const mats = j.materials ?? [];
+      const budget = Math.ceil((j.materialsPence ?? 0) * 1.25) + 100;
+      const got = await this.withCash(async () => {
+        if (this.stopRequested) return null;
+        const cash = await this.avenueCash(region, j.materialsPence ?? 0, `the materials for "${j.name}"`);
+        if (cash !== true) return { ok: false, spent: 0, why: cash, leaseBefore: null, bought: [] };
+        return this.buyIntoWarehouse(port, mats, budget, `"${j.name}"`, "job");
+      });
+      if (!got) return false;
+      if (got.leaseBefore !== null && j.leaseBefore === undefined) j.leaseBefore = got.leaseBefore;
+      j.spent += got.spent;
+      this.noteComponentSpend(got.spent);
+      if (got.bought.length) j.bought = addGoods(j.bought, got.bought);
+      if (!got.ok) return this.stopJob(`its materials couldn't all be bought (${got.why})`), false;
+      j.stage = "make";
+      this.persist(true);
+    }
+    if (j.stage === "make") {
+      const items = await this.client.components().catch(soft);
+      j.before = items?.filter((i) => i.component_id === j.componentId && i.port_id === port).length ?? 0;
+      const labour = j.labour ?? 0;
+      const got = await this.withCash(async () => {
+        if (this.stopRequested) return "stopping";
+        const cash = await this.avenueCash(region, labour, `the labour for "${j.name}"`);
+        if (cash !== true) return cash;
+        return sent(() => this.client.makeComponents({ component_id: j.componentId, port_id: port, quantity: 1 }));
+      });
+      if (got === "no answer") return this.log(agent.name, `components: making "${j.name}" at ${port} had no answer: read back from our components (never sent again)`), false;
+      if (typeof got === "string" || got instanceof Error) return this.stopJob(`"${j.name}" couldn't be made at ${port} (${typeof got === "string" ? got : got.message})`), false;
+      const item = got.items[0];
+      w.vaults.set(region, w.vault(region) - got.labour_pence);
+      j.spent += got.labour_pence;
+      this.noteComponentSpend(got.labour_pence);
+      m.stats.made++;
+      this.designsSeen = null;
+      // The make took its materials: none left to sell off, the lease grown for them back.
+      delete j.bought;
+      this.releaseJobLease(j);
+      if (!item) return this.stopJob(`making "${j.name}" returned no component`), false;
+      j.itemId = item.item_id;
+      j.stage = "fit";
+      this.persist(true);
+      this.log(agent.name, `components: made "${j.name}" at ${port} (labour ${cr(got.labour_pence)})`);
+    }
+    // Fitting (guide 3.19): berthed here, the slot still free, no policy (checked at the start of her turn); the fee on her rebuild value.
+    const fresh = await agent.refresh();
+    if (fresh.ship.status !== "berthed" || fresh.ship.current_port_id !== port) return this.stopJob(`she is no longer berthed at ${port} (the component stays in our warehouse there)`), false;
+    if (!slotFree(fresh.components, j.slot)) return this.stopJob(`her ${j.slot} slot is taken`), false;
+    if (!j.itemId) return this.stopJob("no component to fit"), false;
+    const itemId = j.itemId;
+    j.fee = fittingFee(this.rebuildOf(agent, fresh));
+    j.holdBefore = fresh.effective_hold_capacity_tons;
+    const got = await this.withCash(async () => {
+      if (this.stopRequested) return "stopping";
+      const cash = await this.avenueCash(region, j.fee, `fitting "${j.name}"`);
+      if (cash !== true) return cash;
+      return sent(() => this.client.fitComponent(agent.shipId, itemId));
+    });
+    if (got === "no answer") return this.log(agent.name, `components: fitting "${j.name}" had no answer: read back from her (never sent again)`), false;
+    if (typeof got === "string" || got instanceof Error) return this.stopJob(`"${j.name}" wasn't fitted (${typeof got === "string" ? got : got.message}); it stays in our warehouse at ${port}`), false;
+    w.vaults.set(region, w.vault(region) - got.fitting_fee_pence);
+    const after = await agent.refresh().catch(soft);
+    this.finishFit(j, got.fitting_fee_pence, after);
+    return true;
+  }
+
+  /** The warehouse lease a job's materials grew, back to what it was (what still lies there kept). */
+  private releaseJobLease(j: FitJob): void {
+    if (j.leaseBefore !== undefined && j.leaseBefore !== null) void this.shrinkLease(j.port, j.leaseBefore);
+    delete j.leaseBefore;
+  }
+
+  /** A fit done: booked (the fee toward the day's budget), the hold share it added measured for its design, the job closed. */
+  private finishFit(j: FitJob, fee: number, after: ShipResult | null): void {
+    const m = this.rndMem;
+    j.spent += fee;
+    this.noteComponentSpend(fee);
+    m.stats.fitted++;
+    m.stats.feesPence += fee;
+    const e = effectsOf(this.designsSeen?.options.find((o) => o.componentId === j.componentId)?.effects ?? []);
+    if (after && j.holdBefore && j.holdBefore > 0 && (e?.ups.includes("hold") ?? true)) {
+      const share = (after.effective_hold_capacity_tons - j.holdBefore) / j.holdBefore;
+      if (share > 0 && share < 1) {
+        m.learned = [...m.learned.filter(([k]) => k !== j.componentId), [j.componentId, Math.round(share * 1000) / 1000] as [string, number]].slice(-LEARNED_KEPT);
+      }
+    }
+    m.fits.push({ at: new Date().toISOString(), shipId: j.shipId, ship: j.ship, port: j.port, name: j.name, slot: j.slot, spentPence: j.spent, feePence: fee, gainPerHourPence: j.gainPerHour, outcome: "fitted" });
+    m.fits = m.fits.slice(-FITS_KEPT);
+    this.releaseJobLease(j);
+    m.job = null;
+    this.componentsAction = `fitted "${j.name}" to ${j.ship} at ${j.port}`;
+    this.log(j.ship, `components: fitted "${j.name}" (${j.slot}) at ${j.port}: fee ${cr(fee)}, ${cr(j.spent)} in all; permanent (her rebuild value rises by its worth and the fee)`);
+    this.persist(true);
+  }
+
+  /**
+   * A job stopped (why): recorded, closed. A licence unit or a component made stays for a later fit; make materials it bought and didn't
+   * use are sold off into the port's bids (sellLeftovers; the lease grown for them back after), else its lease goes back now.
+   */
+  private stopJob(why: string): void {
+    const m = this.rndMem;
+    const j = m.job;
+    if (!j) return;
+    m.fits.push({ at: new Date().toISOString(), shipId: j.shipId, ship: j.ship, port: j.port, name: j.name, slot: j.slot, spentPence: j.spent, feePence: 0, gainPerHourPence: j.gainPerHour, outcome: "stopped", why });
+    m.fits = m.fits.slice(-FITS_KEPT);
+    if (j.bought?.length && (j.stage === "materials" || j.stage === "make")) {
+      this.queueLeftovers(j.port, j.bought, j.leaseBefore ?? null, `the materials bought for "${j.name}"`);
+      delete j.leaseBefore;
+    } else this.releaseJobLease(j);
+    m.job = null;
+    this.componentsAction = `fitting "${j.name}" to ${j.ship} stopped: ${why}`;
+    this.log(j.ship, `components: fitting "${j.name}" stopped: ${why}`);
+    this.persist(true);
+  }
+
+  /** Materials left in our warehouse at `port` (commodity, tons), queued to be sold into the bids there (sellLeftovers), the lease back after. */
+  private queueLeftovers(port: string, goods: ReadonlyArray<[string, number]>, leaseBefore: number | null, what: string): void {
+    const m = this.rndMem;
+    const list = goods.filter(([, q]) => q > 0).map(([g, q]) => [g, q] as [string, number]);
+    if (list.length === 0) {
+      if (leaseBefore !== null) void this.shrinkLease(port, leaseBefore);
+      return;
+    }
+    m.leftovers = [...(m.leftovers ?? []), { port, goods: list, leaseBefore, at: Date.now(), what }].slice(-20);
+    this.log("fleet", `${what} (${list.map(([g, q]) => `${q} t ${g}`).join(", ")}) lie unused in our warehouse at ${port}: to be sold into the bids there, the lease back after`);
+    this.persist(true);
+  }
+
+  /**
+   * Our research project closed (abandoned, or granted): its prototype's materials, if it hadn't taken them, are queued to be sold off
+   * (queueLeftovers); otherwise the lease grown for them goes back.
+   */
+  private leaveProtoMaterials(proj: RndProjectRec, consumed: boolean): void {
+    const yard = proj.protoYard;
+    if (!yard) return;
+    const lease = proj.protoLeaseBefore ?? null;
+    if (!consumed && !proj.protoDone && proj.protoBought?.length) this.queueLeftovers(yard, proj.protoBought, lease, "our research prototype's materials (the project closed before taking them)");
+    else if (lease !== null) void this.shrinkLease(yard, lease);
+    proj.protoLeaseBefore = null;
+    delete proj.protoBought;
+  }
+
+  /**
+   * Materials left by a fit stopped or a project closed (rnd.ts LeftoverRec), each pass: sold into the port's bids from our warehouse
+   * there (IOC, never under LEFTOVER_FLOOR_SHARE of base, as a ship's leftover cargo is), no more than the warehouse still holds of them
+   * free of what a fit job or our prototype holds there (a make or a build that used them meanwhile saved selling them); once none is
+   * left the lease grown for them goes back. After LEFTOVER_GIVE_UP_MS what is left stays for the owner (the lease cut to what it holds).
+   * Holds the fit flag, so no fit there counts them while they are being sold.
+   */
+  private async sellLeftovers(): Promise<void> {
+    const m = this.rndMem;
+    if (!m.leftovers?.length || this.stopRequested || this.paused || this.fitBusy) return;
+    const w = this.world;
+    const soft = (e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    };
+    this.fitBusy = true;
+    try {
+      for (const port of [...new Set(m.leftovers.map((l) => l.port))]) {
+        const entries: LeftoverRec[] = (m.leftovers ?? []).filter((l) => l.port === port);
+        const wh = await this.client.warehouse(port).catch(soft);
+        if (wh) {
+          const book = await this.client.book(port).catch(soft);
+          if (book) w.observeBook(book);
+          const reserved = this.reservedMaterials(port);
+          const region = w.region(port);
+          for (const good of new Set(entries.flatMap((l) => l.goods.map(([g]) => g)))) {
+            const i = wh.inventory.find((x) => x.commodity_id === good);
+            // What lies there unlocked bounds what is left of ours (a make or a build may have used them); what isn't held for a job
+            // or our prototype may be sold.
+            let left = i ? Math.max(0, i.quantity - i.locked_quantity) : 0;
+            let free = Math.max(0, left - (reserved.get(good) ?? 0));
+            let sell = 0;
+            for (const l of entries) {
+              l.goods = l.goods.map(([g, q]): [string, number] => {
+                if (g !== good) return [g, q];
+                const have = Math.min(q, left);
+                left -= have;
+                const s = Math.min(have, free);
+                free -= s;
+                sell += s;
+                return [g, have];
+              });
+            }
+            const qty = Math.floor(sell);
+            const floor = Math.max(1, Math.ceil(w.basePrice(good) * LEFTOVER_FLOOR_SHARE));
+            const bid = book?.books.find((b) => b.commodity_id === good)?.best_bid?.price_pence ?? null;
+            if (qty < 1 || (bid !== null && bid < floor)) continue;
+            try {
+              const res = await this.client.placeOrder({ port_id: port, commodity_id: good, side: "ask", time_in_force: "ioc", price_pence: floor, quantity: qty });
+              if (res.filled_quantity > 0) {
+                w.vaults.set(region, w.vault(region) + res.total_gross_pence);
+                this.cashArrived();
+                let sold = res.filled_quantity;
+                for (const l of entries) {
+                  l.goods = l.goods.map(([g, q]): [string, number] => {
+                    if (g !== good || sold <= 0) return [g, q];
+                    const s = Math.min(q, sold);
+                    sold -= s;
+                    return [g, q - s];
+                  });
+                }
+                this.log("fleet", `sold ${res.filled_quantity} t of leftover ${good} from our warehouse at ${port} for ${cr(res.total_gross_pence)}`);
+              }
+            } catch (e) {
+              soft(e);
+              this.logOnceFor(`leftover-sell|${port}|${good}`, "fleet", `selling leftover ${good} at ${port} failed: ${(e as Error).message} (tried again next pass)`);
+            }
+          }
+        }
+        for (const l of entries) {
+          l.goods = l.goods.filter(([, q]) => q >= 1);
+          const done = l.goods.length === 0;
+          const stale = !done && Date.now() - l.at > LEFTOVER_GIVE_UP_MS;
+          if (!done && !stale) continue;
+          if (stale) {
+            this.log(
+              "fleet",
+              `${l.what} at ${port}: ${l.goods.map(([g, q]) => `${q} t ${g}`).join(", ")} not sold in ${Math.round(LEFTOVER_GIVE_UP_MS / 3_600_000)} real hours (no bid at half their base price or more, or the warehouse unread): left there for the owner`,
+            );
+          }
+          if (l.leaseBefore !== null) await this.shrinkLease(port, l.leaseBefore);
+          m.leftovers = (m.leftovers ?? []).filter((x) => x !== l);
+        }
+      }
+      if (m.leftovers?.length === 0) delete m.leftovers;
+    } finally {
+      this.fitBusy = false;
+      this.persist(true);
+    }
+  }
+
+  /**
+   * A fit whose call had no answer (FitJob `sentAt`): read back from our licences (a unit more than before), our components here (one more),
+   * or her fitted components; moved on when it landed, given up after COMPONENT_PENDING_MS (taken as not done; never sent again blind
+   * meanwhile). "wait": still unknown.
+   */
+  private async settleJob(): Promise<"wait" | "ok"> {
+    const m = this.rndMem;
+    const j = m.job;
+    if (!j || j.sentAt === null) return "ok";
+    const soft = (e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    };
+    const expired = Date.now() - j.sentAt > COMPONENT_PENDING_MS;
+    if (j.stage === "licence") {
+      const lic = await this.client.licences().catch(soft);
+      const units = lic?.find((l) => l.component_id === j.componentId)?.units_granted ?? (lic ? 0 : null);
+      if (units !== null && units > (j.before ?? 0)) {
+        const price = j.offer?.price ?? 0;
+        j.spent += price;
+        this.noteComponentSpend(price);
+        m.stats.unitsBought++;
+        j.sentAt = null;
+        j.stage = "materials";
+        this.designsSeen = null;
+        this.log(j.ship, `components: the licence unit for "${j.name}" whose purchase had no answer was bought after all`);
+      } else if (lic && expired) {
+        j.sentAt = null;
+        this.stopJob(`buying its licence unit had no answer and none is among our licences ${Math.round(COMPONENT_PENDING_MS / 60_000)} min on`);
+      } else return "wait";
+    } else if (j.stage === "make") {
+      const items = await this.client.components().catch(soft);
+      const mine = items?.filter((i) => i.component_id === j.componentId && i.port_id === j.port) ?? null;
+      if (mine && mine.length > (j.before ?? 0)) {
+        const item = [...mine].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+        const labour = j.labour ?? 0;
+        j.spent += labour;
+        this.noteComponentSpend(labour);
+        m.stats.made++;
+        j.itemId = item.item_id;
+        j.sentAt = null;
+        j.stage = "fit";
+        delete j.bought;
+        this.releaseJobLease(j);
+        this.log(j.ship, `components: "${j.name}" whose make had no answer was made after all (it lies in our warehouse at ${j.port})`);
+      } else if (mine && expired) {
+        j.sentAt = null;
+        this.stopJob(`making it had no answer and none is among our components ${Math.round(COMPONENT_PENDING_MS / 60_000)} min on`);
+      } else return "wait";
+    } else if (j.stage === "fit") {
+      const r = await this.client.ship(j.shipId).catch(soft);
+      if (r?.components?.some((c) => c.component_id === j.componentId)) {
+        j.sentAt = null;
+        this.finishFit(j, j.fee, r);
+      } else if (r && expired) {
+        j.sentAt = null;
+        this.stopJob(`fitting it had no answer and she shows no such component ${Math.round(COMPONENT_PENDING_MS / 60_000)} min on (it stays in our warehouse at ${j.port})`);
+      } else return "wait";
+    } else {
+      j.sentAt = null;
+    }
+    this.persist(true);
+    return "ok";
+  }
+
+  /**
+   * Research and our patents (guide 3.19; rnd.ts), every RND_CHECK_MS: a fit whose call had no answer read back (not while a fit call is
+   * in flight); materials left by a fit stopped or a project closed sold off (sellLeftovers); then, with research on or a project or
+   * patent of ours to look after: our standing read; a start with no answer reconciled; our project tended (given up when rndAbandonCase
+   * says so, its prototype materials bought into a yard warehouse of ours and held there for it, a trial ship gone from the fleet replaced
+   * once); a closed project's grant judged only once our patents are read (disappointing: made public at once, its upkeep stops; worth
+   * having: licensed out per unit, and fitted like any design where it pays);
+   * and a new project started when the game, the budget, the season and the cash allow. With the setting off nothing is started or bought
+   * for a project (one under way is left to the owner, never given up for that).
+   */
+  private async runRnd(): Promise<void> {
+    if (this.rndBusy) return;
+    this.rndBusy = true;
+    try {
+      const s = this.settings;
+      const w = this.world;
+      const m = this.rndMem;
+      this.rndAt = new Date().toISOString();
+      this.componentsBlocked = this.componentsBlock();
+      // A fit with no answer whose ship has sailed on: read back here too, but never while her turn has a call of the fit in flight (it
+      // books its own answer: settled here too, the spend, the unit, the make or the fit would be booked twice). Holding the same flag
+      // keeps her turn from settling it at the same time.
+      if (m.job && m.job.sentAt !== null && !this.fitBusy) {
+        this.fitBusy = true;
+        try {
+          await this.settleJob();
+        } finally {
+          this.fitBusy = false;
+        }
+      }
+      // Leftover materials of a fit stopped or a project closed: sold into the port's bids, their lease back after.
+      await this.sellLeftovers();
+      const soft = (e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      };
+      const tracked = !!m.project || m.grants.some((g) => g.action === "kept" || g.action === "public failed");
+      if (!s.rndResearch && !tracked) {
+        this.rndBlocked = "research is off";
+        this.rndAction = "off";
+        return;
+      }
+      if (!this.canBuild) {
+        this.rndBlocked = "the key lacks infra_manage (research needs it)";
+        this.rndAction = "off: the key lacks infra_manage";
+        return;
+      }
+      const st = await this.client.rndStatus().catch(soft);
+      if (!st) {
+        this.rndAction = "our R&D standing couldn't be read";
+        return;
+      }
+      this.rndSeen = { at: Date.now(), status: st };
+      const patents = await this.client.ownPatents().catch(soft);
+      const seasonDays = w.seasonLeftMs() / this.gameDayMs;
+      const p = st.project && st.project.status === "active" ? st.project : null;
+      // A start with no answer: ours once the live project matches it (slot, grade, trial ship), else given up after RND_PENDING_MS.
+      const pr = m.project;
+      if (pr?.pending) {
+        if (p && p.slot === pr.slot && p.grade === pr.grade && Date.parse(p.started_at) >= pr.startedAt - 120_000) {
+          pr.id = p.project_id;
+          pr.pending = null;
+          m.rndStats.started++;
+          m.rndStats.spentPence += pr.startFee;
+          this.log("fleet", `research: the ${pr.slot} grade ${pr.grade} project whose start had no answer was started after all`);
+        } else if (Date.now() - pr.pending.at > RND_PENDING_MS) {
+          this.log("fleet", `research: the ${pr.slot} grade ${pr.grade} project whose start had no answer isn't under way ${Math.round(RND_PENDING_MS / 60_000)} min on: it wasn't started`);
+          m.project = null;
+        } else {
+          this.rndAction = "a start had no answer: reading our standing again before anything more";
+          return;
+        }
+        this.persist(true);
+      }
+      // Our project closed: granted (a patent of ours granted since it started, or the project's own grant), or ended without one.
+      // Only the autopilot's own grants are judged: a patent researched by hand is the owner's to keep or give up.
+      if (m.project?.id && p?.project_id !== m.project.id) {
+        const proj = m.project;
+        if (!patents) {
+          // Its grant can only be told from our patents: the project is kept, and judged at a pass that reads them (never dropped unjudged).
+          this.rndAction = "our project has closed: our patents couldn't be read, so its grant is judged at the next pass";
+          return;
+        }
+        const own = st.project && st.project.project_id === proj.id ? st.project : null;
+        const grantId = own?.granted_component_id ?? patents.find((x) => x.slot === proj.slot && x.grade === proj.grade && Date.parse(x.granted_at) >= proj.startedAt - 120_000)?.component_id ?? null;
+        const pt = grantId ? patents.find((x) => x.component_id === grantId) : undefined;
+        if (grantId && !pt) {
+          // Granted, its patent not among ours yet: judged once it shows.
+          this.rndAction = "our project was granted a patent: judging it once it shows among our patents";
+          return;
+        }
+        // The prototype's materials, if it closed before taking them, are sold off (their lease goes back after).
+        this.leaveProtoMaterials(proj, !!pt || !!own?.prototype_consumed || (own?.stage ?? 0) > 2);
+        m.project = null;
+        if (pt) {
+          m.rndStats.granted++;
+          this.log("fleet", `research: our ${proj.slot} grade ${proj.grade} project was granted a patent: "${pt.name}" (${pt.effects.join(", ") || "no effect words"})`);
+          if (!m.grants.some((g) => g.componentId === pt.component_id)) await this.judgeGrant(pt);
+        } else {
+          m.rndStats.abandoned++;
+          this.log("fleet", `research: our ${proj.slot} grade ${proj.grade} project ended without a grant${own?.abandon_reason ? ` (${own.abandon_reason})` : ""}`);
+        }
+        this.persist(true);
+      }
+      // A grant whose making-public failed: tried again.
+      for (const g of m.grants.filter((x) => x.action === "public failed")) {
+        const pt = patents?.find((x) => x.component_id === g.componentId && x.status === "held");
+        if (pt) {
+          m.grants = m.grants.filter((x) => x !== g);
+          await this.judgeGrant(pt);
+        }
+      }
+      await this.licenceOurs(patents);
+      if (p && m.project?.id === p.project_id) await this.tendProject(p, seasonDays);
+      else if (p) {
+        this.rndAction = `a project the autopilot didn't start is under way (${p.slot} grade ${p.grade}, ${p.stage_name}): left to its owner`;
+        return;
+      }
+      if (!p && !m.project) await this.startResearch(st, seasonDays);
+    } finally {
+      this.rndBusy = false;
+      this.persist();
+    }
+  }
+
+  /**
+   * A patent of ours just granted (guide 3.19: its upkeep runs every game day): disappointing (any weakness, or no effect words at all)
+   * is made public at once, so the upkeep stops; worth having (strengths only, safety alone included) is kept (licensed out per unit,
+   * fitted like any design where its gain pays: never on safety alone); unreadable words are kept, with a warning for the owner to judge it.
+   */
+  private async judgeGrant(pt: OwnPatentView): Promise<void> {
+    const m = this.rndMem;
+    const d = disappointing(pt.effects);
+    const valued = effectsOf(pt.effects)?.ups.some((k) => k === "hold" || k === "speed" || k === "turnaround") ?? false;
+    const rec: GrantRec = {
+      componentId: pt.component_id,
+      name: pt.name,
+      slot: pt.slot,
+      grade: pt.grade,
+      effects: pt.effects,
+      at: Date.now(),
+      verdict: d === null ? "unreadable" : d ? "disappointing" : "worth having",
+      action: "kept",
+    };
+    if (d === true) {
+      try {
+        await this.client.makePatentPublic(pt.component_id);
+        rec.action = "made public";
+        this.log("fleet", `research: "${pt.name}" (${pt.slot}, ${pt.effects.join(", ")}) disappoints: made public at once, its upkeep stops`);
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        rec.action = "public failed";
+        this.log("fleet", `research: making "${pt.name}" public failed (${(e as Error).message}); tried again next pass`);
+      }
+    } else {
+      this.log(
+        "fleet",
+        `research: "${pt.name}" (${pt.slot}, ${pt.effects.join(", ") || "no words"}) ${
+          d === null
+            ? "has effect words we can't read: kept (judge it on the R&D page)"
+            : valued
+              ? "is worth having: kept, licensed out and fitted where it pays"
+              : "is worth having for its safety: kept and licensed out (never fitted by us on safety alone)"
+        }`,
+      );
+    }
+    m.grants = [...m.grants, rec].slice(-20);
+    this.designsSeen = null;
+    this.persist(true);
+  }
+
+  /**
+   * Licence offers for our patents kept (guide 3.19: per unit, LICENCE_OFFER_UNITS at a time, open LICENCE_OFFER_GAME_H): one posted for
+   * each held patent of ours with none of ours open. A post with no answer: none again for RND_PENDING_MS (the next read finds it).
+   */
+  private async licenceOurs(patents: OwnPatentView[] | null): Promise<void> {
+    const m = this.rndMem;
+    const kept = (patents ?? []).filter((p) => p.status === "held" && m.grants.some((g) => g.componentId === p.component_id && g.action === "kept"));
+    if (kept.length === 0 || Date.now() - m.offerSentAt < RND_PENDING_MS) return;
+    const offers = await this.client.contractPages({ contract_type: "licence_offer" }, 3).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!offers) return;
+    const ours = offers.items.filter((c) => c.status === "open" && this.isOurCompany(c.issuer_company_id ?? ""));
+    m.offerIds = ours.map((c) => c.id).slice(-20);
+    for (const p of kept) {
+      if (ours.some((c) => c.licence?.component_id === p.component_id)) continue;
+      const price = LICENCE_UNIT_PENCE[Math.min(3, Math.max(1, p.grade))] ?? LICENCE_UNIT_PENCE[1];
+      m.offerSentAt = Date.now();
+      this.persist(true);
+      try {
+        const c = await this.client.createLicenceOffer({ component_id: p.component_id, units: LICENCE_OFFER_UNITS, price_pence: price, price_basis: "per_unit", open_game_hours: LICENCE_OFFER_GAME_H });
+        m.offerIds = [...m.offerIds, c.id].slice(-20);
+        m.offerSentAt = 0;
+        this.log("fleet", `research: licence offer for "${p.name}": ${LICENCE_OFFER_UNITS} units at ${cr(price)} each, open ${LICENCE_OFFER_GAME_H} game hours`);
+      } catch (e) {
+        if (!outcomeUnknown(e)) m.offerSentAt = 0;
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.logOnceFor(`licence-offer|${p.component_id}|${isApiError(e) ? e.status : "?"}`, "fleet", `research: a licence offer for "${p.name}" ${outcomeUnknown(e) ? "had no answer (looked for at the next read)" : `was refused: ${(e as Error).message}`}`);
+      }
+      this.persist(true);
+    }
+  }
+
+  /**
+   * Our live project: given up when rndAbandonCase says so (abandoned: nothing back, no cooldown); at the prototype stage its materials
+   * bought into a yard warehouse of ours (where we have presence, home's region first) within the budget; a trial ship gone from the fleet
+   * replaced (once per project). Nothing bought with research off.
+   */
+  private async tendProject(p: ProjectView, seasonDays: number): Promise<void> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.rndMem;
+    const proj = m.project!;
+    const spent = p.start_fee_pence + p.upkeep_paid_pence + (proj.protoSpent ?? 0);
+    const why = rndAbandonCase(p, { spent, budget: s.rndBudgetPence, seasonLeftGameDays: seasonDays });
+    if (why && s.rndResearch) {
+      try {
+        await this.client.abandonRnd();
+        m.rndStats.abandoned++;
+        m.rndStats.spentPence += p.upkeep_paid_pence + (proj.protoSpent ?? 0);
+        // Prototype materials it never took are sold off (their lease back after); else the lease grown for them goes back.
+        this.leaveProtoMaterials(proj, p.prototype_consumed || p.stage > 2);
+        m.project = null;
+        this.rndAction = `gave up our ${p.slot} grade ${p.grade} project: ${why}`;
+        this.log("fleet", `research: gave up our ${p.slot} grade ${p.grade} project (${p.stage_name}): ${why}`);
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.log("fleet", `research: giving up our project failed (${(e as Error).message}); read again next pass`);
+      }
+      this.persist(true);
+      return;
+    }
+    this.rndAction = `our ${p.slot} grade ${p.grade} project: ${p.stage_name} (${p.stage_points}/${p.stage_points_required}), ${cr(spent)} spent${why ? `; would be given up (${why}) but research is off: left to the owner` : ""}`;
+    // The prototype has taken its materials: nothing held for it any more, nothing to sell off if the project closes.
+    if ((p.prototype_consumed || p.stage > 2) && !proj.protoDone) {
+      proj.protoDone = true;
+      delete proj.protoBought;
+      this.persist(true);
+    }
+    // A trial ship that left the fleet: another named, once per project (guide 3.19).
+    const trial = p.trial_ship_id ? this.agents.get(p.trial_ship_id) : undefined;
+    if ((!trial || trial.gone) && p.trial_ship_swap_available) {
+      const next = this.trialShip(p.grade);
+      if (next) {
+        try {
+          await this.client.swapTrialShip(next.shipId);
+          proj.trialShipId = next.shipId;
+          this.log("fleet", `research: ${next.name} is our project's trial ship now (the last left the fleet)`);
+        } catch (e) {
+          if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+          this.logOnceFor(`trial-swap|${p.project_id}`, "fleet", `research: naming another trial ship failed: ${(e as Error).message}`);
+        }
+      }
+    }
+    // The prototype's materials (guide 3.19: taken from our warehouse at any yard the first day they are all there).
+    if (p.stage === 2 && !p.prototype_consumed && s.rndResearch && !this.avenueSpendBlock()) {
+      const yards = this.quayPorts().filter((y) => w.port(y)?.has_shipyard);
+      // Once some are bought at a yard, the rest go there too (never a second set elsewhere).
+      const yard = proj.protoYard ?? yards.find((y) => w.region(y) === this.homeRegion) ?? yards[0];
+      if (!yard || !yards.includes(yard)) {
+        this.rndAction += `; its prototype's materials wait for a ship of ours (or a factor) at ${proj.protoYard ?? "a yard"}`;
+        return;
+      }
+      const book = await this.client.book(yard).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      const wh = await this.client.warehouse(yard).catch(() => null);
+      // Materials held there for a fit job's make aren't the prototype's.
+      const held = this.freeHeld(wh, this.reservedMaterials(yard, { proto: true }));
+      const est = this.materialsCost(p.prototype_materials, book, held, yard);
+      if (est === null) {
+        this.rndAction += `; its prototype's materials can't be bought at ${yard} now`;
+        return;
+      }
+      if (est === 0) return;
+      if (spent + est > s.rndBudgetPence) {
+        this.rndAction += `; its prototype's materials (~${cr(est)}) would pass the budget`;
+        return;
+      }
+      const got = await this.withCash(async () => {
+        if (this.stopRequested) return null;
+        const cash = await this.avenueCash(w.region(yard), est, "our research prototype's materials");
+        if (cash !== true) return { ok: false, spent: 0, why: cash, leaseBefore: null, bought: [] as Array<[string, number]> };
+        return this.buyIntoWarehouse(yard, p.prototype_materials, Math.ceil(est * 1.25) + 100, "our research prototype", "proto");
+      });
+      if (!got) return;
+      proj.protoYard = yard;
+      // Held there for the prototype until it takes them (no make or own-materials build there counts them).
+      proj.protoNeed = p.prototype_materials.map((x) => [x.commodity_id, x.quantity] as [string, number]);
+      if (got.bought.length) proj.protoBought = addGoods(proj.protoBought, got.bought);
+      proj.protoSpent = (proj.protoSpent ?? 0) + got.spent;
+      if (got.leaseBefore !== null && proj.protoLeaseBefore === undefined) proj.protoLeaseBefore = got.leaseBefore;
+      if (!got.ok) this.log("fleet", `research: the prototype's materials at ${yard} weren't all bought (${got.why}); tried again next pass`);
+      this.persist(true);
+    }
+    // Consumed: the lease grown for them goes back.
+    if (p.prototype_consumed && proj.protoLeaseBefore !== undefined && proj.protoLeaseBefore !== null && proj.protoYard) {
+      void this.shrinkLease(proj.protoYard, proj.protoLeaseBefore);
+      proj.protoLeaseBefore = null;
+      this.persist(true);
+    }
+  }
+
+  /** The trial ship for a grade (guide 3.19): of ours rated for its water, free of the fleet's other modes, the one at sea most. */
+  private trialShip(grade: number): ShipAgent | null {
+    const w = this.world;
+    let best: { a: ShipAgent; sea: number } | null = null;
+    for (const a of this.agents.values()) {
+      if (a.gone || a.arrested || this.smugglers.has(a.shipId) || this.retiring.has(a.shipId) || this.courierOn(a.shipId)) continue;
+      const hull = w.shipClass(a.shipClass)?.hull_category ?? "coastal";
+      if (!trialHullOk(grade, hull)) continue;
+      const t = a.state.time;
+      const sea = t.laden + t.ballast;
+      if (!best || sea > best.sea) best = { a, sea };
+    }
+    return best?.a ?? null;
+  }
+
+  /**
+   * A new project (guide 3.19; research on): the slot and grade by priority with designs free (rndPick), the trial ship, the case
+   * (rndStartCase: the whole expected cost within the budget, the season, the fee spare); the fee raised at home and the start saved as
+   * sent first (one with no answer is reconciled from our standing, never sent again). A refusal waits an hour.
+   */
+  private async startResearch(st: RndStatus, seasonDays: number): Promise<void> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.rndMem;
+    if (!s.rndResearch) {
+      this.rndBlocked = "research is off";
+      this.rndAction = "off: no new project";
+      return;
+    }
+    const block = this.avenueSpendBlock() ?? (Date.now() < this.rndRetryAt ? "a start was refused lately" : null) ?? (this.homeRegion ? null : "the home port isn't known yet");
+    this.rndBlocked = block;
+    if (block) {
+      this.rndAction = `no new project: ${block}`;
+      return;
+    }
+    if (!st.can_start) {
+      this.rndAction = `no new project: ${st.cannot_start_reason ?? "the game doesn't allow one now"}`;
+      return;
+    }
+    const pool = await this.client.rndPool().catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    const pick = pool ? rndPick(pool, w.unlockedPhase) : null;
+    if (!pick) {
+      this.rndAction = pool ? "no new project: no hold, sails or hull design free at a grade the phase opened" : "the research pool couldn't be read";
+      return;
+    }
+    const trial = this.trialShip(pick.grade);
+    if (!trial) {
+      this.rndAction = `no new project: no ship of ours rated for grade ${pick.grade}'s sea trials`;
+      return;
+    }
+    let committed = 0;
+    for (const a of this.agents.values()) committed += this.committedBy(a);
+    const c = rndStartCase(st, { budget: s.rndBudgetPence, seasonLeftGameDays: seasonDays, spare: this.spendable(committed) });
+    if (!c.ok) {
+      this.rndAction = `no new project: ${c.why}`;
+      return;
+    }
+    const home = this.homeRegion!;
+    const fee = st.start_fee_pence;
+    const res = await this.withCash(async () => {
+      if (this.stopRequested || !this.settings.rndResearch) return null;
+      const cash = await this.avenueCash(home, fee, "a research project's start fee");
+      if (cash !== true) return cash;
+      m.project = { id: null, slot: pick.slot, grade: pick.grade, trialShipId: trial.shipId, startedAt: w.now(), startFee: fee, pending: { at: Date.now() } };
+      this.persist(true);
+      await this.journal?.flush();
+      try {
+        const proj = await this.client.startRnd({ slot: pick.slot, grade: pick.grade, trial_ship_id: trial.shipId });
+        m.project.id = proj.project_id;
+        m.project.pending = null;
+        m.rndStats.started++;
+        m.rndStats.spentPence += fee;
+        w.vaults.set(home, w.vault(home) - fee);
+        return proj;
+      } catch (e) {
+        const unknown = outcomeUnknown(e);
+        if (!unknown) m.project = null;
+        this.persist(true);
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        if (unknown) return `no answer (${(e as Error).message}): read back from our standing, never sent again`;
+        this.rndRetryAt = Date.now() + 60 * 60_000;
+        return `refused: ${(e as Error).message}`;
+      }
+    });
+    if (res === null) return;
+    if (typeof res === "string") {
+      this.rndAction = `starting a ${pick.slot} grade ${pick.grade} project: ${res}`;
+      this.log("fleet", `research: starting a ${pick.slot} grade ${pick.grade} project: ${res}`);
+      return;
+    }
+    this.rndAction = `started a ${pick.slot} grade ${pick.grade} project (trial ship ${trial.name})`;
+    this.log(
+      "fleet",
+      `research: started a ${pick.slot} grade ${pick.grade} project (fee ${cr(fee)}, upkeep ${cr(st.upkeep_per_game_day_pence)} a game day, ~${cr(c.cost)} expected in all; trial ship ${trial.name}); the design is drawn at random`,
+    );
+    this.persist(true);
+  }
+
+  /** Components and research for the panel. */
+  private rndReport(): RndReport {
+    const s = this.settings;
+    const m = this.rndMem;
+    const st = this.rndSeen?.status ?? null;
+    const p = st?.project ?? null;
+    const j = m.job;
+    return {
+      components: {
+        enabled: s.components,
+        budgetPence: s.componentBudgetPence,
+        spent24hPence: spentLastDay(m, Date.now()),
+        blocked: this.componentsBlocked,
+        action: this.componentsAction,
+        job: j ? { ship: j.ship, port: j.port, name: j.name, slot: j.slot, stage: j.stage, sentAt: j.sentAt !== null ? new Date(j.sentAt).toISOString() : null } : null,
+        fits: [...m.fits],
+        designs: (this.designsSeen?.options ?? []).slice(0, 40).map((o) => ({
+          componentId: o.componentId,
+          name: o.name,
+          slot: o.slot,
+          grade: o.grade,
+          effects: o.effects,
+          source: o.source,
+          readable: effectsOf(o.effects) !== null,
+          unitPricePence: o.offer?.price ?? null,
+        })),
+        stats: { ...m.stats },
+      },
+      research: {
+        enabled: s.rndResearch,
+        budgetPence: s.rndBudgetPence,
+        blocked: this.rndBlocked,
+        action: this.rndAction,
+        checkedAt: this.rndAt,
+        canStart: st ? st.can_start : null,
+        project: p
+          ? {
+              slot: p.slot,
+              grade: p.grade,
+              stage: p.stage,
+              stageName: p.stage_name,
+              points: p.stage_points,
+              required: p.stage_points_required,
+              trialShip: p.trial_ship_id ? (this.agents.get(p.trial_ship_id)?.name ?? p.trial_ship_id) : null,
+              unpaidDays: p.unpaid_days,
+              upkeepPerDayPence: p.upkeep_per_game_day_pence,
+              spentPence: p.start_fee_pence + p.upkeep_paid_pence + (m.project?.id === p.project_id ? (m.project.protoSpent ?? 0) : 0),
+              startedAt: p.started_at ?? null,
+            }
+          : null,
+        patents: (this.designsSeen?.patents ?? []).map((x) => ({
+          componentId: x.component_id,
+          name: x.name,
+          slot: x.slot,
+          grade: x.grade,
+          status: x.status,
+          upkeepPerDayPence: x.upkeep_per_game_day_pence,
+          arrearsDays: x.arrears_days,
+        })),
+        grants: [...m.grants],
+        stats: { ...m.rndStats },
+      },
+    };
+  }
+
+  // ── News packets (news.ts; guide 3.11, 3.16) ────────────────────────────────
+
+  /** Whether this ship is the fleet's news packet now (news.ts): the setting on, she is our courier and isn't being sold. */
+  private courierOn(shipId: string): boolean {
+    return this.settings.newsPackets && this.newsMem.packetId === shipId && !this.retiring.has(shipId);
+  }
+
+  courierShip(agent: ShipAgent): boolean {
+    return this.courierOn(agent.shipId);
+  }
+
+  /** Whether a packet of ours with her dispatches sealed lies at this port (guide 3.11: our crews' reports there carry her news). */
+  private sealedPacketAt(port: string): boolean {
+    for (const a of this.agents.values()) {
+      const sh = a.last?.ship;
+      if (!a.gone && sh?.dispatches_sealed && sh.status !== "sailing" && sh.current_port_id === port) return true;
+    }
+    return false;
+  }
+
+  /** An ordinary envelope's price (pence), capped at what envelopes sell for (news.ts ordinaryCap: the desk's or players' average), read within the hour. */
+  private ordinaryPrice(price: number): number {
+    const desk = this.deskSeen && Date.now() - this.deskSeen.at < 60 * 60_000 ? this.deskSeen : null;
+    const cap = ordinaryCap(desk);
+    return cap !== null ? Math.max(100, Math.min(price, cap)) : price;
+  }
+
+  /** One of the courier's envelopes sold (guide 3.11: by Lloyd's, or a player): booked to the news packet, the price step up. */
+  private noteNewsSale(port: string, pence: number, title: string): void {
+    const m = this.newsMem;
+    m.stats.sold++;
+    m.stats.incomePence += pence;
+    m.sales = [...m.sales, [Date.now(), pence] as [number, number]].slice(-NEWS_SALES_KEPT);
+    m.step = learnStep(m.step, true);
+    this.log("fleet", `news packet: sold her news at ${port} for ${cr(pence)} (${title}); the next asks a step more`);
+  }
+
+  /** Real hours in a game day. */
+  private get realHoursPerGameDay(): number {
+    return this.gameDayMs / 3_600_000;
+  }
+
+  /** What a packet costs to keep a game day (pence): her upkeep share (sprawl on half her tons, 1 Cr a ton oceanic) and her crew's stores. */
+  private packetUpkeepPerDay(cls: CatalogShipClass, a?: ShipAgent): number {
+    const w = this.world;
+    const oceanic = cls.hull_category === "oceanic";
+    const perHour = a ? this.upkeepShare(a) : w.upkeepDeltaPerHour({ lower: this.fleetTons(false), oceanic: this.fleetTons(true) }, cls.hold_capacity_tons, oceanic);
+    const stores = (Math.max(0, cls.crew_required) / 100) * w.basePrice("provisions");
+    return Math.round(Math.max(0, perHour) * this.realHoursPerGameDay + stores);
+  }
+
+  /** The hubs a packet may make for from `from` (open, an unlocked phase, no cove, no AI ban, over water she is rated for): port → passage game hours. */
+  private async hubLegs(from: string, cls: CatalogShipClass): Promise<Map<string, number>> {
+    const w = this.world;
+    const out = new Map<string, number>();
+    const knots = Math.max(1, cls.base_speed_centiknots / 100);
+    for (const p of w.catalog.ports) {
+      if (!p.is_hub || p.id === from || !w.isOpen(p.id) || w.isCove(p.id) || p.phase > w.unlockedPhase) continue;
+      const plan = await w.route(from, p.id, cls.id).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (!plan || !w.routeRated(plan, cls.hull_category) || this.offLimits(p.id, plan)) continue;
+      out.set(p.id, plan.total_distance_nm / knots);
+    }
+    return out;
+  }
+
+  /**
+   * The courier's envelopes (kind `packet`): our sales booked even with ordinary envelopes off (syncEnvelopes), and ours unsold after
+   * NEWS_STALE_GAME_H withdrawn (the house didn't take it at that price: the step down).
+   */
+  private async syncPacketEnvelopes(): Promise<void> {
+    const w = this.world;
+    const m = this.newsMem;
+    const open = () => [...this.envelopeRecs].filter(([, r]) => r.kind === "packet" && r.status === "open");
+    if (open().length === 0 && !this.pendingEnvelopes.some((p) => p.kind === "packet")) return;
+    const mine = await this.client.myEnvelopePages({ role: "seller" }, 2).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (mine) this.syncEnvelopes(mine.items, mine.complete);
+    const staleMs = NEWS_STALE_GAME_H * 60 * w.gameMinuteMs;
+    for (const [id, r] of open()) {
+      if (w.now() - r.at < staleMs) continue;
+      if (await this.withdrawEnvelope(id, r, "unsold: Lloyd's didn't take it at that price")) {
+        m.step = learnStep(m.step, false);
+        m.stats.withdrawn++;
+      }
+    }
+  }
+
+  /**
+   * The case for one packet (news.ts packetCase) as things stand: the desk as last read, the passage from where she would work (her own
+   * port, else home's) to the nearest hub, her upkeep, and her hull's price (a yard's quote of a packet; none for one already ours).
+   */
+  private async packetCaseNow(cls: CatalogShipClass, a: ShipAgent | undefined): Promise<NewsReport["case"]> {
+    const desk = this.deskSeen;
+    if (!desk) return null;
+    const w = this.world;
+    const sh = a?.last?.ship;
+    const from = (sh?.status !== "sailing" ? sh?.current_port_id : null) ?? a?.last?.route_legs.at(-1)?.to_node ?? this.homePort;
+    if (!from) return null;
+    const legs = await this.hubLegs(from, cls);
+    const leg = Math.min(...legs.values());
+    const upkeep = this.packetUpkeepPerDay(cls, a);
+    let hull = 0;
+    if (!a) {
+      if (!this.knownQuotes(cls.id).has(cls.id)) await this.quoteClass(cls.id, null);
+      const quotes = [...this.hullQuotes].filter(([k]) => k.endsWith(`|${cls.id}`)).map(([, v]) => v);
+      if (!quotes.length) return { ok: false, incomePerDayPence: 0, upkeepPerDayPence: upkeep, netPerDayPence: 0, paybackHours: null, why: "no yard of ours has quoted a packet yet" };
+      hull = Math.min(...quotes);
+    }
+    if (!Number.isFinite(leg)) return { ok: false, incomePerDayPence: 0, upkeepPerDayPence: upkeep, netPerDayPence: 0, paybackHours: null, why: `no hub in reach of ${from}` };
+    const c = packetCase({ desk, legGameH: leg, upkeepPerDay: upkeep, hullCost: hull, paybackHours: this.settings.maxPaybackHours, realHoursPerGameDay: this.realHoursPerGameDay });
+    return { ok: c.ok, incomePerDayPence: Math.round(c.incomePerDay), upkeepPerDayPence: upkeep, netPerDayPence: Math.round(c.netPerDay), paybackHours: c.paybackHours !== null ? Math.round(c.paybackHours * 10) / 10 : null, why: c.why };
+  }
+
+  /**
+   * News packets (guide 3.11, 3.16; news.ts), every NEWS_CHECK_MS: the courier's envelopes synced (sales, stale ones withdrawn); Lloyd's
+   * envelope desk read (also with the setting off: ordinary envelopes are capped by it); then with newsPackets on: our courier judged after
+   * her trial, NEWS_TRIAL_GAME_DAYS from her first envelope (her sales since over the trailing window against her upkeep: given up and
+   * sold down the broker's ladder when short; one that posted nothing NEWS_SILENT_GAME_DAYS after she was taken on likewise), a packet of
+   * ours afloat taken as the courier, or ONE built under the buyer's rules, when the case for one packet passes and no failed courier
+   * holds it back (packetCooldown: several real hours, and the rest of the season unless Lloyd's spend on envelopes doubles).
+   */
+  private async runNews(): Promise<void> {
+    if (this.newsBusy) return;
+    this.newsBusy = true;
+    try {
+      const s = this.settings;
+      const w = this.world;
+      const m = this.newsMem;
+      this.newsAt = new Date().toISOString();
+      const soft = (e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      };
+      await this.syncPacketEnvelopes();
+      const board = await this.client.desks(NEWS_DESK_DAYS).catch(soft);
+      if (board) this.deskSeen = envelopeDesk(board, Date.now());
+      // Our courier, still ours.
+      let courier = m.packetId ? this.agents.get(m.packetId) : undefined;
+      if (m.packetId && (!courier || courier.gone)) {
+        this.log("fleet", "news packet: our courier left the fleet");
+        m.packetId = null;
+        m.since = null;
+        m.trialFrom = null;
+        courier = undefined;
+      }
+      if (m.givenUp && !(this.agents.get(m.givenUp.shipId) && !this.agents.get(m.givenUp.shipId)!.gone)) m.givenUp = null;
+      if (!s.newsPackets) {
+        if (m.packetId) this.log(courier?.name ?? "fleet", "news packets switched off: she is let go to work as any ship (her dispatches stay as they are)");
+        m.packetId = null;
+        m.since = null;
+        m.trialFrom = null;
+        // Off then on again: a courier given up may be tried again (the cooldown after a failed trial stands: packetCooldown).
+        m.givenUp = null;
+        this.newsBlocked = "news packets are off";
+        this.newsAction = "off";
+        return;
+      }
+      const cls = w.shipClass(PACKET_CLASS) ?? w.catalog.ship_classes.find((c) => c.can_seal_dispatches);
+      if (!cls) {
+        this.newsBlocked = "the catalog has no packet";
+        this.newsAction = "off: the catalog has no packet";
+        return;
+      }
+      // A packet of ours afloat the courier could be (never a smuggler, one being sold, a venture's, one under an AI order, one given up).
+      const candidate =
+        courier ??
+        [...this.agents.values()].find(
+          (a) =>
+            !a.gone &&
+            !!w.shipClass(a.shipClass)?.can_seal_dispatches &&
+            !this.smugglers.has(a.shipId) &&
+            !this.retiring.has(a.shipId) &&
+            !this.ventureOn(a.shipId) &&
+            !this.advisor.shipOrder(a.shipId) &&
+            m.givenUp?.shipId !== a.shipId,
+        );
+      // None afloat and the Atlantic not open yet: no packet can be built (guide 3.11: Phase 2), nothing to weigh.
+      if (!candidate && cls.phase > w.unlockedPhase) {
+        this.newsCase = null;
+        if (m.givenUp) await this.sellCourier();
+        this.newsBlocked = `a packet needs phase ${cls.phase} (the world is at ${w.unlockedPhase})`;
+        this.newsAction = `no packet: ${this.newsBlocked}`;
+        return;
+      }
+      this.newsCase = await this.packetCaseNow(cls, candidate);
+      const c = this.newsCase;
+      // Her trial over: what she sold since her first envelope over the trailing window against what she cost (news.ts
+      // NEWS_TRIAL_GAME_DAYS); one that has posted nothing long after she was taken on is given up too.
+      if (courier && m.since !== null) {
+        const trialMs = NEWS_TRIAL_GAME_DAYS * this.gameDayMs;
+        const from = m.trialFrom ?? null;
+        let why: string | null = null;
+        if (from !== null && Date.now() - from >= trialMs) {
+          const income = m.sales.filter(([t]) => t >= from && Date.now() - t <= trialMs).reduce((n, [, p]) => n + p, 0);
+          const upkeep = this.packetUpkeepPerDay(cls, courier) * NEWS_TRIAL_GAME_DAYS;
+          if (income < upkeep) why = `her news sold for ${cr(income)} over the last ${NEWS_TRIAL_GAME_DAYS} game days against ~${cr(upkeep)} of upkeep`;
+        } else if (from === null && Date.now() - m.since >= NEWS_SILENT_GAME_DAYS * this.gameDayMs) {
+          why = `she posted no news in ${NEWS_SILENT_GAME_DAYS} game days as our courier`;
+        }
+        if (why) {
+          m.givenUp = { shipId: courier.shipId, at: Date.now(), why };
+          // No packet again for a long while: the desk didn't keep one (packetCooldown), so the same case would build the same loss.
+          const desk = this.deskSeen && Date.now() - this.deskSeen.at < 60 * 60_000 ? this.deskSeen : null;
+          m.failed = { at: Date.now(), perDay: desk ? desk.perDay : null, seasonEndsAt: w.seasonEndsAt };
+          m.packetId = null;
+          m.since = null;
+          m.trialFrom = null;
+          this.log(courier.name, `news packet: given up (${why}): to be sold down the ship broker's ladder; no packet again for a while`);
+          this.persist(true);
+          courier = undefined;
+        }
+      }
+      if (m.givenUp) await this.sellCourier();
+      this.newsBlocked = this.avenueSpendBlock();
+      const freshDesk = this.deskSeen && Date.now() - this.deskSeen.at < 60 * 60_000 ? this.deskSeen : null;
+      const cool = packetCooldown(m.failed, { now: Date.now(), serverNow: w.now(), perDay: freshDesk ? freshDesk.perDay : null });
+      if (!courier && candidate && candidate.shipId !== m.givenUp?.shipId) {
+        if (cool) this.newsBlocked = cool;
+        else if (c?.ok) {
+          this.takeCourier(candidate.shipId);
+          this.log(candidate.name, `news packet: taken as the fleet's courier (${c.why})`);
+          this.persist(true);
+          candidate.nudge();
+          courier = candidate;
+        }
+      } else if (!courier && !candidate && !m.givenUp && c?.ok && !this.newsBlocked) {
+        // One packet at most: none built while any packet of ours is afloat (a smuggler's, one under an AI order, one being sold).
+        const anyPacket = [...this.agents.values()].some((a) => !a.gone && !!w.shipClass(a.shipClass)?.can_seal_dispatches);
+        if (cool) this.newsBlocked = cool;
+        else if (anyPacket) this.newsBlocked = "a packet of ours is afloat already (taken by another mode or an AI order)";
+        else await this.buildPacket(cls);
+      }
+      const desk = this.deskSeen;
+      this.newsAction = courier
+        ? `courier ${courier.name}${this.courierDest ? ` bound for ${this.courierDest}` : ""}: ${m.stats.sold} envelopes sold for ${cr(m.stats.incomePence)} in all`
+        : m.givenUp
+          ? `courier given up (${m.givenUp.why}): being sold`
+          : c
+            ? `no packet: ${c.ok ? (this.newsBlocked ?? "the buyer's rules hold the build") : c.why}`
+            : desk
+              ? "no packet: the case couldn't be weighed"
+              : "the desks board couldn't be read";
+    } finally {
+      this.newsBusy = false;
+      this.persist();
+    }
+  }
+
+  /** A packet taken on as our courier (adopted or built): since now, her trial waiting for her first envelope, another ship's calls dropped. */
+  private takeCourier(shipId: string): void {
+    const m = this.newsMem;
+    if (m.callsShip !== shipId) {
+      m.calls = [];
+      m.callsShip = shipId;
+    }
+    m.packetId = shipId;
+    m.since = Date.now();
+    m.trialFrom = null;
+  }
+
+  /**
+   * ONE packet built for news (guide 3.11; Phase 2) under the buyer's rules: autoBuy and the key, the fleet under maxShips, the season,
+   * no build outstanding or in hand, the buyer's cool-down, no AI hold; at the cheapest yard where we have presence that quotes one now,
+   * her hull paid back within maxPaybackHours on the case; turnkey from our own cash (never a loan) after the loads, the fence and the
+   * floor her upkeep adds (avenueCash). A build with no answer is watched for by name (pendingBuild) and taken as the courier once found.
+   */
+  private async buildPacket(cls: CatalogShipClass): Promise<void> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.newsMem;
+    const why =
+      !s.autoBuy ? "the buyer is off (autoBuy)"
+      : !this.canBuild ? "the key lacks infra_manage"
+      : cls.phase > w.unlockedPhase ? `a packet needs phase ${cls.phase}`
+      : this.shipsAfloat() >= s.maxShips ? `the fleet is at its ${s.maxShips}-ship limit`
+      : this.pendingBuild ? "a build whose outcome is unknown is watched for"
+      : this.buying ? "the buyer is busy"
+      : Date.now() - this.lastBuy < BUY_COOLDOWN_MS ? "a ship was bought moments ago"
+      : this.advisor.buyHold() ? "the AI holds the buyer's cash"
+      : null;
+    if (why) {
+      this.newsBlocked = why;
+      return;
+    }
+    const yards = this.quayPorts().filter((y) => w.port(y)?.has_shipyard);
+    let best: { yard: string; price: number } | null = null;
+    for (const yard of yards) {
+      const q = await this.client.shipyardQuote(yard, cls.id, "turnkey_cash").catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      if (!q?.available || !q.total_cost_pence) continue;
+      this.noteHullQuote(yard, cls.id, q);
+      if (!best || q.total_cost_pence < best.price) best = { yard, price: q.total_cost_pence };
+    }
+    if (!best) {
+      this.newsBlocked = yards.length ? "no yard of ours can build a packet now" : "no ship of ours (or factor) at a yard to build one";
+      return;
+    }
+    const pick = best;
+    const desk = this.deskSeen!;
+    const legs = await this.hubLegs(pick.yard, cls);
+    const c = packetCase({ desk, legGameH: Math.min(...legs.values()), upkeepPerDay: this.packetUpkeepPerDay(cls), hullCost: pick.price, paybackHours: s.maxPaybackHours, realHoursPerGameDay: this.realHoursPerGameDay });
+    if (!c.ok) {
+      this.newsBlocked = `a packet at ${pick.yard} for ${cr(pick.price)}: ${c.why}`;
+      return;
+    }
+    const name = await pickShipName(new Set([...[...this.agents.values()].map((a) => a.name), ...(this.pendingBuild ? [this.pendingBuild.name] : [])]));
+    const region = w.region(pick.yard);
+    const upkeepFloor = this.homeFloor({ tons: cls.hold_capacity_tons, oceanic: cls.hull_category === "oceanic" }) - this.homeFloor();
+    this.buying = true;
+    try {
+      const built = await this.withCash(async () => {
+        if (this.stopRequested || !this.settings.newsPackets || !this.settings.autoBuy) return null;
+        await w.refreshVaults();
+        let committed = 0;
+        for (const a of this.agents.values()) committed += this.committedBy(a);
+        if (this.spendable(committed) - upkeepFloor < pick.price) {
+          this.noteSpendShort(pick.price + upkeepFloor);
+          this.newsBlocked = `no ${cr(pick.price)} spare for a packet after the fleet's loads and what our loans will take to repay`;
+          return null;
+        }
+        const cash = await this.avenueCash(region, pick.price, "a news packet");
+        if (cash !== true) {
+          this.newsBlocked = cash;
+          return null;
+        }
+        try {
+          return await this.client.buildShip(pick.yard, name, cls.id, "turnkey_cash");
+        } catch (e) {
+          if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+          this.lastBuy = Date.now();
+          if (outcomeUnknown(e)) {
+            this.pendingBuild = { name, yard: pick.yard, cls: cls.id, price: pick.price, cost: pick.price, payback: c.paybackHours ?? 0, lane: "news packet", at: w.now() };
+            this.persist(true);
+            this.log("fleet", `news packet: building a packet at ${pick.yard} had no answer (${(e as Error).message}); watching for "${name}"`);
+            return null;
+          }
+          this.log("fleet", `news packet: building a packet at ${pick.yard} failed: ${(e as Error).message}`);
+          return null;
+        }
+      });
+      if (!built) return;
+      this.lastBuy = Date.now();
+      this.shipSpendPence += built.total_cost_pence;
+      w.vaults.set(region, w.vault(region) - built.total_cost_pence);
+      this.purchases.push({ at: new Date().toISOString(), shipId: built.ship_id, name, shipClass: cls.id, port: pick.yard, costPence: built.total_cost_pence, paybackHours: Math.round((c.paybackHours ?? 0) * 10) / 10, lane: "news packet" });
+      this.takeCourier(built.ship_id);
+      m.stats.built++;
+      this.log("fleet", `news packet: built the packet "${name}" at ${pick.yard} for ${cr(built.total_cost_pence)} (${c.why}); she seals her dispatches and carries news between the hubs`);
+      this.persist(true);
+      await this.scanShips();
+    } finally {
+      this.buying = false;
+    }
+  }
+
+  /**
+   * A courier given up (her income short of her upkeep): sold through housekeeping's retiring (guide 3.4: listed on the Exchange down the
+   * ship broker's ladder at a yard, broken up only when unsold and the break-up still pays), when she lies in port free of her work and
+   * the retiring may run (autoBreakUp on, the key, the season); one refused waits its skip and is marked again after.
+   */
+  private async sellCourier(): Promise<void> {
+    const m = this.newsMem;
+    const g = m.givenUp;
+    if (!g) return;
+    const a = this.agents.get(g.shipId);
+    if (!a || a.gone || this.retiring.has(a.shipId) || (this.retireSkip.get(a.shipId) ?? 0) > Date.now()) return;
+    const blocked = this.retireBlocked();
+    if (blocked) {
+      this.logOnceFor(`news-sell|${a.shipId}|${blocked}`, a.name, `news packet given up, but not sold: ${blocked}`);
+      return;
+    }
+    const r = a.last;
+    if (!r || r.ship.status === "sailing") return;
+    const rebuild = this.rebuildOf(a, r);
+    const earn = m.sales.filter(([t]) => Date.now() - t <= NEWS_TRIAL_GAME_DAYS * this.gameDayMs).reduce((n, [, p]) => n + p, 0) / (NEWS_TRIAL_GAME_DAYS * this.realHoursPerGameDay);
+    const bc = breakUpCase({ rebuild, upkeepPerHour: this.upkeepShare(a), earnPerHour: earn, horizonHours: this.retireHorizonHours() });
+    const yard = await this.breakUpYard(a, r, bc.payout);
+    if (typeof yard === "string") {
+      this.logOnceFor(`news-sell-yard|${a.shipId}`, a.name, `news packet given up, but not sold yet: ${yard}`);
+      return;
+    }
+    this.retiring.set(a.shipId, { stage: "wanted", reason: "news", why: `news packet given up: ${g.why}`, yard: yard.yard, ship: a.name, cls: a.shipClass, rebuild, payout: bc.payout, at: this.world.now() });
+    this.log(a.name, `news packet given up: to be listed for sale on the Exchange at ${yard.yard} (${ladderText()}), broken up there only if unsold and that still pays`);
+    this.persist(true);
+    a.nudge();
+  }
+
+  /**
+   * The courier's turn in port (guide 3.11; news.ts): anything aboard from her trading days is seen to first (null: the ship's own turn
+   * sells or delivers it); the call recorded; her dispatches sealed; one envelope of the other ports' reports she carries that this board
+   * lacks posted here at the learned price; then on to the next hub (the one called at longest ago per hour of passage), alone, as any
+   * passage (stores, the policy guard). A wait, or null.
+   */
+  async courierTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null> {
+    if (!this.courierOn(agent.shipId)) return null;
+    const w = this.world;
+    const m = this.newsMem;
+    if (Object.values(r.cargo_manifest).some((t) => t > 0) || agent.sealedTons() > 0 || agent.paxHeads() > 0 || agent.loaded) return null;
+    if (agent.lane) this.releaseLane(agent);
+    agent.dropOffers("she carries news for the fleet");
+    if (m.callsShip !== agent.shipId) {
+      // Another ship's calls are no news of hers.
+      m.calls = [];
+      m.callsShip = agent.shipId;
+    }
+    if (m.calls.at(-1)?.port !== port) {
+      m.calls = [...m.calls, { port, at: w.now() }].slice(-NEWS_CALLS_KEPT);
+      this.persist(true);
+    }
+    if (!r.ship.dispatches_sealed) {
+      try {
+        await this.client.sealDispatches(agent.shipId, true);
+        this.log(agent.name, "news packet: dispatches sealed (her news stays ours to sell; the boards she calls at get none of it)");
+      } catch (e) {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        this.logOnceFor(`seal|${agent.shipId}`, agent.name, `news packet: sealing her dispatches failed (${(e as Error).message})`);
+      }
+    }
+    await this.courierPost(agent, port);
+    const cls = w.shipClass(agent.shipClass);
+    const legs = cls ? await this.hubLegs(port, cls) : new Map<string, number>();
+    const next = nextPort(legs, port, m.calls, w.now(), 60 * w.gameMinuteMs);
+    if (!next) {
+      this.courierDest = null;
+      await agent.standBy(r, "news packet: no hub in reach to carry news to; waiting");
+      return 15 * 60 * w.gameMinuteMs;
+    }
+    this.courierDest = next;
+    agent.setActivity(`news packet: carrying the news of ${m.calls.length ? [...new Set(m.calls.slice(-4).map((c) => c.port))].join(", ") : port} to ${next}`);
+    return agent.sailFor(await agent.refresh(), next);
+  }
+
+  /**
+   * The courier's envelope at this port: her calls at other ports newer than this board's reports of them (freshNews: the board read
+   * now, at quay tier), at most NEWS_MAX_AGE_GAME_H old, sealed into one envelope of those ports' reports at the desk's average price times
+   * the learned step (newsPrice); one at a time per port, within our envelope cap. Lloyd's buys it once it is a game hour old if its price
+   * is under what the news is worth to the house; she needn't wait for that.
+   */
+  private async courierPost(agent: ShipAgent, port: string): Promise<void> {
+    const w = this.world;
+    const m = this.newsMem;
+    const price = newsPrice(this.deskSeen?.avgPrice ?? null, m.step);
+    if (price === null) return;
+    const recs = [...this.envelopeRecs.values()];
+    const arrived = m.calls.at(-1)?.port === port ? m.calls.at(-1)!.at : w.now();
+    if (recs.some((r) => r.kind === "packet" && r.port === port && r.status === "open" && r.at >= arrived - 60_000) || this.pendingEnvelopes.some((p) => p.kind === "packet" && p.port === port)) return;
+    if (recs.filter((r) => r.status === "open").length + this.pendingEnvelopes.length >= ENVELOPE_MAX_OPEN) return;
+    if ((this.dealSkip.get(`envelope|${port}|packet`) ?? 0) > Date.now()) return;
+    const detail = await this.client.port(port).catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!detail || detail.visibility !== "quay") return;
+    w.observeGossip(detail);
+    const board = new Map<string, number>();
+    for (const g of detail.coffee_house_gossip ?? []) {
+      const at = Date.parse(g.snapshot_at);
+      board.set(g.subject_port_id, Number.isFinite(at) ? at : w.now() - g.age_seconds * 1000);
+    }
+    const fresh = freshNews(m.calls, board, port, w.now(), NEWS_MAX_AGE_GAME_H * 60 * w.gameMinuteMs);
+    if (fresh.length === 0) return;
+    if (await this.postEnvelope(port, "packet", { categories: ["port_reports"], price, ports: fresh.map((f) => f.port) })) {
+      m.stats.posted++;
+      // Her trial runs from her first envelope (news.ts NEWS_TRIAL_GAME_DAYS).
+      if ((m.trialFrom ?? null) === null) m.trialFrom = Date.now();
+      this.log(agent.name, `news packet: offered her news of ${fresh.map((f) => f.port).join(", ")} at ${port} for ${cr(price)} (Lloyd's buys news its board lacks once it is a game hour old)`);
+    }
+  }
+
+  /** News packets for the panel. */
+  private newsReport(): NewsReport {
+    const s = this.settings;
+    const m = this.newsMem;
+    const w = this.world;
+    const iso = (t: number) => new Date(t).toISOString();
+    const d = this.deskSeen;
+    const a = m.packetId ? this.agents.get(m.packetId) : undefined;
+    const trialMs = NEWS_TRIAL_GAME_DAYS * this.gameDayMs;
+    const cls = a ? w.shipClass(a.shipClass) : undefined;
+    const g = m.givenUp;
+    return {
+      enabled: s.newsPackets,
+      blocked: this.newsBlocked,
+      action: this.newsAction,
+      checkedAt: this.newsAt,
+      desk: d ? { days: d.days, perDayPence: Math.round(d.perDay), bought: d.count, avgPence: d.avgPrice !== null ? Math.round(d.avgPrice) : null, playerTrades: d.playerCount, playerAvgPence: d.playerAvg !== null ? Math.round(d.playerAvg) : null, readAt: iso(d.at) } : null,
+      case: this.newsCase,
+      courier:
+        a && !a.gone
+          ? {
+              shipId: a.shipId,
+              ship: a.name,
+              since: m.since !== null ? iso(m.since) : null,
+              port: a.last?.ship.status !== "sailing" ? (a.last?.ship.current_port_id ?? null) : null,
+              dest: a.last?.ship.status === "sailing" ? (a.last?.route_legs.at(-1)?.to_node ?? this.courierDest) : this.courierDest,
+              sealed: !!a.last?.ship.dispatches_sealed,
+              calls: m.calls.slice(-10).map((c) => ({ port: c.port, at: new Date(c.at - w.skewMs).toISOString() })),
+              trailingIncomePence: m.sales.filter(([t]) => t >= (m.trialFrom ?? m.since ?? 0) && Date.now() - t <= trialMs).reduce((n, [, p]) => n + p, 0),
+              trailingUpkeepPence: cls ? this.packetUpkeepPerDay(cls, a) * NEWS_TRIAL_GAME_DAYS : 0,
+            }
+          : null,
+      step: m.step,
+      pricePence: newsPrice(d?.avgPrice ?? null, m.step),
+      ordinaryCapPence: ordinaryCap(d),
+      openEnvelopes: [...this.envelopeRecs.values()].filter((r) => r.kind === "packet" && r.status === "open").length,
+      givenUp: g ? { ship: this.agents.get(g.shipId)?.name ?? g.shipId, at: iso(g.at), why: g.why } : null,
+      stats: { ...m.stats },
+    };
+  }
+
+  // ── Ship shares (shares.ts; guide 3.13.6) ───────────────────────────────────
+
+  /** A ship-shares event for the panel (newest last). */
+  private shareEvent(e: Omit<ShareEvent, "at">): void {
+    this.shareMem.recent = [...this.shareMem.recent, { at: new Date().toISOString(), ...e }].slice(-SHARES_EVENTS_KEPT);
+  }
+
+  /**
+   * Ship shares (guide 3.13.6; shares.ts), every SHARES_CHECK_MS (sooner after a ship_shares_sold notice): our holdings read and sampled
+   * (the dividends paid us, a sinking written off, a listing of ours sold), a buy or listing with no answer reconciled,
+   * our listings managed (withdrawn when she earns again, a step down the ladder when unsold), 64ths the autopilot bought of a ship that
+   * paid us no dividend for SHARES_COLLAPSE_GAME_DAYS listed for sale, then (shipShares on, and no call of ours unanswered) one listing of
+   * a ship we already hold bought when the dividends a 64th of her paid us, as we sampled them, pay it back (buyCase), within the
+   * per-ship cap and the budget. Never one of our own ships or companies.
+   */
+  private async runShares(): Promise<void> {
+    if (this.sharesBusy) return;
+    this.sharesBusy = true;
+    try {
+      const s = this.settings;
+      const w = this.world;
+      const m = this.shareMem;
+      this.sharesAt = new Date().toISOString();
+      const tracked = m.pending !== null || m.holdings.some((h) => h.listing);
+      if (!s.shipShares && !tracked) {
+        this.sharesBlocked = "ship shares are off";
+        this.sharesAction = "off";
+        return;
+      }
+      if (!this.canBuild) {
+        this.sharesBlocked = "the key lacks infra_manage (buying and listing 64ths need it)";
+        this.sharesAction = "off: the key lacks infra_manage";
+        return;
+      }
+      const soft = (e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      };
+      const held = await this.client.shareHoldings().catch(soft);
+      if (!held) {
+        this.sharesAction = "our holdings couldn't be read";
+        return;
+      }
+      const now = w.now();
+      const day = this.gameDayMs;
+      this.syncHoldings(held, now, day);
+      if (m.pending) {
+        await this.settleSharePending();
+        if (m.pending) {
+          this.sharesAction = "a call had no answer: reading it back before anything more";
+          return;
+        }
+      }
+      await this.manageShareSales(now, day);
+      if (m.pending) {
+        // A listing with no answer: read back before anything more (a buy now would take the pending slot and lose it).
+        this.sharesAction = "a listing had no answer: reading it back before any buy";
+        return;
+      }
+      const block = !s.shipShares ? "ship shares are off (our listings looked after only)" : this.avenueSpendBlock();
+      this.sharesBlocked = block;
+      if (block) {
+        this.sharesAction = `no buy: ${block}`;
+        return;
+      }
+      await this.buyMoreShares(now, day);
+    } finally {
+      this.sharesBusy = false;
+      this.persist();
+    }
+  }
+
+  /**
+   * Our holdings as read (never our own ships): each sampled (the dividends paid us, per our 64ths; those since the last read counted), a sinking
+   * written off, a listing of ours whose 64ths left us booked as sold, holdings no longer ours dropped.
+   */
+  private syncHoldings(list: ShareHolding[], now: number, day: number): void {
+    const m = this.shareMem;
+    const seen = new Set<string>();
+    for (const x of list) {
+      if (x.is_owner || this.isOurCompany(x.owner_company_id) || this.agents.has(x.ship_id)) continue;
+      seen.add(x.ship_id);
+      let h = m.holdings.find((y) => y.shipId === x.ship_id);
+      if (!h) {
+        h = { shipId: x.ship_id, ship: x.ship_name, owner: x.owner_company_id, sixty: x.sixty_fourths, costPence: 0, boughtSixty: 0, samples: [], dividends: x.dividends_paid_pence, cls: null, sunk: false, listing: null, seen: Date.now() };
+        m.holdings.push(h);
+      } else if (x.dividends_paid_pence > h.dividends) {
+        m.stats.dividendsPence += x.dividends_paid_pence - h.dividends;
+      }
+      h.dividends = Math.max(h.dividends, x.dividends_paid_pence);
+      if (h.listing && h.listing.id !== null && x.sixty_fourths <= h.sixty - h.listing.sixty) this.shareSold(h, h.listing.sixty);
+      h.sixty = x.sixty_fourths;
+      h.ship = x.ship_name;
+      h.owner = x.owner_company_id;
+      h.seen = Date.now();
+      if (x.sunk && !h.sunk) {
+        h.sunk = true;
+        m.stats.writtenOffPence += h.costPence;
+        this.shareEvent({ ship: h.ship, what: "sunk", sixty: h.sixty, pence: h.costPence, note: "her shares are worthless" });
+        this.log("fleet", `ship shares: "${h.ship}" sank: our ${h.sixty} 64ths of her are worthless${h.costPence ? ` (${cr(h.costPence)} paid for them)` : ""}`);
+      }
+      // Her earnings are read from the dividends paid us (they only rise, and are what a 64th brings), never her realised P&L, which
+      // swings with every cargo bought into her hold and sold out of it.
+      if (!x.sunk) addSample(h, now, x.dividends_paid_pence, x.sixty_fourths, day);
+    }
+    for (const h of [...m.holdings]) {
+      if (seen.has(h.shipId)) continue;
+      if (h.listing && h.listing.id !== null) this.shareSold(h, h.listing.sixty);
+      // A buy with no answer may add her back: kept until it settles.
+      if (m.pending?.shipId === h.shipId) continue;
+      m.holdings = m.holdings.filter((y) => y !== h);
+    }
+  }
+
+  /** Our listing of her 64ths sold (`sixty` of them): booked at its price, the cost of what the autopilot had bought of her reduced pro rata. */
+  private shareSold(h: HoldingRec, sixty: number): void {
+    const m = this.shareMem;
+    const l = h.listing;
+    if (!l) return;
+    const pence = l.price * sixty;
+    m.stats.sold++;
+    m.stats.soldPence += pence;
+    const before = h.boughtSixty;
+    h.boughtSixty = Math.max(0, before - sixty);
+    h.costPence = before > 0 ? Math.round((h.costPence * h.boughtSixty) / before) : 0;
+    h.listing = null;
+    this.shareEvent({ ship: h.ship, what: "sold", sixty, pence });
+    this.log("fleet", `ship shares: sold ${sixty} 64ths of "${h.ship}" for ${cr(pence)}`);
+    this.persist(true);
+  }
+
+  /** A buy or listing with no answer: read back from our holdings (more 64ths of her) or our listings (ours of her, open), else given up after SHARES_PENDING_MS. */
+  private async settleSharePending(): Promise<void> {
+    const m = this.shareMem;
+    const p = m.pending;
+    if (!p) return;
+    const h = m.holdings.find((x) => x.shipId === p.shipId);
+    const expired = Date.now() - p.at > SHARES_PENDING_MS;
+    if (p.kind === "buy") {
+      if (h && h.sixty >= p.before + p.sixty) {
+        this.shareBought(h, p.sixty, p.price, p.region);
+        this.log("fleet", `ship shares: the buy of ${p.sixty} 64ths of "${h.ship}" whose call had no answer went through`);
+        m.pending = null;
+      } else if (expired) {
+        this.log("fleet", `ship shares: the buy of ${p.sixty} 64ths whose call had no answer isn't among our holdings ${Math.round(SHARES_PENDING_MS / 60_000)} min on: it wasn't made`);
+        m.pending = null;
+      }
+    } else {
+      const listings = await this.client.shareListings(p.shipId).catch((e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      });
+      const ours = listings?.find((l) => l.status === "open" && l.ship_id === p.shipId && this.isOurCompany(l.seller_company_id) && l.sixty_fourths === p.sixty);
+      if (ours && h?.listing) {
+        h.listing.id = ours.id;
+        m.pending = null;
+        this.log("fleet", `ship shares: our listing of "${h.ship}" whose call had no answer stands after all`);
+      } else if (listings && expired) {
+        if (h) h.listing = null;
+        m.pending = null;
+        this.log("fleet", `ship shares: our listing whose call had no answer isn't among the listings ${Math.round(SHARES_PENDING_MS / 60_000)} min on: it wasn't made`);
+      }
+    }
+    this.persist(true);
+  }
+
+  /** 64ths bought (pence: the whole listing): booked to her holding, the totals, the vault it was paid from. */
+  private shareBought(h: HoldingRec, sixty: number, pricePer64: number, region: BankingRegion): void {
+    const m = this.shareMem;
+    const pence = pricePer64 * sixty;
+    h.costPence += pence;
+    h.boughtSixty += sixty;
+    m.stats.bought++;
+    m.stats.spentPence += pence;
+    this.world.vaults.set(region, this.world.vault(region) - pence);
+    this.shareEvent({ ship: h.ship, what: "bought", sixty, pence });
+  }
+
+  /** Her class, for her rebuild value (guide 3.4): an Exchange entry for her 64ths names it (read at most every 30 min); null: not known. */
+  private async shareClass(h: HoldingRec): Promise<string | null> {
+    if (h.cls) return h.cls;
+    if (!this.shareClasses || Date.now() - this.shareClasses.at > 30 * 60_000) {
+      const soft = (e: unknown) => {
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return null;
+      };
+      const [entries, listings] = await Promise.all([this.client.exchangePages({ kind: "ship_shares" }, 2).catch(soft), this.client.shareListings().catch(soft)]);
+      if (!entries || !listings) return null;
+      const shipOf = new Map(listings.map((l) => [l.id, l.ship_id]));
+      const byShip = new Map<string, string>();
+      for (const e of entries.items) {
+        const d = e.details as { ship_class?: string };
+        const ship = shipOf.get(e.id);
+        if (ship && typeof d.ship_class === "string") byShip.set(ship, d.ship_class);
+      }
+      this.shareClasses = { at: Date.now(), byShip };
+    }
+    const cls = this.shareClasses.byShip.get(h.shipId) ?? null;
+    if (cls) h.cls = cls;
+    return cls;
+  }
+
+  /**
+   * Our listings and sales: a listing of ours whose ship pays dividends again is withdrawn; one unsold through its step goes a step down
+   * the ladder (SHARES_SELL_LADDER of a 64th of her rebuild value, our figure for her class); 64ths the autopilot bought of a ship that
+   * paid us no dividend over SHARES_COLLAPSE_GAME_DAYS (collapsed) are listed (shipShares on), paid into our home region. 64ths bought by hand are
+   * never sold by the autopilot. Each listing saved as sent first.
+   */
+  private async manageShareSales(now: number, day: number): Promise<void> {
+    const s = this.settings;
+    const m = this.shareMem;
+    const home = this.homeRegion;
+    const stepMs = SHARES_SELL_STEP_GAME_H * 60 * this.world.gameMinuteMs;
+    for (const h of m.holdings) {
+      if (h.sunk || h.sixty <= 0 || m.pending) continue;
+      const down = collapsed(h.samples, now, day);
+      const l = h.listing;
+      if (l) {
+        if (l.id === null) continue;
+        const last = l.step >= SHARES_SELL_LADDER.length - 1;
+        // Withdrawn only on a dividend seen (samples too short to tell, as after they start again, leave the listing as it is); a step
+        // down only while she still pays nothing.
+        const pays = paidLately(h.samples, now, day);
+        if (!pays && !(down && Date.now() - l.at >= stepMs && !last)) continue;
+        // She pays again (keep her), or a step down the ladder: the listing comes off first.
+        const ok = await this.client.cancelShareListing(l.id).then(
+          () => true,
+          (e: unknown) => {
+            if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+            return isApiError(e) && (e.status === 404 || e.status === 409) ? null : false;
+          },
+        );
+        if (ok === false) continue;
+        if (ok === null) {
+          // Closed already (sold, or closed by the game): forgotten. A sale our holdings didn't show yet goes unbooked in the totals.
+          h.listing = null;
+          this.persist(true);
+          continue;
+        }
+        h.listing = null;
+        this.shareEvent({ ship: h.ship, what: "withdrawn", sixty: l.sixty, pence: l.price * l.sixty, note: pays ? "she pays dividends again" : "a step lower next" });
+        if (pays) {
+          this.log("fleet", `ship shares: "${h.ship}" pays dividends again: our listing of her 64ths withdrawn`);
+          continue;
+        }
+        await this.listShare(h, Math.min(SHARES_SELL_LADDER.length - 1, l.step + 1), home);
+        continue;
+      }
+      const sellable = Math.min(h.sixty, h.boughtSixty);
+      if (!down || sellable <= 0 || !s.shipShares) continue;
+      await this.listShare(h, 0, home);
+    }
+  }
+
+  /** Lists the 64ths the autopilot bought of her at a ladder step (guide 3.13.6: 50-150% of a 64th of her rebuild value), saved as sent first. */
+  private async listShare(h: HoldingRec, step: number, home: BankingRegion | null): Promise<void> {
+    const m = this.shareMem;
+    const sixty = Math.min(h.sixty, h.boughtSixty);
+    if (sixty <= 0 || !home) return;
+    const cls = await this.shareClass(h);
+    if (!cls) {
+      this.logOnceFor(`share-cls|${h.shipId}`, "fleet", `ship shares: "${h.ship}" paid us no dividend lately, but her class isn't known (no Exchange entry names it): not listed, no price to put on her`);
+      return;
+    }
+    const price = sellPrice(this.hullValue(cls), step);
+    h.listing = { id: null, price, sixty, at: Date.now(), step };
+    m.pending = { kind: "list", shipId: h.shipId, listingId: null, sixty, price, region: home, at: Date.now(), before: h.sixty };
+    this.persist(true);
+    await this.journal?.flush();
+    try {
+      const l = await this.client.listShares({ ship_id: h.shipId, sixty_fourths: sixty, price_per_64th_pence: price, banking_region: home });
+      h.listing.id = l.id;
+      m.pending = null;
+      this.shareEvent({ ship: h.ship, what: "listed", sixty, pence: price * sixty, note: `step ${step + 1} of ${SHARES_SELL_LADDER.length}` });
+      this.log("fleet", `ship shares: "${h.ship}" paid us no dividend for ${SHARES_COLLAPSE_GAME_DAYS} game days: listed our ${sixty} 64ths of her at ${cr(price)} each (step ${step + 1} of ${SHARES_SELL_LADDER.length}; paid in ${home})`);
+    } catch (e) {
+      const unknown = outcomeUnknown(e);
+      if (!unknown) {
+        h.listing = null;
+        m.pending = null;
+      }
+      this.persist(true);
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      this.logOnceFor(`share-list|${h.shipId}|${step}|${isApiError(e) ? e.status : "?"}`, "fleet", `ship shares: listing our 64ths of "${h.ship}" ${unknown ? "had no answer (looked for among the listings, never sent again)" : `was refused: ${(e as Error).message}`}`);
+    }
+  }
+
+  /**
+   * One listing bought (shipShares on, the spend gates passed): of a ship we already hold (her earnings read from our own samples:
+   * nothing public shows them, so no first buy), never our own ship or company's listing, not one we are selling, her 64ths of ours within
+   * SHARES_MAX_PER_SHIP, what the autopilot paid for its holdings within the budget, paying back per buyCase; the quickest payback. Paid
+   * in the listing's region (avenueCash), saved as sent first.
+   */
+  private async buyMoreShares(now: number, day: number): Promise<void> {
+    const s = this.settings;
+    const w = this.world;
+    const m = this.shareMem;
+    const listings = await this.client.shareListings().catch((e: unknown) => {
+      if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+      return null;
+    });
+    if (!listings) {
+      this.sharesAction = "the share listings couldn't be read";
+      return;
+    }
+    const invested = m.holdings.filter((h) => !h.sunk).reduce((n, h) => n + h.costPence, 0);
+    const seasonDays = w.seasonLeftMs() / day;
+    const rows: SharesReport["candidates"] = [];
+    let best: { l: ShareListing; h: HoldingRec; payback: number } | null = null;
+    for (const l of listings) {
+      const h = m.holdings.find((x) => x.shipId === l.ship_id && !x.sunk && x.sixty > 0);
+      if (l.status !== "open" || !h) continue;
+      const row = { listingId: l.id, ship: l.ship_name, sixtyFourths: l.sixty_fourths, pricePer64thPence: l.price_per_64th_pence, verdict: "" };
+      rows.push(row);
+      const total = l.price_per_64th_pence * l.sixty_fourths;
+      if (this.isOurCompany(l.seller_company_id) || this.isOurCompany(l.owner_company_id) || this.agents.has(l.ship_id)) row.verdict = "ours";
+      else if (h.listing) row.verdict = "we are selling her";
+      else if (h.sixty + l.sixty_fourths > SHARES_MAX_PER_SHIP) row.verdict = `would take us past ${SHARES_MAX_PER_SHIP} 64ths of her`;
+      else if (invested + total > s.sharesBudgetPence) row.verdict = `${cr(total)} would pass the ${cr(s.sharesBudgetPence)} budget (${cr(invested)} in)`;
+      else {
+        const bc = buyCase({ pricePer64: l.price_per_64th_pence, ratePer64: earnRate(h, now, day), seasonLeftDays: seasonDays });
+        if (!bc.ok) row.verdict = bc.why;
+        else {
+          row.verdict = `pays back in ~${bc.paybackDays.toFixed(1)} game days`;
+          if (!best || bc.paybackDays < best.payback) best = { l, h, payback: bc.paybackDays };
+        }
+      }
+    }
+    this.shareCands = rows.slice(0, 20);
+    if (!best) {
+      this.sharesAction = rows.length ? `${rows.length} listing${rows.length === 1 ? "" : "s"} of ships we hold, none worth buying` : `no listing of a ship we hold (${m.holdings.filter((h) => !h.sunk && h.sixty > 0).length} held)`;
+      return;
+    }
+    const { l, h } = best;
+    const total = l.price_per_64th_pence * l.sixty_fourths;
+    const region = l.banking_region;
+    const res = await this.withCash(async () => {
+      if (this.stopRequested || !this.settings.shipShares) return null;
+      const cash = await this.avenueCash(region, total, `${l.sixty_fourths} 64ths of "${l.ship_name}"`);
+      if (cash !== true) return cash;
+      m.pending = { kind: "buy", shipId: l.ship_id, listingId: l.id, sixty: l.sixty_fourths, price: l.price_per_64th_pence, region, at: Date.now(), before: h.sixty };
+      this.persist(true);
+      await this.journal?.flush();
+      try {
+        return await this.client.buyShares(l.id);
+      } catch (e) {
+        const unknown = outcomeUnknown(e);
+        if (!unknown) m.pending = null;
+        this.persist(true);
+        if (this.isFatal(e) || isApiError(e, "world_paused")) throw e;
+        return unknown ? `no answer (${(e as Error).message}): read back from our holdings, never sent again` : `refused: ${(e as Error).message}`;
+      }
+    });
+    if (res === null) return;
+    if (typeof res === "string") {
+      this.sharesAction = `buying ${l.sixty_fourths} 64ths of "${l.ship_name}": ${res}`;
+      this.log("fleet", `ship shares: buying ${l.sixty_fourths} 64ths of "${l.ship_name}" for ${cr(total)}: ${res}`);
+      return;
+    }
+    m.pending = null;
+    this.shareBought(h, l.sixty_fourths, l.price_per_64th_pence, region);
+    h.sixty += l.sixty_fourths;
+    this.sharesAction = `bought ${l.sixty_fourths} 64ths of "${l.ship_name}"`;
+    this.log("fleet", `ship shares: bought ${l.sixty_fourths} 64ths of "${l.ship_name}" for ${cr(total)} (${cr(l.price_per_64th_pence)} each; the dividends a 64th of her paid us, as we sampled them, pay it back in ~${best.payback.toFixed(1)} game days)`);
+    this.persist(true);
+  }
+
+  /** Ship shares for the panel. */
+  private sharesReport(): SharesReport {
+    const s = this.settings;
+    const m = this.shareMem;
+    const now = this.world.now();
+    const day = this.gameDayMs;
+    return {
+      enabled: s.shipShares,
+      budgetPence: s.sharesBudgetPence,
+      investedPence: m.holdings.filter((h) => !h.sunk).reduce((n, h) => n + h.costPence, 0),
+      blocked: this.sharesBlocked,
+      action: this.sharesAction,
+      checkedAt: this.sharesAt,
+      holdings: m.holdings.map((h) => {
+        const rate = earnRate(h, now, day);
+        const ours = rate !== null ? Math.round(rate * h.sixty) : null;
+        return {
+          shipId: h.shipId,
+          ship: h.ship,
+          sixtyFourths: h.sixty,
+          costPence: h.costPence,
+          dividendsPence: h.dividends,
+          ourEarnPerDayPence: ours,
+          yieldBpsPerDay: ours !== null && h.costPence > 0 && h.boughtSixty > 0 ? Math.round(((ours * Math.min(1, h.boughtSixty / Math.max(1, h.sixty))) / h.costPence) * 10_000) : null,
+          sunk: h.sunk,
+          listing: h.listing ? { pricePer64thPence: h.listing.price, sixtyFourths: h.listing.sixty, step: h.listing.step + 1, since: new Date(h.listing.at).toISOString() } : null,
+          verdict: h.sunk ? "sunk: worthless" : h.listing ? "listed for sale" : collapsed(h.samples, now, day) ? "no dividend lately" : rate === null ? "sampling her dividends" : "holding",
+        };
+      }),
+      candidates: this.shareCands,
+      stats: { ...m.stats },
+      recent: [...m.recent],
+    };
   }
 
   // ── Letters of marque ───────────────────────────────────────────────────────
@@ -10507,7 +16539,9 @@ export class FleetManager implements FleetHost {
         const home = this.homeRegion ?? "channel";
         let committed = 0;
         for (const a of this.agents.values()) committed += this.committedBy(a);
-        if (this.spareCash() - committed - this.debtFence() < q.cost_pence || world.vault(home) - this.floorIn(home) < q.cost_pence) return `no spare cash for a ${cr(q.cost_pence)} marque`;
+        // Our deposits at healthy banks and our line's unlent room count (spendable); ours at home come back for it (regionSpare).
+        if (this.spendable(committed) < q.cost_pence || (await this.regionSpare(home, q.cost_pence)) < q.cost_pence) return `no spare cash for a ${cr(q.cost_pence)} marque`;
+        await this.freeLineFor(q.cost_pence, committed, "a letter of marque");
         try {
           const m = await client.issueMarque({ sea_zone_id: pick.zone, added_piracy_bps: q.added_piracy_bps, duration_game_hours: MARQUE_GAME_HOURS });
           const region = m.banking_region ?? home;
@@ -10715,7 +16749,9 @@ export class FleetManager implements FleetHost {
     const home = this.homeRegion ?? "channel";
     let committed = 0;
     for (const a of this.agents.values()) committed += this.committedBy(a);
-    if (this.spareCash() - committed - this.debtFence() < cost || this.world.vault(home) - this.floorIn(home) < cost) return `no spare cash for a ${cr(cost)} ${what}`;
+    // Our deposits at healthy banks and our line's unlent room count (spendable); ours at home come back for it (regionSpare).
+    if (this.spendable(committed) < cost || (await this.regionSpare(home, cost)) < cost) return `no spare cash for a ${cr(cost)} ${what}`;
+    await this.freeLineFor(cost, committed, `a ${what}`);
     return null;
   }
 
@@ -10903,7 +16939,8 @@ export class FleetManager implements FleetHost {
       const home = this.homeRegion ?? "channel";
       let committed = 0;
       for (const a of this.agents.values()) committed += this.committedBy(a);
-      if (this.spareCash() - committed - this.debtFence() < cost || world.vault(home) - this.floorIn(home) < cost) return wait(`no spare ${cr(cost)} at home after the fleet's loads and our loans`);
+      // Our deposits at healthy banks and our line's unlent room count (spendable); ours at home come back for it (regionSpare).
+      if (this.spendable(committed) < cost || (await this.regionSpare(home, cost)) < cost) return wait(`no spare ${cr(cost)} at home after the fleet's loads and our loans`);
       // A patrol: where our ships carry contraband may have changed while this waited (guide 3.18: its search may take our own ship).
       if (o.kind === "patrol") {
         const smuggle = this.smugglingZones();
@@ -10918,6 +16955,8 @@ export class FleetManager implements FleetHost {
           return 0;
         }
       }
+      // Our line comes down first if this needs its room.
+      await this.freeLineFor(cost, committed, label);
       // Saved, and written, before the call: after a crash it is never sent twice.
       this.advisor.noteNaval(o.id, { status: "issuing", sentAt: world.now(), bps, gameHours: hours, costPence: cost, code: undefined });
       await this.journal?.flush();
@@ -11077,11 +17116,13 @@ export class FleetManager implements FleetHost {
           await world.refreshVaults();
           let committed = 0;
           for (const a of this.agents.values()) committed += this.committedBy(a);
-          // Never what our loans will take to repay.
-          if (this.spareCash() - committed - this.debtFence() < r.collateral) return false;
-          // The docs don't say which region's vault the collateral leaves: each candidate keeps its floor.
+          // Never what our loans will take to repay (our deposits at healthy banks and our line's unlent room count: spendable).
+          if (this.spendable(committed) < r.collateral) return false;
+          // The docs don't say which region's vault the collateral leaves: each candidate keeps its floor (our deposits there brought
+          // back first: regionSpare). Our line comes down first if the slice needs its room.
           const home = this.homeRegion ?? "channel";
-          for (const reg of new Set([home, world.region(r.origin)])) if (world.vault(reg) - this.floorIn(reg) < r.collateral) return false;
+          for (const reg of new Set([home, world.region(r.origin)])) if ((await this.regionSpare(reg, r.collateral)) < r.collateral) return false;
+          await this.freeLineFor(r.collateral, committed, `underwriting ${r.lane}`);
           try {
             await client.underwrite({ policy_id: r.policy, slice_bps: r.sliceBps });
             this.log("fleet", `underwrote ${r.sliceBps / 100}% of ${r.lane} (${r.cover}, ${r.premiumBps} bps): ${cr(r.collateral)} collateral for ${cr(r.premiumShare)} premium`);
@@ -11172,10 +17213,9 @@ export class FleetManager implements FleetHost {
     try {
       // Unreadable is not empty: a guess here could buy twice or set the lease below what it is.
       const wh = await this.client.warehouse(yard);
-      const held = (good: string) => {
-        const i = wh.inventory.find((x) => x.commodity_id === good);
-        return i ? Math.max(0, i.quantity - i.locked_quantity) : 0;
-      };
+      // Materials held there for a component's make or our research prototype (reservedMaterials) aren't the build's: the build takes
+      // its own on top, so theirs are still there after it.
+      const held = this.freeHeld(wh, this.reservedMaterials(yard));
       const want = q.materials.map((m) => ({ m, qty: Math.max(0, m.quantity - held(m.commodity_id)) })).filter((x) => x.qty > 0);
       if (want.length === 0) return { ok: true, spent, why: "", leaseBefore };
       const need = wh.used_tonnage + wh.reserved_tonnage + want.reduce((n, x) => n + x.qty, 0);
@@ -11401,17 +17441,18 @@ export class FleetManager implements FleetHost {
     // A build whose outcome is unknown may yet turn up (scanShips): never a second hull on top of it.
     const pending = this.pendingBuild;
     if (pending) return say(`watching for the ${pending.cls} "${pending.name}" whose ${pending.shipId ? "purchase" : "build"} at ${pending.yard} had no answer`, "waiting", "unknown_outcome");
-    if (this.agents.size >= settings.maxShips) return say(`fleet at the ${settings.maxShips}-ship limit`, "unmet", "fleet_full");
+    if (this.shipsAfloat() >= settings.maxShips) return say(`fleet at the ${settings.maxShips}-ship limit`, "unmet", "fleet_full");
     const aiHold = this.advisor.buyHold();
     if (aiHold) return this.setBuyer(`AI: holding cash (${aiHold.slice(0, 160)})`);
     // Season end (guide 3.11): a hull must pay back before it; close to it, none is built (nor a factor hired).
     const seasonMs = world.seasonLeftMs();
     if (seasonMs < SEASON_ENDGAME_MS) return say(`the season ends in ~${Math.max(0, Math.round(seasonMs / 3_600_000))} h: no new hulls`, "unmet", "season");
     const seasonHours = seasonMs / 3_600_000;
-    // Never a packet (guide 3.11: a 16 t courier that can seal its dispatches): it carries almost no cargo, so it never pays as a trader.
+    // Never a packet here (guide 3.11: a 16 t courier that can seal its dispatches): it carries almost no cargo, so it never pays as a
+    // trader. The news-packet avenue (runNews, buildPacket) builds one, on Lloyd's desk's figures, under these same rules.
     const courier = (c: CatalogShipClass) => c.can_seal_dispatches || c.id === "packet";
     const ordered = order ? world.shipClass(order.cls) : undefined;
-    if (ordered && courier(ordered)) return say(`a ${ordered.id} is a courier, never built by the autopilot`, "refused", "class");
+    if (ordered && courier(ordered)) return say(`a ${ordered.id} is a courier, never built as a trader (the news-packet avenue builds one when Lloyd's desk pays for it)`, "refused", "class");
     const classes = world.catalog.ship_classes.filter((c) => (order ? c.id === order.cls : settings.buyClasses.includes(c.id)) && c.phase <= world.unlockedPhase && !courier(c));
     if (classes.length === 0) return say(order ? `a ${order.cls} can't be built in this phase` : "no allowed hull class can be built in this phase", "refused", "class");
     if ([...this.agents.values()].some((a) => a.waitingForCash)) return say("a ship is waiting for cash to load: not buying", "waiting", "cash");
@@ -11420,10 +17461,11 @@ export class FleetManager implements FleetHost {
 
     await world.refreshVaults();
     // Cash the existing fleet still needs for loads it is bound to buy comes first (loads sized on
-    // cash due included: cash due never funds a hull), and what our loans will take to repay.
+    // cash due included: cash due never funds a hull), and what our loans will take to repay. Our deposits
+    // at healthy banks and our lending line's unlent room count as cash (spendable: they come back for the build).
     let committed = 0;
     for (const a of this.agents.values()) committed += this.committedBy(a);
-    const loose = this.spareCash() - committed - this.debtFence();
+    const loose = this.spendable(committed);
     // Close to a new phase: part of it stays in hand for the new tier's charters.
     const chest = this.phaseSoon() ? Math.max(0, Math.round((loose * settings.phaseChestPct) / 100)) : 0;
     const spare = loose - chest;
@@ -11860,9 +17902,10 @@ export class FleetManager implements FleetHost {
       await world.refreshVaults();
       let committedNow = 0;
       for (const a of this.agents.values()) committedNow += this.committedBy(a);
-      // Our own cash for it: after the fleet's loads, the share kept back and what our loans will take to repay.
+      // Our own cash for it: after the fleet's loads, the share kept back and what our loans will take to repay (our deposits at
+      // healthy banks and our lending line's unlent room counted: spendable; they come back below, before anything is borrowed).
       const fence = this.debtFence();
-      const avail = this.spareCash() - committedNow - pick.upkeepFloor - chest - fence;
+      const avail = this.spendable(committedNow) - pick.upkeepFloor - chest;
       // Planned on a mortgage: never when our own cash now covers the hull and its first load; otherwise its terms afresh
       // (the switch, leverage's gates, one owed meanwhile, the debt cap, its case on the hull's net).
       if (pick.mortgage && avail >= price + pick.lane.capital && (pick.cost - pick.hull + price) / pick.net <= this.settings.maxPaybackHours) {
@@ -11894,6 +17937,7 @@ export class FleetManager implements FleetHost {
         // Her guns too (the plan's mCost counted them): her first yard stay mounts them (refitGuns) past the installments' fence.
         const need = cashIn + pick.guns * GUN_PRICE_PENCE + MORTGAGE_FENCED_INSTALLMENTS * mort.installment;
         if (avail < need) {
+          this.noteSpendShort(need);
           return failLater(
             `after the fleet's loads${chest > 0 ? " and the cash kept for the next phase" : ""}${fence > 0 ? " and what our loans will take to repay" : ""} there is no longer ${cr(need)} spare for our part of a mortgaged ${pick.cls} and its first installments`,
             "cash",
@@ -11913,13 +17957,19 @@ export class FleetManager implements FleetHost {
         });
         if ("why" in got) return failLater(`a ${pick.cls} at ${pick.yard} needs a loan of ${cr(principal)}: none taken (${got.why})`, "cash");
       } else if (avail < price) {
+        this.noteSpendShort(price);
         return failLater(
           `after the fleet's loads${chest > 0 ? " and the cash kept for the next phase" : ""}${fence > 0 ? " and what our loans will take to repay" : ""} there is no longer ${cr(price)} spare for a ${pick.cls}`,
           "cash",
         );
       }
+      // Our lending line's room, if the build needs it, is withdrawn first; our deposits come back in ensureCash.
+      await this.freeLineFor((mort ? cashIn + pick.guns * GUN_PRICE_PENCE + MORTGAGE_FENCED_INSTALLMENTS * mort.installment : cashIn) + pick.upkeepFloor + chest, committedNow, purpose);
       const cash = await this.ensureCash(region, cashIn);
-      if (cash < cashIn) return failLater(`could not raise ${cr(cashIn)} in ${region} for a ${pick.cls}`, "cash");
+      if (cash < cashIn) {
+        this.noteSpendShort(cashIn);
+        return failLater(`could not raise ${cr(cashIn)} in ${region} for a ${pick.cls}`, "cash");
+      }
       // Own materials: buy what the warehouse here lacks, then build from it (never on a mortgage: turnkey only).
       let mode: "byom" | "turnkey_cash" = "turnkey_cash";
       if (byom && !mort) {
@@ -12122,10 +18172,19 @@ export class FleetManager implements FleetHost {
       await w.refreshVaults();
       let committedNow = 0;
       for (const a of this.agents.values()) committedNow += this.committedBy(a);
-      const avail = this.spareCash() - committedNow - pick.upkeepFloor - chest - this.debtFence();
-      if (avail < l.price_pence) return failLater(`after the fleet's loads and what our loans will take to repay there is no longer ${cr(l.price_pence)} spare for ${what}`, "cash");
+      // Our deposits at healthy banks and our lending line's unlent room count (spendable): the line comes down first if she needs
+      // its room, our deposits come back in ensureCash.
+      const avail = this.spendable(committedNow) - pick.upkeepFloor - chest;
+      if (avail < l.price_pence) {
+        this.noteSpendShort(l.price_pence);
+        return failLater(`after the fleet's loads and what our loans will take to repay there is no longer ${cr(l.price_pence)} spare for ${what}`, "cash");
+      }
+      await this.freeLineFor(l.price_pence + pick.upkeepFloor + chest, committedNow, what);
       const cash = await this.ensureCash(region, l.price_pence);
-      if (cash < l.price_pence) return failLater(`could not raise ${cr(l.price_pence)} in ${region} for ${what}`, "cash");
+      if (cash < l.price_pence) {
+        this.noteSpendShort(l.price_pence);
+        return failLater(`could not raise ${cr(l.price_pence)} in ${region} for ${what}`, "cash");
+      }
       try {
         return await this.client.buyShip(l.id);
       } catch (e) {
@@ -12556,7 +18615,12 @@ export class FleetManager implements FleetHost {
       let committed = 0;
       for (const a of this.agents.values()) committed += this.committedBy(a);
       const need = cost + c.collateral_pence;
-      if (this.spareCash() - committed - this.debtFence() < need || (await this.ensureCash(region, need)) < need) {
+      // Our deposits at healthy banks and our lending line's unlent room count (spendable): the line comes down first if the build
+      // needs its room, our deposits come back in ensureCash.
+      const enough = this.spendable(committed) >= need;
+      if (enough) await this.freeLineFor(need, committed, what);
+      if (!enough || (await this.ensureCash(region, need)) < need) {
+        this.noteSpendShort(need);
         this.dealsAction = `${what}: no ${cr(need)} spare in ${region} for the build and the collateral after the fleet's loads`;
         if (plan.order) this.noteFinance(plan.order, "waiting", "cash", this.dealsAction);
         return;
@@ -12796,6 +18860,9 @@ export class FleetManager implements FleetHost {
           if (prev && now - prev[1].at < ENVELOPE_EVERY_GAME_H * hourMs) continue;
           const freed = prev ? 1 : 0;
           if (ours - freed >= ENVELOPE_MAX_OPEN || total - freed >= ENVELOPE_GAME_CAP) continue;
+          // Never ordinary news where a sealed packet of ours lies (guide 3.11: our crews' reports there are sealed with it, and hers are
+          // the news packet's to sell to Lloyd's at her own price: news.ts).
+          if (kind === "news" && this.sealedPacketAt(port)) continue;
           const plan = kind === "news" ? this.newsPlan(port) : this.chartersPlan(port);
           if (!plan) continue;
           // The one it supersedes comes off first: still listed (its withdrawal failed), no new one goes up beside it.
@@ -12839,9 +18906,12 @@ export class FleetManager implements FleetHost {
         this.log("fleet", `the envelope at ${p.port} whose post had no answer was listed after all`);
       }
       if (rec.status !== "sold" && e.status === "sold") {
-        this.dealStats.envelopesSold++;
-        this.dealStats.envelopeIncome += e.price_pence;
-        this.log("fleet", `sold sealed news at ${rec.port} for ${cr(e.price_pence)} (${e.title})`);
+        if (rec.kind === "packet") this.noteNewsSale(rec.port, e.price_pence, e.title);
+        else {
+          this.dealStats.envelopesSold++;
+          this.dealStats.envelopeIncome += e.price_pence;
+          this.log("fleet", `sold sealed news at ${rec.port} for ${cr(e.price_pence)} (${e.title})`);
+        }
       }
       rec.status = e.status;
       rec.seen = Date.now();
@@ -12881,7 +18951,7 @@ export class FleetManager implements FleetHost {
       categories.push("sailings");
       items.push({ kind: "sailings", n: sailings.length, ageGameH: sailings.reduce((n, t) => n + (now - t), 0) / sailings.length / hourMs });
     }
-    return categories.length ? { categories, price: envelopePrice(items) } : null;
+    return categories.length ? { categories, price: this.ordinaryPrice(envelopePrice(items)) } : null;
   }
 
   /**
@@ -12897,7 +18967,7 @@ export class FleetManager implements FleetHost {
     const goods = [...new Set(live.map((c) => c.good))].filter((g) => !worked.has(g));
     if (!goods.length) return null;
     const n = live.filter((c) => goods.includes(c.good)).length;
-    return { categories: ["charters"], goods, price: envelopePrice([{ kind: "charters", n, ageGameH: 0 }]) };
+    return { categories: ["charters"], goods, price: this.ordinaryPrice(envelopePrice([{ kind: "charters", n, ageGameH: 0 }])) };
   }
 
   /** Goods the fleet is working: its lanes (and the charters they fill), its holds, the best lanes, charter reservations, postings let lapse. */
@@ -12932,7 +19002,7 @@ export class FleetManager implements FleetHost {
    * Seals and lists one envelope (envelope/post): saved as sent first (one with no answer is found in envelope/mine, never
    * posted blind again). Refused (a section empty after all, our cap, presence gone): that port and kind rest a while.
    */
-  private async postEnvelope(port: string, kind: "news" | "charters", plan: { categories: EnvelopeCategory[]; price: number; goods?: string[] }): Promise<boolean> {
+  private async postEnvelope(port: string, kind: EnvelopeRec["kind"], plan: { categories: EnvelopeCategory[]; price: number; goods?: string[]; ports?: string[] }): Promise<boolean> {
     const w = this.world;
     const pend: PendingEnvelope = { port, kind, price: plan.price, at: w.now() };
     this.pendingEnvelopes.push(pend);
@@ -12944,7 +19014,9 @@ export class FleetManager implements FleetHost {
         price_pence: plan.price,
         categories: plan.categories,
         commodity_ids: plan.goods ?? null,
-        expires_in_game_hours: ENVELOPE_LIFE_GAME_H,
+        // The news packet's: only the other ports' reports she carries (news.ts), and a short life (the house's price falls fast).
+        ...(plan.ports?.length ? { report_port_ids: plan.ports } : {}),
+        expires_in_game_hours: kind === "packet" ? NEWS_LIFE_GAME_H : ENVELOPE_LIFE_GAME_H,
       });
       this.pendingEnvelopes = this.pendingEnvelopes.filter((x) => x !== pend);
       this.envelopeRecs.set(e.id, {
@@ -12971,7 +19043,7 @@ export class FleetManager implements FleetHost {
         return false;
       }
       this.dealSkip.set(`envelope|${port}|${kind}`, Date.now() + ENVELOPE_EVERY_GAME_H * 60 * w.gameMinuteMs);
-      this.logOnceFor(`envelope-refused|${port}|${kind}|${isApiError(e) ? e.status : "?"}`, "fleet", `listing sealed ${kind === "news" ? "news" : "charter news"} at ${port} was refused: ${msg}`);
+      this.logOnceFor(`envelope-refused|${port}|${kind}|${isApiError(e) ? e.status : "?"}`, "fleet", `listing sealed ${kind === "news" ? "news" : kind === "packet" ? "news from our packet" : "charter news"} at ${port} was refused: ${msg}`);
       return false;
     }
   }
@@ -13015,7 +19087,7 @@ export class FleetManager implements FleetHost {
       openEnvelopes: [...this.envelopeRecs]
         .filter(([, r]) => r.status === "open")
         .sort((a, b) => b[1].at - a[1].at)
-        .map(([id, r]) => ({ id, port: r.port, kind: r.kind, pricePence: r.price, createdAt: iso(r.at) ?? "", expiresAt: iso(r.expiresAt) })),
+        .flatMap(([id, r]) => (r.kind === "packet" ? [] : [{ id, port: r.port, kind: r.kind, pricePence: r.price, createdAt: iso(r.at) ?? "", expiresAt: iso(r.expiresAt) }])),
       shipsBought: st.shipsBought,
       commissionsDelivered: st.commissionsDelivered,
       commissionNetPence: st.commissionNet,
@@ -13045,7 +19117,7 @@ export class FleetManager implements FleetHost {
     return {
       listings: (fresh(this.listingsSeen)?.rows ?? []).map((l) => ({ port: l.port, cls: l.cls, price: l.pricePence, build: l.buildPence, guns: l.guns })),
       commissions,
-      open: [...this.envelopeRecs.values()].filter((r) => r.status === "open").length,
+      open: [...this.envelopeRecs.values()].filter((r) => r.status === "open" && r.kind !== "packet").length,
       sold: st.envelopesSold,
       income: st.envelopeIncome,
       commissionNet: st.commissionNet,

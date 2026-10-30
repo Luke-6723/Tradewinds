@@ -97,7 +97,8 @@ export const REGIONS: readonly BankingRegion[] = ["channel", "north_sea", "balti
 
 const cr = (pence: number) => `${Math.round(pence / 100).toLocaleString("en-GB")} Cr`;
 
-export type RetireReason = "idle" | "obsolete";
+/** Why a ship is retired: dead weight (`idle`, `obsolete`), or a news packet given up (`news`: her envelopes didn't cover her upkeep; news.ts). */
+export type RetireReason = "idle" | "obsolete" | "news";
 
 /**
  * A ship the fleet is retiring (saved). `wanted`: judged dead weight, her fresh checks still to pass at her next turn in port;

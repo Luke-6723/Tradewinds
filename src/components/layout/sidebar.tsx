@@ -12,6 +12,7 @@ import {
   Building2Icon,
   CandlestickChartIcon,
   CrownIcon,
+  FlaskConicalIcon,
   Globe2Icon,
   HandCoinsIcon,
   HandshakeIcon,
@@ -56,6 +57,7 @@ const nav = [
     items: [
       { href: "/fleet", label: "Fleet", icon: ShipIcon },
       { href: "/ships-market", label: "Ship market", icon: StoreIcon },
+      { href: "/rnd", label: "R&D", icon: FlaskConicalIcon },
       { href: "/convoys", label: "Convoys", icon: ShipWheelIcon },
       { href: "/market", label: "Market", icon: BarChart3Icon },
       { href: "/monopolies", label: "Monopolies", icon: CrownIcon },

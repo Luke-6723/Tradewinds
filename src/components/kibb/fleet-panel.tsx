@@ -7,8 +7,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Empty, ErrorNote, Loading, Metrics, NativeSelect, Panel, Table } from "@/components/kibb/bits";
-import { MortgageBadge } from "@/components/kibb/finance-common";
+import { Empty, ErrorNote, Loading, Metrics, NativeSelect, Panel, Progress, Table } from "@/components/kibb/bits";
+import { MortgageBadge, regionName } from "@/components/kibb/finance-common";
 import { Segmented } from "@/components/kibb/naval-common";
 import type { AiMode, AiReport } from "@/lib/kibb/ai/advisor";
 import { useCatalog } from "@/hooks/use-catalog";
@@ -17,7 +17,26 @@ import { dash } from "@/lib/kibb/browser";
 import { fmtAgo, fmtBps, fmtCr, fmtDateTime, fmtIn, fmtTime, fmtTons } from "@/lib/kibb/format";
 import type { FleetView } from "@/lib/kibb/fleet-registry";
 import type { TimeUse } from "@/lib/kibb/fleet/agent";
-import type { DealsReport, FinanceLoanRow, FinanceReport, FleetSettings, GunPolicy, HousekeepingReport, PassengerReport, SmuggleReport } from "@/lib/kibb/fleet/manager";
+import type {
+  BankReport,
+  DealsReport,
+  DepositsReport,
+  EscortReport,
+  FinanceLoanRow,
+  FinanceReport,
+  FleetSettings,
+  GunPolicy,
+  HousekeepingReport,
+  NewsReport,
+  OurBankStatus,
+  PassengerReport,
+  PaxVoyagesReport,
+  RndReport,
+  SharesReport,
+  SmuggleReport,
+  VentureView,
+  VenturesReport,
+} from "@/lib/kibb/fleet/manager";
 import type { Lane } from "@/lib/kibb/fleet/planner";
 
 const TIME_PARTS: Array<{ key: keyof TimeUse; label: string; className: string }> = [
@@ -73,10 +92,24 @@ function SettingsForm({
   const [d, setD] = useState(settings);
   // What the form opened with: the diff is what the user changed here, not what changed elsewhere since.
   const [initial] = useState(settings);
-  const crField = (label: string, key: "reservePence" | "minMarginPence" | "underwriteBudgetPence" | "underwriteMaxPerPolicyPence") => (
+  const crField = (
+    label: string,
+    key:
+      | "reservePence"
+      | "minMarginPence"
+      | "underwriteBudgetPence"
+      | "underwriteMaxPerPolicyPence"
+      | "depositBudgetPence"
+      | "bankMinNetWorthPence"
+      | "bankLendingBudgetPence"
+      | "componentBudgetPence"
+      | "rndBudgetPence"
+      | "sharesBudgetPence",
+    disabled = false,
+  ) => (
     <div className="space-y-1">
       <Label>{label}</Label>
-      <Input type="number" min={0} value={d[key] / 100} onChange={(e) => setD({ ...d, [key]: Math.round(Number(e.target.value) * 100) })} />
+      <Input type="number" min={0} disabled={disabled} value={d[key] / 100} onChange={(e) => setD({ ...d, [key]: Math.round(Number(e.target.value) * 100) })} />
     </div>
   );
   return (
@@ -91,6 +124,22 @@ function SettingsForm({
           Object.entries(out).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(initial[k as keyof FleetSettings])),
         ) as Partial<FleetSettings>;
         if (patch.underwrite && !confirm(`Let the autopilot underwrite other companies' voyages, locking up to ${fmtCr(d.underwriteBudgetPence)} of collateral?`)) return;
+        if (
+          patch.runBank &&
+          !confirm(
+            `Let the autopilot charter a bank of ours once net worth reaches ${fmtCr(d.bankMinNetWorthPence)}? The charter costs a 10,000 Cr fee to the Crown that is ` +
+              "never refunded and ties up 50,000 Cr of our own funds. The autopilot never winds the bank down: that is yours, by hand, on the Banks page.",
+          )
+        )
+          return;
+        if (
+          patch.rndResearch &&
+          !confirm(
+            `Let the autopilot start research projects, up to ${fmtCr(d.rndBudgetPence)} each? A project draws a random design (it may disappoint), its start fee ` +
+              "is never refunded, and it costs upkeep every game day for two to three real days.",
+          )
+        )
+          return;
         if (
           patch.smuggling &&
           !confirm(
@@ -191,7 +240,14 @@ function SettingsForm({
         </label>
         <label className="flex items-center gap-1.5" title="Off here is off for Claude too: it may switch it off, never on">
           <input type="checkbox" checked={d.usePassengers} onChange={(e) => setD({ ...d, usePassengers: e.target.checked })} />
-          Offer spare hold to passengers on voyages we sail anyway (never a detour, a smuggler or an insured ship)
+          Offer spare hold to passengers on voyages we sail (never a smuggler or an insured ship)
+        </label>
+        <label
+          className="flex items-center gap-1.5"
+          title="On by default. Off: passengers only in the spare hold of voyages sailed anyway. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.passengerVoyages} disabled={!d.usePassengers} onChange={(e) => setD({ ...d, passengerVoyages: e.target.checked })} />
+          Passenger voyages (needs passengers): count waiting groups&apos; fares when choosing lanes, and sail a passage for fares alone where enough wait for one port (never sailed empty)
         </label>
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.byomBuilds} onChange={(e) => setD({ ...d, byomBuilds: e.target.checked })} />
@@ -200,6 +256,13 @@ function SettingsForm({
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.convoys} onChange={(e) => setD({ ...d, convoys: e.target.checked })} />
           Sail in convoys with our other ships when it pays
+        </label>
+        <label
+          className="flex items-center gap-1.5"
+          title="On by default. Only when the forming ship mounts guns and holds no policy; joiners admitted only when no slower than our slowest, a few at most. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.escortFees} disabled={!d.convoys} onChange={(e) => setD({ ...d, escortFees: e.target.checked })} />
+          Escort fees (needs convoys): open convoys we form with an armed ship to other companies&apos; ships for a fee per ton, our armed ships escorting
         </label>
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.rivalIntel} onChange={(e) => setD({ ...d, rivalIntel: e.target.checked })} />
@@ -216,6 +279,13 @@ function SettingsForm({
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={d.resizeLoads} onChange={(e) => setD({ ...d, resizeLoads: e.target.checked })} />
           Size each load again at its source with the cash there is then
+        </label>
+        <label
+          className="flex items-center gap-1.5"
+          title="On by default. One at a time; market goods only, sailed alone; only when our part beats loading alone by a margin; cancelled (stake back) before anything is bought if too little is raised. Off here is off for Claude too: it may switch it off, never on"
+        >
+          <input type="checkbox" checked={d.ventures} disabled={!d.resizeLoads} onChange={(e) => setD({ ...d, ventures: e.target.checked })} />
+          Commenda ventures (needs re-sizing at source): when cash limits a load and no loan is planned, raise outside capital for a bigger one
         </label>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -381,6 +451,46 @@ function SettingsForm({
           Off here is off for Claude too: it may switch either off, never on.
         </p>
       </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.deposits} onChange={(e) => setD({ ...d, deposits: e.target.checked })} />
+          Put cash the fleet doesn&apos;t need on demand deposit with healthy banks, for their interest (on by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most on deposit at once (Cr)", "depositBudgetPence", !d.deposits)}</div>
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.runBank} onChange={(e) => setD({ ...d, runBank: e.target.checked })} />
+          Run our own bank: exchange fees on drafts and one lending line (OFF by default: the charter&apos;s 10,000 Cr fee to the Crown is never
+          refunded, and it ties up 50,000 Cr of our own funds)
+        </label>
+        {initial.runBank && !d.runBank && (
+          <p className="text-warning-foreground text-xs">
+            Turning it off withdraws our lending line and exchange offers, but the bank stays chartered: winding it down is yours, by hand, on the{" "}
+            <Link href="/banks" className="underline">
+              Banks page
+            </Link>
+            .
+          </p>
+        )}
+        <div className="grid gap-3 sm:grid-cols-3">
+          {crField("Least net worth before chartering (Cr)", "bankMinNetWorthPence", !d.runBank)}
+          {crField("Most our lending line has out (Cr)", "bankLendingBudgetPence", !d.runBank)}
+        </div>
+        <p className="text-muted-foreground text-xs">
+          Deposits: cash that has had nothing to fund for 6 game hours, beyond the fleet&apos;s loads, loans and commissions, a buffer (25,000 Cr or
+          two game days of bills) and the next hull while the buyer may build, goes on demand deposit where it lies: only at banks open with
+          nothing overdue, reserves at the Crown&apos;s 20% and a rate above nothing that isn&apos;t mispriced, never our own; insured first, at most
+          2,500 Cr a bank unless it is insured with reserves twice the Crown&apos;s. Money on deposit at a healthy bank counts as cash: a spend takes
+          it back first (free in its own region, or by the bank&apos;s exchange when that beats the Crown&apos;s fee), and it never stops a loan. A bank
+          in trouble has ours asked back at once (what it can&apos;t pay is owed later and never counted as cash); everything comes back when a ship
+          waits for cash, we owe on a dearer loan, or in the season&apos;s final hours. Deposits made by hand are never touched. Our bank: chartered
+          only with net worth at the bar, the fee, the funds and a buffer spare beyond the fleet&apos;s needs, and the season normal; deposit rates 0,
+          uninsured (no depositors&apos; money taken on purpose). It posts exchange fees 15% under the Crown&apos;s median into regions where our vault
+          keeps a clear surplus (never home), and one lending line (ship liens, balloon, 70% of the Goldsmiths&apos; rate, at most 50% loan-to-value
+          and 5,000 Cr a borrower, clean borrowers only); both are withdrawn when the fleet needs the cash, the line also whenever we owe on a loan.
+          A bank of ours that closed is chartered again only after you switch this off and on. Off here is off for Claude too: it may switch
+          either off or lower the budgets (the net-worth bar only raised), never more.
+        </p>
+      </div>
       <div className="col-span-full space-y-2 rounded-lg border border-destructive/50 bg-destructive/5 p-3">
         <label className="flex items-center gap-1.5 font-medium text-sm">
           <input
@@ -455,8 +565,17 @@ function SettingsForm({
           Ship deals: buy ships for sale for less than building them, and build commissions to order (on by default)
         </label>
         <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.shipShares} onChange={(e) => setD({ ...d, shipShares: e.target.checked })} />
+          Ship shares: buy more 64ths of other players&apos; ships we already hold when what they earn pays them back fast (on by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most paid for 64ths held at once (Cr)", "sharesBudgetPence", !d.shipShares)}</div>
+        <label className="flex items-center gap-1.5 text-sm">
           <input type="checkbox" checked={d.envelopes} onChange={(e) => setD({ ...d, envelopes: e.target.checked })} />
           Sell sealed news from our quays as intelligence envelopes (on by default)
+        </label>
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.newsPackets} onChange={(e) => setD({ ...d, newsPackets: e.target.checked })} />
+          News packet: run one packet as a courier, selling the ports&apos; reports she carries, when Lloyd&apos;s news desk buys enough to pay her way (on by default)
         </label>
         <p className="text-muted-foreground text-xs">
           With ship deals on, the buyer also looks at the ships for sale wherever a ship of yours (or a factor) is in port: one priced under
@@ -469,8 +588,44 @@ function SettingsForm({
           missed deadline forfeits the collateral). Never your own companies&apos; listings or commissions; your ships are never listed for sale.
           Envelopes: every 2 game hours at each of your quays, the port&apos;s coffee-house reports and sailing notices (only when none of
           yours is among them; and its non-public charters, only of goods the fleet isn&apos;t carrying, planning or letting lapse, withdrawn
-          once it works one) are sealed and listed at 5-20 Cr an item, halved for every 12 game hours of age (10 Cr at least), for 24 game
-          hours; unsold ones are withdrawn after 12. At most 16 open. Envelopes are never bought.
+          once it works one) are sealed and listed at 5-20 Cr an item, halved for every 12 game hours of age (10 Cr at least), never above what
+          envelopes sell for at the desk, for 24 game hours; unsold ones are withdrawn after 12. At most 16 open. Envelopes are never bought.
+          Ship shares: nothing public shows a ship&apos;s earnings, so only ships we already hold 64ths of (a holding bought by hand is where it
+          starts) are bought more of, when the dividends a 64th of her paid us, over ten game days or more of our holdings, pay the listing back within
+          20 game days; never our own ships, at most 8 64ths of one ship. 64ths the autopilot bought of a ship that paid no dividend for 10 game days
+          are listed for sale down a short ladder. News packet: when one packet&apos;s share of what Lloyd&apos;s news desk spends beats her upkeep and
+          pays her hull back within the payback setting, one packet is built under the buyer&apos;s rules (or one of ours afloat is taken); she seals
+          her dispatches, shuttles between the hubs and posts one envelope of the newer reports she carries at each, and is sold down the ship
+          broker&apos;s ladder if 3 game days after her first envelope her sales don&apos;t cover her upkeep (then no packet for 6 real hours, nor that season unless the desk&apos;s spend doubles). Off here is off for Claude too: it may switch either off or
+          lower the shares budget, never more.
+        </p>
+      </div>
+      <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.components} onChange={(e) => setD({ ...d, components: e.target.checked })} />
+          Components: fit one at a yard call when it clearly pays (on by default)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most on components in any 24 h (Cr)", "componentBudgetPence", !d.components)}</div>
+        <label className="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" checked={d.rndResearch} onChange={(e) => setD({ ...d, rndResearch: e.target.checked })} />
+          Research: start R&amp;D projects for designs of our own (OFF by default: a project draws a random design, its start fee is never refunded,
+          and it costs upkeep every game day for two to three real days)
+        </label>
+        <div className="grid gap-3 sm:grid-cols-3">{crField("Most one project may cost (Cr)", "rndBudgetPence", !d.rndResearch)}</div>
+        <p className="text-muted-foreground text-xs">
+          Components: only berthed at a yard on her way (never a detour), once a stay before loading: one we made lying there, one of our
+          licences, our own patents or public designs whose make materials are known, or a unit bought on a licence offer, its materials bought
+          into our warehouse there. Effect words are read conservatively (any weakness or unreadable word: never fitted; sizes are small priors by
+          grade, or what our own fits measured), and her extra earnings over the season left (two weeks at most) must be twice the licence,
+          materials, labour and the 4% fitting fee. Fitting is permanent: never on an insured ship, a smuggler, one being retired or under a
+          venture. Research: only when the game allows a start, its whole expected cost (fee and upkeep) fits the budget and the season leaves time
+          to use the grant; given up when its cost would pass the budget by a quarter, its upkeep goes unpaid, or the season would end first. A
+          disappointing grant is made public at once (its upkeep stops); one worth having is kept and licensed out. Off here is off for Claude
+          too: it may switch either off or lower the budgets, never more. By hand on the{" "}
+          <Link href="/rnd" className="underline">
+            R&amp;D page
+          </Link>
+          .
         </p>
       </div>
       <div className="col-span-full space-y-2 rounded-lg border border-dashed p-3">
@@ -513,12 +668,14 @@ function SettingsForm({
 
 export function FleetPanel() {
   const { portName, goodName, shipClassName } = useCatalog();
-  // "rye flour + timber (sell) + freight", main good first.
+  // "rye flour + timber (sell) + freight + ~6 passengers", main good first; a passage for fares alone: "~12 passengers".
+  // (pax: absent from a manager older than passenger voyages)
   const loadText = (l: Lane) =>
     [
       ...(l.parts ?? []).map((p) => `${goodName(p.good)}${p.kind === "market" ? " (sell)" : ""}`),
       ...((l.freight ?? []).length ? ["freight"] : []),
-    ].join(" + ") || goodName(l.good);
+      ...(l.pax ? [`~${l.pax.heads} passengers${l.pax.dest !== l.dest ? ` for ${portName(l.pax.dest)}` : ""}`] : []),
+    ].join(" + ") || (l.kind === "passengers" ? "passengers" : goodName(l.good));
   const { data: view, error, reload } = usePoll(() => dash.get<FleetView>("/api/kibb/fleet"), 4_000);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -663,6 +820,12 @@ export function FleetPanel() {
               {fmtCr((st.finance.quotes ?? []).reduce((n, q) => n + q.principalPence, 0))} quoted on loan requests
             </span>
           )}
+          {st?.deposits && st.deposits.heldPence > 0 && (
+            <span title="Cash on demand deposit with other banks: it counts as cash, and a spend takes it back first">
+              {" · "}
+              {fmtCr(st.deposits.heldPence)} on deposit
+            </span>
+          )}
           {st?.cash && st.cash.duePence > 0 && (
             <span title="Cash pay due from our cargo at sea, at the share counted; loads bought after it lands may count on it">
               {" · "}
@@ -723,7 +886,7 @@ export function FleetPanel() {
             if (
               m === "live" &&
               !confirm(
-                `Let Claude steer the autopilot for its horizon: any setting within your ceilings (ship limit and budgets never above yours, the reserve only raised, borrowing and idle-cash lending never on while yours are off), ` +
+                `Let Claude steer the autopilot for its horizon: any setting within your ceilings (ship limit and budgets never above yours, the reserve and the bank's net-worth bar only raised, borrowing, lending, deposits, our bank and the other money avenues never on while yours are off), ` +
                   `bans on ports, zones, goods and charters, lane bias, stall calls, orders to single ships (a lane, a charter, a port, hold, release), ` +
                   `the ship buyer (hold, one build, classes forbidden), marques or patrols within your marque budget (${fmtCr(view.settings.marqueBudgetPence)} a day; an issued one can't be withdrawn), ` +
                   `money orders, and housekeeping orders (break up a ship, move the home port; never while yours are off)? ` +
@@ -840,8 +1003,13 @@ export function FleetPanel() {
                       <>
                         {laneText(a)}
                         <div className="text-muted-foreground">
-                          ~{fmtCr(a.lane.margin)}/t · ~{fmtCr(a.lane.profitPerHour)}/h
+                          {a.lane.kind === "passengers" ? "a passage for fares alone" : `~${fmtCr(a.lane.margin)}/t`} · ~{fmtCr(a.lane.profitPerHour)}/h
                         </div>
+                        {a.lane.pax && (
+                          <div className="text-muted-foreground" title="Expected fares (the odds of winning the round and of landing counted), in the lane's profit; the offer itself goes up at sail time">
+                            ~{fmtCr(a.lane.pax.value)} in fares counted ({fmtCr(a.lane.pax.perHead)} a head)
+                          </div>
+                        )}
                         {a.lane.resizedFrom !== undefined && a.lane.resizedFrom !== a.lane.tons && (
                           <div className="text-muted-foreground">
                             re-sized at source: {fmtTons(a.lane.resizedFrom)} → {fmtTons(a.lane.tons)}
@@ -909,11 +1077,35 @@ export function FleetPanel() {
 
         {st?.finance && <FinanceView f={st.finance} maxDebtPct={view.settings.maxDebtPct} shipName={(id) => agents.find((a) => a.shipId === id)?.name ?? id.slice(0, 8)} />}
 
+        {/* The money avenues below are absent from older managers: each renders only with its report. */}
+        {st?.deposits && (st.deposits.enabled || st.deposits.deposits.length > 0 || st.deposits.depositsMade > 0 || st.deposits.owedLaterPence > 0) && (
+          <DepositsView d={st.deposits} />
+        )}
+
+        {st?.bank && (st.bank.enabled || st.bank.status !== "none" || st.bank.lines.length > 0 || st.bank.warnings.length > 0) && <BankView b={st.bank} />}
+
         {st?.deals && <DealsView d={st.deals} />}
+
+        {st?.news && (st.news.enabled || !!st.news.courier || st.news.stats.posted > 0 || !!st.news.givenUp) && <NewsView n={st.news} />}
+
+        {st?.shares && (st.shares.enabled || st.shares.holdings.length > 0 || st.shares.stats.bought > 0) && <SharesView s={st.shares} />}
 
         {st?.passengers && (st.passengers.enabled || st.passengers.earnedPence > 0 || st.passengers.aboard.length > 0 || st.passengers.offers.length > 0) && (
           <PassengersView p={st.passengers} />
         )}
+
+        {st?.passengerVoyages && (st.passengerVoyages.enabled || st.passengerVoyages.chosen > 0 || st.passengerVoyages.recent.length > 0) && (
+          <PaxVoyagesView v={st.passengerVoyages} />
+        )}
+
+        {st?.ventures && (st.ventures.enabled || !!st.ventures.active || st.ventures.recent.length > 0) && <VenturesView v={st.ventures} />}
+
+        {st?.escort && (st.escort.enabled || st.escort.open.length > 0 || st.escort.stats.offered > 0 || st.escort.recent.length > 0) && <EscortView e={st.escort} />}
+
+        {st?.rnd &&
+          (st.rnd.components.enabled || st.rnd.research.enabled || st.rnd.components.fits.length > 0 || !!st.rnd.components.job || !!st.rnd.research.project || st.rnd.research.patents.length > 0 || st.rnd.research.grants.length > 0) && (
+            <RndView r={st.rnd} />
+          )}
 
         {st?.housekeeping && <HousekeepingView h={st.housekeeping} />}
 
@@ -948,13 +1140,25 @@ export function FleetPanel() {
                       <td className="text-xs">
                         <div className="font-medium text-sm">{loadText(l)}</div>
                         {l.speculative && <Badge variant="info" size="sm" className="mr-1">crisis charter expected</Badge>}
+                        {l.kind === "passengers" && (
+                          <Badge variant="info" size="sm" className="mr-1" title="A passage for passengers waiting there: never sailed empty if nobody boards">
+                            fares alone
+                          </Badge>
+                        )}
                         {portName(l.source)} → {portName(l.dest)}
                         {l.next && <div className="text-muted-foreground">then {l.next}</div>}
                       </td>
-                      <td className="tabular-nums">{fmtTons(l.tons)}</td>
+                      <td className="whitespace-nowrap tabular-nums">{l.kind === "passengers" ? `~${l.pax?.heads ?? 0} heads` : fmtTons(l.tons)}</td>
                       <td className="whitespace-nowrap tabular-nums">
-                        {fmtCr(l.margin)}/t{!l.askKnown && <span className="text-muted-foreground"> est.</span>}
+                        {l.kind === "passengers" ? (
+                          <>~{fmtCr(l.pax?.value ?? 0)} fares</>
+                        ) : (
+                          <>
+                            {fmtCr(l.margin)}/t{!l.askKnown && <span className="text-muted-foreground"> est.</span>}
+                          </>
+                        )}
                         {l.bonus > 0 && <div className="text-muted-foreground text-xs">incl. {fmtCr(l.bonus)} bonus</div>}
+                        {l.pax && l.kind !== "passengers" && <div className="text-muted-foreground text-xs">+ ~{fmtCr(l.pax.value)} fares</div>}
                       </td>
                       <td className="text-muted-foreground tabular-nums" title="Expected share of the load lost to pirates, priced into the margin">
                         {fmtBps(l.piracyBps ?? 0)}
@@ -1710,6 +1914,710 @@ function HousekeepingView({ h }: { h: HousekeepingReport }) {
   );
 }
 
+/** "1 loan", "3 loans". */
+const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString("en-GB")} ${n === 1 ? one : many}`;
+
+/** A deposit rate (bps a game day) and what it comes to in a year (360 game days, simple). */
+const dayRate = (bps: number) => `${bps.toLocaleString("en-GB", { maximumFractionDigits: 2 })} bps/day (~${fmtBps(bps * 360)}/yr)`;
+
+/** Idle cash on demand deposit (guide 3.13.4; deposits.ts): ours by bank, the banks weighed, what was asked back. */
+function DepositsView({ d }: { d: DepositsReport }) {
+  const trouble = d.deposits.filter((x) => x.trouble);
+  const pulls = [...d.pulls].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Deposits: {fmtCr(d.heldPence)} on deposit (target {fmtCr(d.targetPence)}, budget {fmtCr(d.budgetPence)}) · interest ~{fmtCr(d.interestPence)}
+        {d.owedLaterPence > 0 && ` · ${fmtCr(d.owedLaterPence)} owed later by the banks`}
+        {d.pulledPence > 0 && ` · ${fmtCr(d.pulledPence)} taken back`}
+        {!d.enabled && " · off"}
+        {trouble.length > 0 && <span className="text-destructive">{` · ${plural(trouble.length, "deposit")} at a bank in trouble`}</span>}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        Last pass: {d.action}.{d.blocked ? ` No new deposit for now: ${d.blocked}.` : ""} {fmtCr(d.depositedPence)} deposited in {plural(d.depositsMade, "deposit")} since
+        the records began, {fmtCr(d.pulledPence)} taken back.{d.checkedAt ? ` Checked ${fmtAgo(d.checkedAt)}.` : ""}
+      </p>
+      {d.deposits.length > 0 && (
+        <Table head={["On deposit", "Balance", "Rate", "Insured", "Interest", "Bank's health"]} className="mt-2">
+          {d.deposits.map((x) => (
+            <tr key={x.id} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{x.bank}</div>
+                {regionName(x.region)}
+                {x.openedAt ? ` · opened ${fmtAgo(x.openedAt)}` : ""}
+                {!x.ours && <div className="text-muted-foreground">made by hand: never touched</div>}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(x.balancePence)}
+                {x.pendingWithdrawalPence > 0 && <div className="text-muted-foreground text-xs">{fmtCr(x.pendingWithdrawalPence)} asked back, owed later</div>}
+              </td>
+              <td className="whitespace-nowrap text-xs tabular-nums">{dayRate(x.rateBps)}</td>
+              <td className="text-xs">{x.insured === null ? "—" : x.insured ? "insured" : "uninsured"}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.interestPence)}</td>
+              <td className="text-xs">
+                {x.trouble ? (
+                  <>
+                    <Badge variant="destructive" size="sm">in trouble</Badge>
+                    <div className="text-muted-foreground">{x.trouble}</div>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">no trouble seen</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {d.banks.length > 0 && (
+        <Table head={["Bank", "Rate", "Deposits", "Reserves", "Room for ours", "Verdict"]} className="mt-2">
+          {d.banks.map((b) => (
+            <tr key={b.id} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{b.name}</div>
+                {b.insured ? "insured" : "uninsured"}
+              </td>
+              <td className="whitespace-nowrap text-xs tabular-nums">{dayRate(b.rateBps)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(b.depositsPence)}</td>
+              <td className={`whitespace-nowrap tabular-nums ${b.reservesPence < b.requiredPence ? "text-destructive" : ""}`}>
+                {fmtCr(b.reservesPence)}
+                <div className="text-muted-foreground text-xs">{fmtCr(b.requiredPence)} required</div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(b.roomPence)}</td>
+              <td className="text-muted-foreground text-xs">{b.verdict}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {pulls.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {pulls.map((p, i) => (
+            <li key={`${p.at}-${i}`}>
+              {fmtDateTime(p.at)}: asked {fmtCr(p.amountPence)} back from {p.bank} in {regionName(p.region)}
+              {p.to && p.to !== p.region ? ` into ${regionName(p.to)} (its exchange fee ${fmtCr(p.feePence)})` : ""}:{" "}
+              {p.paidPence === null ? "what came at once not known" : `${fmtCr(p.paidPence)} came at once`}
+              {p.owedPence > 0 ? `, ${fmtCr(p.owedPence)} owed later` : ""} ({p.why})
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Rates are bps a game day as each deposit was opened (a year is 360 game days). Money at a healthy bank counts as cash: a spend takes it
+        back first; what a bank can&apos;t pay at once (or owes from a bank that isn&apos;t open) is owed later and never counted as cash. Deposit or
+        withdraw by hand on the{" "}
+        <Link href="/banks" className="underline">
+          Banks page
+        </Link>
+        ; the autopilot never touches a deposit made by hand.
+      </p>
+    </details>
+  );
+}
+
+const BANK_STATUS: Record<OurBankStatus, { label: string; variant: "success" | "info" | "warning" | "destructive" | "secondary" }> = {
+  none: { label: "no bank", variant: "secondary" },
+  chartering: { label: "chartering", variant: "info" },
+  open: { label: "open", variant: "success" },
+  winding_down: { label: "winding down", variant: "warning" },
+  closed: { label: "closed", variant: "secondary" },
+  failed: { label: "failed", variant: "destructive" },
+};
+
+/** Our own bank (guide 3.13.4, 3.13.8, 3.12; bank.ts): the charter case or how it stands, exchange fees posted, drafts, the lending line. */
+function BankView({ b }: { b: BankReport }) {
+  const s = BANK_STATUS[b.status] ?? { label: String(b.status), variant: "secondary" as const };
+  const ours = b.lines.filter((l) => l.ours);
+  const out = ours.reduce((n, l) => n + l.outstandingPence + l.quotedPence, 0);
+  const room = ours.reduce((n, l) => n + l.remainingPence, 0);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Our bank: {s.label}
+        {b.drafts > 0 && ` · ${plural(b.drafts, "draft")} carried, ${fmtCr(b.draftFeesPence)} in fees`}
+        {b.fees.length > 0 && ` · exchange fees posted into ${plural(b.fees.length, "region")}`}
+        {ours.length > 0 && ` · lending line ${fmtCr(out)} out, ${fmtCr(room)} room`}
+        {b.loans.made > 0 && ` · ${plural(b.loans.made, "loan")} made, interest ~${fmtCr(b.loans.interestPence)}`}
+        {b.loans.defaults > 0 && <span className="text-destructive">{` · ${plural(b.loans.defaults, "default")}`}</span>}
+        {b.warnings.length > 0 && <span className="text-warning-foreground">{` · ${plural(b.warnings.length, "warning")}`}</span>}
+        {!b.enabled && " · running a bank off"}
+      </summary>
+      {b.warnings.length > 0 && (
+        <ul className="mt-2 space-y-0.5 rounded-md bg-warning/10 px-3 py-2 text-warning-foreground text-xs">
+          {b.warnings.map((w, i) => (
+            <li key={i}>{w}</li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        <Badge variant={s.variant} size="sm" className="mr-1">
+          {s.label}
+        </Badge>
+        {b.verdict}.{b.action !== b.verdict ? ` Last pass: ${b.action}.` : ""}
+        {b.checkedAt ? ` Checked ${fmtAgo(b.checkedAt)}.` : ""}
+      </p>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {b.charteredAt ? `Chartered ${fmtDateTime(b.charteredAt)}. ` : ""}
+        Net worth {b.netWorthPence === null ? "not known yet" : `~${fmtCr(b.netWorthPence)}`} against the {fmtCr(b.minNetWorthPence)} bar to charter (a
+        10,000 Cr fee to the Crown, never refunded, and 50,000 Cr of our own funds); lending budget {fmtCr(b.lendingBudgetPence)}.
+        {b.terms &&
+          ` Deposit terms: ${b.terms.demandRateBps} bps/day on demand, ${b.terms.noticeRateBps} bps/day at ${b.terms.noticeGameHours} game hours' notice, ${b.terms.insured ? "insured" : "uninsured"}.`}
+        {b.status !== "none" &&
+          ` Depositors hold ${fmtCr(b.depositsOwedPence)}${
+            b.owedByRegion.length ? ` (${b.owedByRegion.map((x) => `${regionName(x.region)} ${fmtCr(x.pence)}`).join(", ")}; kept out of spending there)` : ""
+          }; reserves ${fmtCr(b.reservesPence)} against ${fmtCr(b.requiredReservePence)} required${b.overdueWithdrawalsPence > 0 ? `; ${fmtCr(b.overdueWithdrawalsPence)} of withdrawals OVERDUE` : ""}.`}
+      </p>
+      {b.fees.length > 0 && (
+        <Table head={["Drafts into", "Our fee", "Crown's median"]} className="mt-2">
+          {b.fees.map((f) => (
+            <tr key={f.region}>
+              <td className="text-xs">{regionName(f.region)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtBps(f.feeBps)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtBps(f.crownMedianBps)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {b.lines.length > 0 && (
+        <Table head={["Lending line", "Terms", "Lent out", "Quoted", "Room left"]} className="mt-2">
+          {b.lines.map((l) => (
+            <tr key={l.id} className="align-top">
+              <td className="text-xs">
+                {l.regions.map(regionName).join(", ") || "—"}
+                <div className="text-muted-foreground">{l.ours ? "the autopilot's" : "posted by hand: never touched"}</div>
+              </td>
+              <td className="text-xs">
+                {fmtBps(l.ratePctBps)} of the Goldsmiths&apos; rate, at most {fmtBps(l.maxLtvBps)} of the pledge, {l.maxTermDays} game days
+                <div className="text-muted-foreground">
+                  {fmtCr(l.maxPerBorrowerPence)} a borrower · {fmtCr(l.maxLinePence)} in all
+                </div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(l.outstandingPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(l.quotedPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(l.remainingPence)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Loans our lines made: {b.loans.made} ({b.loans.active} running, {fmtCr(b.loans.outstandingPence)} owed us), {plural(b.loans.defaults, "default")}, interest
+        received ~{fmtCr(b.loans.interestPence)}.{b.feesChangedAt ? ` Exchange fees last changed ${fmtAgo(b.feesChangedAt)}.` : ""} A draft carries another
+        company&apos;s remittance for our fee (85% of the Crown&apos;s median into the region, 20 bps at least), paid out of our vault there. The
+        autopilot never winds the bank down or changes its deposit terms: that is yours, on the{" "}
+        <Link href="/banks" className="underline">
+          Banks page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+const PAX_OUTCOME: Record<string, { label: string; variant: "success" | "warning" | "secondary" | "outline" }> = {
+  planned: { label: "planned", variant: "secondary" },
+  sailed: { label: "sailed with them", variant: "success" },
+  unboarded: { label: "sailed without them", variant: "outline" },
+  given_up: { label: "given up: nobody boarded", variant: "warning" },
+};
+
+/** Passenger voyages (guide 3.20; voyages.ts): lanes chosen with waiting passengers' fares counted, passages for fares alone, what became of them. */
+function PaxVoyagesView({ v }: { v: PaxVoyagesReport }) {
+  const { portName } = useCatalog();
+  const recent = [...v.recent].reverse().slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Passenger voyages: {plural(v.chosen, "lane")} chosen with fares counted (~{fmtCr(v.expectedPence)} expected), {v.only} for fares alone · {v.sailed} sailed
+        with them aboard{v.givenUp > 0 ? `, ${v.givenUp} given up (nobody boarded)` : ""}
+        {!v.enabled && " · off"}
+        {v.enabled && v.blocked && " · blocked"}
+      </summary>
+      {v.blocked && <p className="mt-2 text-muted-foreground text-xs">No fares counted for now: {v.blocked}.</p>}
+      {recent.length > 0 && (
+        <Table head={["Voyage", "Passengers", "Fares expected", "Outcome"]} className="mt-2">
+          {recent.map((r, i) => {
+            const o = PAX_OUTCOME[r.outcome] ?? { label: String(r.outcome), variant: "secondary" as const };
+            return (
+              <tr key={`${r.shipId}-${r.at}-${i}`} className="align-top">
+                <td className="text-xs">
+                  <div className="font-medium text-sm">{r.ship}</div>
+                  {r.only ? "for fares alone" : "with cargo"} · for {portName(r.dest)}
+                  <div className="text-muted-foreground">{fmtAgo(r.at)}</div>
+                </td>
+                <td className="whitespace-nowrap text-xs tabular-nums">
+                  ~{r.heads} at {fmtCr(r.perHead)} a head
+                </td>
+                <td className="whitespace-nowrap tabular-nums">{fmtCr(r.valuePence)}</td>
+                <td className="text-xs">
+                  <Badge variant={o.variant} size="sm">
+                    {o.label}
+                  </Badge>
+                </td>
+              </tr>
+            );
+          })}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Where a ship lies with groups waiting, the planner counts the fares of those bound where her first passage goes that board whole in the
+        hold the cargo leaves (at the pricer&apos;s ask, times the odds of winning the round and of landing; the weight&apos;s extra sailing time
+        added): a cargo must still pay by itself. A passage for fares alone needs at least 4 heads and 500 Cr expected after the odds, the
+        hull&apos;s risk charged; nobody aboard once the round has passed and it is given up, never sailed empty. Never a smuggler, contraband
+        aboard, an insured ship or one being retired. Waiting groups cached now: {v.groupsCached} at {plural(v.portsCached, "port")}.
+      </p>
+    </details>
+  );
+}
+
+const VENTURE_STAGE: Record<string, string> = {
+  opening: "opening",
+  raising: "raising capital",
+  buying: "buying the load",
+  loaded: "under way",
+  selling: "selling at its port",
+  settling: "settling",
+  closed: "closed",
+};
+
+const VENTURE_OUTCOME: Record<string, "success" | "secondary" | "destructive" | "outline"> = {
+  settled: "success",
+  cancelled: "secondary",
+  not_opened: "outline",
+  lost: "destructive",
+  failed: "destructive",
+};
+
+/** Commenda ventures (guide 3.13.5; ventures.ts): the one under way, the last ones, capital raised from others, our profit. */
+function VenturesView({ v }: { v: VenturesReport }) {
+  const { portName, goodName } = useCatalog();
+  const st = v.stats;
+  const rows: VentureView[] = [...(v.active ? [v.active] : []), ...[...v.recent].reverse()].slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Ventures:{" "}
+        {v.active ? `${v.active.ship} ${VENTURE_STAGE[v.active.stage] ?? v.active.stage} (${portName(v.active.origin)} → ${portName(v.active.dest)})` : "none under way"}
+        {` · ${st.settled} settled, ${st.cancelled} cancelled${st.lost ? `, ${st.lost} lost` : ""}`}
+        {` · ${fmtCr(st.outsidePence)} raised from others · profit ${fmtCr(v.profitPence)}`}
+        {!v.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {v.blocked ? `No new venture for now: ${v.blocked}. ` : ""}The next offers investors {fmtBps(v.shareBps)} of the profit and expects outside
+        capital of ~{Math.round(v.outsideRatio * 100)}% of a hold&apos;s fill at catalog prices (both learned from what outsiders put in). {plural(st.opened, "venture")}{" "}
+        opened; outside capital {fmtCr(st.outsidePence)} (the Merchant Adventurers {fmtCr(st.maPence)}); our stakes {fmtCr(st.stakedPence)}, paid back{" "}
+        {fmtCr(st.payoutPence)} plus {fmtCr(st.merchantPence)} as the merchant&apos;s share.
+      </p>
+      {rows.length > 0 && (
+        <Table head={["Venture", "Capital", "Goods (bought / planned)", "Money", "State"]} className="mt-2">
+          {rows.map((x) => (
+            <tr key={`${x.shipId}-${x.openedAt}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{x.ship}</div>
+                {portName(x.origin)} → {portName(x.dest)}
+                <div className="text-muted-foreground">
+                  investors {fmtBps(x.shareBps)} of the profit · opened {fmtAgo(x.openedAt)}
+                </div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(x.capitalPence)}
+                <div className="text-muted-foreground text-xs">
+                  ours {fmtCr(x.stakePence)} · others {fmtCr(x.outsidePence)}
+                  {x.maPence > 0 ? ` (Merchant Adventurers ${fmtCr(x.maPence)})` : ""}
+                </div>
+              </td>
+              <td className="text-xs">{x.goods.length ? x.goods.map((g) => `${g.boughtTons} / ${fmtTons(g.plannedTons)} ${goodName(g.good)}`).join(", ") : "—"}</td>
+              <td className="whitespace-nowrap text-xs tabular-nums">
+                spent {fmtCr(x.spentPence)} · sold {fmtCr(x.proceedsPence)}
+                {(x.merchantSharePence !== null || x.stakePayoutPence !== null) && (
+                  <div className="text-muted-foreground">
+                    to us {fmtCr((x.merchantSharePence ?? 0) + (x.stakePayoutPence ?? 0))} ({fmtCr(x.merchantSharePence ?? 0)} merchant&apos;s share,{" "}
+                    {fmtCr(x.stakePayoutPence ?? 0)} on our stake)
+                  </div>
+                )}
+              </td>
+              <td className="text-xs">
+                {x.outcome ? (
+                  <Badge variant={VENTURE_OUTCOME[x.outcome] ?? "secondary"} size="sm">
+                    {x.outcome.replace(/_/g, " ")}
+                  </Badge>
+                ) : (
+                  <Badge variant="info" size="sm">
+                    {VENTURE_STAGE[x.stage] ?? x.stage}
+                  </Badge>
+                )}
+                {!x.outcome && x.stage === "raising" && x.buyAt && <div className="text-muted-foreground">buys {fmtIn(x.buyAt)}</div>}
+                {!x.outcome && x.raiseBy && <div className="text-muted-foreground">raising closes {fmtIn(x.raiseBy)}</div>}
+                {x.why && <div className="text-muted-foreground">{x.why}</div>}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Only where a load at its source is cut to the cash and no load loan was planned (a loan that pays always wins): a venture on the ship to
+        the lane&apos;s port, market goods only, nothing of ours aboard, sailed alone, not liened or insured, one at a time. Opened when our part of
+        the bigger load&apos;s profit beats loading alone by a margin; at the buy it is judged again on what was raised, and cancelled (our stake
+        back, the load bought as ever) before anything is bought if it no longer pays. Bought, sailed and sold through the venture, then settled.
+        Ventures by hand on the{" "}
+        <Link href="/ventures" className="underline">
+          Ventures page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Convoy escort fees (guide 3.10; escort.ts): our convoys open to others, requests decided, fees our escorts were paid. */
+function EscortView({ e }: { e: EscortReport }) {
+  const { portName } = useCatalog();
+  const st = e.stats;
+  const recent = [...e.recent].reverse().slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Escort fees: {fmtCr(st.feesPence)} earned in {plural(st.settlements, "settlement")} · {plural(st.offered, "convoy")} offered · {plural(st.approved, "joiner")}{" "}
+        admitted ({st.escortsApproved} as escorts), {st.rejected} turned away
+        {e.open.length > 0 && ` · ${e.open.length} forming now`}
+        {!e.enabled && " · off"}
+      </summary>
+      {e.blocked && <p className="mt-2 text-muted-foreground text-xs">No convoy offered to others for now: {e.blocked}.</p>}
+      {e.open.length > 0 && (
+        <Table head={["Convoy forming", "Fee", "Ships", "Fees in escrow", "Departs"]} className="mt-2">
+          {e.open.map((c) => (
+            <tr key={c.convoyId} className="align-top">
+              <td className="text-xs">
+                {portName(c.from)} → {portName(c.dest)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(c.feePerTonPence)}/t
+                {c.minSpeedCk ? <div className="text-muted-foreground text-xs">no slower than {(c.minSpeedCk / 100).toFixed(1)} kn</div> : null}
+              </td>
+              <td className="whitespace-nowrap text-xs">
+                {c.ours} ours · {c.outsiders} others{c.pending ? ` · ${c.pending} asking` : ""}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(c.escrowPence)}</td>
+              <td className="whitespace-nowrap text-xs">{fmtIn(c.departsAt)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.what === "failed" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {x.what}
+              {x.dest ? ` (our convoy to ${portName(x.dest)})` : ""}: {x.note}
+              {x.what === "settled" && x.pence !== undefined ? ` · ${fmtCr(x.pence)} to our escorts` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        A convoy we form whose ship mounts guns (and holds no policy consorts could void) is announced public, admission by approval, charging
+        other companies&apos; ships about half what sailing with us saves an unarmed hold ({fmtCr(e.floorPerTonPence)} to {fmtCr(e.capPerTonPence)} a ton);
+        our armed ships join it as escorts, so the fees (escrowed on joining, paid on arrival) come to us. A request is admitted only from a ship
+        no slower than our slowest, an escort with guns, and while few others are in; ours always. Otherwise our convoys stay private, as
+        before. Convoys by hand on the{" "}
+        <Link href="/convoys" className="underline">
+          Convoys page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+const DESIGN_SOURCE: Record<string, string> = { licence: "our licence", own: "our patent", public: "public design", offer: "licence offer" };
+
+/** Components and research (guide 3.19; rnd.ts): the fit under way and the last fits, designs we could fit, our project, patents and grants. */
+function RndView({ r }: { r: RndReport }) {
+  const { portName } = useCatalog();
+  const c = r.components;
+  const x = r.research;
+  const p = x.project;
+  const fits = [...c.fits].reverse().slice(0, 8);
+  const designs = c.designs.slice(0, 10);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Components and R&amp;D: {plural(c.stats.fitted, "component")} fitted ({fmtCr(c.stats.spentPence)} spent; {fmtCr(c.spent24hPence)} of{" "}
+        {fmtCr(c.budgetPence)} in the last 24 h)
+        {c.job && ` · fitting ${c.job.name} to ${c.job.ship}`}
+        {!c.enabled && " · components off"}
+        {" · research: "}
+        {p ? `${p.slot} grade ${p.grade}, ${p.stageName}` : x.enabled ? "no project" : "off"}
+        {x.stats.granted > 0 && ` · ${plural(x.stats.granted, "grant")}`}
+        {x.patents.some((t) => t.arrearsDays > 0) && <span className="text-destructive"> · patent upkeep in arrears</span>}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        Components: {c.blocked ? `nothing fitted for now: ${c.blocked}. ` : ""}Last pass: {c.action}. {plural(c.stats.unitsBought, "licence unit")} bought,{" "}
+        {c.stats.made} made, fitting fees {fmtCr(c.stats.feesPence)}.
+      </p>
+      {c.job && (
+        <p className="mt-2 text-xs">
+          Under way: {c.job.name} ({c.job.slot}) for {c.job.ship} at {portName(c.job.port)}, at the {c.job.stage} step
+          {c.job.sentAt ? `; its call sent ${fmtAgo(c.job.sentAt)} had no answer yet and is being read back` : ""}.
+        </p>
+      )}
+      {fits.length > 0 && (
+        <Table head={["Fit", "Ship", "Spent", "Gain /h", "Outcome"]} className="mt-2">
+          {fits.map((f, i) => (
+            <tr key={`${f.at}-${i}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{f.name}</div>
+                {f.slot} · {fmtAgo(f.at)}
+              </td>
+              <td className="text-xs">
+                {f.ship} at {portName(f.port)}
+              </td>
+              <td className="whitespace-nowrap tabular-nums">
+                {fmtCr(f.spentPence)}
+                <div className="text-muted-foreground text-xs">fee {fmtCr(f.feePence)}</div>
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(f.gainPerHourPence)}</td>
+              <td className="text-xs">
+                <Badge variant={f.outcome === "fitted" ? "success" : "secondary"} size="sm">
+                  {f.outcome}
+                </Badge>
+                {f.why && <div className="text-muted-foreground">{f.why}</div>}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {designs.length > 0 && (
+        <Table head={["Design we could fit", "Slot", "Effects", "From", "Unit"]} className="mt-2">
+          {designs.map((g) => (
+            <tr key={`${g.componentId}-${g.source}`} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{g.name}</div>
+                grade {g.grade}
+              </td>
+              <td className="text-xs">{g.slot}</td>
+              <td className="text-xs">
+                {g.effects.join(", ") || "—"}
+                {!g.readable && <div className="text-muted-foreground">not read as a clear gain: never fitted</div>}
+              </td>
+              <td className="text-xs">{DESIGN_SOURCE[g.source] ?? g.source}</td>
+              <td className="whitespace-nowrap tabular-nums">{g.unitPricePence === null ? "—" : fmtCr(g.unitPricePence)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {c.designs.length > designs.length && <p className="mt-1 text-muted-foreground text-xs">and {c.designs.length - designs.length} more designs.</p>}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Research{x.enabled ? "" : " (off)"}: {x.blocked ? `nothing started for now: ${x.blocked}. ` : ""}Last pass: {x.action}.
+        {x.canStart !== null && ` The game ${x.canStart ? "allows" : "doesn't allow"} a start now.`} Budget {fmtCr(x.budgetPence)} a project.{" "}
+        {plural(x.stats.started, "project")} started, {x.stats.abandoned} given up, {plural(x.stats.granted, "grant")}; spent {fmtCr(x.stats.spentPence)}, licence
+        income {fmtCr(x.stats.licenceIncomePence)}.{x.checkedAt ? ` Checked ${fmtAgo(x.checkedAt)}.` : ""}
+      </p>
+      {p && (
+        <div className="mt-2 space-y-1 rounded-md border px-3 py-2 text-xs">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <span className="font-medium">
+              {p.slot} grade {p.grade}: stage {p.stage}, {p.stageName}
+            </span>
+            <span className="text-muted-foreground tabular-nums">
+              {p.points.toLocaleString("en-GB")} / {p.required.toLocaleString("en-GB")} points
+            </span>
+          </div>
+          <Progress value={p.points} max={p.required} />
+          <div className="text-muted-foreground">
+            Trial ship {p.trialShip ?? "—"} · upkeep {fmtCr(p.upkeepPerDayPence)} a game day · spent {fmtCr(p.spentPence)} of the {fmtCr(x.budgetPence)} budget
+            {p.startedAt ? ` · started ${fmtAgo(p.startedAt)}` : ""}
+          </div>
+          {p.unpaidDays > 0 && (
+            <div className="text-destructive">
+              Upkeep unpaid {plural(p.unpaidDays, "game day")} running (three give the project up with nothing back).
+            </div>
+          )}
+        </div>
+      )}
+      {x.patents.length > 0 && (
+        <Table head={["Our patent", "Slot", "Status", "Upkeep", "Arrears"]} className="mt-2">
+          {x.patents.map((t) => (
+            <tr key={t.componentId} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{t.name}</div>
+                grade {t.grade}
+              </td>
+              <td className="text-xs">{t.slot}</td>
+              <td className="text-xs">{t.status.replace(/_/g, " ")}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(t.upkeepPerDayPence)}/day</td>
+              <td className={`whitespace-nowrap tabular-nums ${t.arrearsDays > 0 ? "text-destructive" : ""}`}>{t.arrearsDays > 0 ? plural(t.arrearsDays, "day") : "—"}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {x.grants.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {[...x.grants]
+            .reverse()
+            .slice(0, 8)
+            .map((g) => (
+              <li key={`${g.componentId}-${g.at}`}>
+                {fmtDateTime(new Date(g.at).toISOString())}: granted {g.name} ({g.slot} grade {g.grade}; {g.effects.join(", ") || "no effect words"}): {g.verdict}, {g.action}
+              </li>
+            ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Gain /h is what the fit was expected to add to her earnings a real hour. Projects, patents, licences and fits by hand on the{" "}
+        <Link href="/rnd" className="underline">
+          R&amp;D page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** The news packet (guide 3.11, 3.16; news.ts): Lloyd's envelope desk as read, the case for a packet, our courier and her sales. */
+function NewsView({ n }: { n: NewsReport }) {
+  const { portName } = useCatalog();
+  const c = n.courier;
+  const k = n.case;
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        News packet: {c ? `${c.ship} couriering` : n.givenUp ? `${n.givenUp.ship} given up` : "none"}
+        {` · ${n.stats.sold} of ${plural(n.stats.posted, "envelope")} sold for ${fmtCr(n.stats.incomePence)}`}
+        {k && ` · case: ~${fmtCr(k.incomePerDayPence)} a game day against ~${fmtCr(k.upkeepPerDayPence)} upkeep`}
+        {!n.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {n.blocked ? `No packet for now: ${n.blocked}. ` : ""}Last pass: {n.action}.{n.checkedAt ? ` Checked ${fmtAgo(n.checkedAt)}.` : ""}
+      </p>
+      {n.givenUp && (
+        <p className="mt-2 rounded-md bg-warning/10 px-3 py-2 text-warning-foreground text-xs">
+          {n.givenUp.ship} was given up as the news packet {fmtAgo(n.givenUp.at)}: {n.givenUp.why}. She is sold down the ship broker&apos;s ladder
+          (with break-ups on); switching news packets off and on again re-arms one.
+        </p>
+      )}
+      {c && (
+        <div className="mt-2 space-y-1 rounded-md border px-3 py-2 text-xs">
+          <div className="font-medium">
+            {c.ship}
+            {c.port ? ` at ${portName(c.port)}` : ""}
+            {c.dest ? `, bound for ${portName(c.dest)}` : ""}
+            {!c.sealed && (
+              <Badge variant="warning" size="sm" className="ml-1">
+                dispatches not sealed
+              </Badge>
+            )}
+          </div>
+          <div className="text-muted-foreground">
+            Couriering{c.since ? ` since ${fmtAgo(c.since)}` : ""}; over the last 3 game days she sold {fmtCr(c.trailingIncomePence)} against{" "}
+            {fmtCr(c.trailingUpkeepPence)} of upkeep
+            {c.calls.length > 0 &&
+              `; calls: ${[...c.calls]
+                .reverse()
+                .slice(0, 6)
+                .map((x) => `${portName(x.port)} ${fmtAgo(x.at)}`)
+                .join(", ")}`}
+            .
+          </div>
+          <div className="text-muted-foreground">
+            Her next envelope asks {n.pricePence === null ? "—" : fmtCr(n.pricePence)} (the desk&apos;s average ×{n.step.toFixed(2)}, learned from her sales);{" "}
+            {n.openEnvelopes} open.
+          </div>
+        </div>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        {n.desk
+          ? `Lloyd's envelope desk, last ${n.desk.days} game days: ${n.desk.bought} bought, ~${fmtCr(n.desk.perDayPence)} a game day, ${
+              n.desk.avgPence === null ? "no average yet" : `${fmtCr(n.desk.avgPence)} on average`
+            }; players ${plural(n.desk.playerTrades, "trade")}${n.desk.playerAvgPence === null ? "" : ` at ${fmtCr(n.desk.playerAvgPence)}`} (read ${fmtAgo(n.desk.readAt)}).`
+          : "Lloyd's envelope desk not read yet."}
+        {k &&
+          ` The case for one packet: ~${fmtCr(k.incomePerDayPence)} a game day against ~${fmtCr(k.upkeepPerDayPence)} of upkeep, net ${fmtCr(k.netPerDayPence)}: ${k.ok ? "it pays" : "it doesn't"} (${k.why}).`}
+        {n.ordinaryCapPence !== null && ` Ordinary envelopes are capped at ${fmtCr(n.ordinaryCapPence)}.`}
+        {` ${n.stats.posted} posted, ${n.stats.sold} sold for ${fmtCr(n.stats.incomePence)}, ${n.stats.withdrawn} withdrawn unsold, ${n.stats.built} built. `}
+        Envelopes by hand on the{" "}
+        <Link href="/envelopes" className="underline">
+          Envelopes page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
+/** Ship shares (guide 3.13.6; shares.ts): our 64ths of other players' ships, dividends, yield, listings weighed, ours for sale. */
+function SharesView({ s }: { s: SharesReport }) {
+  const live = s.holdings.filter((h) => !h.sunk);
+  const recent = [...s.recent].reverse().slice(0, 8);
+  return (
+    <details className="text-sm">
+      <summary className="cursor-pointer text-muted-foreground text-xs">
+        Ship shares: {live.length ? `64ths of ${plural(live.length, "ship")}, ${fmtCr(s.investedPence)} paid of the ${fmtCr(s.budgetPence)} budget` : "no holdings"}
+        {` · dividends ${fmtCr(s.stats.dividendsPence)}`}
+        {s.stats.sold > 0 && ` · ${s.stats.sold} sold for ${fmtCr(s.stats.soldPence)}`}
+        {s.stats.writtenOffPence > 0 && <span className="text-destructive">{` · ${fmtCr(s.stats.writtenOffPence)} written off (sunk)`}</span>}
+        {!s.enabled && " · off"}
+      </summary>
+      <p className="mt-2 text-muted-foreground text-xs">
+        {s.blocked ? `No buy for now: ${s.blocked}. ` : ""}Last pass: {s.action}. {plural(s.stats.bought, "lot")} bought for {fmtCr(s.stats.spentPence)}.
+        {s.checkedAt ? ` Checked ${fmtAgo(s.checkedAt)}.` : ""}
+      </p>
+      {s.holdings.length > 0 && (
+        <Table head={["Holding", "Paid", "Dividends", "Earns us /day", "Yield", "Verdict"]} className="mt-2">
+          {s.holdings.map((h) => (
+            <tr key={h.shipId} className="align-top">
+              <td className="text-xs">
+                <div className="font-medium text-sm">{h.ship}</div>
+                {h.sixtyFourths}/64
+              </td>
+              <td className="whitespace-nowrap tabular-nums">{h.costPence > 0 ? fmtCr(h.costPence) : <span className="text-muted-foreground text-xs">by hand</span>}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(h.dividendsPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{h.ourEarnPerDayPence === null ? "—" : fmtCr(h.ourEarnPerDayPence)}</td>
+              <td className="whitespace-nowrap tabular-nums">{h.yieldBpsPerDay === null ? "—" : `${fmtBps(h.yieldBpsPerDay)}/day`}</td>
+              <td className={`text-xs ${h.sunk ? "text-destructive" : "text-muted-foreground"}`}>
+                {h.verdict}
+                {h.listing && (
+                  <div>
+                    {h.listing.sixtyFourths}/64 listed at {fmtCr(h.listing.pricePer64thPence)} each (step {h.listing.step}) since {fmtAgo(h.listing.since)}
+                  </div>
+                )}
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {s.candidates.length > 0 && (
+        <Table head={["Listing weighed", "64ths", "Price a 64th", "Verdict"]} className="mt-2">
+          {s.candidates.map((x) => (
+            <tr key={x.listingId} className="align-top">
+              <td className="text-xs">{x.ship}</td>
+              <td className="tabular-nums">{x.sixtyFourths}</td>
+              <td className="whitespace-nowrap tabular-nums">{fmtCr(x.pricePer64thPence)}</td>
+              <td className="text-muted-foreground text-xs">{x.verdict}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {recent.length > 0 && (
+        <ul className="mt-2 space-y-0.5 text-muted-foreground text-xs">
+          {recent.map((x, i) => (
+            <li key={`${x.at}-${i}`} className={x.what === "sunk" ? "text-destructive" : undefined}>
+              {fmtDateTime(x.at)}: {x.what} {x.sixty}/64 of {x.ship}, {fmtCr(x.pence)}
+              {x.note ? ` (${x.note})` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-2 text-muted-foreground text-xs">
+        Earnings a game day are her realised P&amp;L as our holdings show it, for our 64ths; the yield is on what the autopilot paid (none for
+        64ths bought by hand). Only ships we already hold are bought more of; never our own ships, at most 8 64ths of one. Buy, list or sell
+        by hand on the{" "}
+        <Link href="/shares" className="underline">
+          Shares page
+        </Link>
+        .
+      </p>
+    </details>
+  );
+}
+
 /** World events in force, what the planner makes of each, and what it has learned from them. */
 function WorldEventsView({ w }: { w: NonNullable<FleetView["state"]>["worldEvents"] }) {
   const { catalog, portName, goodName } = useCatalog();
@@ -1878,8 +2786,10 @@ function AiPanel({
       </div>
       <p className="text-muted-foreground text-xs">
         Shadow: Claude advises and every answer is logged, nothing changes. Live: its directives apply until they lapse (15-180 min): any
-        setting but its own within your ceilings (max ships, the marque and underwriting budgets, the debt cap and the cash due counted
-        never above yours, the reserve only raised, borrowing, mortgages, idle-cash lending, passengers, break-ups and moving home never switched on while yours are off), bans on ports, sea zones, goods and charters, a bias on lane ranks, calls on stalled expansion charters, orders to single
+        setting but its own within your ceilings (max ships, the marque, underwriting, deposit, bank lending, component, research and ship-share
+        budgets, the debt cap and the cash due counted never above yours, the reserve and the bank&apos;s net-worth bar only raised, borrowing,
+        mortgages, idle-cash lending, deposits, our bank, passengers, passenger voyages, ventures, escort fees, the news packet, components,
+        research, ship shares, break-ups and moving home never switched on while yours are off), bans on ports, sea zones, goods and charters, a bias on lane ranks, calls on stalled expansion charters, orders to single
         ships (a lane, a charter, a port, hold in the roadstead, drop a planned lane), the ship buyer (hold, one build, classes forbidden),
         marques or patrols within your marque budget (set it to 0 to forbid them; an issued one runs its term and can&apos;t be withdrawn), and
         money orders: borrow for a ship&apos;s load or a new ship (within your debt cap and required return), repay a loan early, build a

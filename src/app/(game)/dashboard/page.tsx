@@ -215,7 +215,9 @@ function ChartersPanel({
 
 export default function DashboardPage() {
   const { data: profile, error: profileError } = usePoll(() => kibbGet<CompanyProfile>("/v1/company/profile"), 15_000);
-  const { data: ships } = usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { limit: 200 }), 10_000);
+  const { data: listed } = usePoll(() => kibbGet<ShipResult[]>("/v1/fleet/ships", { limit: 200 }), 10_000);
+  // The fleet list keeps sunk hulls (status `sunk`): the fleet is what still floats.
+  const ships = listed?.filter((r) => r.ship.status !== "sunk");
   const { data: expansion } = usePoll(() => kibbGet<ExpansionStatus>("/v1/world/expansion"), 60_000);
   const { data: charters } = usePoll(
     () => kibbGet<ContractListing[]>("/v1/contract/list", { contract_type: "charter", status: "open", limit: 200 }),

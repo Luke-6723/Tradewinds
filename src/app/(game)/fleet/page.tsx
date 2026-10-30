@@ -29,6 +29,13 @@ function hullUpkeep(lower: number, oceanic: number): number {
   return sprawlPerDay(lower + Math.floor(oceanic / 2)) + 100 * oceanic;
 }
 
+/** "3 ships" for the hulls afloat; sunk hulls the fleet list still carries are counted apart, never as ships. */
+function fleetCount(ships: ShipResult[]): string {
+  const sunk = ships.filter((r) => r.ship.status === "sunk").length;
+  const n = ships.length - sunk;
+  return `${n} ship${n === 1 ? "" : "s"}${sunk ? ` (${sunk} sunk)` : ""}`;
+}
+
 /** Extra upkeep per game day the new hull adds to the fleet's bill, in pence. */
 function upkeepDelta(ships: ShipResult[], classes: CatalogShipClass[], cls: CatalogShipClass): number {
   const afloat = ships.filter((r) => r.ship.status !== "sunk");
@@ -340,7 +347,7 @@ export default function FleetPage() {
     <div className="space-y-5 pb-8 sm:space-y-6">
       <PageHeader title="Fleet" subtitle="Ships, where they are and what they carry. Build more at a shipyard." />
       <ErrorNote error={error} />
-      <Panel title={ships ? `${ships.length} ship${ships.length === 1 ? "" : "s"}` : "Ships"}>
+      <Panel title={ships ? fleetCount(ships) : "Ships"}>
         {!ships ? (
           <Loading />
         ) : ships.length === 0 ? (

@@ -207,6 +207,35 @@ export interface FleetHost {
    * break-up. A wait (real ms), or null: carry on as any ship (no mark, or it was withdrawn).
    */
   retireTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null>;
+  /**
+   * Commenda ventures (guide 3.13.5; manager.ts, ventures.ts): her turn in port while a venture of ours is under way on her (raising
+   * capital, buying through it, sailing alone to its port, selling through it, settling). A wait (real ms), or null: no venture
+   * on her (or it just closed): carry on as any ship.
+   */
+  ventureTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null>;
+  /**
+   * At a lane's source, berthed, stores aboard, nothing of the load bought: whether a venture was opened for it instead (the load
+   * cash-limited, no load loan planned, the value test passed). True: the lane is given up, ventureTurn takes her from now on.
+   */
+  ventureStart(agent: ShipAgent, r: ShipResult, lane: Lane): Promise<boolean>;
+  /** Whether a venture under way on her holds this good aboard (its tons are never ours to sell, deliver, unload or stow). */
+  ventureGood(agent: ShipAgent, good: string): boolean;
+  /** Whether a venture of ours is under way on her (no convoy, no passengers, no other work). */
+  ventureShip(agent: ShipAgent): boolean;
+  /** A lane chosen with passengers' fares counted (voyages.ts): what became of it at sail time. */
+  notePaxVoyage(agent: ShipAgent, lane: Lane, outcome: "sailed" | "unboarded" | "given_up"): void;
+  /**
+   * Components (guide 3.19; manager.ts, rnd.ts): berthed at a yard, before anything is loaded there (never a detour), whether a component
+   * that pays her was fitted now (made there first if need be). True: her hold, speed or turnaround may have changed (read her again).
+   */
+  fitComponents(agent: ShipAgent, r: ShipResult, port: string): Promise<boolean>;
+  /** Whether she is the fleet's news packet (news.ts): no lane, convoy or passengers; her turn in port is the courier's. */
+  courierShip(agent: ShipAgent): boolean;
+  /**
+   * The news packet's turn in port (guide 3.11; manager.ts, news.ts): her dispatches sealed, her news of other ports posted here, on to
+   * the next hub. A wait (real ms), or null: carry on as any ship (anything aboard from her trading days is seen to first).
+   */
+  courierTurn(agent: ShipAgent, r: ShipResult, port: string): Promise<number | null>;
 }
 
 /** What one ship's agent saves, so a restart resumes its lane, sell floors and record. */
@@ -367,7 +396,7 @@ interface Stay {
   port: string;
   key: string;
   scouted: boolean;
-  /** Kinds of berth trades done: "cargo", "stores", "freight", "arm", "yard". */
+  /** Kinds of berth trades done: "cargo", "stores", "freight", "arm", "yard", "component". */
   traded: Set<string>;
   /** Tons of each good bought or unloaded from stores here: never deliverable to a charter here. */
   boughtHere: Map<string, number>;
@@ -395,6 +424,8 @@ interface Stay {
   paxPosts?: Map<string, number>;
   /** The one hold for a round this stay: until when (server ms), and the heads its offer had taken then (a boarding ends it early). */
   paxHold?: { until: number; taken: number };
+  /** A passage for fares alone was given up here (nobody boarded): none is planned again this stay (voyages.ts). */
+  paxLaneFailed?: boolean;
 }
 
 const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
@@ -732,6 +763,8 @@ export class ShipAgent {
    */
   ownTons(r: ShipResult, good: string): number {
     if (this.host.world.isContraband(good)) return 0;
+    // A venture's cargo (guide 3.13.5): sold, unloaded, delivered or stowed only through the venture, never as ours.
+    if (this.host.ventureGood(this, good)) return 0;
     let sealed = 0;
     for (const f of this.freight.values()) if (f.good === good) sealed += f.tons;
     return Math.max(0, (r.cargo_manifest[good] ?? 0) - sealed);
@@ -1184,6 +1217,20 @@ export class ShipAgent {
     return this.offers.size > 0;
   }
 
+  /**
+   * Whether a passage for fares alone may be planned for her now (voyages.ts): in port, no hold for a round decided this stay (one
+   * wait at most) and none given up here, nobody aboard (their port pins her).
+   */
+  paxLaneAllowed(): boolean {
+    const s = this.stay;
+    return !!s && !s.paxHold && !s.paxLaneFailed && this.aboard.size === 0;
+  }
+
+  /** Tons of free hold kept back from berths for a stores top-up, as offerBerths keeps them (planning: from the stores aboard). */
+  paxPlanReserve(r: ShipResult): number {
+    return Math.max(PAX_STORES_SLACK_TONS, Math.ceil(r.stores.provisions_tons * PAX_STORES_SLACK_SHARE));
+  }
+
   /** Whether a passenger notice naming this offer or group is about her (a group aboard, or just gone from her list). */
   knowsPax(offerId: string | undefined, groupId: string | undefined): boolean {
     if (offerId !== undefined && [...this.offers.values()].some((o) => o.id === offerId)) return true;
@@ -1285,7 +1332,8 @@ export class ShipAgent {
     const port = stay.port;
     if (!settings.usePassengers || world.paxBlockedNow() !== null || dest === port || r.ship.status === "sailing") return;
     // Nor on a ship being retired (guide 3.4: none aboard or offered when she changes hands at the yard).
-    if (this.arrest || this.host.isSmuggler(this) || this.host.retireStage(this) !== null || this.contrabandAboard(r).length > 0) return;
+    // Nor on a venture's voyage (guide 3.13.5): its timing is the raise deadline's, and the hold is the venture's.
+    if (this.arrest || this.host.isSmuggler(this) || this.host.retireStage(this) !== null || this.contrabandAboard(r).length > 0 || this.host.ventureShip(this) || this.host.courierShip(this)) return;
     const had = this.offers.get(dest);
     if (had && had.port === port && had.spot === r.ship.status) return;
     // Moved since it was posted (to or from the berth, into a convoy): taken as closed by the move, and posted again below.
@@ -2015,6 +2063,23 @@ export class ShipAgent {
       r = await this.reread();
     }
 
+    // A venture of ours on her (guide 3.13.5): its turn drives her (raise, buy through it, sail alone to its port, sell through it,
+    // settle) before any other work; its tons are never ours meanwhile (ownTons).
+    if (this.host.ventureShip(this)) {
+      const wait = await this.host.ventureTurn(this, r, port);
+      if (wait !== null) return wait;
+      // Settled or cancelled: back to work as any ship.
+      r = await this.reread();
+    }
+
+    // The fleet's news packet (guide 3.11): her turn seals her dispatches, posts her news here and sails her on to the next hub. With
+    // cargo, sealed freight or passengers aboard from her trading days, those are seen to first below (no lane is planned for her).
+    if (this.host.courierShip(this)) {
+      const wait = await this.host.courierTurn(this, r, port);
+      if (wait !== null) return wait;
+      r = await this.reread();
+    }
+
     // 1. Freight that ends here (works from the roadstead).
     let refusedHere = false;
     let freightChanged = false;
@@ -2128,6 +2193,15 @@ export class ShipAgent {
       return STAND_BY_MS;
     }
 
+    // A component that pays her (guide 3.19), fitted while berthed at a yard and before anything is loaded here (a bigger hold sizes the
+    // load); once a stay.
+    if (atYard && r.ship.status === "berthed" && !stay.traded.has("component") && !stay.traded.has("cargo")) {
+      stay.traded.add("component");
+      if (await this.host.fitComponents(this, r, port)) {
+        r = await this.reread();
+        if (this.lane && this.lane.source === port && this.laneLoaded !== this.lane.key) this.host.releaseLane(this);
+      }
+    }
     if (atYard && (await this.refitGuns(r, stay))) {
       r = await this.reread();
       // Still to load here: plan again so the load uses the room the refit freed (or gave up).
@@ -2722,6 +2796,8 @@ export class ShipAgent {
     // Insured since the plan (the user, from the dashboard): nothing goes aboard after a policy is written.
     const insured = await this.policyNow();
     if (insured !== null) return this.stopLoading(stay, insured);
+    // A passage for fares alone (voyages.ts): nothing to buy, no berth needed.
+    if (lane.kind === "passengers") return this.sailForFares(r, lane, stay);
     if (r.ship.status !== "berthed") {
       // Docking costs a berth stay: only when at least a ton (or the freight's collateral) can be paid for;
       // for a load counting on cash due, the main cargo buyPart would sail with (the rest waits in the roadstead).
@@ -2744,6 +2820,8 @@ export class ShipAgent {
       this.sizedAt = { stay: stay.key, at: Date.now() };
       // Never insured here (checked just above): an insured ship loads nothing.
       lane = (await this.host.resizeLane(this, stay.port, r)) ?? lane;
+      // Re-sizing plans loads, never a passage for fares alone; should one come back all the same, it sails as one.
+      if (lane.kind === "passengers") return this.sailForFares(r, lane, stay);
     }
     // Season end (guide 3.11): a load that can't land before it isn't bought (the planner's lanes all can; one
     // kept as planned when re-sizing found nothing may not).
@@ -2761,6 +2839,13 @@ export class ShipAgent {
       await this.buyStores(cur, stay, storesTons(cur.stores.provisions_tons, await this.storesTarget(lane.source, lane.dest, lane.source)));
     }
     r = await this.reread();
+
+    // A load cash limits may raise outside capital instead (guide 3.13.5; manager.ts ventureStart): the stores are aboard (their lock
+    // is behind the venture's buy, not after it), nothing of the load is. Opened: the lane is given up and the venture takes her.
+    if (untouched && this.laneGoodsAboard(r, lane) === 0 && (await this.host.ventureStart(this, r, lane))) {
+      this.activity = `raising capital for a venture to ${lane.dest}`;
+      return 1_000;
+    }
 
     // The main cargo first: without it the lane is off. Each purchase and lot reads the policy afresh first: one
     // written meanwhile stops the loading where it stands (stopLoading).
@@ -2829,6 +2914,21 @@ export class ShipAgent {
     // Any room still free: freight bound the same way, if it pays for its berth time.
     await this.takeFreight(await this.reread(), lane.dest, stay);
     return this.sailTo(await this.reread(), lane.dest, stay);
+  }
+
+  /**
+   * A passage for fares alone (a "passengers" lane; voyages.ts): nothing to buy. She sails for its port as any passage: the offer goes
+   * up at sailTo's hook with its one round, and if nobody boards sailTo gives the lane up rather than sail empty.
+   */
+  private async sailForFares(r: ShipResult, lane: Lane, stay: Stay): Promise<number> {
+    this.laneLoaded = lane.key;
+    this.host.persist(true);
+    return this.sailTo(r, lane.dest, stay);
+  }
+
+  /** To a berth (or the queue for one), as any call does: a wait (never with contraband aboard in an ordinary port). */
+  async berth(r: ShipResult): Promise<number> {
+    return this.dockOrWait(r);
   }
 
   /** Tons of a charter part its charters still have room for (all of a market part). */
@@ -4142,6 +4242,25 @@ export class ShipAgent {
       this.activity = `boarding passengers for ${dest}: waiting ${secs(paxHold)} for the next game-hour round`;
       return paxHold;
     }
+    // A passage for fares alone (voyages.ts): sailed only with passengers aboard for its port, never empty for fares that didn't board.
+    // Whether or not it counts as loaded (loadAt's early return after a trade this stay reaches here without sailForFares).
+    const paxOnly = this.lane?.kind === "passengers" && this.lane.dest === dest ? this.lane : null;
+    if (paxOnly && this.paxHeads(dest) === 0) {
+      const o = this.offers.get(dest);
+      const round = o && o.port === port ? world.nextGameHour(o.at) : null;
+      const settle = round !== null ? round + PAX_ROUND_SLACK_GAME_MIN * world.gameMinuteMs : 0;
+      // Its round not chosen yet (a lock held her past the hold's decision): the same one wait, to just after that round.
+      if (round !== null && world.now() < settle) {
+        this.activity = `boarding passengers for ${dest}: waiting ${secs(settle - world.now())} for the game-hour round`;
+        return settle - world.now() + 500;
+      }
+      this.log(`no passengers boarded for ${dest}${o ? "" : " (no offer could be posted)"}: not sailing there empty; planning again`);
+      this.avoid.set(paxOnly.key, world.now() + LANE_COOLDOWN_MS * (60 / world.timeScale));
+      stay.paxLaneFailed = true;
+      this.host.notePaxVoyage(this, paxOnly, "given_up");
+      this.host.releaseLane(this);
+      return 3_000;
+    }
 
     // Our other ships bound the same way soon: sail together (pirates board just one ship of a
     // convoy, and guns are pooled).
@@ -4168,6 +4287,9 @@ export class ShipAgent {
       this.noteDues(port, res.berth_dues_pence);
       // Departing closed our offers here on the server.
       if (this.offers.size) this.closeOffers();
+      // A lane chosen with fares counted (voyages.ts): whether its passengers came.
+      const pl = this.lane;
+      if (pl?.pax && pl.pax.dest === dest) this.host.notePaxVoyage(this, pl, this.paxHeads(dest) > 0 ? "sailed" : "unboarded");
       for (const w of res.warnings) {
         if (w.code !== "stores_below_safe") {
           this.log(`depart warning ${w.code}: ${w.detail}`);

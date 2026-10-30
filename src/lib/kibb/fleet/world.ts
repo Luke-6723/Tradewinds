@@ -25,7 +25,8 @@ import type {
   RoutePlan,
   ZoneClass,
 } from "../types";
-import type { FareBandView, FareRecordView, LloydsListNotice, MonopolyResult, PassengerKind, UnderwritingFigures, UnmetRouteView, WorldEventResult, WorldEventType } from "../schema";
+import type { FareBandView, FareRecordView, LloydsListNotice, MonopolyResult, PassengerKind, UnderwritingFigures, UnmetRouteView, WaitingGroupView, WorldEventResult, WorldEventType } from "../schema";
+import { PAX_WAITING_PORTS_KEPT, PAX_WAITING_TTL_GAME_MIN } from "./voyages";
 
 /** Passenger fares (guide 3.20, public): pages of 200 read world-wide a game day at a time, a route's own up to this many, and routes learned kept. */
 const FARE_PAGES = 3;
@@ -797,6 +798,8 @@ export class World {
   private fareSummaryTried = 0;
   /** The passenger pricer's nudge and the rounds won and lost per route (`from>to`). */
   private readonly paxRoutes = new Map<string, PaxRoute>();
+  /** Groups waiting per port as last read for the planner's passenger voyages (waitingAt; local ms). */
+  private readonly waitingCache = new Map<string, { at: number; groups: WaitingGroupView[] }>();
   /** Active trading companies (expansion board), or null before the first read. */
   activeCompanies: number | null = null;
   /** Expansion charters of the tier in play by `port|good`: our own flow into each, and its rival record. */
@@ -2418,6 +2421,45 @@ export class World {
     this.routeFareRecs.set(key, { at: Date.now(), items });
     if (this.routeFareRecs.size > PAX_ROUTES_KEPT) this.routeFareRecs.delete(this.routeFareRecs.keys().next().value!);
     return items;
+  }
+
+  /** The fares accepted on `from` → `to` as last read for an offer there (routeFares), while fresh; undefined: not read lately. No call. */
+  routeFaresCached(from: string, to: string): FareRecordView[] | undefined {
+    const hit = this.routeFareRecs.get(routeKey(from, to));
+    return hit && Date.now() - hit.at < this.fareTtlMs ? hit.items : undefined;
+  }
+
+  /**
+   * The groups waiting at `port` (guide 3.20: public), for the planner's passenger voyages (voyages.ts): one port's at a time, the
+   * ship's own, read again once PAX_WAITING_TTL_GAME_MIN old, at most PAX_WAITING_PORTS_KEPT ports kept. A failed read keeps the
+   * last (none: nothing). Never throws but on a dead key, a frozen company or a paused world.
+   */
+  async waitingAt(port: string): Promise<WaitingGroupView[]> {
+    const hit = this.waitingCache.get(port);
+    if (hit && Date.now() - hit.at < PAX_WAITING_TTL_GAME_MIN * this.gameMinuteMs) return hit.groups;
+    let groups: WaitingGroupView[];
+    try {
+      groups = await this.client.passengersWaiting(port);
+    } catch (e) {
+      if (isFatalApiError(e) || isApiError(e, "world_paused")) throw e;
+      groups = hit?.groups ?? [];
+    }
+    this.waitingCache.delete(port);
+    this.waitingCache.set(port, { at: Date.now(), groups: Array.isArray(groups) ? groups : [] });
+    while (this.waitingCache.size > PAX_WAITING_PORTS_KEPT) this.waitingCache.delete(this.waitingCache.keys().next().value!);
+    return this.waitingCache.get(port)!.groups;
+  }
+
+  /** Ports whose waiting groups are cached (fresh), and how many groups, for the report. */
+  waitingCached(): { ports: number; groups: number } {
+    let ports = 0;
+    let groups = 0;
+    for (const v of this.waitingCache.values()) {
+      if (Date.now() - v.at >= PAX_WAITING_TTL_GAME_MIN * this.gameMinuteMs) continue;
+      ports++;
+      groups += v.groups.length;
+    }
+    return { ports, groups };
   }
 
   /** A passenger offer was refused for the key's sake (403): none is tried by any ship for an hour (the scope may be granted meanwhile). */
